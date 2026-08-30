@@ -1,13 +1,9 @@
 """Agent lifecycle logic: start/stop/pause/resume.
 
-Tmux is handled generically: callers (a module's own port) supply the real
-window operations as callbacks, and this file never imports tmux directly.
-
-Openshell is NOT handled the same way -- start_agent's and stop_agent's
-openshell branches import an openshell client directly (see the GAP comments
-at each import) rather than going through a callback. That's an open
-inconsistency with the tmux path, not a deliberate design choice; flag it
-rather than assume it's correct.
+This is the library a module uses to keep track of agent lifecycles
+it keeps track of which agent ran where, which profile. 
+Its used AFTER the agent has started, the starting og the agent is done by h-agent.
+This library keeps track of it. 
 """
 
 import json
@@ -20,11 +16,6 @@ from core.logging import log_record
 from core.policy import tags_key
 from core.registry import port_type
 
-# TODO(gap, not guessed at): AGENT_STATE_RESOURCES and available_profiles
-# have no h-mesh equivalent anywhere yet. stop_agent and the openshell
-# branch of start_agent below still reference them. Undecided where either
-# belongs -- this module, or core alongside registry.py -- before relying
-# on this file as-is.
 
 _STARTABLE_VABS = {"tmux", "api", "openshell"}
 _FIXED_PARTICIPANTS = {"api", "host"}
@@ -209,7 +200,7 @@ def start_agent(
         # Both self-supplied: the enrolling client generates its own secret and
         # hands it to lifecycle, rather than lifecycle minting one it has no
         # synchronous channel to hand back over (StartAgent is fire-and-forget,
-        # LLD-api §6). HMAC verification needs the same secret on both sides to
+        # HMAC verification needs the same secret on both sides to
         # recompute the MAC, so it is stored in the clear here, not hashed —
         # unlike a password hash, a digest of the secret could never reproduce
         # a matching signature.
@@ -250,13 +241,6 @@ def start_agent(
         if not isinstance(cli, str) or not cli:
             raise ValueError("StartAgent payload.cli must be a non-empty string")
 
-        # Same validation as the generic (tmux) branch below -- an
-        # openshell agent's profile is meant to select which
-        # CLAUDE_OAUTH_TOKEN_*/CODEX_AUTH_JSON_*/AGY_AUTH_JSON_* env var the
-        # openshell delivery path reads at delivery time, same naming
-        # convention `window_env` already uses for tmux agents. h-mesh's
-        # openshell delivery module doesn't exist yet -- verify this against
-        # whatever h-mesh actually builds.
         profile = payload.get("profile")
         if profile:
             prefix("check", "check", agent=profile, resource="profile")
@@ -294,19 +278,7 @@ def start_agent(
             committed, "registry row published", "registry row publish",
             lambda: r.hset(registry_key, agent, agent_port_type),
         )
-        # Actual-state: provision the real sandbox now, synchronously.
-        # Unlike tmux, which defers window creation to tmuxhost's async
-        # reconciler (a window needs a session/server that may not exist
-        # yet), an OpenShell sandbox is a single gRPC call with no
-        # equivalent staged startup, so there is nothing to gain by
-        # deferring it to a separate reconciler process.
-        #
-        # Imported here, not at module top: the openshell client pulls in
-        # grpc/protobuf, and this file is loaded for every lifecycle
-        # delivery regardless of port_type.
-        # GAP: h-mesh has no openshell module yet -- this import has no
-        # target in this repo. Left as-is rather than fabricated; fix once
-        # openshell exists.
+
         from modules.openshell import OpenShellClient, OpenShellUnavailable
         from modules.openshell.naming import sandbox_name, workspace_name
 
