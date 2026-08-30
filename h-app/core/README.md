@@ -16,6 +16,7 @@ Everything else is a module that plugs into this.
 | `queues.py` | `admit_ingress()` — shared atomic ingress-admission Lua op |
 | `registry.py` | read-only registry access (`members`/`is_member`/`port_type`) |
 | `policy.py` | import/export tag ACL (`allows`/`require_allowed`) |
+| `dispatch.py` | generic port_type -> handler registry and dispatch, invoked only by whatever the switch's kick actually calls -- the switch itself never imports this |
 | `logging.py` | contract-shaped JSON event logging and durable stdout mirroring |
 | `retention.py` | count-based trimming for completed-task and dead-letter queues |
 | `windowlog.py` | agent-window log tailing, offset tracking, and bounded truncation |
