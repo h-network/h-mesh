@@ -30,3 +30,9 @@ jobs:
           POD: ci-smoke
           TENANT: ci-smoke
         run: python3 h-app/tools/smoke_switch.py
+      - name: Delivery smoke test (real Redis)
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/0
+          POD: ci-delivery
+          TENANT: ci-delivery
+        run: python3 h-app/tools/smoke_delivery.py
