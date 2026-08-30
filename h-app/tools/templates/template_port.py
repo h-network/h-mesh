@@ -10,7 +10,7 @@ from core.keys import prefix
 class TemplatePort:
     """Wrap one participant's registry row and send/receive queue boundaries.
 
-    A real module owns what its openers do at the far edge. The reusable bus
+    A real module owns what its openers do at the far edge. The reusable core
     mechanics remain the same: register a participant, send through egress,
     receive through ingress, and remove only that participant's scoped state.
     """

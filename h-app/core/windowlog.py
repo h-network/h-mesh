@@ -75,7 +75,7 @@ class WindowLogTailer:
                     # touches stdout directly — it lands in the window file and
                     # reaches the log only when this re-emits it. Without this
                     # call the durable evidence has `popped` through `opened` and
-                    # no `sent`, which reads exactly like an envelope the bus
+                    # no `sent`, which reads exactly like an envelope the switch
                     # invented. Measured on a live tenant 2026-08-22: five of six
                     # stages in the file, `sent` count 0.
                     mirror(line)
