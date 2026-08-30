@@ -15,9 +15,15 @@ from core.policy import tags_key
 from core.registry import port_type
 
 # TODO(gap, not guessed at): AGENT_STATE_RESOURCES and available_profiles
-# have no h-mesh core equivalent yet. stop_agent and the openshell branch of
-# start_agent below still reference them; decide whether to add them to core,
-# or reimplement locally, before relying on this file as-is.
+# have no h-mesh equivalent yet, anywhere. stop_agent and the openshell
+# branch of start_agent below still reference them. Core was scoped
+# strictly to wire format + switch -- available_profiles (account/CLI
+# discovery) is not a wire-format concern, so it likely does NOT belong in
+# core just because the old repo put it there. AGENT_STATE_RESOURCES is a
+# closer call (it's key-schema knowledge, but only ever used for lifecycle
+# cleanup). Decide where each actually belongs -- probably this module,
+# possibly core only if something else outside lifecycle needs it too --
+# before relying on this file as-is.
 
 _STARTABLE_VABS = {"tmux", "api", "openshell"}
 _FIXED_PARTICIPANTS = {"api", "host"}
