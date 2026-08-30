@@ -2,7 +2,6 @@ import json
 import sys
 import unittest
 from collections import defaultdict, deque
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -77,19 +76,6 @@ class FakeRedis:
                 value = {"count": 1, "since": since}
             self.hset(key, client, json.dumps(value, separators=(",", ":")))
             return value["count"]
-        if "core ack streak" in script:
-            key, destination, now_ts, cutoff_ts = keys[0], argv[0], argv[1], argv[2]
-            existing = self.hget(key, destination)
-            data = json.loads(existing) if existing else None
-            within_window = (
-                isinstance(data, dict)
-                and isinstance(data.get("streak"), (int, float))
-                and isinstance(data.get("last_ts"), str)
-                and cutoff_ts <= data["last_ts"] <= now_ts
-            )
-            value = {"streak": data["streak"] + 1 if within_window else 1, "last_ts": now_ts}
-            self.hset(key, destination, json.dumps(value, separators=(",", ":")))
-            return value["streak"]
         if "core ingress admission" in script:
             limit, raw = int(argv[0]), argv[1]
             for index, key in enumerate(keys, start=1):
@@ -153,32 +139,6 @@ class ChannelTests(unittest.TestCase):
             destination="client", payload={"text": "reply"},
         )
         self.assertIsNone(self.redis.hget(key, "client"))
-
-    def test_ack_streak_increments_resets_after_window_and_clears_on_non_ack(self):
-        self.register(alice="tmux", bob="tmux")
-        key = prefix(POD, TENANT, "alice", "acks")
-        for _ in range(2):
-            send(
-                self.redis, pod=POD, tenant=TENANT, source="alice",
-                destination="bob", payload={"text": "Thanks!"},
-            )
-        self.assertEqual(json.loads(self.redis.hget(key, "bob"))["streak"], 2)
-
-        expired = datetime.now(timezone.utc) - timedelta(seconds=121)
-        self.redis.hset(
-            key, "bob",
-            json.dumps({"streak": 9, "last_ts": expired.isoformat(timespec="milliseconds").replace("+00:00", "Z")}),
-        )
-        send(
-            self.redis, pod=POD, tenant=TENANT, source="alice",
-            destination="bob", payload={"text": "noted"},
-        )
-        self.assertEqual(json.loads(self.redis.hget(key, "bob"))["streak"], 1)
-        send(
-            self.redis, pod=POD, tenant=TENANT, source="alice",
-            destination="bob", payload={"text": "Here is substantive work"},
-        )
-        self.assertIsNone(self.redis.hget(key, "bob"))
 
     def test_receive_dead_letters_opener_rejection(self):
         envelope_id = send(

@@ -39,7 +39,7 @@ def main() -> None:
     owned_keys = [
         prefix(pod, tenant, agent, resource)
         for agent in (sender, recipient)
-        for resource in ("egress", "ingress", "dead", "unreplied", "acks")
+        for resource in ("egress", "ingress", "dead", "unreplied")
     ]
 
     def cleanup() -> None:
