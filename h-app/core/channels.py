@@ -1,4 +1,4 @@
-"""The switch's two channels: send into ingress, receive out of egress."""
+"""The switch's two channels: send into egress, receive out of ingress."""
 
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
