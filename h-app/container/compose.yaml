@@ -1,0 +1,78 @@
+# One container is one tenant.
+#   . container/mesh-compose.sh && resolve_compose_files hq
+#   COMPOSE=(docker compose -p "$MESH_COMPOSE_PROJECT" --env-file "$MESH_TENANT_ENV_PATH")
+#   for file in "${MESH_COMPOSE_FILES[@]}"; do COMPOSE+=(-f "$file"); done
+#   "${COMPOSE[@]}" up -d
+#   "${COMPOSE[@]}" down -v
+# Always use the tenant-specific project name to scope lifecycle commands.
+
+services:
+  tenant:
+    build:
+      context: ..
+      dockerfile: container/Dockerfile
+    # Commit tags prevent reusing an image built from different source.
+    image: ${MESH_TENANT_IMAGE:-h-mesh:latest}
+    # --env-file controls interpolation; env_file also passes tenant variables in.
+    env_file:
+      - "${MESH_TENANT_ENV_PATH:?resolve a tenant with container/mesh-compose.sh}"
+    environment:
+      POD: "${POD:-acme}"
+      TENANT: "${TENANT:-hq}"
+      # name:port_type pairs.
+      ROSTER_SEED: "${ROSTER_SEED:-architect:tmux,sme-2:tmux,sme-3:tmux}"
+      ROSTER_POLL_SECONDS: "${ROSTER_POLL_SECONDS:-5}"
+      # Keep this explicit default aligned with watchdog/service.py.
+      VERIFY_AFTER_SECONDS: "${VERIFY_AFTER_SECONDS:-120}"
+      INGRESS_MAX: "${INGRESS_MAX:-300}"
+      DONE_TASK_MAX: "${DONE_TASK_MAX:-500}"
+      DEAD_LETTER_MAX: "${DEAD_LETTER_MAX:-500}"
+      WINDOW_LOG_MAX_BYTES: "${WINDOW_LOG_MAX_BYTES:-8388608}"
+      # Exceptions only — "frontend=codex", "backend=work".
+      AGENT_CLIS: "${AGENT_CLIS:-}"
+      AGENT_ACCOUNTS: "${AGENT_ACCOUNTS:-}"
+      # env_file carries dynamic MODEL_PROVIDER_<NAME>_* variables without
+      # hardcoding provider names here.
+      AGENT_PROVIDERS: "${AGENT_PROVIDERS:-}"
+      TENANT_ACCESS_TOKEN: "${TENANT_ACCESS_TOKEN:?set TENANT_ACCESS_TOKEN in the tenant .env}"
+      # Publish addresses let the entrypoint enforce TLS independently of the
+      # fixed container listen ports.
+      API_LISTEN_PORT: "8080"
+      TERMINAL_LISTEN_PORT: "8081"
+      # Explicit because the healthcheck branches on this opt-in service.
+      API_SERVICE_ENABLED: "${API_SERVICE_ENABLED:-0}"
+      API_PUBLISH_ADDRESS: "${API_PUBLISH_ADDRESS:-}"
+      TERMINAL_PUBLISH_ADDRESS: "${TERMINAL_PUBLISH_ADDRESS:-}"
+      ALLOW_INSECURE_PUBLISH: "${ALLOW_INSECURE_PUBLISH:-0}"
+      API_TLS_CERT: "${API_TLS_CERT:-}"
+      API_TLS_KEY: "${API_TLS_KEY:-}"
+      TERMINAL_TLS_CERT: "${TERMINAL_TLS_CERT:-}"
+      TERMINAL_TLS_KEY: "${TERMINAL_TLS_KEY:-}"
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN:-}"
+      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID:-}"
+      TELEGRAM_VOICE: "${TELEGRAM_VOICE:-0}"
+      # Unset omits the Telegram Dashboard button.
+      MINI_APP_URL: "${MINI_APP_URL:-}"
+    # Redis remains critical so a restart purges transport before reconnect.
+    restart: unless-stopped
+    init: false  # tini is PID 1 from the image's own ENTRYPOINT
+    healthcheck:
+      # Match the API's TLS mode; without the opt-in API, probe switch and Redis.
+      test: ["CMD-SHELL", "if [ \"$${API_SERVICE_ENABLED:-0}\" = \"0\" ]; then pgrep -f 'python3 -m mesh.switch' >/dev/null && redis-cli -u \"$${REDIS_URL:-redis://127.0.0.1:6379/0}\" ping >/dev/null || exit 1; elif [ -n \"$$API_TLS_CERT\" ]; then curl -fsSk -H \"Authorization: Bearer $$TENANT_ACCESS_TOKEN\" https://127.0.0.1:8080/health || exit 1; else curl -fsS -H \"Authorization: Bearer $$TENANT_ACCESS_TOKEN\" http://127.0.0.1:8080/health || exit 1; fi"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    # Bound Docker's otherwise unbounded json-file log.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    volumes:
+      # A named volume preserves event evidence across container replacement.
+      - event-log:${EVENT_LOG_DIR:-/home/ubuntu/.mesh/events}
+
+volumes:
+  event-log:
+    name: "${COMPOSE_PROJECT_NAME:-h-mesh}-event-log"
