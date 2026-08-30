@@ -15,15 +15,10 @@ from core.policy import tags_key
 from core.registry import port_type
 
 # TODO(gap, not guessed at): AGENT_STATE_RESOURCES and available_profiles
-# have no h-mesh equivalent yet, anywhere. stop_agent and the openshell
-# branch of start_agent below still reference them. Core was scoped
-# strictly to wire format + switch -- available_profiles (account/CLI
-# discovery) is not a wire-format concern, so it likely does NOT belong in
-# core just because the old repo put it there. AGENT_STATE_RESOURCES is a
-# closer call (it's key-schema knowledge, but only ever used for lifecycle
-# cleanup). Decide where each actually belongs -- probably this module,
-# possibly core only if something else outside lifecycle needs it too --
-# before relying on this file as-is.
+# have no h-mesh equivalent anywhere yet. stop_agent and the openshell
+# branch of start_agent below still reference them. Undecided where either
+# belongs -- this module, or core alongside registry.py -- before relying
+# on this file as-is.
 
 _STARTABLE_VABS = {"tmux", "api", "openshell"}
 _FIXED_PARTICIPANTS = {"api", "host"}
@@ -250,12 +245,12 @@ def start_agent(
             raise ValueError("StartAgent payload.cli must be a non-empty string")
 
         # Same validation as the generic (tmux) branch below -- an
-        # openshell agent's profile selects which CLAUDE_OAUTH_TOKEN_*/
-        # CODEX_AUTH_JSON_*/AGY_AUTH_JSON_* env var the openshell delivery
-        # path reads at delivery time, same naming convention `window_env`
-        # already uses for tmux agents. (h-mesh's openshell delivery module
-        # doesn't exist yet -- this comment describes the old repo's intent,
-        # verify against whatever h-mesh actually builds.)
+        # openshell agent's profile is meant to select which
+        # CLAUDE_OAUTH_TOKEN_*/CODEX_AUTH_JSON_*/AGY_AUTH_JSON_* env var the
+        # openshell delivery path reads at delivery time, same naming
+        # convention `window_env` already uses for tmux agents. h-mesh's
+        # openshell delivery module doesn't exist yet -- verify this against
+        # whatever h-mesh actually builds.
         profile = payload.get("profile")
         if profile:
             prefix("check", "check", agent=profile, resource="profile")
@@ -304,8 +299,8 @@ def start_agent(
         # grpc/protobuf, and this file is loaded for every lifecycle
         # delivery regardless of port_type.
         # GAP: h-mesh has no openshell module yet -- this import has no
-        # target in this repo. Left as-is (describes old repo intent,
-        # not guessed at) rather than fabricated; fix once openshell exists.
+        # target in this repo. Left as-is rather than fabricated; fix once
+        # openshell exists.
         from modules.openshell import OpenShellClient, OpenShellUnavailable
         from modules.openshell.naming import sandbox_name, workspace_name
 
