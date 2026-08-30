@@ -1,7 +1,13 @@
-"""Agent lifecycle logic: start/stop/pause/resume, generic over the actual
-mechanism -- callers (a module's own port) supply the real window/sandbox
-operations as callbacks. This file never imports tmux, openshell, or any
-other port-specific module.
+"""Agent lifecycle logic: start/stop/pause/resume.
+
+Tmux is handled generically: callers (a module's own port) supply the real
+window operations as callbacks, and this file never imports tmux directly.
+
+Openshell is NOT handled the same way -- start_agent's and stop_agent's
+openshell branches import an openshell client directly (see the GAP comments
+at each import) rather than going through a callback. That's an open
+inconsistency with the tmux path, not a deliberate design choice; flag it
+rather than assume it's correct.
 """
 
 import json
