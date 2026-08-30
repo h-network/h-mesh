@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install redis
+      - run: python3 -m unittest discover -s h-app/tests -v
+      - name: Switch smoke test (real Redis)
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/0
+          POD: ci-smoke
+          TENANT: ci-smoke
+        run: python3 h-app/tools/smoke_switch.py
