@@ -16,6 +16,9 @@ Everything else is a module that plugs into this.
 | `queues.py` | `admit_ingress()` — shared atomic ingress-admission Lua op |
 | `registry.py` | read-only registry access (`members`/`is_member`/`port_type`) |
 | `policy.py` | import/export tag ACL (`allows`/`require_allowed`) |
+| `logging.py` | contract-shaped JSON event logging and durable stdout mirroring |
+| `retention.py` | count-based trimming for completed-task and dead-letter queues |
+| `windowlog.py` | agent-window log tailing, offset tracking, and bounded truncation |
 | `service.py` | the `Switch` class — BLPOP/forward/kick loop, is what "the switch" is |
 
 The tenant participant hash is the wire-visible `registry` resource. Delivery
