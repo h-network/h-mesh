@@ -1,9 +1,8 @@
 """Forward tenant egress queues without interpreting payloads."""
 
 import os
-import signal
-import subprocess
 import time
+from collections.abc import Callable
 
 import redis
 
@@ -46,6 +45,7 @@ class Switch:
         tenant: str,
         poll_seconds: int = 5,
         ingress_max: int = 300,
+        kick: Callable[[str, dict], None] | None = None,
     ):
         if ingress_max < 1:
             raise ValueError("ingress_max must be positive")
@@ -54,6 +54,7 @@ class Switch:
         self.tenant = tenant
         self.poll_seconds = poll_seconds
         self.ingress_max = ingress_max
+        self.kick = kick
         self._offset = 0
 
     def _agents(self) -> set[str]:
@@ -103,22 +104,31 @@ class Switch:
             limit=self.ingress_max,
         )
 
-    @staticmethod
-    def _kick(agent: str, envelope: dict) -> None:
+    def _kick(self, agent: str, envelope: dict) -> None:
+        if self.kick is None:
+            _log_observation(
+                "kick_deferred",
+                stream_id=envelope.get("stream_id"),
+                correlation_id=envelope.get("correlation_id"),
+                source=envelope.get("l2", {}).get("source"),
+                destination=agent,
+                reason="no delivery kick callback configured",
+            )
+            return
         try:
-            subprocess.Popen(["flock.port", agent])
-        except OSError as exc:
+            self.kick(agent, envelope)
+        except Exception as exc:
             _log_observation(
                 "kick_unknown",
                 stream_id=envelope.get("stream_id"),
                 correlation_id=envelope.get("correlation_id"),
                 source=envelope.get("l2", {}).get("source"),
                 destination=agent,
-                reason=f"port kick outcome UNKNOWN after {exc}",
+                reason=f"delivery kick outcome UNKNOWN after {exc}",
             )
             return
-        # Popen success proves only that the switch started a delivery attempt;
-        # it does not claim that the child reached or popped the ingress queue.
+        # A callback return proves only that the switch started a delivery
+        # attempt; it does not claim that the edge reached or popped ingress.
         _log_observation(
             "kick_started",
             stream_id=envelope.get("stream_id"),
@@ -258,17 +268,6 @@ class Switch:
 
 
 def main() -> None:
-    # Let the kernel reap kicked ports. Without this the switch accumulates a
-    # zombie per delivery under load: CPython only reaps children that have
-    # already exited, at the top of the next Popen, so during a burst the
-    # reaping lags the spawning. Measured at 65 zombies for a 100-envelope run,
-    # and they persist at rest until traffic resumes.
-    #
-    # Safe here precisely because the kick is fire and forget: SIG_IGN makes
-    # wait()/poll() unusable, and we never call them — we do not want a
-    # return code.
-    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
-
     r = redis.Redis.from_url(os.environ["REDIS_URL"])
     switch = Switch(
         r,
