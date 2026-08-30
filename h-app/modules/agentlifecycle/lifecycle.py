@@ -17,7 +17,7 @@ from core.policy import tags_key
 from core.registry import port_type
 
 
-_STARTABLE_VABS = {"tmux", "api", "openshell"}
+_STARTABLE_VABS = {"tmux", "api"}
 _FIXED_PARTICIPANTS = {"api", "host"}
 _START_AGENT_KEYS = frozenset(
     {
@@ -236,66 +236,6 @@ def start_agent(
         )
         return
 
-    if agent_port_type == "openshell":
-        cli = payload.get("cli", "claude")
-        if not isinstance(cli, str) or not cli:
-            raise ValueError("StartAgent payload.cli must be a non-empty string")
-
-        profile = payload.get("profile")
-        if profile:
-            prefix("check", "check", agent=profile, resource="profile")
-            profiles = available_profiles(r, pod=pod, tenant=tenant)
-            if profiles is not None and profile not in profiles:
-                raise ValueError(
-                    f"unknown account {profile!r}; available accounts: {', '.join(profiles)}"
-                )
-        elif profile not in (None, ""):
-            raise ValueError("StartAgent payload.profile must be a segment string")
-
-        if policy_supplied:
-            policy_key = tags_key(pod, tenant, agent)
-            _write_desired(
-                committed, "policy reset", "policy reset", lambda: r.delete(policy_key)
-            )
-            for side, values in policy.items():
-                _write_desired(
-                    committed, f"{side} policy published", f"{side} policy publish",
-                    lambda side=side, values=values: r.hset(
-                        policy_key, side, json.dumps(values, separators=(",", ":"))
-                    ),
-                )
-        launch_key = prefix(pod, tenant, agent=agent, resource="launch")
-        _write_desired(
-            committed, "launch published", "launch publish", lambda: r.set(launch_key, cli)
-        )
-        if profile:
-            profile_key = prefix(pod, tenant, agent=agent, resource="profile")
-            _write_desired(
-                committed, "profile published", "profile publish",
-                lambda: r.set(profile_key, profile),
-            )
-        _write_desired(
-            committed, "registry row published", "registry row publish",
-            lambda: r.hset(registry_key, agent, agent_port_type),
-        )
-
-        from modules.openshell import OpenShellClient, OpenShellUnavailable
-        from modules.openshell.naming import sandbox_name, workspace_name
-
-        client = OpenShellClient(workspace_name(pod, tenant))
-        try:
-            try:
-                client.create_sandbox(
-                    sandbox_name(agent),
-                    environment={"AGENT_NAME": agent, "TENANT": tenant},
-                    labels={"agent": agent},
-                )
-            except OpenShellUnavailable as exc:
-                raise _actual_unknown(committed, "creating the sandbox", exc) from exc
-        finally:
-            client.close()
-        return
-
     cli = payload.get("cli", "claude")
     if not isinstance(cli, str) or not cli:
         raise ValueError("StartAgent payload.cli must be a non-empty string")
@@ -476,23 +416,7 @@ def stop_agent(
         committed, "delivery lock cleared", "delivery lock clear",
         lambda: r.hdel(prefix(pod, tenant, resource="delivering"), agent),
     )
-    if agent_port_type == "openshell":
-        # Imported here, not at module top -- see start_agent's openshell
-        # branch for why (the openshell client pulls in grpc/protobuf, paid
-        # only for openshell deliveries/lifecycle actions, not every one).
-        # GAP: h-mesh has no openshell module yet, same as start_agent above.
-        from modules.openshell import OpenShellClient, OpenShellUnavailable
-        from modules.openshell.naming import sandbox_name, workspace_name
-
-        client = OpenShellClient(workspace_name(pod, tenant))
-        try:
-            try:
-                client.delete_sandbox(sandbox_name(agent))
-            except OpenShellUnavailable as exc:
-                raise _actual_unknown(committed, "deleting the sandbox", exc) from exc
-        finally:
-            client.close()
-    elif agent_port_type != "api":
+    if agent_port_type != "api":
         try:
             kill_window(agent)
         except Exception as exc:

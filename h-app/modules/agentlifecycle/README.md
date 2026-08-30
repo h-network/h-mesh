@@ -1,11 +1,10 @@
 # agentlifecycle
 
-A library, not a port. Generic start/stop/pause/resume logic for an agent:
+A library, not a port. Start/stop/pause/resume logic for an agent/participant:
 writes registry/policy/HMAC-key desired state, and delegates the actual
-mechanism (a tmux window, an openshell sandbox, whatever) to callbacks the
-caller supplies. This module never imports tmux, openshell, or any other
-port-specific module -- a module that needs lifecycle behavior imports
-`lifecycle.py` and passes its own real callbacks in.
+mechanism (a tmux window, for now) to callbacks the caller supplies. Supports
+`tmux` and `api` port types today; openshell support was removed until that
+module actually exists in h-mesh.
 
 | file | what it holds |
 |---|---|
