@@ -404,14 +404,9 @@ def stop_agent(
         committed, "registry row removed", "registry row removal",
         lambda: r.hdel(registry_key, agent),
     )
-    state_keys = [
-        prefix(pod, tenant, agent=agent, resource=resource)
-        for resource in sorted(AGENT_STATE_RESOURCES)
-    ]
-    _write_desired(
-        committed, "agent resources purged", "agent resource purge",
-        lambda: r.delete(*state_keys),
-    )
+    # TODO: purging an agent's other per-agent state on stop needs to be
+    # implemented. Deferred -- not needed to move forward, no other code
+    # depends on it.
     _write_desired(
         committed, "delivery lock cleared", "delivery lock clear",
         lambda: r.hdel(prefix(pod, tenant, resource="delivering"), agent),
