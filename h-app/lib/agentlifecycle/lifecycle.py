@@ -156,8 +156,9 @@ def start_agent(
     tenant: str,
     envelope: dict,
     replace_window: Callable[[str], object],
+    available_profiles: Callable[[str, str], list[str] | None],
 ) -> None:
-    """Publish desired state; tmuxhost is the one implementation that creates windows."""
+    """Publish desired state using a tenant-wide profile lookup supplied by the caller."""
     agent, payload = _target(envelope, _START_AGENT_KEYS)
     policy = {}
     policy_supplied = any(side in payload for side in ("export", "import"))
@@ -243,7 +244,7 @@ def start_agent(
     profile = payload.get("profile")
     if profile:
         prefix("check", "check", agent=profile, resource="profile")
-        profiles = available_profiles(r, pod=pod, tenant=tenant)
+        profiles = available_profiles(pod, tenant)
         if profiles is not None and profile not in profiles:
             raise ValueError(
                 f"unknown account {profile!r}; available accounts: {', '.join(profiles)}"
