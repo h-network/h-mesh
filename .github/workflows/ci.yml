@@ -42,3 +42,9 @@ jobs:
           POD: ci-acl-denial
           TENANT: ci-acl-denial
         run: python3 h-app/tools/smoke_acl_denial.py
+      - name: Template port demo (real Redis)
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/0
+          POD: ci-template
+          TENANT: ci-template
+        run: python3 h-app/tools/templates/demo_template_port.py
