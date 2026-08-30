@@ -273,10 +273,10 @@ def main() -> None:
         r,
         pod=os.environ["POD"],
         tenant=os.environ["TENANT"],
-        poll_seconds=int(os.environ.get("ROSTER_POLL_SECONDS", "5")),
+        poll_seconds=int(os.environ.get("REGISTRY_POLL_SECONDS", "5")),
         ingress_max=int(os.environ.get("INGRESS_MAX", "300")),
     )
-    # Config for the same reason ROSTER_POLL_SECONDS is: two offices can
+    # Config for the same reason REGISTRY_POLL_SECONDS is: two offices can
     # legitimately trade feed latency against filesystem polling. A knob beside
     # an existing knob is consistency; a knob on its own would be speculation.
     switch.run(

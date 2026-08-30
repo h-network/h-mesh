@@ -22,3 +22,8 @@ The tenant participant hash is the wire-visible `registry` resource. Delivery
 itself remains outside core: pass a `kick(agent, envelope)` callback to
 `Switch` when an edge module should be notified after ingress admission. With
 no callback, forwarding still completes and core records `kick_deferred`.
+
+Core logging uses the `H_MESH_WRITER`, `H_MESH_CUSTODY_FILE`,
+`H_MESH_LOG_FILE`, `H_MESH_LOG_QUIET`, and
+`H_MESH_LOG_FILE_AGENT_ONLY` environment variables. Switch registry refresh is
+configured with `REGISTRY_POLL_SECONDS`.

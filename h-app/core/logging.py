@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from .config import state_path
 
-_WRITER = os.environ.get("FLOCK_WRITER")
+_WRITER = os.environ.get("H_MESH_WRITER")
 
 _ENVELOPE_EVENTS = {
     "sent",
@@ -31,9 +31,8 @@ def mirror(line: str) -> None:
     """Append one already-formatted record to the durable evidence file.
 
     ⚠ **Container stdout is deleted with the container.** Docker's `json-file`
-    driver goes with `docker compose down`, so this file is the only thing that
-    says a run happened once the tenant is gone — the failure `TEST-SIGNOFF`
-    records as *"evidence /tmp/b77-build.log — torn down, no sha256"*.
+    driver goes with `docker compose down`, so this file is the only durable
+    evidence that says a run happened once the tenant is gone.
 
     ⚠ **Call this ONLY where the same line is printed to stdout**, so the file
     stays a byte copy of what `docker logs` shows for that container's lifetime.
@@ -44,7 +43,7 @@ def mirror(line: str) -> None:
 
     Never raises. A full or read-only evidence volume must not fail a command.
     """
-    path = os.environ.get("FLOCK_CUSTODY_FILE")
+    path = os.environ.get("H_MESH_CUSTODY_FILE")
     if not path:
         return
     try:
@@ -72,7 +71,7 @@ def log_record(
 
     `stream_id` belongs to envelope events only — it is the join key for one
     envelope's life, and a synthetic value on a lifecycle event makes the six
-    records of a real envelope harder to find. See CONTRACTS §3.
+    records of a real envelope harder to find.
 
     ⚠ This said "four" until 2026-08-22. A delivered unicast leaves SIX —
     `sent, popped, forwarded, kick_started, received, opened` — and the count in
@@ -113,18 +112,19 @@ def log_record(
     # there hands the agent module names, stream ids and correlation ids it has
     # no use for. Measured: an agent read `{"module":"port",...}` out of its
     # own terminal, reasoned that envelope ids imply a broker, went looking, and
-    # found Redis. HLD §5 already says these records reach the log through the
-    # window file the switch tails — the print was redundant as well as a
-    # signpost. A daemon has no FLOCK_LOG_FILE and still prints to its stdout.
-    # ⚠ `office` sets FLOCK_LOG_QUIET because it runs in an agent's PANE: its
+    # found Redis. These records reach the log through the window file the
+    # switch tails — the print was redundant as well as a signpost. A daemon
+    # has no H_MESH_LOG_FILE and still prints to its stdout.
+    # ⚠ `office` sets H_MESH_LOG_QUIET because it runs in an agent's PANE: its
     # stdout is the agent's screen. Printing an envelope record there hands the
     # agent module names, stream ids and correlation ids it has no use for.
     # Measured: an agent read {"module":"port",...} out of its own terminal,
     # reasoned that envelope ids imply a broker, went looking and found Redis.
     # The record still reaches the log through the window file the switch tails
-    # (HLD §5), so nothing is lost. Daemons do not set this and keep printing.
-    path = os.environ.get("FLOCK_LOG_FILE")
-    if os.environ.get("FLOCK_LOG_QUIET") != "1":
+    # through the switch's window-file tailer, so nothing is lost. Daemons do
+    # not set this and keep printing.
+    path = os.environ.get("H_MESH_LOG_FILE")
+    if os.environ.get("H_MESH_LOG_QUIET") != "1":
         # One syscall-sized write, newline included. Container daemons share
         # stdout, and print() writes the text and newline separately under
         # PYTHONUNBUFFERED; another process can land its record between them and
@@ -137,18 +137,17 @@ def log_record(
         sys.stdout.flush()
         # ⚠ A DURABLE MIRROR OF STDOUT, and deliberately nothing more. Container
         # stdout is Docker's `json-file`, which is deleted with the container —
-        # so before this existed, `docker compose down` destroyed the only
-        # evidence a run ever happened. TEST-SIGNOFF's own REFUSED example fails
-        # on exactly that: "evidence /tmp/b77-build.log — torn down, no sha256".
+        # so without this mirror, `docker compose down` destroys the only
+        # evidence a run ever happened.
         # ⚠ Gated on the SAME condition as the stdout write, so the file is a
         # byte-for-byte copy of what `docker logs` shows. A pane record is
         # QUIET here and reaches the log once, when the switch re-emits the
-        # window file it tails (HLD §5). Mirroring it directly as well would
+        # window file it tails. Mirroring it directly as well would
         # write it TWICE, and a duplicate custody record is indistinguishable
         # from a duplicate delivery to every conservation check we have.
         mirror(line)
     try:
-        agent_only = os.environ.get("FLOCK_LOG_FILE_AGENT_ONLY")
+        agent_only = os.environ.get("H_MESH_LOG_FILE_AGENT_ONLY")
         if path and (not agent_only or os.environ.get("AGENT_NAME")):
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
