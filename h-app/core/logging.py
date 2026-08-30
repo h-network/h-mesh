@@ -5,6 +5,8 @@ import os
 import sys
 from datetime import datetime, timezone
 
+from .config import state_path
+
 _WRITER = os.environ.get("FLOCK_WRITER")
 
 _ENVELOPE_EVENTS = {
@@ -15,6 +17,7 @@ _ENVELOPE_EVENTS = {
     "forward_unknown",
     "source_stamped",
     "kick_started",
+    "kick_deferred",
     "kick_unknown",
     "dead_lettered",
     "received",
@@ -185,7 +188,7 @@ def record_task_event(
 ) -> None:
     """Append one board-history event without ever breaking its command."""
     try:
-        path = os.environ.get("TASK_RECORD", "/home/ubuntu/.h-mesh/tasks.jsonl")
+        path = os.environ.get("TASK_RECORD") or state_path("tasks.jsonl")
         parent = os.path.dirname(path)
         if parent:
             os.makedirs(parent, exist_ok=True)

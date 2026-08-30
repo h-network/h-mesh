@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+from .config import state_path
 from .keys import prefix
 from .logging import log_record, mirror
 
@@ -14,13 +15,13 @@ class WindowLogTailer:
         *,
         pod: str,
         tenant: str,
-        path: str | Path = "/home/ubuntu/.h-mesh/window.log.jsonl",
+        path: str | Path | None = None,
         max_bytes: int = 8 * 1024 * 1024,
     ):
         if max_bytes < 1:
             raise ValueError("window log cap must be positive")
         self.r = r
-        self.path = Path(path)
+        self.path = Path(path) if path is not None else state_path("window.log.jsonl")
         self.max_bytes = max_bytes
         self.offset_key = prefix(pod, tenant, resource="window.log.offset")
 
