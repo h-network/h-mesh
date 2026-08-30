@@ -36,3 +36,9 @@ jobs:
           POD: ci-delivery
           TENANT: ci-delivery
         run: python3 h-app/tools/smoke_delivery.py
+      - name: ACL denial smoke test (real Redis)
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/0
+          POD: ci-acl-denial
+          TENANT: ci-acl-denial
+        run: python3 h-app/tools/smoke_acl_denial.py
