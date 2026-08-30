@@ -14,13 +14,10 @@ from core.logging import log_record
 from core.policy import tags_key
 from core.registry import port_type
 
-# TODO(gap, not guessed at): the old repo's equivalents of AGENT_STATE_RESOURCES
-# (bus/resources.py) and available_profiles (bus/accounts.py) don't exist in
-# h-mesh's core yet -- those files were deliberately deferred as "supporting
-# infra a minimal rebuild could defer" during core's own build-out. stop_agent
-# and the openshell branch of start_agent below still reference them; decide
-# whether to port those two pieces into core, or reimplement locally, before
-# relying on this file as-is.
+# TODO(gap, not guessed at): AGENT_STATE_RESOURCES and available_profiles
+# have no h-mesh core equivalent yet. stop_agent and the openshell branch of
+# start_agent below still reference them; decide whether to add them to core,
+# or reimplement locally, before relying on this file as-is.
 
 _STARTABLE_VABS = {"tmux", "api", "openshell"}
 _FIXED_PARTICIPANTS = {"api", "host"}
