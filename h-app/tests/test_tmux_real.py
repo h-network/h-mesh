@@ -276,6 +276,38 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         delivering_key = prefix(self.pod, self.tenant, resource="delivering")
         self.assertIsNone(self.r.hget(delivering_key, "grace"))
 
+    def test_reconciler_empty_registry_settles_without_churn(self):
+        reconciler = TmuxReconciler(
+            pod=self.pod,
+            tenant=self.tenant,
+            redis_url=self.redis_url,
+            session_name=self.session_name,
+            socket=self.socket,
+        )
+
+        # 1. Empty registry: should create __init__ once and settle
+        for _ in range(3):
+            reconciler.reconcile_once(self.r)
+            self.assertEqual(list_windows(self.session_name, socket=self.socket), {"__init__"})
+
+        # 2. Add an agent: should create agent window and remove __init__
+        self.r.hset(self.registry, "helen", "tmux")
+        reconciler.reconcile_once(self.r)
+        self.assertEqual(list_windows(self.session_name, socket=self.socket), {"helen"})
+
+        for _ in range(2):
+            reconciler.reconcile_once(self.r)
+            self.assertEqual(list_windows(self.session_name, socket=self.socket), {"helen"})
+
+        # 3. Remove agent: should recreate __init__ and remove agent window without churn
+        self.r.hdel(self.registry, "helen")
+        reconciler.reconcile_once(self.r)
+        self.assertEqual(list_windows(self.session_name, socket=self.socket), {"__init__"})
+
+        for _ in range(3):
+            reconciler.reconcile_once(self.r)
+            self.assertEqual(list_windows(self.session_name, socket=self.socket), {"__init__"})
+
 
 if __name__ == "__main__":
     unittest.main()

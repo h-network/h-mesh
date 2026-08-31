@@ -167,13 +167,18 @@ class TmuxReconciler:
             code, out, err = tmux_ops.run_tmux(*cmd, socket=self.socket)
             if code != 0:
                 log_record("tmux_reconciler", "error", reason=f"Failed to create tmux session: {err}")
-            elif initial_window != "__init__":
-                self.log_window_created(r, initial_window)
+            else:
+                tmux_ops.run_tmux("set-window-option", "-t", f"{self.session_name}:{initial_window}", "automatic-rename", "off", socket=self.socket)
+                tmux_ops.run_tmux("set-window-option", "-t", f"{self.session_name}:{initial_window}", "allow-rename", "off", socket=self.socket)
+                if initial_window != "__init__":
+                    self.log_window_created(r, initial_window)
 
         # Set session & server options
         tmux_ops.run_tmux("set-option", "-g", "exit-empty", "off", socket=self.socket)
         tmux_ops.run_tmux("set-option", "-g", "default-size", "120x32", socket=self.socket)
         tmux_ops.run_tmux("set-option", "-g", "history-limit", "2000", socket=self.socket)
+        tmux_ops.run_tmux("set-option", "-g", "automatic-rename", "off", socket=self.socket)
+        tmux_ops.run_tmux("set-option", "-g", "allow-rename", "off", socket=self.socket)
 
     def get_windows(self) -> Set[str]:
         return tmux_ops.list_windows(self.session_name, socket=self.socket)
@@ -287,14 +292,12 @@ class TmuxReconciler:
 
         # Remove windows that are no longer in roster.
         #
-        # ⚠ The session must keep at least one window or tmux exits, but the
-        # guard used to mean a RETIRED AGENT'S window survived forever when it
-        # was the last one — an office showing a name that is no longer a member,
-        # which is the "present but unaddressable" state we work hardest to
-        # avoid. Put up the placeholder the empty-roster path already uses, then
-        # retire the agent properly.
-        stale = [w for w in sorted(existing_windows) if w not in roster_agents]
-        if stale and len(stale) == len(existing_windows):
+        # ⚠ The session must keep at least one window or tmux exits.
+        # When the roster is empty, the placeholder __init__ must be preserved, and
+        # any stale windows other than __init__ must be removed.
+        # When the roster has active agents, any window not in roster_agents
+        # (including __init__) is stale and should be removed.
+        if not roster_agents:
             placeholder = "__init__"
             if placeholder not in existing_windows:
                 ret, _, stderr = tmux_ops.create_window(
@@ -305,6 +308,10 @@ class TmuxReconciler:
                 else:
                     log_record("tmux_reconciler", "error", destination=placeholder,
                                reason=f"placeholder window failed, keeping stale window: {stderr}")
+            stale = [w for w in sorted(existing_windows) if w != placeholder]
+        else:
+            stale = [w for w in sorted(existing_windows) if w not in roster_agents]
+
         for window in stale:
             if len(existing_windows) > 1:
                 if self.kill_window(window):

@@ -574,15 +574,16 @@ def create_window(
     new-session, which does not come through here) named the lead; every other
     agent's guide had been silently overwritten and named nobody.
     """
-    if cwd is None:
-        cwd = f"/workdir/{agent_name}"
+    if agent_name != "__init__":
+        if cwd is None:
+            cwd = f"/workdir/{agent_name}"
 
-    try:
-        os.makedirs(cwd, exist_ok=True)
-    except OSError:
-        pass
+        try:
+            os.makedirs(cwd, exist_ok=True)
+        except OSError:
+            pass
 
-    write_agent_guide(cwd, agent_name, lead=lead, profile=profile)
+        write_agent_guide(cwd, agent_name, lead=lead, profile=profile)
 
     # ⚠ Idempotent by name. tmux happily creates a second window with the same
     # name, and then refuses to resolve it: `tmux -t hq:<name>` answers
@@ -599,9 +600,15 @@ def create_window(
     if not command:
         command = window_env(agent_name, cwd=cwd) + ["bash", "-il"]
 
-    args = ["new-window", "-t", f"{session_name}:", "-n", agent_name, "-c", cwd]
+    args = ["new-window", "-t", f"{session_name}:", "-n", agent_name]
+    if cwd:
+        args.extend(["-c", cwd])
     args.extend(command)
-    return run_tmux(*args, socket=socket)
+    ret, out, err = run_tmux(*args, socket=socket)
+    if ret == 0:
+        run_tmux("set-window-option", "-t", f"{session_name}:{agent_name}", "automatic-rename", "off", socket=socket)
+        run_tmux("set-window-option", "-t", f"{session_name}:{agent_name}", "allow-rename", "off", socket=socket)
+    return ret, out, err
 
 
 def kill_window(session_name: str, window_name: str, socket: str | None = None) -> tuple[int, str, str]:
