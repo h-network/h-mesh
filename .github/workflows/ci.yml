@@ -22,7 +22,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install redis
+      - run: pip install fastapi redis uvicorn
       - run: python3 -m unittest discover -s h-app/tests -v
       - name: Switch smoke test (real Redis)
         env:
