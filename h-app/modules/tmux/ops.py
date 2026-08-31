@@ -325,7 +325,12 @@ def window_env(
     """Single place where a window environment is constructed for all execution paths."""
     cwd = get_agent_workdir(agent_name, cwd)
     guide_path = f"{cwd}/AGENTS.md"
-    log_path = str(log_file) if log_file is not None else (os.environ.get("H_MESH_LOG_FILE") or str(state_path("window.log.jsonl")))
+    # ⚠ Do not inherit ambient H_MESH_LOG_FILE from the caller's process.
+    # The window's log path must resolve through `state_path` (which respects
+    # `H_MESH_STATE_DIR`) or an explicit `log_file` override. Inheriting an
+    # ambient H_MESH_LOG_FILE causes test windows and nested processes to write
+    # into whatever production or parent office log happens to be in the environment.
+    log_path = str(log_file) if log_file is not None else str(state_path("window.log.jsonl"))
     env_vars = [
         "env",
         f"AGENT_NAME={agent_name}",

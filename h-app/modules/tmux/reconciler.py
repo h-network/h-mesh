@@ -1,8 +1,10 @@
 import json
 import os
 import time
-import redis
+from pathlib import Path
 from typing import Set
+
+import redis
 
 from core.keys import prefix
 from core.logging import log_record
@@ -22,6 +24,7 @@ class TmuxReconciler:
         poll_seconds: float = 5.0,
         session_name: str | None = None,
         socket: str | None = None,
+        log_file: str | Path | None = None,
     ):
         self.pod = pod
         self.tenant = tenant
@@ -29,6 +32,7 @@ class TmuxReconciler:
         self.poll_seconds = poll_seconds
         self.session_name = session_name or tenant
         self.socket = socket or os.environ.get("TMUX_SOCKET")
+        self.log_file = log_file
 
     def get_agent_cli(self, r: redis.Redis, agent: str) -> str | None:
         launch_key = prefix(self.pod, self.tenant, agent=agent, resource="launch")
@@ -159,7 +163,7 @@ class TmuxReconciler:
                 cmd.extend(
                     window_env(
                         initial_window, tenant=self.tenant, cwd=cwd, profile=profile, provider=provider,
-                        skip_permissions=skip_permissions, claude_tools=claude_tools,
+                        skip_permissions=skip_permissions, claude_tools=claude_tools, log_file=self.log_file,
                     )
                     + cmd_args
                 )
@@ -199,7 +203,7 @@ class TmuxReconciler:
         cwd = get_agent_workdir(agent_name, cwd)
         env_args = window_env(
             agent_name, tenant=self.tenant, cwd=cwd, profile=profile, provider=provider,
-            skip_permissions=skip_permissions, claude_tools=claude_tools,
+            skip_permissions=skip_permissions, claude_tools=claude_tools, log_file=self.log_file,
         )
 
         # ⚠ Not written here — tmux_ops.create_window below writes it for every

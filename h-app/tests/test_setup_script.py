@@ -51,16 +51,26 @@ def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
         f.write("#!/usr/bin/env bash\nexec bash -il\n")
     os.chmod(fake_h_agent, 0o755)
 
+    state_dir = os.path.join(tmpdir, "state")
+    os.makedirs(state_dir, exist_ok=True)
+
     env = dict(os.environ)
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
     env["PYTHONPATH"] = str(REPO_ROOT / "h-app")
     env["H_MESH_RUN_DIR"] = run_dir
+    env["H_MESH_STATE_DIR"] = state_dir
+    env["H_MESH_LOG_FILE"] = os.path.join(state_dir, "window.log.jsonl")
     env["AGENT_NAME"] = "architect"
     env["POD"] = pod
     env["TENANT"] = tenant
     env["REDIS_URL"] = redis_url
     env["TMUX_SESSION"] = session_name
     env["TMUX_SOCKET"] = socket_path
+
+    # Scrub ambient tokens to prevent real credential leakage into test processes
+    for k in list(env.keys()):
+        if k.startswith("CLAUDE_OAUTH_TOKEN_") or k == "CLAUDE_CODE_OAUTH_TOKEN":
+            del env[k]
 
     switch_pid = None
     reconciler_pid = None

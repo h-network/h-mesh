@@ -30,6 +30,10 @@ from modules.tmux.reconciler import TmuxReconciler
 class RealTmuxIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
+        self.state_dir = os.path.join(self.tmpdir, "state")
+        os.makedirs(self.state_dir, exist_ok=True)
+        self.workdir_root = os.path.join(self.tmpdir, "workdir")
+        os.makedirs(self.workdir_root, exist_ok=True)
         self.socket = os.path.join(self.tmpdir, "isolated_tmux.sock")
         self.redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
         self.r = redis.Redis.from_url(self.redis_url)
@@ -40,7 +44,28 @@ class RealTmuxIntegrationTests(unittest.TestCase):
 
         self.registry = prefix(self.pod, self.tenant, resource="registry")
 
+        # ⚠ Isolate environment: state dir, workdir, socket, session, and strip any ambient credentials.
+        # This prevents test processes from inheriting production tokens or writing into the real office log.
+        env_patch = {
+            "H_MESH_STATE_DIR": self.state_dir,
+            "H_MESH_WORKDIR": self.workdir_root,
+            "TMUX_SOCKET": self.socket,
+            "TMUX_SESSION": self.session_name,
+        }
+        for k in list(os.environ.keys()):
+            if k.startswith("CLAUDE_OAUTH_TOKEN_") or k == "CLAUDE_CODE_OAUTH_TOKEN":
+                env_patch[k] = ""
+        if "H_MESH_LOG_FILE" in os.environ:
+            env_patch["H_MESH_LOG_FILE"] = ""
+
+        self.env_patcher = unittest.mock.patch.dict(os.environ, env_patch, clear=False)
+        self.env_patcher.start()
+
     def tearDown(self):
+        try:
+            self.env_patcher.stop()
+        except Exception:
+            pass
         try:
             run_tmux("kill-server", socket=self.socket)
         except Exception:
@@ -480,6 +505,41 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         self.assertIn("arg-office peers", guide_arg)
         self.assertIn("arg-office send", guide_arg)
 
+    def test_window_env_resolves_log_path_via_state_path_not_ambient_env(self):
+        from modules.tmux.ops import window_env
+
+        # Ambient H_MESH_LOG_FILE must not override state_path
+        with unittest.mock.patch.dict(os.environ, {"H_MESH_LOG_FILE": "/real/office/window.log.jsonl"}):
+            env = window_env("worker", tenant="custom-tenant")
+            expected_log = os.path.join(self.state_dir, "window.log.jsonl")
+            self.assertIn(f"H_MESH_LOG_FILE={expected_log}", env)
+            self.assertNotIn("H_MESH_LOG_FILE=/real/office/window.log.jsonl", env)
+
+        # Explicit log_file argument overrides state_path
+        custom_log = "/custom/isolated/path/window.log.jsonl"
+        env_explicit = window_env("worker", tenant="custom-tenant", log_file=custom_log)
+        self.assertIn(f"H_MESH_LOG_FILE={custom_log}", env_explicit)
+
+    def test_window_env_token_handling(self):
+        from modules.tmux.ops import window_env
+
+        # When tokens are unset or empty, CLAUDE_CODE_OAUTH_TOKEN is not in env_vars
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_OAUTH_TOKEN_DEFAULT": "", "CLAUDE_OAUTH_TOKEN_WORK": ""}):
+            env_default = window_env("worker")
+            self.assertFalse(any(var.startswith("CLAUDE_CODE_OAUTH_TOKEN=") for var in env_default))
+
+            env_work = window_env("worker", profile="work")
+            self.assertFalse(any(var.startswith("CLAUDE_CODE_OAUTH_TOKEN=") for var in env_work))
+
+        # When a test double token is explicitly provided, it is injected for that profile
+        with unittest.mock.patch.dict(os.environ, {"CLAUDE_OAUTH_TOKEN_WORK": "test-double-work-token"}):
+            env_work = window_env("worker", profile="work")
+            self.assertIn("CLAUDE_CODE_OAUTH_TOKEN=test-double-work-token", env_work)
+
+            env_default = window_env("worker")
+            self.assertFalse(any(var.startswith("CLAUDE_CODE_OAUTH_TOKEN=") for var in env_default))
+
 
 if __name__ == "__main__":
     unittest.main()
+
