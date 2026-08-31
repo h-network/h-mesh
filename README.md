@@ -27,6 +27,7 @@ provides these process entry points:
 
 - `h-mesh-switch` — the core switch daemon
 - `h-mesh-api` — the REST API daemon
+- `h-mesh-openshell-port AGENT` — direct OpenShell delivery-port invocation
 - `h-mesh-session` — the tmux control-mode session daemon
 - `h-mesh-tmux-reconciler` — the tmux registry reconciler daemon
 - `h-mesh-tmux-port AGENT` — direct tmux delivery-port invocation

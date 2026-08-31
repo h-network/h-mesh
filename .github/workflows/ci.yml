@@ -35,6 +35,7 @@ jobs:
           import modules.api
           import modules.office.cli
           import modules.office.port
+          import modules.openshell.port
           import modules.session.app
           import modules.tmux.port
           import services.api
@@ -43,6 +44,7 @@ jobs:
 
           expected = {
               "h-mesh-api",
+              "h-mesh-openshell-port",
               "h-mesh-session",
               "h-mesh-switch",
               "h-mesh-tmux-port",
