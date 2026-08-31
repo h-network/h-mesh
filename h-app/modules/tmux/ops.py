@@ -16,7 +16,8 @@ from lib.paths import get_agent_workdir, get_workdir_root
 # still relies on. 0.5 is the margin decision across CLIs (Claude Code Ink,
 # codex, agy) to ensure Enter keystrokes are never swallowed into input boxes.
 ENTER_DELAY = float(os.environ.get("PASTE_ENTER_DELAY", "0.5"))
-OFFICE_TOOLS_ENV = "OFFICE_TOOLS=office"
+OFFICE_TOOLS_CMD = os.environ.get("OFFICE_TOOLS", "h-mesh-office")
+OFFICE_TOOLS_ENV = f"OFFICE_TOOLS={OFFICE_TOOLS_CMD}"
 
 
 class AmbientTmuxError(RuntimeError):
@@ -73,14 +74,20 @@ def list_windows(session_name: str, socket: str | None = None) -> Set[str]:
     return {w for w in stdout.splitlines() if w}
 
 
-def generate_agents_md(agent_name: str, tenant: str = "default", lead: str | None = None) -> str:
+def generate_agents_md(
+    agent_name: str,
+    tenant: str = "default",
+    lead: str | None = None,
+    office_cmd: str | None = None,
+) -> str:
+    cmd = office_cmd or os.environ.get("OFFICE_TOOLS", "h-mesh-office")
     if lead and agent_name == lead:
         lead_sentence = (
             "You are the lead of this office. The other agents follow your direction, "
             "and yours is the account that decides when something is done.\n\n"
-            "Before you hand out work, check `office status`. An agent that is `blocked` "
+            f"Before you hand out work, check `{cmd} status`. An agent that is `blocked` "
             "will not receive it — hold the work and say so. Do not try to fix the agent.\n\n"
-            "`office cloneToAll` only ever reuses a copy it made during that same call "
+            f"`{cmd} cloneToAll` only ever reuses a copy it made during that same call "
             "as a local source for the next agent — never a target that already existed "
             "before the call started. Mixing a pre-existing agent into the same `-a` list "
             "as fresh hires is safe: the existing one is skipped, not reused as a source.\n\n"
@@ -100,17 +107,17 @@ def generate_agents_md(agent_name: str, tenant: str = "default", lead: str | Non
 
 Run any of those with --help. To see your tmux colleagues:
 
-    office peers
+    {cmd} peers
 
 That's colleagues only — an app client (a Telegram bot, say) or the tenant's
-lifecycle provider won't be on it; `office peers -i` lists those too, labeled
-apart from colleagues. Either way it's still a valid `office send` destination.
+lifecycle provider won't be on it; `{cmd} peers -i` lists those too, labeled
+apart from colleagues. Either way it's still a valid `{cmd} send` destination.
 A message arrives in your terminal as `[message from <name>] …` — reply by name,
 whether or not `peers` lists it:
 
-    office send -a <name> "one quoted argument"
-    office send -a <name> --stdin      < the body on stdin
-    office send -a <name> --file PATH  the body from a file
+    {cmd} send -a <name> "one quoted argument"
+    {cmd} send -a <name> --stdin      < the body on stdin
+    {cmd} send -a <name> --file PATH  the body from a file
 
 ⚠ The body is ONE argument. Unquoted words after the first are rejected, not
 sent — and anything long or multi-line belongs on --stdin or --file, which are
@@ -120,9 +127,9 @@ This directory is yours; work in it.
 
 You have a task board. Nothing will notify you about it — check it yourself:
 
-    office list        titles waiting for you
-    office take        take the next one, and it prints in full
-    office done        when it is finished
+    {cmd} list        titles waiting for you
+    {cmd} take        take the next one, and it prints in full
+    {cmd} done        when it is finished
 
 Take a ticket *before* you start work, not after. `doing` is how the office
 knows what you are on.
@@ -130,10 +137,10 @@ knows what you are on.
 ## Working in this office
 
 This directory is your own clone — work only here. Do not read or write
-another agent's files or state directly; `office send` is how you reach
+another agent's files or state directly; `{cmd} send` is how you reach
 another agent, not a shortcut around it.
 
-Always reply through `office send`, not just in your own terminal output.
+Always reply through `{cmd} send`, not just in your own terminal output.
 Text you write as your own response is only visible to whoever is directly
 watching that pane — it never reaches the sender unless you also send it.
 
@@ -141,10 +148,10 @@ A short reply that reads like the last line of a conversation — a
 confirmation, an acknowledgment, "nice," "got it" — is the highest-risk
 moment for skipping this, not a low-risk one. It feels complete as text alone
 precisely because it reads like a natural close. Before treating a turn as
-finished: did an office send call actually execute in this turn, not "did I
+finished: did an {cmd} send call actually execute in this turn, not "did I
 mean to."
 
-That said, "always reply via office send" means a substantive message must
+That said, "always reply via {cmd} send" means a substantive message must
 actually reach its recipient — it does not mean every message needs a reply
 forever. Once an exchange is down to pure closing acknowledgments ("thanks",
 "got it", "noted") with nothing new in either message, let it end. Replying
@@ -163,7 +170,7 @@ which agent did which work. No co-author line, no "generated with" trailer,
 no other identity in a commit: only the one you are authenticated as.
 
 When a ticket is done, message the lead a summary before or alongside
-`office done`. A closed ticket with no report is invisible to the lead.
+`{cmd} done`. A closed ticket with no report is invisible to the lead.
 
 Long-running work: don't go silent. Background it, or answer a check-in
 with real status — not silence until you're finished.
@@ -324,7 +331,7 @@ def window_env(
         f"AGENT_NAME={agent_name}",
         f"TENANT={tenant}",
         f"H_MESH_LOG_FILE={log_path}",
-        OFFICE_TOOLS_ENV,
+        f"OFFICE_TOOLS={os.environ.get('OFFICE_TOOLS', 'h-mesh-office')}",
         f"AGENT_GUIDE={guide_path}",
     ]
     if profile:

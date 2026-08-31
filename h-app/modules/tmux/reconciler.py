@@ -11,7 +11,6 @@ from lib.paths import get_agent_workdir, get_workdir_root
 from . import ops as tmux_ops
 from .ops import write_agent_guide, window_env
 
-OFFICE_TOOLS_ENV = "OFFICE_TOOLS=office"
 
 
 class TmuxReconciler:
