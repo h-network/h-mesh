@@ -66,8 +66,11 @@ def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
     reconciler_pid = None
 
     try:
-        # Run setup.sh with our isolated virtual environment
-        venv_dir = str(REPO_ROOT / ".venv")
+        # Reuse the venv already running this test process -- it necessarily
+        # has h-mesh's dependencies installed, since this file imports them.
+        # A path like REPO_ROOT/.venv is not guaranteed to exist or be
+        # populated; --skip-install would leave a freshly created one empty.
+        venv_dir = sys.prefix
         res = subprocess.run(
             [
                 str(SETUP_SH),
@@ -114,7 +117,7 @@ def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
         assert reconciler_pid > 0
 
         # 2. Hire an agent: host hires 'worker1'
-        venv_python = str(REPO_ROOT / ".venv" / "bin" / "python")
+        venv_python = sys.executable
         env_hire = dict(env)
         env_hire["AGENT_NAME"] = "host"
         hire_res = subprocess.run(
