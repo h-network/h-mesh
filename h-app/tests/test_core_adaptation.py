@@ -45,6 +45,14 @@ class CoreAdaptationTests(unittest.TestCase):
                 self.assertNotIn("flock", text)
                 self.assertNotIn("roster", text)
 
+    def test_session_module_contains_no_old_project_names(self):
+        session_mod = H_APP / "modules" / "session"
+        checked = [*session_mod.glob("*.py"), *session_mod.glob("*.md")]
+        for path in checked:
+            text = path.read_text(encoding="utf-8").casefold()
+            with self.subTest(path=path.name):
+                self.assertNotIn("flock", text)
+
     def test_tree_contains_no_flock_imports(self):
         """Guard against any module, client, service or test importing from flock."""
         py_files = list(H_APP.rglob("*.py"))

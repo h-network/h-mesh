@@ -37,3 +37,6 @@ include-package-data = true
 where = ["h-app"]
 include = ["clients*", "core*", "lib*", "modules*", "services*", "tools*"]
 namespaces = true
+
+[tool.pytest.ini_options]
+pythonpath = ["h-app"]
