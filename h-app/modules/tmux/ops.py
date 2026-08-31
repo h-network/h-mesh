@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 from typing import Set
 
+from core.config import state_path
 from core.logging import log_record
 from lib.paths import get_agent_workdir, get_workdir_root
 
@@ -312,13 +313,17 @@ def window_env(
     provider: dict | None = None,
     skip_permissions: bool | None = None,
     claude_tools: str | None = None,
+    log_file: str | Path | None = None,
 ) -> list[str]:
     """Single place where a window environment is constructed for all execution paths."""
     cwd = get_agent_workdir(agent_name, cwd)
     guide_path = f"{cwd}/AGENTS.md"
+    log_path = str(log_file) if log_file is not None else (os.environ.get("H_MESH_LOG_FILE") or str(state_path("window.log.jsonl")))
     env_vars = [
         "env",
         f"AGENT_NAME={agent_name}",
+        f"TENANT={tenant}",
+        f"H_MESH_LOG_FILE={log_path}",
         OFFICE_TOOLS_ENV,
         f"AGENT_GUIDE={guide_path}",
     ]
@@ -568,6 +573,8 @@ def create_window(
     socket: str | None = None,
     lead: str | None = None,
     profile: str | None = None,
+    tenant: str = "default",
+    log_file: str | Path | None = None,
 ) -> tuple[int, str, str]:
     """⚠ This writes the guide for every caller, so it needs the lead.
 
@@ -599,7 +606,7 @@ def create_window(
         return 0, "", ""
 
     if not command:
-        command = window_env(agent_name, cwd=cwd) + ["bash", "-il"]
+        command = window_env(agent_name, tenant=tenant, cwd=cwd, profile=profile, log_file=log_file) + ["bash", "-il"]
 
     args = ["new-window", "-t", f"{session_name}:", "-n", agent_name]
     if cwd:
