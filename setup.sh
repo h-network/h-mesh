@@ -113,6 +113,11 @@ if [ "$USE_VENV" -eq 1 ]; then
     echo
 fi
 
+# 1.6. Install h-mesh's default tmux.conf, unless the user already has one
+echo "Installing default tmux.conf (unless one already exists)..."
+"$PYTHON" -m services.tmux_conf
+echo
+
 # 2. Verify Redis connection
 echo "Checking Redis connection at $REDIS_URL..."
 if ! REDIS_URL="$REDIS_URL" "$PYTHON" -c '
