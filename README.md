@@ -26,9 +26,9 @@ Contributors running the test suite should install the test extra with
 `.venv/bin/python -m pip install -e '.[test]'`.
 
 Use an isolated environment when developing or validating an install. In
-particular, do not install h-mesh into an environment that provides h-flock's
-live commands; keeping their prefixes separate prevents either application
-from replacing the other's executables.
+particular, do not install h-mesh into an environment that provides another
+application's live commands; keeping prefixes separate prevents either
+application from replacing the other's executables.
 
 The install makes the top-level `core`, `lib`, `modules`, and `services`
 packages importable independently of the current working directory. It also
@@ -45,7 +45,7 @@ provides these process entry points:
 - `h-mesh-clone-to-all` — the standalone clone-to-all compatibility command
 
 The `h-mesh-` prefix is intentional: h-mesh can share an installation prefix
-with h-flock without replacing h-flock's live `office` executable.
+with another application without replacing its live `office` executable.
 
 Each process reads its deployment configuration from environment variables;
 the module READMEs document the required variables and external services.
