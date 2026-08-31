@@ -271,7 +271,7 @@ return 1
 
 
 class ActivityTailer:
-    """Make one non-blocking pass over every participant's newest session file."""
+    """Make one non-blocking pass over every participant's session files."""
 
     def __init__(self, r, *, pod: str, tenant: str, home_root: str | Path = "/home/ubuntu"):
         self.r = r
@@ -343,16 +343,26 @@ class ActivityTailer:
             pass
         return model
 
-    def _newest(self, agent: str) -> tuple[Path, str] | None:
+    def _candidates(self, agent: str) -> list[tuple[Path, str]]:
+        """Every session file this agent could currently be writing to.
+
+        ⚠ Every regular candidate is tailed each poll, not just whichever one
+        has the newest mtime. `_tail` seeks to that path's own saved offset,
+        so re-checking an already-fully-read file is a cheap no-op -- and
+        picking a single "newest" file by `stat().st_mtime_ns` broke on a
+        filesystem whose mtime resolution wasn't fine enough to strictly
+        order two files touched close together, silently starving whichever
+        one lost the tie. Tailing every candidate has no such tie to lose.
+        """
         cli = self._cli(agent)
         if cli == "agy":
             # ⚠ One shared, non-relocatable file for every agy agent on the
             # host (`watchdog/service.py`'s credential lookup carries the same
             # comment for `antigravity-oauth-token`) — profile plays no part,
-            # and there is no per-agent file to pick the newest of. Per-agent
+            # and there is no per-agent file to choose among. Per-agent
             # attribution happens per LINE, in `_agy_events`, not per file here.
             path = self.home_root / ".gemini" / "antigravity-cli" / "history.jsonl"
-            return (path, "agy") if path.is_file() else None
+            return [(path, "agy")] if path.is_file() else []
         profile = self._profile(agent)
         suffix = f"-{profile}" if profile else ""
         claude = self.home_root / f".claude{suffix}" / "projects" / f"-workdir-{agent}"
@@ -362,14 +372,11 @@ class ActivityTailer:
             candidates.extend((path, "claude") for path in claude.glob("*.jsonl"))
         if cli in (None, "codex"):
             candidates.extend((path, "codex") for path in codex.glob("**/rollout-*.jsonl"))
-        regular = [
+        return [
             (path, flavor)
             for path, flavor in candidates
             if path.is_file() and (flavor != "codex" or self._codex_session_belongs_to(path, agent))
         ]
-        if not regular:
-            return None
-        return max(regular, key=lambda candidate: candidate[0].stat().st_mtime_ns)
 
     def _state(self, agent: str) -> dict[str, int]:
         raw = self.r.get(prefix(self.pod, self.tenant, agent, "activity.offset"))
@@ -654,11 +661,11 @@ class ActivityTailer:
     def poll(self, agents=None) -> None:
         agents = members(self.r, pod=self.pod, tenant=self.tenant) if agents is None else agents
         for agent in sorted(agents):
-            try:
-                newest = self._newest(agent)
-                if newest is not None:
-                    self._tail(agent, *newest)
-            except OSError:
-                # Session rotation can remove a candidate between discovery and
-                # open. The next tenant pass will discover its replacement.
-                continue
+            for path, flavor in self._candidates(agent):
+                try:
+                    self._tail(agent, path, flavor)
+                except OSError:
+                    # Session rotation can remove a candidate between discovery
+                    # and open. Other candidates for this agent still get read;
+                    # the next pass will discover this one's replacement.
+                    continue

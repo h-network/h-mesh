@@ -12,7 +12,7 @@ module was built to.
 
 | file | what it holds |
 |---|---|
-| `activity.py` | `ActivityTailer` -- tails each agent's CLI session file (claude/codex/agy) into a privacy-reduced per-agent `activity` stream, and emits token usage records |
+| `activity.py` | `ActivityTailer` -- tails each agent's CLI session files (claude/codex/agy) into a privacy-reduced per-agent `activity` stream, and emits token usage records |
 | `presence.py` | `PresenceSampler` -- derives `working`/`idle`/`unknown` per agent from recency of that activity stream |
 | `verification.py` | `DeliveryVerifier` -- judges aged `pending.verify` markers (written by `modules.tmux.port.mark_delivery_pending`) against later activity, and sets/clears the `blocked` hash |
 | `service.py` | `Watchdog` -- polls stalls, blocked deliveries, credential expiry, and the doing/todo/hold/unreplied/ack-loop alert family; `main()` runs all four (three observers plus the alerting poll) as one daemon loop |
