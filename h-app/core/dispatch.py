@@ -24,15 +24,26 @@ _DEFAULT_REGISTRY: dict[str, HandlerSpec] = {}
 
 _REGISTRY: dict[str, HandlerSpec] = dict(_DEFAULT_REGISTRY)
 
+_DRAIN_INGRESS = """
+-- core unroutable ingress drain v1
+local key = KEYS[1]
+local items = redis.call('LRANGE', key, 0, -1)
+if #items > 0 then
+    redis.call('DEL', key)
+end
+return items
+"""
+
 
 def register_type(port_type_name: str, handler: HandlerSpec) -> None:
     """Register or override a delivery handler for a port_type.
 
-    A lazy (module_path, attr_name) spec is resolved once here to reject an
-    invalid registration immediately, but the original spec is retained so
-    later lookups still resolve it lazily (paying the import cost only when
-    a delivery for that port_type actually happens).
+    A lazy (module_path, attr_name) spec is imported once here to reject an
+    invalid registration immediately. The original spec is retained and
+    imported again on every lookup so delivery resolves the current attribute.
     """
+    if not port_type_name:
+        raise ValueError("port_type name must be non-empty")
     resolved = handler
     if isinstance(handler, tuple) and len(handler) == 2:
         module_path, attr_name = handler
@@ -66,8 +77,9 @@ def reset_registry() -> None:
 def get_handler(port_type_name: str) -> Callable[..., Any] | None:
     """Look up and resolve the delivery handler for a given port_type.
 
-    Resolves a lazy (module_path, attr_name) spec on every call, so a
-    registration never pays an import cost that a lookup doesn't need.
+    Resolves a lazy (module_path, attr_name) spec on every call. Registration
+    has already imported it once for validation; lookup imports it again to
+    resolve the current attribute.
     """
     if not port_type_name or port_type_name not in _REGISTRY:
         return None
@@ -101,9 +113,7 @@ def dead_letter_unroutable(
     """Drain and dead-letter everything queued for a destination with no handler."""
     ingress_key = prefix(pod, tenant, agent, "ingress")
     dead_key = prefix(pod, tenant, agent, "dead")
-    items = r.lrange(ingress_key, 0, -1)
-    if items:
-        r.delete(ingress_key)
+    items = r.eval(_DRAIN_INGRESS, 1, ingress_key)
     for raw in items:
         r.rpush(dead_key, raw)
 
