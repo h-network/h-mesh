@@ -8,6 +8,7 @@ settled `lib.agentlifecycle` API. Same domain, both sides, one module.
 | file | what it holds |
 |---|---|
 | `cli.py` | the sending half -- argparse dispatch and every command that builds an envelope or reads/mutates Redis state the caller owns directly |
+| `dispatcher.py` | the unified `h-mesh COMMAND` routing layer; delegates to this CLI and the existing service entry points without replacing them |
 | `pricing.py` | model token pricing and cost calculation, used only by `usage` |
 | `port.py` | the receiving half -- one-envelope lifecycle dispatch plus its runnable kick entrypoint |
 
