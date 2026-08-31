@@ -161,6 +161,16 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
             echo "error: h-agent is missing, and installing it needs curl or wget" >&2
             exit 1
         fi
+        # ⚠ h-agent's installer only updates ~/.bashrc/~/.profile, for
+        # FUTURE shells -- it never touches this process's own PATH. Left
+        # alone, the daemons this same run starts later (which is what
+        # actually execs tmux window commands) would inherit the
+        # pre-install PATH and fail to find h-agent with "command not
+        # found" (tmux reports that as the pane exiting status 127) --
+        # measured live, on a host where h-agent had never been installed
+        # before. ${PREFIX:-$HOME/.local}/bin matches the installer's own
+        # default (see H_AGENT_URL's install.sh), and its override.
+        export PATH="${PREFIX:-$HOME/.local}/bin:$PATH"
     fi
     echo
 fi
