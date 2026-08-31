@@ -29,10 +29,14 @@ _SERVICE_ROUTES: dict[str, _Route] = {
         "run the OpenShell port", "modules.openshell.port", accepts_argv=True
     ),
     "session": _Route("run the session service", "services.session"),
+    "start": _Route("start h-mesh daemons", "services.daemons", accepts_argv=True),
     "switch": _Route("run the message switch", "core.service"),
     "tmux-port": _Route("run the tmux port", "modules.tmux.port", accepts_argv=True),
     "tmux-reconciler": _Route(
         "run the tmux reconciler", "services.tmux_reconciler"
+    ),
+    "upgrade": _Route(
+        "upgrade an h-mesh installation", "services.upgrade", accepts_argv=True
     ),
     "watchdog": _Route("run the watchdog service", "services.watchdog"),
 }

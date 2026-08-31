@@ -11,6 +11,8 @@ def test_no_args_prints_unified_help(capsys):
     assert "usage: h-mesh" in out
     assert "hire" in out
     assert "api" in out
+    assert "start" in out
+    assert "upgrade" in out
     assert "tmux-reconciler" in out
 
 
@@ -23,13 +25,23 @@ def test_office_command_delegates_with_original_argv(monkeypatch):
     target.assert_called_once_with(["send", "-a", "worker", "hello"])
 
 
-@pytest.mark.parametrize("command", ["openshell-port", "tmux-port"])
-def test_argv_service_delegates_remainder(monkeypatch, command):
+@pytest.mark.parametrize(
+    ("command", "module"),
+    [
+        ("openshell-port", "modules.openshell.port"),
+        ("start", "services.daemons"),
+        ("tmux-port", "modules.tmux.port"),
+        ("upgrade", "services.upgrade"),
+    ],
+)
+def test_argv_service_delegates_remainder(monkeypatch, command, module):
     target = Mock()
-    monkeypatch.setattr(dispatcher, "_load", Mock(return_value=target))
+    loader = Mock(return_value=target)
+    monkeypatch.setattr(dispatcher, "_load", loader)
 
     dispatcher.main([command, "--verbose"])
 
+    assert loader.call_args.args[0].module == module
     target.assert_called_once_with(["--verbose"])
 
 
