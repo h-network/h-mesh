@@ -21,7 +21,7 @@ place rather than silently rewritten (`docs/TEST-SIGNOFF.md`'s rule for a
 living document). Two specific claims this left behind are corrected below,
 at §13 and §27, where they had gone furthest from stating the truth.
 
-⚠ **Treat `src/flock/` as frozen, but not sealed.** The framework is finished for
+⚠ **Treat the api as frozen, but not sealed.** The framework is finished for
 this build. If the console needs something the api does not offer, **say so
 first** — a gap is a finding. Small, reviewed additions are allowed when the
 alternative is the client rediscovering what the api already knows.

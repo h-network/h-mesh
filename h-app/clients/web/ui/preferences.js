@@ -1,6 +1,6 @@
 "use strict";
 
-const KEY = "hflock.console.preferences.v1";
+const KEY = "hmesh.console.preferences.v1";
 const defaults = { density: "comfortable", theme: "system", selectedAgent: "", officeColumn: 42 };
 
 export class Preferences {

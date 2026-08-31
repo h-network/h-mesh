@@ -71,7 +71,7 @@ def test_part_two_product_controls_and_preferences_ship_as_modules():
         "shortcuts-dialog", "preferences-dialog", "notification-control",
     ):
         assert f'id="{element}"' in html
-    assert "hflock.console.preferences.v1" in (WEB_DIR / "ui" / "preferences.js").read_text(encoding="utf-8")
+    assert "hmesh.console.preferences.v1" in (WEB_DIR / "ui" / "preferences.js").read_text(encoding="utf-8")
     assert "API_TOKEN" not in (WEB_DIR / "ui" / "preferences.js").read_text(encoding="utf-8")
 
 

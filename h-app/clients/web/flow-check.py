@@ -2,7 +2,7 @@
 """flow-check — drive the console like an operator and report what happened.
 
     python3 clients/web/flow-check.py --console http://HOST:8098 --secret S \
-        --container h-flock-<tenant>-tenant-1 --ssh <user@host> --tenant <name>
+        --container h-mesh-<tenant>-tenant-1 --ssh <user@host> --tenant <name>
 
 ⚠ **Every flow here is a bug an operator hit in use.** The console had tests
 before this file existed — they asserted that files exist and that no token

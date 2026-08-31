@@ -1,6 +1,6 @@
-# h-flock Console
+# h-mesh Console
 
-The h-flock Console is the browser control surface for one AI office. It gives
+The h-mesh Console is the browser control surface for one AI office. It gives
 an operator one place to answer three questions: who is working, what needs
 attention, and what work is moving.
 
@@ -24,7 +24,7 @@ The console has no build step and no package installation. Python 3 serves the
 vendored browser assets and proxies one tenant's HTTP, event-stream and terminal
 connections through the same origin.
 
-For local access on the machine running h-flock:
+For local access on the machine running h-mesh:
 
 ```bash
 cd clients/web
@@ -358,7 +358,7 @@ Two checkers, both needing a real tenant and a browser:
 ```bash
 python3 clients/web/visual-check.py --url http://127.0.0.1:8099
 python3 clients/web/flow-check.py --console http://HOST:8098 --secret S \
-    --container h-flock-<tenant>-tenant-1 --tenant <name> [--ssh user@host]
+    --container h-mesh-<tenant>-tenant-1 --tenant <name> [--ssh user@host]
 ```
 
 `visual-check` measures layout: overflow, layout shift, console errors, failed

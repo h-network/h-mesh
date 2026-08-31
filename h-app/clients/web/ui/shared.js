@@ -66,7 +66,7 @@ export const classifyFailure = (status, error, hasData) => {
   else status.error(error);
 };
 
-export const cursorKey = (client, feed) => `hflock.cursor.${client}.${feed}`;
+export const cursorKey = (client, feed) => `hmesh.cursor.${client}.${feed}`;
 
 const isNewCursor = (candidate, previous) => {
   if (!previous) return true;

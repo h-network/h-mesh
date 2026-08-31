@@ -198,7 +198,7 @@ from).
 document (API.md's Watchdog Alerts Feed). The two newer, lead-only alerts —
 `doing_duration` and `todo_duration` (the "unpicked ticket" one) — are pasted
 directly into the *lead's* tmux pane as an ordinary `Message` envelope
-(`flock/watchdog/service.py`'s `_notify_lead`, confirmed against `_check_doing_duration`/
+(`modules.watchdog.service`'s `_notify_lead`, confirmed against `_check_doing_duration`/
 `_check_todo_duration`), and never touch the alerts stream at all. There is
 currently no API surface — REST or SSE — that exposes them to anything but
 the lead's own pane, so this bot cannot surface them regardless of which
@@ -532,7 +532,7 @@ Built strictly against [`docs/API.md`](../../docs/API.md). The following gaps an
    Without `after`, `GET /alerts?limit=N` returns the *oldest* `N` stored entries (`xrange(min="-")`), not the most recent — unintuitive for a "show me recent alerts" one-shot. A client wanting the tail must fetch up to the retention cap and slice client-side, as this bot does. Worth a line in API.md's §4a gotchas.
 
 7. **The two newest watchdog alerts never reach `GET /alerts`**:
-   `doing_duration` and `todo_duration` ("unpicked ticket") are delivered as a direct `Message` to the lead's tmux pane (`_notify_lead`), not written to the alerts stream `_alert` writes to. API.md's Watchdog Alerts Feed section reads as if it covers "alerts produced by `flock.watchdog`" generally; it does not mention this split, and nothing in the REST/SSE surface exposes those two kinds at all.
+   `doing_duration` and `todo_duration` ("unpicked ticket") are delivered as a direct `Message` to the lead's tmux pane (`_notify_lead`), not written to the alerts stream `_alert` writes to. API.md's Watchdog Alerts Feed section reads as if it covers "alerts produced by `modules.watchdog`" generally; it does not mention this split, and nothing in the REST/SSE surface exposes those two kinds at all.
 
 8. **The account/profile registry has no REST endpoint**:
    `available_profiles` (`bus/accounts.py`) — what `office profiles` reads and what `StartAgent`'s `profile` field is validated against (`control/openers.py`) — is direct-Redis only. A REST client can `StartAgent` with a `profile` and get a clear `422` naming the valid accounts if it guesses wrong, but cannot list them ahead of time to offer a picker. `office usage` is the same shape (direct Redis, no REST equivalent).

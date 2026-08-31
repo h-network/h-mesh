@@ -107,8 +107,8 @@ def test_terminal_part_ii_overengineering_features():
     assert "_showPasteConfirmationModal" in js
 
     # 3. LocalStorage settings persistence (font size & scrollback depth)
-    assert "hflock.terminal.fontSize" in js
-    assert "hflock.terminal.scrollback" in js
+    assert "hmesh.terminal.fontSize" in js
+    assert "hmesh.terminal.scrollback" in js
 
     # 4. Multi-terminal side-by-side grid
     assert "terminal-multi-grid" in html
