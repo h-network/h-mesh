@@ -220,6 +220,28 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
                              "(default: $VIRTUAL_ENV or ./.venv)")
 
 
+def merged_daemon_env(tenant: str, base_env: dict | None = None) -> dict:
+    """Persisted tenant config layered beneath a live environment.
+
+    Persisted tenant config (PROVIDER_*/CLAUDE_OAUTH_TOKEN_*, from the
+    setup.sh wizard) first, so daemons started fresh -- in a shell that
+    never ran the wizard itself, or never exported what it just collected --
+    still see them; base_env (the live process env, by default) on top, so
+    an explicit export still wins over what's on disk.
+
+    The one place this merge happens, so every daemon-starting caller
+    (resolve_config() here, and setup.sh's own daemon-start step, which
+    can't go through resolve_config() end-to-end because it must keep
+    --no-venv's ambient-python mode working, which resolve_config()'s own
+    venv resolution doesn't support) gets it consistently. Skipping this
+    merge is exactly what left a wizard-collected OAuth token invisible to
+    the reconciler hiring the first agent in the same run -- measured live.
+    """
+    env = dict(read_tenant_env(tenant))
+    env.update(base_env if base_env is not None else os.environ)
+    return env
+
+
 def resolve_config(args: argparse.Namespace) -> DaemonConfig:
     tmux_session = args.tmux_session or args.tenant
     run_dir = Path(os.environ.get("H_MESH_RUN_DIR", str(Path.home() / ".h-mesh" / "run" / args.tenant)))
@@ -231,12 +253,7 @@ def resolve_config(args: argparse.Namespace) -> DaemonConfig:
     h_app_path = str(REPO_ROOT / "h-app")
     pythonpath = f"{existing_pythonpath}{os.pathsep}{h_app_path}" if existing_pythonpath else h_app_path
 
-    # Persisted tenant config (PROVIDER_*/CLAUDE_OAUTH_TOKEN_*, from the
-    # setup.sh wizard) first, so daemons started fresh -- in a shell that
-    # never ran setup.sh itself -- still see them; live process env on top,
-    # so an explicit export still wins over what's on disk.
-    env = dict(read_tenant_env(args.tenant))
-    env.update(os.environ)
+    env = merged_daemon_env(args.tenant)
     env.update({
         "POD": args.pod,
         "TENANT": args.tenant,

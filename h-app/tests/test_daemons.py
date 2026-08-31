@@ -10,6 +10,7 @@ import redis
 from services.daemons import (
     DaemonError,
     add_common_args,
+    merged_daemon_env,
     pid_alive,
     resolve_config,
     start_daemons,
@@ -174,3 +175,29 @@ def test_resolve_config_live_env_overrides_persisted_tenant_env(monkeypatch, tmp
     config = resolve_config(args)
 
     assert config.env["PROVIDER_LOCAL_URL"] == "http://live-override:8000"
+
+
+def test_merged_daemon_env_includes_persisted_token_not_in_base_env(monkeypatch, tmp_path):
+    # The exact shape of the real bug: setup.sh's own shell never exports
+    # what the wizard's ask_token() collected -- it only ever lands in the
+    # persisted tenant config -- so a caller building env from a bare
+    # dict(os.environ) (or any base_env that doesn't have it either) would
+    # never see it. merged_daemon_env() must pull it in regardless.
+    monkeypatch.setenv("H_MESH_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_OAUTH_TOKEN_DEFAULT", raising=False)
+    write_tenant_env("mytenant", {"CLAUDE_OAUTH_TOKEN_DEFAULT": "sekrit-token"})
+
+    base_env = {"PATH": "/usr/bin"}  # deliberately does not have the token
+    env = merged_daemon_env("mytenant", base_env=base_env)
+
+    assert env["CLAUDE_OAUTH_TOKEN_DEFAULT"] == "sekrit-token"
+    assert env["PATH"] == "/usr/bin"
+
+
+def test_merged_daemon_env_base_env_overrides_persisted(monkeypatch, tmp_path):
+    monkeypatch.setenv("H_MESH_STATE_DIR", str(tmp_path))
+    write_tenant_env("mytenant", {"CLAUDE_OAUTH_TOKEN_DEFAULT": "old-token"})
+
+    env = merged_daemon_env("mytenant", base_env={"CLAUDE_OAUTH_TOKEN_DEFAULT": "new-token"})
+
+    assert env["CLAUDE_OAUTH_TOKEN_DEFAULT"] == "new-token"
