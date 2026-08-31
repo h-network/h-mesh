@@ -300,7 +300,17 @@ class Switch:
                         )
                 next_maintenance = now + maintenance_poll_seconds
             timeout = min(self.poll_seconds, max(0.1, next_maintenance - time.monotonic()))
-            self.step(timeout=timeout)
+            try:
+                self.step(timeout=timeout)
+            except redis.exceptions.ConnectionError as exc:
+                # redis-py reconnects on the next command. Keep this bare-nohup
+                # daemon alive across a Redis restart, but avoid a hot retry loop
+                # while the server is still unavailable.
+                _emit_observation(
+                    "error", {},
+                    reason=f"forwarding pass failed: {type(exc).__name__}: {exc}",
+                )
+                time.sleep(timeout)
 
 
 def main() -> None:
