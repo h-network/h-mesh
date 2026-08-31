@@ -50,9 +50,13 @@ class CoreAdaptationTests(unittest.TestCase):
         }
         checked = 0
         violations = []
+        excluded_dirs = {".git", ".pytest_cache", "__pycache__"}
 
         for path in H_APP.rglob("*"):
-            if not path.is_file() or "__pycache__" in path.parts:
+            if (
+                not path.is_file()
+                or any(part in excluded_dirs or part.endswith(".egg-info") for part in path.parts)
+            ):
                 continue
             relative = path.relative_to(H_APP)
             checked += 1
