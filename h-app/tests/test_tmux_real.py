@@ -427,6 +427,21 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         self.assertEqual(len(killed_events), 1)
         self.assertEqual(killed_events[0]["destination"], "liam")
 
+    def test_start_agent_command_flags(self):
+        from modules.tmux.ops import start_agent_command
+
+        self.assertEqual(start_agent_command("claude", resume=False), ["h-agent", "claude"])
+        self.assertEqual(start_agent_command("claude", resume=True), ["h-agent", "claude", "--continue"])
+
+        self.assertEqual(start_agent_command("codex", resume=False), ["h-agent", "codex"])
+        self.assertEqual(start_agent_command("codex", resume=True), ["h-agent", "codex", "resume", "--last"])
+
+        self.assertEqual(start_agent_command("agy", resume=False), ["h-agent", "agy"])
+        self.assertEqual(start_agent_command("agy", resume=True), ["h-agent", "agy", "--continue"])
+
+        self.assertEqual(start_agent_command("custom", resume=False), ["h-agent", "custom"])
+        self.assertEqual(start_agent_command("custom", resume=True), ["h-agent", "custom", "--continue"])
+
 
 if __name__ == "__main__":
     unittest.main()
