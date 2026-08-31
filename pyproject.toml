@@ -30,6 +30,8 @@ h-mesh-tmux-reconciler = "services.tmux_reconciler:main"
 h-mesh-watchdog = "services.watchdog:main"
 h-mesh-office = "modules.office.cli:main"
 h-mesh-clone-to-all = "modules.office.cli:clone_to_all_entrypoint"
+h-mesh-upgrade = "services.upgrade:main"
+h-mesh-start = "services.daemons:main"
 
 [tool.setuptools]
 package-dir = {"" = "h-app"}

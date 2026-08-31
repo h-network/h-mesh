@@ -37,6 +37,38 @@ h-mesh-office hire <agent-name>
 Hiring starts a fresh CLI session by default, even when that agent name has
 local session history. Pass `--resume` to opt into restoring prior history.
 
+## Upgrading and restarting daemons
+
+`h-mesh-upgrade` (`services.upgrade`) updates an existing install in place --
+`git pull --ff-only`, reinstall, then cleanly restart the same daemons
+setup.sh started (stop via SIGTERM/SIGKILL fallback, then start fresh with
+the current environment). It won't double-start daemons against an
+already-running install: it always stops first.
+
+```bash
+h-mesh-upgrade --pod mypod --tenant mytenant
+```
+
+Same pod/tenant/redis-url/session/tmux-tmpdir/tmux-socket/venv flags as
+setup.sh, plus `--skip-install` and `--skip-pull` (`h-mesh-upgrade --help`
+for the full list).
+
+⚠ **Known limit:** a hired agent's tmux pane inherits its environment once,
+at creation. Upgrading restarts h-mesh's own daemons and reinstalls the code
+they run, but it cannot reach into an already-hired agent's live pane and
+refresh its env -- that agent keeps whatever it started with until it's
+re-hired or its window is otherwise recreated. This is deliberate: forcing
+that refresh would mean killing live agent sessions on every upgrade.
+
+`h-mesh-start` (`services.daemons`) starts the same daemons without pulling
+or reinstalling -- useful after a crash, or on a host where they aren't
+running yet. It's also duplicate-safe: a daemon it finds already alive (via
+its pidfile) is left running rather than started a second time.
+
+```bash
+h-mesh-start --pod mypod --tenant mytenant
+```
+
 ## Host installation
 
 h-mesh is installed from the repository root. An editable install is useful for
@@ -68,6 +100,8 @@ provides these process entry points:
 - `h-mesh-tmux-port AGENT` — direct tmux delivery-port invocation
 - `h-mesh-office` — the operator CLI
 - `h-mesh-clone-to-all` — the standalone clone-to-all compatibility command
+- `h-mesh-upgrade` — pull, reinstall, and cleanly restart the daemons setup.sh started
+- `h-mesh-start` — start those same daemons if not already running, without pulling or reinstalling
 
 The `h-mesh-` prefix is intentional: h-mesh can share an installation prefix
 with another application without replacing its live `office` executable.
