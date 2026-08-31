@@ -12,9 +12,42 @@ A Telegram interface is included, talking to the framework over the same REST AP
 
 Every hop a message takes is logged, the same way a real packet's path can be traced -- nothing moves silently.
 
+## Quick install
+
+On a fresh host, one command clones h-mesh and hands off straight to
+`setup.sh`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/h-network/h-mesh/main/install.sh | sh
+```
+
+It clones into `~/h-mesh` by default (`H_MESH_INSTALL_DIR` to choose
+another location), or updates an existing checkout there if one already
+exists. Extra arguments pass straight through to `setup.sh` -- e.g. to skip
+the wizard:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/h-network/h-mesh/main/install.sh \
+  | sh -s -- --pod mypod --tenant mytenant --non-interactive
+```
+
+This is a companion to cloning it yourself, not a replacement -- see below
+for the manual clone-then-`setup.sh` path, and [Host installation](#host-installation)
+for installing just the Python package without any of the bootstrap steps.
+
 ## Bootstrap script
 
-`./setup.sh` bootstraps a fresh host or pod. Run at a real terminal with no
+Cloning it yourself first works exactly the same way, if you'd rather skip
+the one-liner above:
+
+```bash
+git clone https://github.com/h-network/h-mesh.git
+cd h-mesh
+./setup.sh
+```
+
+`./setup.sh` bootstraps a fresh host or pod (already have a checkout? this
+is what `install.sh` above hands off to). Run at a real terminal with no
 flags, it's an interactive wizard: pod/tenant name, how many agents and
 their names (`architect` is agent #1 by default), which CLI each runs
 (claude/codex/agy), account setup if more than one credential is needed, and
