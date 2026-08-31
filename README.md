@@ -11,3 +11,41 @@ Every endpoint is a module, and every module owns its own port -- the piece that
 A Telegram interface is included, talking to the framework over the same REST API any external client would use -- a separate module, not a special case.
 
 Every hop a message takes is logged, the same way a real packet's path can be traced -- nothing moves silently.
+
+## Host installation
+
+h-mesh is installed from the repository root. An editable install is useful for
+development; a regular install uses the same package metadata for production:
+
+```bash
+python -m venv .venv
+.venv/bin/python -m pip install -e .
+```
+
+Contributors running the test suite should install the test extra with
+`.venv/bin/python -m pip install -e '.[test]'`.
+
+Use an isolated environment when developing or validating an install. In
+particular, do not install h-mesh into an environment that provides h-flock's
+live commands; keeping their prefixes separate prevents either application
+from replacing the other's executables.
+
+The install makes the top-level `core`, `lib`, `modules`, and `services`
+packages importable independently of the current working directory. It also
+provides these process entry points:
+
+- `h-mesh-switch` — the core switch daemon
+- `h-mesh-api` — the REST API daemon
+- `h-mesh-openshell-port AGENT` — direct OpenShell delivery-port invocation
+- `h-mesh-session` — the tmux control-mode session daemon
+- `h-mesh-tmux-reconciler` — the tmux registry reconciler daemon
+- `h-mesh-watchdog` — the delivery and presence watchdog daemon
+- `h-mesh-tmux-port AGENT` — direct tmux delivery-port invocation
+- `h-mesh-office` — the operator CLI
+- `h-mesh-clone-to-all` — the standalone clone-to-all compatibility command
+
+The `h-mesh-` prefix is intentional: h-mesh can share an installation prefix
+with h-flock without replacing h-flock's live `office` executable.
+
+Each process reads its deployment configuration from environment variables;
+the module READMEs document the required variables and external services.

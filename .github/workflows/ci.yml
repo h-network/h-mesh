@@ -22,7 +22,58 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install fastapi redis uvicorn
+      - name: Install h-mesh
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --editable '.[test]'
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+      - name: Verify installed package and entry points outside the checkout
+        run: |
+          smoke_dir="$(mktemp -d)"
+          cd "$smoke_dir"
+          python - <<'PY'
+          from importlib.metadata import distribution
+
+          import core.service
+          import modules.api
+          import modules.office.cli
+          import modules.office.port
+          import modules.openshell.port
+          import modules.session.app
+          import modules.tmux.port
+          import services.api
+          import services.session
+          import services.tmux_reconciler
+          import services.watchdog
+
+          expected = {
+              "h-mesh-api",
+              "h-mesh-openshell-port",
+              "h-mesh-session",
+              "h-mesh-switch",
+              "h-mesh-tmux-port",
+              "h-mesh-tmux-reconciler",
+              "h-mesh-watchdog",
+              "h-mesh-office",
+              "h-mesh-clone-to-all",
+          }
+          scripts = {
+              entry.name: entry
+              for entry in distribution("h-mesh").entry_points
+              if entry.group == "console_scripts"
+          }
+          missing = expected - scripts.keys()
+          if missing:
+              raise SystemExit(f"missing console scripts: {sorted(missing)}")
+          for name in expected:
+              if not callable(scripts[name].load()):
+                  raise SystemExit(f"{name} does not resolve to a callable")
+          PY
+          if h-mesh-tmux-port 2>tmux-port.stderr; then
+            echo "h-mesh-tmux-port unexpectedly succeeded without an agent" >&2
+            exit 1
+          fi
+          grep -F "usage: python -m modules.tmux.port <agent>" tmux-port.stderr
       - run: python3 -m unittest discover -s h-app/tests -v
       - name: Switch smoke test (real Redis)
         env:
