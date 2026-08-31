@@ -13,6 +13,7 @@ from core.keys import prefix
 from core.registry import port_type
 from lib.attachment_schema import validate_attachment_payload
 from lib.board_interaction import add_ticket
+from lib.paths import get_workdir_root
 from .ops import list_windows, submit_text
 
 # The CLIs that write a session file the switch can tail. An agent running
@@ -169,7 +170,7 @@ def attachment_opener(
     envelope: dict,
     session_name: str,
     socket: str | None = None,
-    workdir_root: str = "/workdir",
+    workdir_root: str | None = None,
 ) -> None:
     if not isinstance(envelope, dict):
         raise DeadLetter("envelope must be a dict")
@@ -189,8 +190,9 @@ def attachment_opener(
     if agent not in windows:
         raise DeadLetter("window_missing")
 
-    # Create /workdir/<recipient>/attachments/<stream_id>/
-    target_dir = os.path.join(workdir_root, agent, "attachments", stream_id)
+    # Create <workdir_root>/<recipient>/attachments/<stream_id>/
+    root = workdir_root or get_workdir_root()
+    target_dir = os.path.join(root, agent, "attachments", stream_id)
     try:
         os.makedirs(target_dir, exist_ok=True)
     except Exception as exc:

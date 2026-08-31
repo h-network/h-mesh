@@ -308,6 +308,24 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             reconciler.reconcile_once(self.r)
             self.assertEqual(list_windows(self.session_name, socket=self.socket), {"__init__"})
 
+    def test_reconciler_host_workdir_custom_path_creation(self):
+        custom_workdir = os.path.join(self.tmpdir, "custom_workdir_root")
+        with unittest.mock.patch.dict(os.environ, {"H_MESH_WORKDIR": custom_workdir}):
+            reconciler = TmuxReconciler(
+                pod=self.pod,
+                tenant=self.tenant,
+                redis_url=self.redis_url,
+                session_name=self.session_name,
+                socket=self.socket,
+            )
+            self.r.hset(self.registry, "ian", "tmux")
+            reconciler.reconcile_once(self.r)
+
+            self.assertIn("ian", list_windows(self.session_name, socket=self.socket))
+            ian_workdir = os.path.join(custom_workdir, "ian")
+            self.assertTrue(os.path.isdir(ian_workdir))
+            self.assertTrue(os.path.isfile(os.path.join(ian_workdir, "AGENTS.md")))
+
 
 if __name__ == "__main__":
     unittest.main()

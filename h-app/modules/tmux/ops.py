@@ -1,11 +1,12 @@
 import json
 import os
-from pathlib import Path
-
-from core.logging import log_record
 import subprocess
 import time
+from pathlib import Path
 from typing import Set
+
+from core.logging import log_record
+from lib.paths import get_agent_workdir, get_workdir_root
 
 
 # Seconds between the paste and the Enter. `paste-buffer -p` only emits the
@@ -313,7 +314,7 @@ def window_env(
     claude_tools: str | None = None,
 ) -> list[str]:
     """Single place where a window environment is constructed for all execution paths."""
-    cwd = cwd or f"/workdir/{agent_name}"
+    cwd = get_agent_workdir(agent_name, cwd)
     guide_path = f"{cwd}/AGENTS.md"
     env_vars = [
         "env",
@@ -399,11 +400,12 @@ def has_session_history(
     cli: str,
     profile: str | None = None,
     home_root: str | Path | None = None,
+    cwd: str | None = None,
 ) -> bool:
     """Return True if prior session history exists for the given agent/CLI/profile."""
     home = Path(home_root) if home_root is not None else Path(os.environ.get("HOME", os.path.expanduser("~")))
     suffix = f"-{profile}" if profile else ""
-    cwd = f"/workdir/{agent}"
+    cwd = get_agent_workdir(agent, cwd)
 
     if cli == "claude":
         project_dir = home / f".claude{suffix}" / "projects" / cwd.replace("/", "-")
@@ -575,8 +577,7 @@ def create_window(
     agent's guide had been silently overwritten and named nobody.
     """
     if agent_name != "__init__":
-        if cwd is None:
-            cwd = f"/workdir/{agent_name}"
+        cwd = get_agent_workdir(agent_name, cwd)
 
         try:
             os.makedirs(cwd, exist_ok=True)

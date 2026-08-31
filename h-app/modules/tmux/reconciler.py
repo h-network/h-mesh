@@ -7,6 +7,7 @@ from typing import Set
 from core.keys import prefix
 from core.logging import log_record
 from core.registry import members, port_type
+from lib.paths import get_agent_workdir, get_workdir_root
 from . import ops as tmux_ops
 from .ops import write_agent_guide, window_env
 
@@ -135,7 +136,7 @@ class TmuxReconciler:
     ) -> None:
         ret, stdout, stderr = tmux_ops.run_tmux("has-session", "-t", self.session_name, socket=self.socket)
         if ret != 0:
-            cwd = f"/workdir/{initial_window}" if initial_window != "__init__" else None
+            cwd = get_agent_workdir(initial_window) if initial_window != "__init__" else None
             cmd = [
                 "new-session", "-d", "-s", self.session_name, "-n", initial_window, "-x", "120", "-y", "32"
             ]
@@ -150,7 +151,7 @@ class TmuxReconciler:
                 write_agent_guide(cwd, initial_window, self.tenant, lead=lead, profile=profile)
                 if cli:
                     if resume is None:
-                        should_resume = tmux_ops.has_session_history(initial_window, cli, profile=profile)
+                        should_resume = tmux_ops.has_session_history(initial_window, cli, profile=profile, cwd=cwd)
                     else:
                         should_resume = resume
                     cmd_args = tmux_ops.start_agent_command(cli, resume=should_resume)
@@ -196,7 +197,7 @@ class TmuxReconciler:
         skip_permissions: bool | None = None,
         claude_tools: str | None = None,
     ) -> bool:
-        cwd = cwd or f"/workdir/{agent_name}"
+        cwd = get_agent_workdir(agent_name, cwd)
         env_args = window_env(
             agent_name, tenant=self.tenant, cwd=cwd, profile=profile, provider=provider,
             skip_permissions=skip_permissions, claude_tools=claude_tools,
@@ -206,7 +207,7 @@ class TmuxReconciler:
         # caller, and writing it twice is what dropped the lead sentence.
         if cli:
             if resume is None:
-                should_resume = tmux_ops.has_session_history(agent_name, cli, profile=profile)
+                should_resume = tmux_ops.has_session_history(agent_name, cli, profile=profile, cwd=cwd)
             else:
                 should_resume = resume
             command = env_args + tmux_ops.start_agent_command(cli, resume=should_resume)
