@@ -86,6 +86,15 @@ def test_unknown_command_is_an_argparse_error(capsys):
     assert "unknown command: no-such-command" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("alias", ["cloneToAll", "sendFile", "letGo"])
+def test_camel_case_office_aliases_are_not_dispatched(alias, capsys):
+    with pytest.raises(SystemExit) as exc:
+        dispatcher.main([alias])
+
+    assert exc.value.code == 2
+    assert f"unknown command: {alias}" in capsys.readouterr().err
+
+
 def test_service_modules_are_loaded_only_when_dispatched(monkeypatch):
     imported = []
     target = Mock()
