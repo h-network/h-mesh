@@ -38,8 +38,8 @@ export class TerminalPanel {
     this.searchAddon = null;
 
     // Settings (persisted in localStorage)
-    this.fontSize = parseInt(localStorage.getItem("hflock.terminal.fontSize") || "14", 10);
-    this.scrollback = parseInt(localStorage.getItem("hflock.terminal.scrollback") || "2000", 10);
+    this.fontSize = parseInt(localStorage.getItem("hmesh.terminal.fontSize") || "14", 10);
+    this.scrollback = parseInt(localStorage.getItem("hmesh.terminal.scrollback") || "2000", 10);
 
     // Session Recording & Replay State
     this.isRecording = false;
@@ -210,7 +210,7 @@ export class TerminalPanel {
       fontSizeSelect.value = String(this.fontSize);
       fontSizeSelect.onchange = (e) => {
         this.fontSize = parseInt(e.target.value, 10);
-        localStorage.setItem("hflock.terminal.fontSize", String(this.fontSize));
+        localStorage.setItem("hmesh.terminal.fontSize", String(this.fontSize));
         if (this.term) this.term.options.fontSize = this.fontSize;
       };
     }
@@ -219,7 +219,7 @@ export class TerminalPanel {
       scrollbackSelect.value = String(this.scrollback);
       scrollbackSelect.onchange = (e) => {
         this.scrollback = parseInt(e.target.value, 10);
-        localStorage.setItem("hflock.terminal.scrollback", String(this.scrollback));
+        localStorage.setItem("hmesh.terminal.scrollback", String(this.scrollback));
         if (this.term) this.term.options.scrollback = this.scrollback;
       };
     }

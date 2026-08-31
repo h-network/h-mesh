@@ -1,6 +1,6 @@
 "use strict";
 
-const KEY = "hflock.console.notifications.v1";
+const KEY = "hmesh.console.notifications.v1";
 
 export class AlertNotifications {
   constructor() {
