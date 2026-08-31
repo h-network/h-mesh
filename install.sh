@@ -38,4 +38,26 @@ else
 fi
 
 cd "$dest"
-exec ./setup.sh "$@"
+
+# ⚠ `curl ... | sh` consumes stdin as sh's own script source -- by the time
+# we get here, fd 0 is the exhausted pipe, not a terminal, even when this
+# was run interactively. Without this, setup.sh's own `[ -t 0 ]` check
+# (correctly) sees a non-tty and silently skips the wizard, with no prompts
+# and no error -- a real user hit exactly that live. Re-point stdin at the
+# controlling terminal before handing off, when there is one; if there
+# isn't (genuinely non-interactive -- CI, cron, a script piped from a
+# file), opening /dev/tty fails and setup.sh keeps today's correct
+# non-interactive behavior.
+# ⚠ Probed in a subshell with a no-op, not a bare `exec 3</dev/tty` as the
+# if-condition directly -- POSIX requires a shell to exit outright when a
+# bare `exec`'s own redirection fails, even one used only as an if's
+# condition. That's fine for the real handoff below (failing there really
+# should end the script), but as a *probe* it would have killed this
+# script instead of just answering "no tty" -- measured: `sh install.sh`
+# with no controlling terminal exited before ever reaching the fallback
+# branch.
+if ( : < /dev/tty ) 2>/dev/null; then
+    exec ./setup.sh "$@" < /dev/tty
+else
+    exec ./setup.sh "$@"
+fi
