@@ -32,6 +32,8 @@ class DispatchRedis:
         self.values = {}
         self.lock = threading.Lock()
         self.hsetnx_contention = threading.Event()
+        self.after_drain = None
+        self.eval_calls = 0
 
     def get(self, key):
         with self.lock:
@@ -79,6 +81,21 @@ class DispatchRedis:
             self.lists[key].extend(values)
             return len(self.lists[key])
 
+    def eval(self, script, key_count, *args):
+        self.assert_drain_script(script, key_count)
+        key = args[0]
+        with self.lock:
+            self.eval_calls += 1
+            items = list(self.lists.pop(key, ()))
+        if self.after_drain is not None:
+            self.after_drain()
+        return items
+
+    @staticmethod
+    def assert_drain_script(script, key_count):
+        if "core unroutable ingress drain" not in script or key_count != 1:
+            raise AssertionError("unexpected Redis script")
+
 
 class DispatchTests(unittest.TestCase):
     def setUp(self):
@@ -107,8 +124,19 @@ class DispatchTests(unittest.TestCase):
         dead = prefix(POD, TENANT, AGENT, "dead")
         self.redis.rpush(ingress, b"first", b"second")
         dispatch_ingress(self.redis, pod=POD, tenant=TENANT, agent=AGENT)
+        self.assertEqual(self.redis.eval_calls, 1)
         self.assertEqual(list(self.redis.lists[ingress]), [])
         self.assertEqual(list(self.redis.lists[dead]), [b"first", b"second"])
+
+    def test_unroutable_drain_preserves_ingress_appended_after_atomic_snapshot(self):
+        self.redis.hset(self.registry, AGENT, "unknown")
+        ingress = prefix(POD, TENANT, AGENT, "ingress")
+        dead = prefix(POD, TENANT, AGENT, "dead")
+        self.redis.rpush(ingress, b"snapshot")
+        self.redis.after_drain = lambda: self.redis.rpush(ingress, b"concurrent")
+        dispatch_ingress(self.redis, pod=POD, tenant=TENANT, agent=AGENT)
+        self.assertEqual(list(self.redis.lists[dead]), [b"snapshot"])
+        self.assertEqual(list(self.redis.lists[ingress]), [b"concurrent"])
 
     def test_paused_destination_is_not_dispatched_or_dead_lettered(self):
         calls = []
@@ -142,6 +170,12 @@ class DispatchTests(unittest.TestCase):
             with self.subTest(handler=handler):
                 with self.assertRaisesRegex(ValueError, "invalid delivery handler"):
                     register_type("invalid", handler)
+
+    def test_register_rejects_falsy_port_type_names(self):
+        for name in ("", None, 0):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, "port_type name must be non-empty"):
+                    register_type(name, sample_lazy_handler)
 
     def test_delivery_kick_serializes_concurrent_dispatches_and_releases_tag(self):
         entered_first = threading.Event()
