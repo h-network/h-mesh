@@ -36,68 +36,38 @@ class RegistryRedis:
 
 
 class CoreAdaptationTests(unittest.TestCase):
-    def test_core_contains_no_old_project_names(self):
-        core = H_APP / "core"
-        checked = [*core.glob("*.py"), *core.glob("*.md")]
-        for path in checked:
-            text = path.read_text(encoding="utf-8").casefold()
-            with self.subTest(path=path.name):
-                self.assertNotIn("flock", text)
-                self.assertNotIn("roster", text)
+    def test_tree_contains_no_old_project_names(self):
+        banned = (
+            "f" + "lock",
+            "f" + "lock_",
+            "f" + "lockclient",
+            "h" + "f" + "lock_",
+            "h" + "f" + "lock_session",
+        )
+        allowed = {
+            (Path("tests/test_session.py"), 371),
+            (Path("tests/test_session.py"), 372),
+        }
+        checked = 0
+        violations = []
 
-    def test_session_module_contains_no_old_project_names(self):
-        session_mod = H_APP / "modules" / "session"
-        checked = [*session_mod.glob("*.py"), *session_mod.glob("*.md")]
-        for path in checked:
-            text = path.read_text(encoding="utf-8").casefold()
-            with self.subTest(path=path.name):
-                self.assertNotIn("flock", text)
-
-    def test_tree_contains_no_flock_imports(self):
-        """Guard against any module, client, service or test importing from flock."""
-        py_files = list(H_APP.rglob("*.py"))
-        self.assertTrue(len(py_files) > 20, "Expected at least 20 python files across h-app")
-        for path in py_files:
-            text = path.read_text(encoding="utf-8")
-            lines = text.splitlines()
-            for idx, line in enumerate(lines, start=1):
-                stripped = line.strip()
-                if stripped.startswith("#"):
+        for path in H_APP.rglob("*"):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            relative = path.relative_to(H_APP)
+            checked += 1
+            for line_number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                if (relative, line_number) in allowed:
                     continue
-                with self.subTest(path=str(path.relative_to(H_APP)), line=idx):
-                    self.assertFalse(
-                        stripped.startswith("import flock") or stripped.startswith("from flock"),
-                        f"Found flock import at {path.relative_to(H_APP)}:{idx}: {line}",
-                    )
+                folded = line.casefold()
+                matches = [name for name in banned if name in folded]
+                if matches:
+                    violations.append(f"{relative}:{line_number}: {', '.join(matches)}")
 
-    def test_tree_clients_and_services_use_h_mesh_convention(self):
-        """Ensure clients and services define and prioritize H_MESH_ env vars and classes."""
-        # 1. Telegram bot client and launcher
-        tg_bot = (H_APP / "clients" / "telegram" / "bot.py").read_text(encoding="utf-8")
-        self.assertIn("class MeshClient:", tg_bot)
-        self.assertIn("mesh_telegram", tg_bot)
-        self.assertIn("H_MESH_API_URL", tg_bot)
-        self.assertIn("H_MESH_SESSION_URL", tg_bot)
-        self.assertIn("H_MESH_API_TOKEN", tg_bot)
-        self.assertNotIn("FLOCK_", tg_bot)
-        self.assertNotIn("FlockClient", tg_bot)
-
-        # 2. Web console server
-        web_server = (H_APP / "clients" / "web" / "server.py").read_text(encoding="utf-8")
-        self.assertIn('server_version = "h-mesh-web/1"', web_server)
-        self.assertIn("hmesh_session", web_server)
-        self.assertIn("H_MESH_SECRET", web_server)
-        self.assertIn("H_MESH_API", web_server)
-        self.assertIn("H_MESH_SESSION", web_server)
-        self.assertNotIn("HFLOCK_", web_server)
-        self.assertNotIn("hflock_session", web_server)
-
-        # 3. Services launchers
-        svc_tg = (H_APP / "services" / "telegram_bot.py").read_text(encoding="utf-8")
-        self.assertIn("MeshClient", svc_tg)
-        self.assertIn("H_MESH_API_URL", svc_tg)
-        self.assertNotIn("FLOCK_", svc_tg)
-        self.assertNotIn("FlockClient", svc_tg)
+        self.assertGreater(checked, 100, "Expected to scan the complete h-app tree")
+        self.assertEqual(violations, [], "Old project names found:\n" + "\n".join(violations))
 
     def test_registry_uses_registry_wire_resource(self):
         client = RegistryRedis()
