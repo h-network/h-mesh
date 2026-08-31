@@ -22,3 +22,5 @@ Nothing per-request (e.g. `agentlifecycle`) and nothing CLI-invoked (e.g.
 |---|---|
 | `api.py` | Loads API settings and runs the module's FastAPI application with uvicorn. |
 | `tmux_reconciler.py` | Loads tmux configuration and runs `TmuxReconciler.run_forever()`. |
+| `telegram_bot.py` | `clients.telegram.bot.TelegramBot` polling client |
+| `web_console.py` | `clients.web.server.WebConsoleServer` HTTP/WS proxy server |
