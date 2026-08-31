@@ -24,7 +24,7 @@ from clients.telegram.bot import (
 )
 
 
-class DummyFlockClient:
+class DummyMeshClient:
     def __init__(self, app_name="telegram", base_url="http://127.0.0.1:8080", token="dummy-token"):
         self.app_name = app_name
         self.base_url = base_url
@@ -203,7 +203,7 @@ def test_enrol_retries_until_success_and_seeds_cursor(monkeypatch):
     slept = []
     monkeypatch.setattr(bot.time, "sleep", lambda s: slept.append(s))
 
-    class FlakyFlockClient(DummyFlockClient):
+    class FlakyMeshClient(DummyMeshClient):
         def __init__(self):
             super().__init__()
             self.attempts = 0
@@ -214,28 +214,28 @@ def test_enrol_retries_until_success_and_seeds_cursor(monkeypatch):
                 return 500, {"detail": "<urlopen error [Errno 111] Connection refused>"}
             return 202, {"stream_id": "s1", "correlation_id": "c1"}
 
-    flock = FlakyFlockClient()
+    mesh = FlakyMeshClient()
     with tempfile.TemporaryDirectory() as tmpdir:
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        bot_instance = TelegramBot(flock, DummyTelegramClient(), store, target_agent="architect")
+        bot_instance = TelegramBot(mesh, DummyTelegramClient(), store, target_agent="architect")
         ok = bot_instance.enrol()
 
     assert ok is True
-    assert flock.attempts == 3
+    assert mesh.attempts == 3
     assert len(slept) == 2  # retried after attempt 1 and attempt 2, not after the success
 
 
 def test_enrol_gives_up_after_timeout_without_raising(monkeypatch):
     monkeypatch.setattr(bot.time, "sleep", lambda s: None)
 
-    class AlwaysDownFlockClient(DummyFlockClient):
+    class AlwaysDownMeshClient(DummyMeshClient):
         def enrol(self):
             return 500, {"detail": "<urlopen error [Errno 111] Connection refused>"}
 
-    flock = AlwaysDownFlockClient()
+    mesh = AlwaysDownMeshClient()
     with tempfile.TemporaryDirectory() as tmpdir:
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        bot_instance = TelegramBot(flock, DummyTelegramClient(), store, target_agent="architect")
+        bot_instance = TelegramBot(mesh, DummyTelegramClient(), store, target_agent="architect")
         # timeout_s=0 -> the deadline has already passed after the first
         # attempt, so this returns quickly instead of retrying for 60s.
         ok = bot_instance.enrol(timeout_s=0)
@@ -244,11 +244,11 @@ def test_enrol_gives_up_after_timeout_without_raising(monkeypatch):
 
 
 def test_enrol_registers_bot_commands():
-    flock = DummyFlockClient()
+    mesh = DummyMeshClient()
     telegram = DummyTelegramClient()
     with tempfile.TemporaryDirectory() as tmpdir:
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        bot_instance = TelegramBot(flock, telegram, store, target_agent="architect")
+        bot_instance = TelegramBot(mesh, telegram, store, target_agent="architect")
         bot_instance.enrol()
 
     assert len(telegram.commands_set) == 1
@@ -264,7 +264,7 @@ def test_run_polling_does_not_enrol_itself():
         """Not an Exception: run_polling's `except Exception` (which retries
         forever on any failure) must not swallow this, or the loop never ends."""
 
-    class CountingFlockClient(DummyFlockClient):
+    class CountingMeshClient(DummyMeshClient):
         def __init__(self):
             super().__init__()
             self.enrol_calls = 0
@@ -277,27 +277,27 @@ def test_run_polling_does_not_enrol_itself():
         def get_updates(self, offset=None, timeout=20):
             raise _StopPolling
 
-    flock = CountingFlockClient()
+    mesh = CountingMeshClient()
     with tempfile.TemporaryDirectory() as tmpdir:
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        bot_instance = TelegramBot(flock, OneShotTelegramClient(), store, target_agent="architect")
+        bot_instance = TelegramBot(mesh, OneShotTelegramClient(), store, target_agent="architect")
         try:
             bot_instance.run_polling()
         except _StopPolling:
             pass
-    assert flock.enrol_calls == 0
+    assert mesh.enrol_calls == 0
 
 
 def test_handle_user_prompt_returns_immediately_without_waiting():
     """Live bug this replaced: one chat's unanswered prompt used to block
     forever waiting for a reply, freezing the whole bot for every chat.
     handle_user_prompt must now post and return -- no wait loop at all."""
-    flock = DummyFlockClient()
-    flock.presence_state = "working"  # would have looped forever under the old design
+    mesh = DummyMeshClient()
+    mesh.presence_state = "working"  # would have looped forever under the old design
     telegram = DummyTelegramClient()
     with tempfile.TemporaryDirectory() as tmpdir:
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        bot_instance = TelegramBot(flock, telegram, store, target_agent="architect")
+        bot_instance = TelegramBot(mesh, telegram, store, target_agent="architect")
 
         reply = bot_instance.handle_user_prompt(111, "hi")
 
@@ -340,11 +340,11 @@ def test_cursor_store_save_creates_missing_parent_directories(tmp_path):
 
 
 def test_status_command():
-    flock = DummyFlockClient()
+    mesh = DummyMeshClient()
     telegram = DummyTelegramClient()
     with tempfile.TemporaryDirectory() as tmpdir:
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        bot = TelegramBot(flock, telegram, store, target_agent="architect")
+        bot = TelegramBot(mesh, telegram, store, target_agent="architect")
 
         text = bot.handle_status_command(12345)
         assert "State: idle" in text
@@ -354,12 +354,12 @@ def test_status_command():
 
 
 def test_handle_user_prompt_when_blocked():
-    flock = DummyFlockClient()
-    flock.presence_state = "blocked"
+    mesh = DummyMeshClient()
+    mesh.presence_state = "blocked"
     telegram = DummyTelegramClient()
     with tempfile.TemporaryDirectory() as tmpdir:
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        bot = TelegramBot(flock, telegram, store, target_agent="architect")
+        bot = TelegramBot(mesh, telegram, store, target_agent="architect")
 
         text = bot.handle_user_prompt(12345, "check auth")
         assert text == "architect is not accepting messages right now"
@@ -368,12 +368,12 @@ def test_handle_user_prompt_when_blocked():
 
 
 def test_handle_user_prompt_success():
-    flock = DummyFlockClient()
-    flock.presence_state = "working"
+    mesh = DummyMeshClient()
+    mesh.presence_state = "working"
     telegram = DummyTelegramClient()
     with tempfile.TemporaryDirectory() as tmpdir:
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        bot = TelegramBot(flock, telegram, store, target_agent="architect")
+        bot = TelegramBot(mesh, telegram, store, target_agent="architect")
 
         reply = bot.handle_user_prompt(12345, "please check auth")
 
@@ -383,12 +383,12 @@ def test_handle_user_prompt_success():
 
 
 def test_handle_user_prompt_shows_typing_before_dispatch():
-    flock = DummyFlockClient()
-    flock.presence_state = "working"
+    mesh = DummyMeshClient()
+    mesh.presence_state = "working"
     telegram = DummyTelegramClient()
     with tempfile.TemporaryDirectory() as tmpdir:
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        bot = TelegramBot(flock, telegram, store, target_agent="architect")
+        bot = TelegramBot(mesh, telegram, store, target_agent="architect")
 
         bot.handle_user_prompt(12345, "please check auth")
 
@@ -400,7 +400,7 @@ def test_dispatching_flows_all_show_typing_before_their_network_call():
     a typing indicator first -- add ticket, lifecycle control, hire, retire,
     broadcast, and the main prompt dispatch (covered separately above)."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
 
         bot_instance.pending["12345"] = {"flow": "addticket", "agent": "architect", "stage": "priority", "title": "t"}
         bot_instance.handle_addticket_priority(12345, "high")
@@ -439,21 +439,21 @@ def test_door_context_verifies_by_default():
 
 
 def test_telegram_api_client_takes_no_context():
-    """⚠ --insecure is about the h-flock door. api.telegram.org is a public host
+    """⚠ --insecure is about the h-mesh door. api.telegram.org is a public host
     with a real certificate, and must keep being verified."""
     assert "ssl_context" not in inspect.signature(bot.TelegramClient.__init__).parameters
 
 
 def test_handle_user_prompt_when_refused_by_policy():
-    class RefusingFlockClient(DummyFlockClient):
+    class RefusingMeshClient(DummyMeshClient):
         def send_message(self, destination, text):
             return 422, {"detail": "policy denied 'telegram' -> 'architect': no shared export/import tag"}
 
-    flock = RefusingFlockClient()
+    mesh = RefusingMeshClient()
     telegram = DummyTelegramClient()
     with tempfile.TemporaryDirectory() as tmpdir:
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        bot_instance = TelegramBot(flock, telegram, store, target_agent="architect")
+        bot_instance = TelegramBot(mesh, telegram, store, target_agent="architect")
 
         reply = bot_instance.handle_user_prompt(12345, "hello architect")
         assert "policy denied" in reply
@@ -463,15 +463,15 @@ def test_handle_user_prompt_when_refused_by_policy():
 
 # ── inline menu ──────────────────────────────────────────────────────────────
 
-def _make_bot(flock=None, telegram=None, tmpdir=None, allowed_chat_id=None, **kwargs):
-    flock = flock or DummyFlockClient()
+def _make_bot(mesh=None, telegram=None, tmpdir=None, allowed_chat_id=None, **kwargs):
+    mesh = mesh or DummyMeshClient()
     telegram = telegram if telegram is not None else DummyTelegramClient()
     store = CursorStore(str(Path(tmpdir) / "cursor.json"))
     kwargs.setdefault("voice_feature_enabled", False)
     bot_instance = TelegramBot(
-        flock, telegram, store, target_agent="architect", allowed_chat_id=allowed_chat_id, **kwargs
+        mesh, telegram, store, target_agent="architect", allowed_chat_id=allowed_chat_id, **kwargs
     )
-    return bot_instance, flock, telegram
+    return bot_instance, mesh, telegram
 
 
 # ── chat_id restriction ────────────────────────────────────────────────────────
@@ -497,22 +497,22 @@ def test_chat_allowed_matches_configured_id_across_str_int():
 
 def test_dispatch_update_ignores_a_message_from_an_unconfigured_chat():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=None)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=None)
         bot_instance._dispatch_update({"message": {"chat": {"id": 999}, "text": "hire sme-9 please"}})
         assert telegram.sent_messages == []
-        assert flock.hired == []
+        assert mesh.hired == []
 
 
 def test_dispatch_update_ignores_a_message_from_the_wrong_chat():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
         bot_instance._dispatch_update({"message": {"chat": {"id": 999}, "text": "/menu"}})
         assert telegram.sent_messages == []
 
 
 def test_dispatch_update_processes_a_message_from_the_allowed_chat():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
         bot_instance._dispatch_update({"message": {"chat": {"id": 42}, "text": "/menu"}})
         assert len(telegram.sent_messages) == 1
 
@@ -521,7 +521,7 @@ def test_dispatch_update_ignores_a_callback_from_the_wrong_chat():
     """Not even answer_callback_query -- an unauthorized tap gets nothing
     back, not even acknowledgement that a bot is listening."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
         bot_instance._dispatch_update({
             "callback_query": {"id": "cb-1", "data": "hi", "message": {"chat": {"id": 999}}},
         })
@@ -531,7 +531,7 @@ def test_dispatch_update_ignores_a_callback_from_the_wrong_chat():
 
 def test_dispatch_update_processes_a_callback_from_the_allowed_chat():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
         bot_instance._dispatch_update({
             "callback_query": {"id": "cb-1", "data": "ov", "message": {"chat": {"id": 42}}},
         })
@@ -545,14 +545,14 @@ def test_direct_handler_calls_bypass_the_allowlist():
     invocations from shell access, not untrusted Telegram network input, so
     the allowlist (which guards inbound Telegram updates) does not apply."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
         bot_instance.handle_text_message(999, "/menu")
         assert len(telegram.sent_messages) == 1
 
 
 def test_menu_command_sends_sticky_keyboard():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.handle_menu_command(12345)
         assert len(telegram.sent_messages) == 1
         markup = telegram.sent_messages[0]["reply_markup"]
@@ -574,13 +574,13 @@ def test_menu_command_sends_sticky_keyboard():
 
 def test_dashboard_button_only_appears_when_mini_app_url_is_configured():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         assert bot_instance.mini_app_url is None
         markup = bot_instance._sticky_keyboard(12345)
         flat = [b["text"] for row in markup["keyboard"] for b in row]
         assert "📊 Dashboard" not in flat
 
-        bot_instance, flock, telegram = _make_bot(
+        bot_instance, mesh, telegram = _make_bot(
             tmpdir=tmpdir, mini_app_url="https://mini.example.invalid/mini.html",
         )
         markup = bot_instance._sticky_keyboard(12345)
@@ -591,7 +591,7 @@ def test_dashboard_button_only_appears_when_mini_app_url_is_configured():
 
 def test_handle_text_message_menu_and_status_still_work():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.handle_text_message(12345, "/menu")
         assert telegram.sent_messages[-1]["reply_markup"] is not None
 
@@ -601,17 +601,17 @@ def test_handle_text_message_menu_and_status_still_work():
 
 def test_tmux_agents_excludes_api_clients():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.roster = {"architect": "tmux", "sme-2": "tmux", "telegram": "api", "host": "control"}
-        bot_instance, _, _ = _make_bot(flock=flock, tmpdir=tmpdir)
+        mesh = DummyMeshClient()
+        mesh.roster = {"architect": "tmux", "sme-2": "tmux", "telegram": "api", "host": "control"}
+        bot_instance, _, _ = _make_bot(mesh=mesh, tmpdir=tmpdir)
         assert set(bot_instance._tmux_agents()) == {"architect", "sme-2"}
 
 
 def test_overview_command_renders_state_and_open_ticket():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.presence_state = "working"
-        bot_instance, _, telegram = _make_bot(flock=flock, tmpdir=tmpdir)
+        mesh = DummyMeshClient()
+        mesh.presence_state = "working"
+        bot_instance, _, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
 
         text = bot_instance.handle_overview_command(12345)
         assert "architect" in text and "working" in text and "Review auth change" in text
@@ -621,7 +621,7 @@ def test_overview_command_renders_state_and_open_ticket():
 
 def test_callback_query_dispatch_answers_and_routes():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.handle_callback_query(12345, "cbid-1", "ov")
         assert telegram.answered_callbacks == [{"callback_query_id": "cbid-1", "text": None}]
         assert "Office overview" in telegram.sent_messages[-1]["text"]
@@ -629,7 +629,7 @@ def test_callback_query_dispatch_answers_and_routes():
 
 def test_addticket_full_flow_via_callbacks_and_text():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
 
         bot_instance.handle_callback_query(12345, "cb-1", "at")
         rows = telegram.sent_messages[-1]["reply_markup"]["inline_keyboard"]
@@ -651,60 +651,60 @@ def test_addticket_full_flow_via_callbacks_and_text():
         reply = bot_instance.handle_callback_query(12345, "cb-3", "ap:high")
         assert "Ticket added to sme-2" in reply
         assert 12345 not in bot_instance.pending
-        assert flock.added_tickets == [
+        assert mesh.added_tickets == [
             {"agent": "sme-2", "title": "Fix the flaky test", "description": "Seen twice in CI this week", "priority": "high"}
         ]
 
 
 def test_addticket_description_dash_skips_it():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.pending[12345] = {"flow": "addticket", "agent": "architect", "stage": "title"}
         bot_instance.handle_text_message(12345, "Quick fix")
         bot_instance.handle_text_message(12345, "-")
         bot_instance.handle_callback_query(12345, "cb-1", "ap:normal")
-        assert flock.added_tickets == [
+        assert mesh.added_tickets == [
             {"agent": "architect", "title": "Quick fix", "description": "", "priority": "normal"}
         ]
 
 
 def test_addticket_priority_stray_text_reprompts_without_losing_the_flow():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.pending[12345] = {"flow": "addticket", "agent": "architect", "stage": "priority",
                                         "title": "Quick fix", "description": ""}
         reply = bot_instance.handle_text_message(12345, "high please")
         assert "Tap a priority button" in reply
         assert 12345 in bot_instance.pending
-        assert flock.added_tickets == []
+        assert mesh.added_tickets == []
 
 
 def test_addticket_flow_cancel():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.pending[12345] = {"flow": "addticket", "agent": "architect", "stage": "title"}
         reply = bot_instance.handle_text_message(12345, "/cancel")
         assert reply == "Cancelled."
         assert 12345 not in bot_instance.pending
-        assert flock.added_tickets == []
+        assert mesh.added_tickets == []
 
 
 def test_pending_flow_takes_priority_over_ordinary_prompt():
     """A message during an open flow must not fall through to handle_user_prompt
     (which would send it to target_agent instead of consuming it as an answer)."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.pending[12345] = {"flow": "addticket", "agent": "architect", "stage": "title"}
         bot_instance.handle_text_message(12345, "not a prompt for architect")
         # send_message (chat) was only used for the flow prompt, never routed as
-        # a Message envelope — DummyFlockClient has no record of prompt sends,
+        # a Message envelope — DummyMeshClient has no record of prompt sends,
         # so we assert indirectly: the flow advanced instead of completing.
         assert bot_instance.pending[12345]["stage"] == "description"
 
 
 def test_lifecycle_full_flow_via_callbacks():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
 
         bot_instance.handle_callback_query(12345, "cb-1", "lc")
         rows = telegram.sent_messages[-1]["reply_markup"]["inline_keyboard"]
@@ -718,17 +718,17 @@ def test_lifecycle_full_flow_via_callbacks():
 
         reply = bot_instance.handle_callback_query(12345, "cb-3", "lp:architect")
         assert reply == "✅ architect paused."
-        assert flock.control_calls == [{"kind": "PauseAgent", "agent": "architect"}]
+        assert mesh.control_calls == [{"kind": "PauseAgent", "agent": "architect"}]
 
 
 def test_lifecycle_control_failure_reports_detail():
     with tempfile.TemporaryDirectory() as tmpdir:
-        class FailingFlockClient(DummyFlockClient):
+        class FailingMeshClient(DummyMeshClient):
             def control_agent(self, kind, agent):
                 return 422, {"detail": "unknown agent"}
 
-        flock = FailingFlockClient()
-        bot_instance, _, telegram = _make_bot(flock=flock, tmpdir=tmpdir)
+        mesh = FailingMeshClient()
+        bot_instance, _, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
         reply = bot_instance.handle_callback_query(12345, "cb-1", "lr:ghost")
         assert "Failed to resume ghost" in reply
         assert "unknown agent" in reply
@@ -736,7 +736,7 @@ def test_lifecycle_control_failure_reports_detail():
 
 def test_lifecycle_picker_includes_retire():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.handle_callback_query(12345, "cb-1", "lc:architect")
         buttons = telegram.sent_messages[-1]["reply_markup"]["inline_keyboard"]
         assert any(b["callback_data"] == "lret:architect" for row in buttons for b in row)
@@ -744,7 +744,7 @@ def test_lifecycle_picker_includes_retire():
 
 def test_retire_requires_typing_the_exact_name():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
 
         reply = bot_instance.handle_callback_query(12345, "cb-1", "lret:architect")
         assert "Type 'architect' exactly" in reply
@@ -753,32 +753,32 @@ def test_retire_requires_typing_the_exact_name():
         reply = bot_instance.handle_text_message(12345, "architeckt")  # typo
         assert "doesn't match" in reply
         assert 12345 in bot_instance.pending  # still open for retry
-        assert flock.retired == []
+        assert mesh.retired == []
 
         reply = bot_instance.handle_text_message(12345, "architect")
         assert "architect retired" in reply
         assert 12345 not in bot_instance.pending
-        assert flock.retired == ["architect"]
+        assert mesh.retired == ["architect"]
 
 
 def test_retire_cancel():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.pending[12345] = {"flow": "retire", "agent": "architect"}
         reply = bot_instance.handle_text_message(12345, "/cancel")
         assert reply == "Cancelled."
         assert 12345 not in bot_instance.pending
-        assert flock.retired == []
+        assert mesh.retired == []
 
 
 def test_retire_failure_reports_detail():
     with tempfile.TemporaryDirectory() as tmpdir:
-        class FailingFlockClient(DummyFlockClient):
+        class FailingMeshClient(DummyMeshClient):
             def retire_agent(self, agent):
                 return 422, {"detail": "unknown agent"}
 
-        flock = FailingFlockClient()
-        bot_instance, _, telegram = _make_bot(flock=flock, tmpdir=tmpdir)
+        mesh = FailingMeshClient()
+        bot_instance, _, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
         bot_instance.pending[12345] = {"flow": "retire", "agent": "architect"}
         reply = bot_instance.handle_text_message(12345, "architect")
         assert "Failed to retire architect" in reply
@@ -789,7 +789,7 @@ def test_retire_failure_reports_detail():
 
 def test_broadcast_full_flow():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
 
         reply = bot_instance.handle_text_message(12345, "📢 Broadcast")
         assert "type the message" in reply
@@ -798,27 +798,27 @@ def test_broadcast_full_flow():
         reply = bot_instance.handle_text_message(12345, "standup in 5")
         assert reply == "📢 Broadcast sent."
         assert 12345 not in bot_instance.pending
-        assert flock.sent_envelopes == [{"destination": "all", "text": "standup in 5"}]
+        assert mesh.sent_envelopes == [{"destination": "all", "text": "standup in 5"}]
 
 
 def test_broadcast_cancel():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.pending[12345] = {"flow": "broadcast"}
         reply = bot_instance.handle_text_message(12345, "/cancel")
         assert reply == "Cancelled."
         assert 12345 not in bot_instance.pending
-        assert flock.sent_envelopes == []
+        assert mesh.sent_envelopes == []
 
 
 def test_broadcast_failure_reports_detail():
     with tempfile.TemporaryDirectory() as tmpdir:
-        class FailingFlockClient(DummyFlockClient):
+        class FailingMeshClient(DummyMeshClient):
             def send_message(self, destination, text):
                 return 422, {"detail": "policy denied"}
 
-        flock = FailingFlockClient()
-        bot_instance, _, telegram = _make_bot(flock=flock, tmpdir=tmpdir)
+        mesh = FailingMeshClient()
+        bot_instance, _, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
         bot_instance.pending[12345] = {"flow": "broadcast"}
         reply = bot_instance.handle_text_message(12345, "hi all")
         assert "Broadcast failed" in reply
@@ -829,7 +829,7 @@ def test_broadcast_failure_reports_detail():
 
 def test_hire_full_flow_via_sticky_button_and_text():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
 
         reply = bot_instance.handle_text_message(12345, "➕ Hire")
         assert "New agent's name?" in reply
@@ -846,12 +846,12 @@ def test_hire_full_flow_via_sticky_button_and_text():
         reply = bot_instance.handle_text_message(12345, "-")
         assert "Hire accepted for sme-9" in reply
         assert 12345 not in bot_instance.pending
-        assert flock.hired == [{"agent": "sme-9", "cli": "claude", "profile": None, "provider": None}]
+        assert mesh.hired == [{"agent": "sme-9", "cli": "claude", "profile": None, "provider": None}]
 
 
 def test_hire_with_a_profile_and_provider():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.pending[12345] = {"flow": "hire", "stage": "name"}
 
         bot_instance.handle_text_message(12345, "sme-9")
@@ -859,34 +859,34 @@ def test_hire_with_a_profile_and_provider():
         reply = bot_instance.handle_text_message(12345, "gpu-a")
 
         assert "Hire accepted for sme-9 (profile work, provider gpu-a)" in reply
-        assert flock.hired == [{"agent": "sme-9", "cli": "claude", "profile": "work", "provider": "gpu-a"}]
+        assert mesh.hired == [{"agent": "sme-9", "cli": "claude", "profile": "work", "provider": "gpu-a"}]
 
 
 def test_hire_rejects_invalid_name_without_consuming_the_flow():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.pending[12345] = {"flow": "hire", "stage": "name"}
 
         reply = bot_instance.handle_text_message(12345, "123")  # all-digits, refused
         assert "won't work" in reply
         assert bot_instance.pending[12345] == {"flow": "hire", "stage": "name"}  # still open
-        assert flock.hired == []
+        assert mesh.hired == []
 
         reply = bot_instance.handle_text_message(12345, "all")  # reserved
         assert "won't work" in reply
-        assert flock.hired == []
+        assert mesh.hired == []
 
         # A valid name after the bad attempts still works, and gets to the profile step.
         reply = bot_instance.handle_text_message(12345, "sme-9")
         assert "Profile for sme-9?" in reply
         bot_instance.handle_text_message(12345, "-")
         bot_instance.handle_text_message(12345, "-")
-        assert flock.hired == [{"agent": "sme-9", "cli": "claude", "profile": None, "provider": None}]
+        assert mesh.hired == [{"agent": "sme-9", "cli": "claude", "profile": None, "provider": None}]
 
 
 def test_hire_cancel_at_any_stage():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         for state in (
             {"flow": "hire", "stage": "name"},
             {"flow": "hire", "stage": "profile", "name": "sme-9"},
@@ -896,17 +896,17 @@ def test_hire_cancel_at_any_stage():
             reply = bot_instance.handle_text_message(12345, "/cancel")
             assert reply == "Cancelled."
             assert 12345 not in bot_instance.pending
-        assert flock.hired == []
+        assert mesh.hired == []
 
 
 def test_hire_failure_reports_detail():
     with tempfile.TemporaryDirectory() as tmpdir:
-        class FailingFlockClient(DummyFlockClient):
+        class FailingMeshClient(DummyMeshClient):
             def hire_agent(self, agent, cli="claude", profile=None, provider=None):
                 return 422, {"detail": "unknown account 'bogus'; available accounts: default, work"}
 
-        flock = FailingFlockClient()
-        bot_instance, _, telegram = _make_bot(flock=flock, tmpdir=tmpdir)
+        mesh = FailingMeshClient()
+        bot_instance, _, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
         bot_instance.pending[12345] = {"flow": "hire", "stage": "provider", "name": "sme-9", "profile": "bogus"}
         reply = bot_instance.handle_text_message(12345, "-")
         assert "Failed to hire sme-9" in reply
@@ -945,9 +945,9 @@ def test_agent_picker_keyboard_handles_no_agents():
 
 def test_addticket_lifecycle_message_watch_pickers_all_use_the_shared_grid():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.roster = {f"agent-{i}": "tmux" for i in range(10)}
-        bot_instance, flock, telegram = _make_bot(flock=flock, tmpdir=tmpdir)
+        mesh = DummyMeshClient()
+        mesh.roster = {f"agent-{i}": "tmux" for i in range(10)}
+        bot_instance, mesh, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
 
         for handler, prefix in (
             (bot_instance.handle_addticket_start, "at"),
@@ -968,7 +968,7 @@ def test_addticket_lifecycle_message_watch_pickers_all_use_the_shared_grid():
 
 def test_message_agent_picker_and_prompt_routing():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
 
         reply = bot_instance.handle_text_message(12345, "🎯 Message: architect")
         assert "pick a different agent" in reply
@@ -990,7 +990,7 @@ def test_message_agent_picker_and_prompt_routing():
 
 def test_message_agent_selection_is_per_chat():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.handle_callback_query(111, "cb-1", "ta:sme-2")
 
         assert bot_instance._target_for(111) == "sme-2"
@@ -1022,13 +1022,13 @@ def test_parse_mention_keeps_multiline_bodies_intact():
 
 def test_mention_routes_a_single_message_without_changing_the_persistent_target():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         # persistent target starts as the default ("architect")
         assert bot_instance._target_for(12345) == "architect"
 
         reply = bot_instance.handle_text_message(12345, "@sme-2 can you check this?")
         assert reply == "✅ Sent to sme-2."
-        assert flock.sent_envelopes[-1]["destination"] == "sme-2"
+        assert mesh.sent_envelopes[-1]["destination"] == "sme-2"
 
         # one-off only: the persistent target for a later plain message is unchanged
         assert bot_instance._target_for(12345) == "architect"
@@ -1039,46 +1039,46 @@ def test_mention_routes_a_single_message_without_changing_the_persistent_target(
 
 def test_mention_unknown_agent_errors_back_instead_of_misrouting():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "@nonexistent hello")
         assert "isn't a known agent" in reply
-        assert flock.sent_envelopes == []
+        assert mesh.sent_envelopes == []
 
 
 def test_mention_rejects_a_non_tmux_client_by_name():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.roster["telegram"] = "api"
-        bot_instance, flock, telegram = _make_bot(flock=flock, tmpdir=tmpdir)
+        mesh = DummyMeshClient()
+        mesh.roster["telegram"] = "api"
+        bot_instance, mesh, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "@telegram hello")
         assert "isn't a known agent" in reply
-        assert flock.sent_envelopes == []
+        assert mesh.sent_envelopes == []
 
 
 def test_mention_rejects_a_reserved_name():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "@all broadcast this")
         assert "isn't a known agent" in reply
-        assert flock.sent_envelopes == []
+        assert mesh.sent_envelopes == []
 
 
 def test_mention_with_no_body_prompts_for_usage_instead_of_sending_empty():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "@architect")
         assert "nothing to send" in reply
-        assert flock.sent_envelopes == []
+        assert mesh.sent_envelopes == []
 
 
 def test_mention_mid_sentence_is_not_routing_just_message_content():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "please check with @sme-2 first")
         # not parsed as a mention: goes to the persistent target (architect) as-is
         assert reply == "✅ Sent to architect."
-        assert flock.sent_envelopes[-1]["destination"] == "architect"
-        assert flock.sent_envelopes[-1]["text"] == "please check with @sme-2 first"
+        assert mesh.sent_envelopes[-1]["destination"] == "architect"
+        assert mesh.sent_envelopes[-1]["text"] == "please check with @sme-2 first"
 
 
 # ── /run: raw, unwrapped pane injection via a Command-kind envelope ────────
@@ -1086,58 +1086,58 @@ def test_mention_mid_sentence_is_not_routing_just_message_content():
 
 def test_run_sends_a_command_envelope_not_a_message_one():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "/run sme-2 /clear")
         assert reply == "✅ Ran on sme-2."
-        assert flock.sent_commands == [{"destination": "sme-2", "text": "/clear"}]
+        assert mesh.sent_commands == [{"destination": "sme-2", "text": "/clear"}]
         # never goes through the Message-kind path
-        assert flock.sent_envelopes == []
+        assert mesh.sent_envelopes == []
 
 
 def test_run_is_one_off_and_does_not_change_the_persistent_target():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         assert bot_instance._target_for(12345) == "architect"
         bot_instance.handle_text_message(12345, "/run sme-2 /clear")
         assert bot_instance._target_for(12345) == "architect"
         assert "12345" not in bot_instance.chat_target_agent
         bot_instance.handle_text_message(12345, "plain text after /run")
-        assert flock.sent_envelopes[-1]["destination"] == "architect"
+        assert mesh.sent_envelopes[-1]["destination"] == "architect"
 
 
 def test_run_allows_compact_too():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "/run architect /compact")
         assert reply == "✅ Ran on architect."
-        assert flock.sent_commands[-1]["text"] == "/compact"
+        assert mesh.sent_commands[-1]["text"] == "/compact"
 
 
 def test_run_rejects_a_command_not_on_the_allowlist():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "/run architect /add-dir /some/path")
         assert "isn't an allowed /run command" in reply
         assert "/clear" in reply and "/compact" in reply
-        assert flock.sent_commands == []
-        assert flock.sent_envelopes == []
+        assert mesh.sent_commands == []
+        assert mesh.sent_envelopes == []
 
 
 def test_run_rejects_arbitrary_text_not_shaped_like_a_command():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "/run architect rm -rf /")
         assert "isn't an allowed /run command" in reply
-        assert flock.sent_commands == []
+        assert mesh.sent_commands == []
 
 
 def test_run_rejects_an_allowed_command_name_with_trailing_arguments():
     """Exact match only -- /clear plus anything else is not /clear."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "/run architect /clear extra")
         assert "isn't an allowed /run command" in reply
-        assert flock.sent_commands == []
+        assert mesh.sent_commands == []
 
 
 def test_run_rejects_an_embedded_newline_even_inside_an_allowed_command():
@@ -1145,24 +1145,24 @@ def test_run_rejects_an_embedded_newline_even_inside_an_allowed_command():
     then paste a second, unvetted line right after it -- rejected before
     the allowlist is even checked."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "/run architect /clear\nrm -rf /")
         assert "single line" in reply
-        assert flock.sent_commands == []
+        assert mesh.sent_commands == []
 
 
 def test_run_allowlist_is_configurable_per_instance():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(
+        bot_instance, mesh, telegram = _make_bot(
             tmpdir=tmpdir, run_allowed_commands=frozenset({"/help"}),
         )
         reply = bot_instance.handle_text_message(12345, "/run architect /clear")
         assert "isn't an allowed /run command" in reply
-        assert flock.sent_commands == []
+        assert mesh.sent_commands == []
 
         reply = bot_instance.handle_text_message(12345, "/run architect /help")
         assert reply == "✅ Ran on architect."
-        assert flock.sent_commands[-1]["text"] == "/help"
+        assert mesh.sent_commands[-1]["text"] == "/help"
 
 
 def test_parse_command_allowlist_strips_whitespace_and_drops_blanks():
@@ -1171,63 +1171,63 @@ def test_parse_command_allowlist_strips_whitespace_and_drops_blanks():
 
 def test_run_with_no_agent_or_text_prompts_for_usage():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "/run")
         assert "Usage: /run" in reply
-        assert flock.sent_commands == []
+        assert mesh.sent_commands == []
 
         reply = bot_instance.handle_text_message(12345, "/run architect")
         assert "Usage: /run" in reply
-        assert flock.sent_commands == []
+        assert mesh.sent_commands == []
 
         reply = bot_instance.handle_text_message(12345, "/run architect   ")
         assert "Usage: /run" in reply
-        assert flock.sent_commands == []
+        assert mesh.sent_commands == []
 
 
 def test_run_unknown_agent_errors_back_instead_of_running_anywhere():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "/run nonexistent /clear")
         assert "isn't a known agent" in reply
-        assert flock.sent_commands == []
+        assert mesh.sent_commands == []
 
 
 def test_run_rejects_a_non_tmux_client_by_name():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.roster["telegram"] = "api"
-        bot_instance, flock, telegram = _make_bot(flock=flock, tmpdir=tmpdir)
+        mesh = DummyMeshClient()
+        mesh.roster["telegram"] = "api"
+        bot_instance, mesh, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "/run telegram /clear")
         assert "isn't a known agent" in reply
-        assert flock.sent_commands == []
+        assert mesh.sent_commands == []
 
 
 def test_run_rejects_a_reserved_name():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "/run all /clear")
         assert "isn't a known agent" in reply
-        assert flock.sent_commands == []
+        assert mesh.sent_commands == []
 
 
 def test_run_blocked_agent_is_refused_same_as_a_regular_message():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
-        flock.presence_state = "blocked"
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        mesh.presence_state = "blocked"
         reply = bot_instance.handle_text_message(12345, "/run architect /clear")
         assert "not accepting messages" in reply
-        assert flock.sent_commands == []
+        assert mesh.sent_commands == []
 
 
 def test_run_failure_reports_run_specific_wording_not_send_wording():
     with tempfile.TemporaryDirectory() as tmpdir:
-        class RefusingFlockClient(DummyFlockClient):
+        class RefusingMeshClient(DummyMeshClient):
             def send_command(self, destination, text):
                 return 422, {"detail": "policy denied"}
 
-        flock = RefusingFlockClient()
-        bot_instance, flock, telegram = _make_bot(flock=flock, tmpdir=tmpdir)
+        mesh = RefusingMeshClient()
+        bot_instance, mesh, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "/run architect /clear")
         assert "Failed to run on architect" in reply
 
@@ -1255,7 +1255,7 @@ def test_valid_attachment_mime_type():
 
 def test_dispatch_update_routes_a_photo_instead_of_silently_dropping_it(monkeypatch):
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=12345)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=12345)
         calls = []
         monkeypatch.setattr(
             bot_instance, "handle_photo_message",
@@ -1274,7 +1274,7 @@ def test_dispatch_update_routes_a_photo_instead_of_silently_dropping_it(monkeypa
 
 def test_handle_photo_message_sends_an_attachment_envelope_to_the_persistent_target():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         photo_sizes = [{"file_id": "thumb", "file_size": 100}, {"file_id": "full", "file_size": 5000}]
 
         reply = bot_instance.handle_photo_message(12345, photo_sizes, "")
@@ -1282,74 +1282,74 @@ def test_handle_photo_message_sends_an_attachment_envelope_to_the_persistent_tar
         assert reply == "✅ Photo sent to architect."
         assert ("getFile", {"file_id": "full"}) in telegram.requests
         assert telegram.downloaded_paths == ["photos/file_1.jpg"]
-        assert len(flock.sent_attachments) == 1
-        sent = flock.sent_attachments[0]
+        assert len(mesh.sent_attachments) == 1
+        sent = mesh.sent_attachments[0]
         assert sent["destination"] == "architect"
         assert sent["filename"] == "file_1.jpg"
         assert sent["mime_type"] == "image/jpeg"
         assert base64.b64decode(sent["content_base64"]) == b"fake-jpeg-bytes"
         assert sent["caption"] is None
-        assert flock.sent_envelopes == []  # no more Message fallback
+        assert mesh.sent_envelopes == []  # no more Message fallback
 
 
 def test_handle_photo_message_maps_caption_to_the_envelope_caption_field():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.handle_photo_message(12345, [{"file_id": "full"}], "a nice view")
-        assert flock.sent_attachments[0]["caption"] == "a nice view"
+        assert mesh.sent_attachments[0]["caption"] == "a nice view"
 
 
 def test_handle_photo_message_falls_back_to_a_generated_filename_when_telegrams_is_invalid():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         telegram.get_file_response = {"ok": True, "result": {"file_path": "../evil.jpg"}}
         bot_instance.handle_photo_message(12345, [{"file_id": "full"}], "")
-        filename = flock.sent_attachments[0]["filename"]
+        filename = mesh.sent_attachments[0]["filename"]
         assert _valid_attachment_filename(filename)
         assert filename.endswith(".jpg")
 
 
 def test_handle_photo_message_mention_routes_without_changing_the_persistent_target():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         photo_sizes = [{"file_id": "full"}]
 
         reply = bot_instance.handle_photo_message(12345, photo_sizes, "@sme-2 check this out")
 
         assert reply == "✅ Photo sent to sme-2."
-        assert flock.sent_attachments[-1]["destination"] == "sme-2"
-        assert flock.sent_attachments[-1]["caption"] == "check this out"
+        assert mesh.sent_attachments[-1]["destination"] == "sme-2"
+        assert mesh.sent_attachments[-1]["caption"] == "check this out"
         assert "12345" not in bot_instance.chat_target_agent
 
 
 def test_handle_photo_message_mention_to_unknown_agent_is_refused():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_photo_message(12345, [{"file_id": "full"}], "@nonexistent look")
         assert "isn't a known agent" in reply
-        assert flock.sent_attachments == []
+        assert mesh.sent_attachments == []
         assert telegram.requests == []  # never even attempted the download
 
 
 def test_handle_photo_message_respects_blocked_presence():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.presence_state = "blocked"
-        bot_instance, flock, telegram = _make_bot(flock=flock, tmpdir=tmpdir)
+        mesh = DummyMeshClient()
+        mesh.presence_state = "blocked"
+        bot_instance, mesh, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
         reply = bot_instance.handle_photo_message(12345, [{"file_id": "full"}], "")
         assert reply == "architect is not accepting messages right now"
-        assert flock.sent_attachments == []
+        assert mesh.sent_attachments == []
         assert telegram.requests == []
 
 
 def test_handle_photo_message_rejects_an_oversized_reported_file_size():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         photo_sizes = [{"file_id": "huge", "file_size": TELEGRAM_MAX_FILE_BYTES + 1}]
         reply = bot_instance.handle_photo_message(12345, photo_sizes, "")
         assert "too large" in reply
         assert telegram.requests == []  # rejected before ever calling getFile
-        assert flock.sent_attachments == []
+        assert mesh.sent_attachments == []
 
 
 def test_handle_photo_message_rejects_a_download_over_the_attachment_cap_even_under_telegrams_own_ceiling():
@@ -1357,27 +1357,27 @@ def test_handle_photo_message_rejects_a_download_over_the_attachment_cap_even_un
     smaller than 20MB (Telegram's own getFile ceiling), so a file that
     downloads fine must still be refused here."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         telegram.download_response = b"x" * (ATTACHMENT_MAX_BYTES + 1)
         assert len(telegram.download_response) <= TELEGRAM_MAX_FILE_BYTES
         reply = bot_instance.handle_photo_message(12345, [{"file_id": "full"}], "")
         assert "too large" in reply
-        assert flock.sent_attachments == []
+        assert mesh.sent_attachments == []
 
 
 def test_handle_photo_message_reports_a_getfile_failure():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         telegram.get_file_response = {"ok": False, "description": "file expired"}
         reply = bot_instance.handle_photo_message(12345, [{"file_id": "full"}], "")
         assert "file expired" in reply
-        assert flock.sent_attachments == []
+        assert mesh.sent_attachments == []
 
 
 def test_handle_photo_message_reports_an_attachment_send_failure():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
-        flock.send_attachment = lambda *a, **kw: (422, {"detail": "invalid attachment mime_type"})
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        mesh.send_attachment = lambda *a, **kw: (422, {"detail": "invalid attachment mime_type"})
         reply = bot_instance.handle_photo_message(12345, [{"file_id": "full"}], "")
         assert "Failed to send" in reply
         assert "invalid attachment mime_type" in reply
@@ -1385,7 +1385,7 @@ def test_handle_photo_message_reports_an_attachment_send_failure():
 
 def test_handle_photo_message_shows_typing_before_the_download():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.handle_photo_message(12345, [{"file_id": "full"}], "")
         assert telegram.chat_actions == [{"chat_id": "12345", "action": "typing"}]
 
@@ -1394,7 +1394,7 @@ def test_handle_photo_message_shows_typing_before_the_download():
 
 def test_dispatch_update_routes_a_document_instead_of_falling_through(monkeypatch):
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=12345)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=12345)
         calls = []
         monkeypatch.setattr(
             bot_instance, "handle_document_message",
@@ -1408,14 +1408,14 @@ def test_dispatch_update_routes_a_document_instead_of_falling_through(monkeypatc
 
 def test_handle_document_message_uses_telegrams_own_filename_and_mime_type():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         telegram.get_file_response = {"ok": True, "result": {"file_path": "documents/file_1"}}
         document = {"file_id": "doc1", "file_name": "report.pdf", "mime_type": "application/pdf", "file_size": 5000}
 
         reply = bot_instance.handle_document_message(12345, document, "")
 
         assert reply == "✅ File sent to architect."
-        sent = flock.sent_attachments[0]
+        sent = mesh.sent_attachments[0]
         assert sent["filename"] == "report.pdf"
         assert sent["mime_type"] == "application/pdf"
         assert base64.b64decode(sent["content_base64"]) == b"fake-jpeg-bytes"
@@ -1423,64 +1423,64 @@ def test_handle_document_message_uses_telegrams_own_filename_and_mime_type():
 
 def test_handle_document_message_falls_back_to_octet_stream_for_an_invalid_reported_mime_type():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         document = {"file_id": "doc1", "file_name": "notes.txt", "mime_type": "text/plain; charset=utf-8"}
         bot_instance.handle_document_message(12345, document, "")
-        assert flock.sent_attachments[0]["mime_type"] == "application/octet-stream"
+        assert mesh.sent_attachments[0]["mime_type"] == "application/octet-stream"
 
 
 def test_handle_document_message_defaults_a_missing_mime_type_to_octet_stream():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         document = {"file_id": "doc1", "file_name": "notes.txt"}  # Telegram's mime_type is optional
         bot_instance.handle_document_message(12345, document, "")
-        assert flock.sent_attachments[0]["mime_type"] == "application/octet-stream"
+        assert mesh.sent_attachments[0]["mime_type"] == "application/octet-stream"
 
 
 def test_handle_document_message_falls_back_to_a_generated_filename_with_no_extension_assumed():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         document = {"file_id": "doc1", "file_name": "../evil", "mime_type": "application/octet-stream"}
         bot_instance.handle_document_message(12345, document, "")
-        filename = flock.sent_attachments[0]["filename"]
+        filename = mesh.sent_attachments[0]["filename"]
         assert _valid_attachment_filename(filename)
         assert filename.startswith("telegram-file-")
 
 
 def test_handle_document_message_mention_routes_without_changing_the_persistent_target():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         document = {"file_id": "doc1", "file_name": "report.pdf", "mime_type": "application/pdf"}
         reply = bot_instance.handle_document_message(12345, document, "@sme-2 the numbers")
         assert reply == "✅ File sent to sme-2."
-        assert flock.sent_attachments[-1]["destination"] == "sme-2"
-        assert flock.sent_attachments[-1]["caption"] == "the numbers"
+        assert mesh.sent_attachments[-1]["destination"] == "sme-2"
+        assert mesh.sent_attachments[-1]["caption"] == "the numbers"
         assert "12345" not in bot_instance.chat_target_agent
 
 
 def test_handle_document_message_respects_blocked_presence():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.presence_state = "blocked"
-        bot_instance, flock, telegram = _make_bot(flock=flock, tmpdir=tmpdir)
+        mesh = DummyMeshClient()
+        mesh.presence_state = "blocked"
+        bot_instance, mesh, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
         document = {"file_id": "doc1", "file_name": "report.pdf", "mime_type": "application/pdf"}
         reply = bot_instance.handle_document_message(12345, document, "")
         assert reply == "architect is not accepting messages right now"
-        assert flock.sent_attachments == []
+        assert mesh.sent_attachments == []
 
 
 def test_handle_document_message_with_no_document_is_a_no_op():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         assert bot_instance.handle_document_message(12345, {}, "") == ""
-        assert flock.sent_attachments == []
+        assert mesh.sent_attachments == []
 
 
 def test_status_command_respects_per_chat_target():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.boards["sme-2"] = {"todo": [], "doing": [{"title": "Fix the flaky test"}], "hold": [], "done": []}
-        bot_instance, _, telegram = _make_bot(flock=flock, tmpdir=tmpdir)
+        mesh = DummyMeshClient()
+        mesh.boards["sme-2"] = {"todo": [], "doing": [{"title": "Fix the flaky test"}], "hold": [], "done": []}
+        bot_instance, _, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
         bot_instance.chat_target_agent[12345] = "sme-2"
 
         text = bot_instance.handle_status_command(12345)
@@ -1492,7 +1492,7 @@ def test_callback_query_back_to_menu():
     """An inline "◀ Back" button (e.g. from the Add Ticket agent picker)
     still resolves to "menu" and re-shows the sticky keyboard."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.handle_callback_query(12345, "cb-1", "menu")
         markup = telegram.sent_messages[-1]["reply_markup"]
         assert markup == bot_instance._sticky_keyboard(12345)
@@ -1504,9 +1504,9 @@ def test_sticky_labels_cover_the_office_options():
 
 def test_sticky_keyboard_tap_dispatches_like_the_matching_inline_code():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.alerts = [{"kind": "blocked", "agent": "sme-2", "unconsumed_s": 60, "cursor": "1-0"}]
-        bot_instance, _, telegram = _make_bot(flock=flock, tmpdir=tmpdir)
+        mesh = DummyMeshClient()
+        mesh.alerts = [{"kind": "blocked", "agent": "sme-2", "unconsumed_s": 60, "cursor": "1-0"}]
+        bot_instance, _, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
 
         reply = bot_instance.handle_text_message(12345, "🔔 Alerts")
         assert "blocked" in reply
@@ -1519,7 +1519,7 @@ def test_hide_menu_sends_remove_keyboard_not_a_dead_end():
     reply_markup={"remove_keyboard": True} (ReplyKeyboardRemove) actually
     removes it."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_hide_menu_command(12345)
         assert len(telegram.sent_messages) == 1
         assert telegram.sent_messages[0]["reply_markup"] == {"remove_keyboard": True}
@@ -1528,7 +1528,7 @@ def test_hide_menu_sends_remove_keyboard_not_a_dead_end():
 
 def test_hide_menu_button_dispatches_via_the_sticky_keyboard_tap():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         reply = bot_instance.handle_text_message(12345, "🙈 Hide menu")
         assert telegram.sent_messages[-1]["reply_markup"] == {"remove_keyboard": True}
         assert reply == telegram.sent_messages[-1]["text"]
@@ -1536,7 +1536,7 @@ def test_hide_menu_button_dispatches_via_the_sticky_keyboard_tap():
 
 def test_menu_command_still_brings_the_keyboard_back_after_hiding():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.handle_hide_menu_command(12345)
         bot_instance.handle_menu_command(12345)
         assert telegram.sent_messages[-1]["reply_markup"] == bot_instance._sticky_keyboard("12345")
@@ -1570,12 +1570,12 @@ def test_render_alert_unknown_kind_degrades_gracefully():
 
 def test_handle_alerts_command_lists_recent_and_slices_tail():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.alerts = [
+        mesh = DummyMeshClient()
+        mesh.alerts = [
             {"kind": "credential", "account": "default", "cli": "claude", "status": "expiring", "cursor": f"{i}-0"}
             for i in range(15)
         ]
-        bot_instance, _, telegram = _make_bot(flock=flock, tmpdir=tmpdir)
+        bot_instance, _, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
         text = bot_instance.handle_alerts_command(12345, limit=10)
         assert text.count("credential") == 10
         assert telegram.sent_messages[-1]["text"] == text
@@ -1583,16 +1583,16 @@ def test_handle_alerts_command_lists_recent_and_slices_tail():
 
 def test_handle_alerts_command_empty():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         text = bot_instance.handle_alerts_command(12345)
         assert text == "🔔 No alerts."
 
 
 def test_callback_query_alerts_routes_to_handler():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.alerts = [{"kind": "blocked", "agent": "sme-2", "unconsumed_s": 60, "cursor": "1-0"}]
-        bot_instance, _, telegram = _make_bot(flock=flock, tmpdir=tmpdir)
+        mesh = DummyMeshClient()
+        mesh.alerts = [{"kind": "blocked", "agent": "sme-2", "unconsumed_s": 60, "cursor": "1-0"}]
+        bot_instance, _, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
         reply = bot_instance.handle_callback_query(12345, "cb-1", "al")
         assert "blocked" in reply
         assert telegram.answered_callbacks == [{"callback_query_id": "cb-1", "text": None}]
@@ -1640,10 +1640,10 @@ def test_parse_sse_events_accepts_bytes():
 
 def test_alert_pusher_pushes_each_new_alert_and_persists_cursor():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "alerts_cursor.json"))
-        pusher = AlertPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = AlertPusher(mesh, telegram, chat_id=999, cursor_store=store)
 
         alerts = [
             {"kind": "blocked", "agent": "sme-2", "unconsumed_s": 60, "cursor": "10-0"},
@@ -1666,12 +1666,12 @@ def test_alert_pusher_seeds_from_tail_on_first_run_not_from_history():
     """A fresh cursor store must not replay the whole retained alert history as
     if every entry were new — it should start from GET /alerts's next_cursor."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.alerts = [{"kind": "blocked", "agent": "old-agent", "cursor": "1-0"}] * 50
-        flock.alerts_next_cursor = "50-0"
+        mesh = DummyMeshClient()
+        mesh.alerts = [{"kind": "blocked", "agent": "old-agent", "cursor": "1-0"}] * 50
+        mesh.alerts_next_cursor = "50-0"
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "alerts_cursor.json"))
-        pusher = AlertPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = AlertPusher(mesh, telegram, chat_id=999, cursor_store=store)
 
         seen_after = []
 
@@ -1687,12 +1687,12 @@ def test_alert_pusher_seeds_from_tail_on_first_run_not_from_history():
 
 def test_alert_pusher_resumes_from_persisted_cursor_without_reseeding():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.alerts_next_cursor = "999-0"  # would be wrong to use this
+        mesh = DummyMeshClient()
+        mesh.alerts_next_cursor = "999-0"  # would be wrong to use this
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "alerts_cursor.json"))
         store.save("42-0")
-        pusher = AlertPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = AlertPusher(mesh, telegram, chat_id=999, cursor_store=store)
 
         seen_after = []
 
@@ -1719,10 +1719,10 @@ def test_render_reply_uses_source_and_falls_back_to_provided_name():
 
 def test_reply_pusher_pushes_each_new_message_and_persists_cursor():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        pusher = ReplyPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = ReplyPusher(mesh, telegram, chat_id=999, cursor_store=store)
 
         messages = [
             {"l2": {"source": "architect"}, "payload": {"text": "first"}, "cursor": "10-0"},
@@ -1743,10 +1743,10 @@ def test_reply_pusher_pushes_each_new_message_and_persists_cursor():
 
 def test_reply_pusher_delivers_an_attachment_via_send_document():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        pusher = ReplyPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = ReplyPusher(mesh, telegram, chat_id=999, cursor_store=store)
 
         content = base64.b64encode(b"%PDF-fake-bytes").decode("ascii")
         messages = [{
@@ -1769,10 +1769,10 @@ def test_reply_pusher_delivers_an_attachment_via_send_document():
 
 def test_reply_pusher_attachment_caption_omits_colon_when_none_sent():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        pusher = ReplyPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = ReplyPusher(mesh, telegram, chat_id=999, cursor_store=store)
 
         content = base64.b64encode(b"data").decode("ascii")
         messages = [{
@@ -1787,11 +1787,11 @@ def test_reply_pusher_attachment_caption_omits_colon_when_none_sent():
 
 def test_reply_pusher_reports_a_send_document_failure_instead_of_dropping_it():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         telegram.send_document_response = {"ok": False, "description": "file too large"}
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        pusher = ReplyPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = ReplyPusher(mesh, telegram, chat_id=999, cursor_store=store)
 
         content = base64.b64encode(b"data").decode("ascii")
         messages = [{
@@ -1808,10 +1808,10 @@ def test_reply_pusher_reports_a_send_document_failure_instead_of_dropping_it():
 
 def test_reply_pusher_reports_malformed_attachment_base64_without_crashing():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        pusher = ReplyPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = ReplyPusher(mesh, telegram, chat_id=999, cursor_store=store)
 
         messages = [{
             "kind": "Attachment",
@@ -1827,10 +1827,10 @@ def test_reply_pusher_reports_malformed_attachment_base64_without_crashing():
 
 def test_reply_pusher_reports_an_attachment_missing_required_fields():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        pusher = ReplyPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = ReplyPusher(mesh, telegram, chat_id=999, cursor_store=store)
 
         messages = [{
             "kind": "Attachment",
@@ -1856,10 +1856,10 @@ def test_attachment_allowed_payload_keys_matches_the_closed_schema():
 
 def test_reply_pusher_rejects_an_invalid_filename():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        pusher = ReplyPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = ReplyPusher(mesh, telegram, chat_id=999, cursor_store=store)
         content = base64.b64encode(b"data").decode("ascii")
 
         for bad_name in ("..", "a/b.txt", ""):
@@ -1872,10 +1872,10 @@ def test_reply_pusher_rejects_an_invalid_filename():
 
 def test_reply_pusher_rejects_an_invalid_mime_type():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        pusher = ReplyPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = ReplyPusher(mesh, telegram, chat_id=999, cursor_store=store)
         content = base64.b64encode(b"data").decode("ascii")
 
         messages = [_attachment_message({"filename": "x.txt", "mime_type": "text/*", "content_base64": content})]
@@ -1890,10 +1890,10 @@ def test_reply_pusher_rejects_a_missing_mime_type_rather_than_defaulting_it():
     application/octet-stream instead of rejecting, which is not what the
     contract promises."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        pusher = ReplyPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = ReplyPusher(mesh, telegram, chat_id=999, cursor_store=store)
         content = base64.b64encode(b"data").decode("ascii")
 
         messages = [_attachment_message({"filename": "x.txt", "content_base64": content})]
@@ -1904,10 +1904,10 @@ def test_reply_pusher_rejects_a_missing_mime_type_rather_than_defaulting_it():
 
 def test_reply_pusher_rejects_an_oversized_caption():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        pusher = ReplyPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = ReplyPusher(mesh, telegram, chat_id=999, cursor_store=store)
         content = base64.b64encode(b"data").decode("ascii")
 
         messages = [_attachment_message({
@@ -1921,10 +1921,10 @@ def test_reply_pusher_rejects_an_oversized_caption():
 
 def test_reply_pusher_rejects_decoded_content_over_the_attachment_cap():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        pusher = ReplyPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = ReplyPusher(mesh, telegram, chat_id=999, cursor_store=store)
         content = base64.b64encode(b"x" * (ATTACHMENT_MAX_BYTES + 1)).decode("ascii")
 
         messages = [_attachment_message({"filename": "x.bin", "mime_type": "application/octet-stream", "content_base64": content})]
@@ -1938,10 +1938,10 @@ def test_reply_pusher_rejects_an_unexpected_payload_field():
     is accepted" -- enforced here the same as the api door and the tmux
     opener, since a direct bus caller bypasses the api door entirely."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        pusher = ReplyPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = ReplyPusher(mesh, telegram, chat_id=999, cursor_store=store)
         content = base64.b64encode(b"data").decode("ascii")
 
         messages = [_attachment_message({
@@ -1956,13 +1956,13 @@ def test_reply_pusher_rejects_an_unexpected_payload_field():
 
 def test_reply_pusher_seeds_from_tail_on_first_run_not_from_history():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.messages_queue = [
+        mesh = DummyMeshClient()
+        mesh.messages_queue = [
             {"l2": {"source": "architect"}, "payload": {"text": "old"}, "cursor": "1-0"},
         ] * 20
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
-        pusher = ReplyPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = ReplyPusher(mesh, telegram, chat_id=999, cursor_store=store)
 
         seen_after = []
 
@@ -1971,7 +1971,7 @@ def test_reply_pusher_seeds_from_tail_on_first_run_not_from_history():
             return iter([])
 
         pusher.run(stream_fn=fake_stream)
-        # DummyFlockClient.get_messages(after=None) with a non-empty queue
+        # DummyMeshClient.get_messages(after=None) with a non-empty queue
         # returns the last item's cursor as next_cursor -- "1-0" here since
         # every seeded message shares that cursor.
         assert seen_after == ["1-0"]
@@ -1981,12 +1981,12 @@ def test_reply_pusher_seeds_from_tail_on_first_run_not_from_history():
 
 def test_reply_pusher_resumes_from_persisted_cursor_without_reseeding():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.messages_queue = [{"l2": {"source": "architect"}, "payload": {"text": "x"}, "cursor": "999-0"}]
+        mesh = DummyMeshClient()
+        mesh.messages_queue = [{"l2": {"source": "architect"}, "payload": {"text": "x"}, "cursor": "999-0"}]
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
         store.save("42-0")
-        pusher = ReplyPusher(flock, telegram, chat_id=999, cursor_store=store)
+        pusher = ReplyPusher(mesh, telegram, chat_id=999, cursor_store=store)
 
         seen_after = []
 
@@ -2128,11 +2128,11 @@ def test_dry_run_telegram_client_send_voice(capsys):
 
 def test_reply_pusher_voice_reply_success(monkeypatch):
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
         pusher = ReplyPusher(
-            flock,
+            mesh,
             telegram,
             chat_id=999,
             cursor_store=store,
@@ -2172,11 +2172,11 @@ def test_reply_pusher_voice_reply_success(monkeypatch):
 
 def test_reply_pusher_text_only_when_voice_disabled():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
         pusher = ReplyPusher(
-            flock,
+            mesh,
             telegram,
             chat_id=999,
             cursor_store=store,
@@ -2201,11 +2201,11 @@ def test_reply_pusher_text_only_when_voice_disabled():
 
 def test_reply_pusher_per_message_voice_override(monkeypatch):
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
+        mesh = DummyMeshClient()
         telegram = DummyTelegramClient()
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
         pusher = ReplyPusher(
-            flock,
+            mesh,
             telegram,
             chat_id=999,
             cursor_store=store,
@@ -2235,11 +2235,11 @@ def test_reply_pusher_per_message_voice_override(monkeypatch):
 
 
 def test_telegram_bot_voice_feature_flag_disabled_by_default(tmp_path):
-    flock = DummyFlockClient()
+    mesh = DummyMeshClient()
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     bot_instance = TelegramBot(
-        mesh_client=flock,
+        mesh_client=mesh,
         telegram_client=telegram,
         cursor_store=store,
         target_agent="architect",
@@ -2259,11 +2259,11 @@ def test_telegram_bot_voice_feature_flag_disabled_by_default(tmp_path):
 
 
 def test_telegram_bot_voice_toggle_and_menu_when_feature_enabled(tmp_path):
-    flock = DummyFlockClient()
+    mesh = DummyMeshClient()
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     bot_instance = TelegramBot(
-        mesh_client=flock,
+        mesh_client=mesh,
         telegram_client=telegram,
         cursor_store=store,
         target_agent="architect",
@@ -2301,10 +2301,10 @@ def test_telegram_bot_voice_toggle_and_menu_when_feature_enabled(tmp_path):
 
 
 def test_telegram_bot_enrol_registers_voice_command(tmp_path):
-    flock = DummyFlockClient()
+    mesh = DummyMeshClient()
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
-    bot_instance = TelegramBot(mesh_client=flock, telegram_client=telegram, cursor_store=store)
+    bot_instance = TelegramBot(mesh_client=mesh, telegram_client=telegram, cursor_store=store)
     assert bot_instance.enrol() is True
     assert len(telegram.commands_set) == 1
     cmds = {c["command"]: c["description"] for c in telegram.commands_set[0]}
@@ -2314,12 +2314,12 @@ def test_telegram_bot_enrol_registers_voice_command(tmp_path):
 
 
 def test_telegram_bot_chat_id_type_normalization_with_reply_pusher(monkeypatch):
-    flock = DummyFlockClient()
+    mesh = DummyMeshClient()
     telegram = DummyTelegramClient()
     with tempfile.TemporaryDirectory() as tmpdir:
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
         bot_instance = TelegramBot(
-            mesh_client=flock,
+            mesh_client=mesh,
             telegram_client=telegram,
             cursor_store=store,
             allowed_chat_id="46444780",
@@ -2343,7 +2343,7 @@ def test_telegram_bot_chat_id_type_normalization_with_reply_pusher(monkeypatch):
 
         # ReplyPusher with string chat_id should see voice enabled
         pusher = ReplyPusher(
-            mesh=flock,
+            mesh=mesh,
             telegram=telegram,
             chat_id="46444780",
             cursor_store=store,
@@ -2377,11 +2377,11 @@ def test_telegram_bot_chat_id_type_normalization_with_reply_pusher(monkeypatch):
 
 
 def test_telegram_bot_int_str_chat_id_in_flows(tmp_path):
-    flock = DummyFlockClient()
+    mesh = DummyMeshClient()
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     bot_instance = TelegramBot(
-        mesh_client=flock,
+        mesh_client=mesh,
         telegram_client=telegram,
         cursor_store=store,
         allowed_chat_id=46444780,
@@ -2486,7 +2486,7 @@ def test_activity_render_flush_debouncing():
     assert len(client.edited_messages) == 1
 
 
-def test_flock_client_stream_activity(monkeypatch):
+def test_mesh_client_stream_activity(monkeypatch):
     mesh = MeshClient("http://fake:8080", "fake-token")
 
     raw_sse = (
@@ -2516,12 +2516,12 @@ def test_flock_client_stream_activity(monkeypatch):
 
 
 def test_telegram_bot_live_activity_with_user_prompt_and_reply_pusher(monkeypatch, tmp_path):
-    flock = DummyFlockClient()
-    flock.activity_queue = [{"cursor": "50-0", "agent": "architect", "kind": "input"}]
+    mesh = DummyMeshClient()
+    mesh.activity_queue = [{"cursor": "50-0", "agent": "architect", "kind": "input"}]
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     bot_instance = TelegramBot(
-        mesh_client=flock,
+        mesh_client=mesh,
         telegram_client=telegram,
         cursor_store=store,
         target_agent="architect",
@@ -2537,7 +2537,7 @@ def test_telegram_bot_live_activity_with_user_prompt_and_reply_pusher(monkeypatc
     def fake_stream(agent, after=None):
         yield from activity_events
 
-    monkeypatch.setattr(flock, "stream_activity", fake_stream)
+    monkeypatch.setattr(mesh, "stream_activity", fake_stream)
 
     # User sends prompt
     reply = bot_instance.handle_user_prompt(12345, "build the feature")
@@ -2554,7 +2554,7 @@ def test_telegram_bot_live_activity_with_user_prompt_and_reply_pusher(monkeypatc
 
     # ReplyPusher delivers final reply
     pusher = ReplyPusher(
-        mesh=flock,
+        mesh=mesh,
         telegram=telegram,
         chat_id=12345,
         cursor_store=store,
@@ -2581,12 +2581,12 @@ def test_telegram_bot_live_activity_with_user_prompt_and_reply_pusher(monkeypatc
 
 def test_telegram_bot_multi_output_turn_does_not_early_exit(monkeypatch, tmp_path):
     """Verify that multiple output events interleaved with tools do not cause early exit."""
-    flock = DummyFlockClient()
-    flock.activity_queue = [{"cursor": "70-0", "agent": "architect", "kind": "input"}]
+    mesh = DummyMeshClient()
+    mesh.activity_queue = [{"cursor": "70-0", "agent": "architect", "kind": "input"}]
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     bot_instance = TelegramBot(
-        mesh_client=flock,
+        mesh_client=mesh,
         telegram_client=telegram,
         cursor_store=store,
         target_agent="architect",
@@ -2620,7 +2620,7 @@ def test_telegram_bot_multi_output_turn_does_not_early_exit(monkeypatch, tmp_pat
             import time
             time.sleep(0.05)
 
-    monkeypatch.setattr(flock, "stream_activity", fake_stream)
+    monkeypatch.setattr(mesh, "stream_activity", fake_stream)
 
     reply = bot_instance.handle_user_prompt(12345, "run multi step task")
     assert reply == "✅ Sent to architect."
@@ -2639,7 +2639,7 @@ def test_telegram_bot_multi_output_turn_does_not_early_exit(monkeypatch, tmp_pat
 
     # Final reply arrives via ReplyPusher and finalizes the render
     pusher = ReplyPusher(
-        mesh=flock,
+        mesh=mesh,
         telegram=telegram,
         chat_id=12345,
         cursor_store=store,
@@ -2656,11 +2656,11 @@ def test_telegram_bot_multi_output_turn_does_not_early_exit(monkeypatch, tmp_pat
 
 
 def test_telegram_bot_no_activity_push_flag(tmp_path):
-    flock = DummyFlockClient()
+    mesh = DummyMeshClient()
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     bot_instance = TelegramBot(
-        mesh_client=flock,
+        mesh_client=mesh,
         telegram_client=telegram,
         cursor_store=store,
         target_agent="architect",
@@ -2677,11 +2677,11 @@ def test_telegram_bot_no_activity_push_flag(tmp_path):
 
 
 def test_get_activity_tail_pagination_and_true_tail(tmp_path):
-    flock = DummyFlockClient()
+    mesh = DummyMeshClient()
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     bot_instance = TelegramBot(
-        mesh_client=flock,
+        mesh_client=mesh,
         telegram_client=telegram,
         cursor_store=store,
     )
@@ -2690,7 +2690,7 @@ def test_get_activity_tail_pagination_and_true_tail(tmp_path):
     assert bot_instance._get_activity_tail("architect") is None
 
     # 550 events (more than 1, less than 1000)
-    flock.activity_queue = [
+    mesh.activity_queue = [
         {"agent": "architect", "kind": "tool", "tool": "Bash", "cursor": f"{i}-0"}
         for i in range(1, 551)
     ]
@@ -2698,7 +2698,7 @@ def test_get_activity_tail_pagination_and_true_tail(tmp_path):
     assert bot_instance._get_activity_tail("architect") == "550-0"
 
     # 2500 events (spanning 3 pages of 1000)
-    flock.activity_queue = [
+    mesh.activity_queue = [
         {"agent": "architect", "kind": "tool", "tool": "Bash", "cursor": f"{i:05d}-0"}
         for i in range(1, 2501)
     ]
@@ -2706,11 +2706,11 @@ def test_get_activity_tail_pagination_and_true_tail(tmp_path):
 
 
 def test_reply_pusher_seed_cursor_pagination(tmp_path):
-    flock = DummyFlockClient()
+    mesh = DummyMeshClient()
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     pusher = ReplyPusher(
-        mesh=flock,
+        mesh=mesh,
         telegram=telegram,
         chat_id=123,
         cursor_store=store,
@@ -2720,7 +2720,7 @@ def test_reply_pusher_seed_cursor_pagination(tmp_path):
     assert pusher._seed_cursor() is None
 
     # 1500 messages (spanning 2 pages of 1000)
-    flock.messages_queue = [
+    mesh.messages_queue = [
         {"cursor": f"{i:05d}-0", "payload": {"text": f"msg {i}"}}
         for i in range(1, 1501)
     ]
@@ -2889,7 +2889,7 @@ class FakeWatchWS:
 
 def test_run_pane_watch_renders_a_cropped_snapshot_and_sends_refresh_true():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
         pane = "\n".join(f"row{i}" for i in range(1, 15))
         stop_event = threading.Event()
         ws = FakeWatchWS(
@@ -2910,7 +2910,7 @@ def test_run_pane_watch_renders_a_cropped_snapshot_and_sends_refresh_true():
 
 def test_run_pane_watch_ignores_incremental_diffs_between_snapshots():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
         pane = "\n".join(f"row{i}" for i in range(1, 15))
         stop_event = threading.Event()
         ws = FakeWatchWS(
@@ -2930,24 +2930,24 @@ def test_run_pane_watch_ignores_incremental_diffs_between_snapshots():
 
 def test_run_pane_watch_stops_on_working_to_idle_transition_not_on_initial_idle():
     with tempfile.TemporaryDirectory() as tmpdir:
-        flock = DummyFlockClient()
-        flock.presence_state = "working"
-        bot_instance, flock, telegram = _make_bot(flock=flock, tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
+        mesh = DummyMeshClient()
+        mesh.presence_state = "working"
+        bot_instance, mesh, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
         frame = [json.dumps({"agent": "architect", "data": SNAPSHOT_PREFIX + "hi"})]
         ws = FakeWatchWS([frame, frame])
         render = PaneWatchRender(chat_id=123, agent="architect")
         stop_event = threading.Event()
 
         calls = {"n": 0}
-        real_get_presence = flock.get_presence
+        real_get_presence = mesh.get_presence
 
         def get_presence(agent):
             calls["n"] += 1
             if calls["n"] >= 2:
-                flock.presence_state = "idle"
+                mesh.presence_state = "idle"
             return real_get_presence(agent)
 
-        flock.get_presence = get_presence
+        mesh.get_presence = get_presence
 
         bot_instance._run_pane_watch(123, "architect", render, stop_event, ws_connect_fn=lambda: ws)
 
@@ -2957,7 +2957,7 @@ def test_run_pane_watch_stops_on_working_to_idle_transition_not_on_initial_idle(
 
 def test_run_pane_watch_stops_at_max_duration():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
         bot_instance.pane_watch_max_duration_s = 0.0
         frame = [json.dumps({"agent": "architect", "data": SNAPSHOT_PREFIX + "hi"})]
         ws = FakeWatchWS([frame])
@@ -2972,7 +2972,7 @@ def test_run_pane_watch_stops_at_max_duration():
 
 def test_handle_watch_pick_rejects_an_unknown_agent():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
         reply = bot_instance.handle_watch_pick(123, "nonexistent")
         assert "Unknown agent" in reply
         assert "123" not in bot_instance.pane_watches
@@ -2980,7 +2980,7 @@ def test_handle_watch_pick_rejects_an_unknown_agent():
 
 def test_handle_watch_pick_replaces_an_existing_watch_in_the_same_chat(monkeypatch):
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
         monkeypatch.setattr(bot_instance, "_run_pane_watch", lambda *a, **kw: None)
         bot_instance.handle_watch_pick(123, "architect")
         first_stop_event = bot_instance.pane_watches["123"]["stop_event"]
@@ -2991,14 +2991,14 @@ def test_handle_watch_pick_replaces_an_existing_watch_in_the_same_chat(monkeypat
 
 def test_handle_watch_stop_command_with_no_active_watch():
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
         reply = bot_instance.handle_watch_stop_command(123)
         assert "No active watch" in reply
 
 
 def test_handle_watch_stop_via_callback_matches_agent_and_sets_stop_event(monkeypatch):
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
         monkeypatch.setattr(bot_instance, "_run_pane_watch", lambda *a, **kw: None)
         bot_instance.handle_watch_pick(123, "architect")
         stop_event = bot_instance.pane_watches["123"]["stop_event"]
@@ -3010,7 +3010,7 @@ def test_handle_watch_stop_via_callback_matches_agent_and_sets_stop_event(monkey
 
 def test_watch_command_routes_through_text_and_callback(monkeypatch):
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, flock, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
         monkeypatch.setattr(bot_instance, "_run_pane_watch", lambda *a, **kw: None)
 
         reply = bot_instance.handle_text_message(123, "/watch architect")
