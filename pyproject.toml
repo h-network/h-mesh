@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "h-mesh"
+version = "0.1.0"
+description = "Host-installed message mesh for stateful agent offices"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "redis>=5,<7",
+  "uvicorn>=0.30,<1",
+]
+
+[project.scripts]
+h-mesh-api = "services.api:main"
+h-mesh-switch = "core.service:main"
+h-mesh-tmux-port = "modules.tmux.port:main"
+h-mesh-tmux-reconciler = "services.tmux_reconciler:main"
+
+[tool.setuptools]
+package-dir = {"" = "h-app"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["h-app"]
+include = ["clients*", "core*", "lib*", "modules*", "services*", "tools*"]
+namespaces = true
