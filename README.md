@@ -12,6 +12,28 @@ A Telegram interface is included, talking to the framework over the same REST AP
 
 Every hop a message takes is logged, the same way a real packet's path can be traced -- nothing moves silently.
 
+## Bootstrap script
+
+`./setup.sh` wraps the manual install below into one step for a fresh host or
+pod: it installs h-mesh into a venv, seeds the registry's fixed lifecycle
+participants (`host` -> office, `api` -> api) for the given pod/tenant, and
+starts the `h-mesh-switch` and `h-mesh-tmux-reconciler` daemons.
+
+```bash
+./setup.sh --pod mypod --tenant mytenant
+```
+
+Run `./setup.sh --help` for the full set of flags (Redis URL, tmux session
+name and socket, an existing venv, `--skip-install`, `--no-daemons`, etc.).
+Daemon logs and PID files are written under `$H_MESH_RUN_DIR`
+(default `~/.h-mesh/run/<tenant>`). Once daemons are running, hire the first
+agent as `host`:
+
+```bash
+export AGENT_NAME=host POD=mypod TENANT=mytenant
+h-mesh-office hire <agent-name>
+```
+
 ## Host installation
 
 h-mesh is installed from the repository root. An editable install is useful for

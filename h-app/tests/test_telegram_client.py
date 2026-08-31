@@ -602,7 +602,7 @@ def test_handle_text_message_menu_and_status_still_work():
 def test_tmux_agents_excludes_api_clients():
     with tempfile.TemporaryDirectory() as tmpdir:
         mesh = DummyMeshClient()
-        mesh.roster = {"architect": "tmux", "sme-2": "tmux", "telegram": "api", "host": "control"}
+        mesh.roster = {"architect": "tmux", "sme-2": "tmux", "telegram": "api", "host": "office"}
         bot_instance, _, _ = _make_bot(mesh=mesh, tmpdir=tmpdir)
         assert set(bot_instance._tmux_agents()) == {"architect", "sme-2"}
 
