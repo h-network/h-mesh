@@ -475,7 +475,7 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             os.environ.pop("OFFICE_TOOLS", None)
             lead_guide = generate_agents_md("architect", lead="architect")
             self.assertIn("h-mesh-office status", lead_guide)
-            self.assertIn("h-mesh-office cloneToAll", lead_guide)
+            self.assertIn("h-mesh-office clone-to-all", lead_guide)
             self.assertIn("h-mesh-office peers", lead_guide)
             self.assertIn("h-mesh-office send", lead_guide)
             self.assertIn("h-mesh-office list", lead_guide)

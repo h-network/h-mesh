@@ -164,7 +164,7 @@ def test_send_builds_message_envelope(mock_send, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
-# hire / letGo / pause / resume (_lifecycle_command)
+# lifecycle commands (_lifecycle_command)
 # ---------------------------------------------------------------------------
 
 
@@ -326,7 +326,7 @@ def test_add_sends_envelope_and_never_writes_recipient_board(mock_send, monkeypa
 
 
 # ---------------------------------------------------------------------------
-# cloneToAll
+# clone-to-all
 # ---------------------------------------------------------------------------
 
 
@@ -335,11 +335,20 @@ def test_clone_to_all_dry_run_reports_without_writing(monkeypatch, tmp_path, cap
     r = FakeRedis(registry={"backend": "tmux", "frontend": "tmux"})
     monkeypatch.setattr(office_cli, "_WORKDIR_ROOT", tmp_path)
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
-        office_main(["cloneToAll", "git@example.com:org/repo.git", "--dry-run"])
+        office_main(["clone-to-all", "git@example.com:org/repo.git", "--dry-run"])
     out = capsys.readouterr().out
     assert "backend: would clone" in out
     assert "frontend: would clone" in out
     assert "summary: cloned=0 skipped=0 failed=0" in out
+
+
+@pytest.mark.parametrize("alias", ["cloneToAll", "sendFile", "letGo"])
+def test_camel_case_command_aliases_are_rejected(alias, capsys):
+    with pytest.raises(SystemExit) as exc:
+        office_main([alias])
+
+    assert exc.value.code == 2
+    assert f"unknown command: {alias}" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

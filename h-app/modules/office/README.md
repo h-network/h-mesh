@@ -1,7 +1,7 @@
 # office
 
 The `office` CLI and its receiving port, together. `office` builds and sends
-envelopes (hire/letGo/pause/resume, send, board, peers, etc); this module's
+envelopes (hire/retire/pause/resume, send, board, peers, etc); this module's
 own port receives the hire/retire/pause/resume envelopes back and calls the
 settled `lib.agentlifecycle` API. Same domain, both sides, one module.
 

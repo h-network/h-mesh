@@ -87,7 +87,7 @@ def generate_agents_md(
             "and yours is the account that decides when something is done.\n\n"
             f"Before you hand out work, check `{cmd} status`. An agent that is `blocked` "
             "will not receive it — hold the work and say so. Do not try to fix the agent.\n\n"
-            f"`{cmd} cloneToAll` only ever reuses a copy it made during that same call "
+            f"`{cmd} clone-to-all` only ever reuses a copy it made during that same call "
             "as a local source for the next agent — never a target that already existed "
             "before the call started. Mixing a pre-existing agent into the same `-a` list "
             "as fresh hires is safe: the existing one is skipped, not reused as a source.\n\n"

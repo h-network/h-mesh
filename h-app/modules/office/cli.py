@@ -2,7 +2,7 @@
 
 port.py is the receiving half: a `deliver_office`
 entrypoint, shaped like `modules.tmux.port.deliver_tmux`, that calls into
-`agentlifecycle` for hire/letGo/pause/resume envelopes addressed back to the
+`agentlifecycle` for hire/retire/pause/resume envelopes addressed back to the
 fixed lifecycle participant. This file only builds and sends envelopes, or
 reads/mutates Redis state the caller owns directly -- it never calls
 agentlifecycle itself, the same separation `office/cli.py` and
@@ -408,7 +408,7 @@ def _now() -> str:
 
 
 # ---------------------------------------------------------------------------
-# hire, letGo, pause, resume
+# lifecycle commands
 #
 # ⚠ Named `_lifecycle_command`, not `_control_command`. "Control" now names a
 # different layer -- the fixed participant these envelopes reach is a
@@ -740,7 +740,7 @@ def _add_command(argv: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# cloneToAll / clone-to-all
+# clone-to-all
 # ---------------------------------------------------------------------------
 
 
@@ -797,7 +797,7 @@ def _git_clone(source: str, target: Path, upstream: str) -> tuple[bool, str]:
 
 
 def _clone_to_all_command(argv: list[str]) -> None:
-    parser = _operation_parser("cloneToAll", "Clone one repository into agent workspaces.")
+    parser = _operation_parser("clone-to-all", "Clone one repository into agent workspaces.")
     parser.add_argument("repo_url", metavar="REPO-URL")
     parser.add_argument("-a", "--agents", metavar="AGENT,...", help="comma-separated tmux agents")
     parser.add_argument("--dry-run", action="store_true", help="show actions without writing")
@@ -1028,12 +1028,12 @@ def _usage_command(argv: list[str]) -> None:
 
 _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("send",), "send a message to one agent", _send_command),
-    (("send-file", "sendFile"), "send a file attachment to one agent", _send_file_command),
+    (("send-file",), "send a file attachment to one agent", _send_file_command),
     (("broadcast",), "send a message to every peer agent", _broadcast_command),
     (("peers",), "list peer agents", _peers_command),
     (("status",), "show agent presence and open work", _status_command),
     (("hire",), "enrol a new agent", lambda argv: _lifecycle_command("hire", argv)),
-    (("letGo", "let-go"), "retire an agent", lambda argv: _lifecycle_command("letGo", argv)),
+    (("let-go",), "retire an agent", lambda argv: _lifecycle_command("letGo", argv)),
     (("pause",), "pause an agent's CLI", lambda argv: _lifecycle_command("pause", argv)),
     (("resume",), "resume an agent's CLI and inbox", lambda argv: _lifecycle_command("resume", argv)),
     (("list",), "show a task board", _list_command),
@@ -1043,7 +1043,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("hold",), "put your open task on hold", _hold_command),
     (("delete",), "permanently remove a task", _delete_command),
     (("add",), "add a task to another agent's board", _add_command),
-    (("cloneToAll", "clone-to-all"), "clone a repository into agent workspaces", _clone_to_all_command),
+    (("clone-to-all",), "clone a repository into agent workspaces", _clone_to_all_command),
     (("usage",), "show token usage and estimated cost", _usage_command),
 )
 
@@ -1102,7 +1102,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
 
 def clone_to_all_entrypoint(argv: Sequence[str] | None = None) -> None:
-    """`cloneToAll <url>` -- the bare name on PATH, one implementation behind it.
+    """`clone-to-all <url>` -- the bare name on PATH, one implementation behind it.
 
     Renamed from the previous system's `clone_to_all_main`: this module's own
     `main()` is a different entry point (the whole dispatcher) and naming
@@ -1112,7 +1112,7 @@ def clone_to_all_entrypoint(argv: Sequence[str] | None = None) -> None:
     clone, and left directories every later run misread as already done.
     Delegate; do not reimplement.
     """
-    main(["cloneToAll", *(sys.argv[1:] if argv is None else argv)])
+    main(["clone-to-all", *(sys.argv[1:] if argv is None else argv)])
 
 
 if __name__ == "__main__":
