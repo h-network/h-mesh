@@ -216,12 +216,11 @@ class ChannelTests(unittest.TestCase):
                 (agent, port_type, envelope["stream_id"])
             ),
         )
-        with patch("core.service._emit_observation"), patch("core.service._log_observation"):
+        with patch("core.service._emit_observation"), patch("core.service._log_observation") as log:
             self.assertTrue(switch.step(timeout=0))
-        self.assertEqual(
-            kicks,
-            [("bob", None, stream_id), ("carol", None, stream_id)],
-        )
+        self.assertEqual(kicks, [])
+        deferred = [call for call in log.call_args_list if call.args == ("kick_deferred",)]
+        self.assertEqual([call.kwargs["destination"] for call in deferred], ["bob", "carol"])
         self.assertEqual(self.redis.hget_calls[hgets_before_step:], [])
         self.assertEqual(self.redis.hexists_calls, [])
 

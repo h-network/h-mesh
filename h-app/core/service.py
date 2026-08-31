@@ -1,6 +1,9 @@
 """Forward tenant egress queues without interpreting payloads."""
 
 import os
+import signal
+import subprocess
+import sys
 import time
 from collections.abc import Callable
 
@@ -29,6 +32,24 @@ def _log_observation(event: str, **fields) -> None:
         log_record("switch", event, **fields)
     except Exception:
         pass
+
+
+def transmission(agent: str, port_type_name: str | None, envelope: dict) -> None:
+    """Start one module-owned port process; ingress carries the envelope.
+
+    The registry port_type is currently assumed to be the module directory
+    name, making the target ``modules.<port_type>.port``. The frame itself is
+    never placed in argv; the child reads its own ingress queue from Redis.
+
+    The switch defers broadcasts before calling here because their HKEYS-only
+    path has no resolved port_type yet. Reject direct misuse rather than ever
+    constructing ``modules.None.port``.
+    """
+    if port_type_name is None:
+        raise ValueError("cannot transmit without a resolved port_type")
+    subprocess.Popen(
+        [sys.executable, "-m", f"modules.{port_type_name}.port", agent]
+    )
 
 # ⚠ activity, presence and verification are NOT here. They observe agents; the
 # watchdog owns them. What is left runs on the forwarding thread because it is
@@ -105,6 +126,16 @@ class Switch:
         )
 
     def _kick(self, agent: str, port_type_name: str | None, envelope: dict) -> None:
+        if port_type_name is None:
+            _log_observation(
+                "kick_deferred",
+                stream_id=envelope.get("stream_id"),
+                correlation_id=envelope.get("correlation_id"),
+                source=envelope.get("l2", {}).get("source"),
+                destination=agent,
+                reason="broadcast port_type is unresolved; delivery kick deferred",
+            )
+            return
         if self.kick is None:
             _log_observation(
                 "kick_deferred",
@@ -273,6 +304,11 @@ class Switch:
 
 
 def main() -> None:
+    # Delivery kicks are fire-and-forget: this process never calls wait() or
+    # poll() on their children. Ignoring SIGCHLD makes the kernel auto-reap
+    # exited port processes instead of leaving one zombie per delivery.
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+
     r = redis.Redis.from_url(os.environ["REDIS_URL"])
     switch = Switch(
         r,
@@ -280,6 +316,7 @@ def main() -> None:
         tenant=os.environ["TENANT"],
         poll_seconds=int(os.environ.get("REGISTRY_POLL_SECONDS", "5")),
         ingress_max=int(os.environ.get("INGRESS_MAX", "300")),
+        kick=transmission,
     )
     # Config for the same reason REGISTRY_POLL_SECONDS is: two offices can
     # legitimately trade feed latency against filesystem polling. A knob beside

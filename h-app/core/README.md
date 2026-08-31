@@ -26,6 +26,11 @@ The tenant participant hash is the wire-visible `registry` resource. Delivery
 itself remains outside core: pass a `kick(agent, port_type, envelope)` callback to
 `Switch` when an edge module should be notified after ingress admission. With
 no callback, forwarding still completes and core records `kick_deferred`.
+The production switch uses `transmission` to start
+`python -m modules.<port_type>.port <agent>`; `port_type` is currently assumed
+to equal its module directory name, and the child reads the frame from ingress.
+Broadcast kicks remain deferred until their membership-only path also resolves
+participant types.
 
 Core logging uses the `H_MESH_WRITER`, `H_MESH_CUSTODY_FILE`,
 `H_MESH_LOG_FILE`, `H_MESH_LOG_QUIET`, and

@@ -1,9 +1,11 @@
 import os
+import signal
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from unittest.mock import MagicMock
 
 
 H_APP = Path(__file__).resolve().parents[1]
@@ -12,7 +14,7 @@ if str(H_APP) not in sys.path:
 
 from core.config import state_dir, state_path
 from core.registry import is_member, members, port_type
-from core.service import Switch
+from core.service import Switch, main, transmission
 from core.windowlog import WindowLogTailer
 
 
@@ -79,6 +81,52 @@ class CoreAdaptationTests(unittest.TestCase):
             switch._kick("bob", "tmux", envelope)
         self.assertEqual(log.call_args.args, ("kick_deferred",))
         self.assertEqual(log.call_args.kwargs["destination"], "bob")
+
+    def test_broadcast_without_resolved_type_defers_before_callback(self):
+        kick = MagicMock()
+        switch = Switch(object(), pod="mesh", tenant="office", kick=kick)
+        envelope = {"stream_id": "stream", "l2": {"source": "alice"}}
+        with patch("core.service._log_observation") as log:
+            switch._kick("bob", None, envelope)
+        kick.assert_not_called()
+        self.assertEqual(log.call_args.args, ("kick_deferred",))
+        self.assertIn("broadcast port_type is unresolved", log.call_args.kwargs["reason"])
+
+    def test_transmission_spawns_module_port_without_envelope_in_argv(self):
+        envelope = {"stream_id": "secret", "payload": {"text": "not argv"}}
+        with patch("core.service.subprocess.Popen") as popen:
+            transmission("bob", "tmux", envelope)
+        popen.assert_called_once_with(
+            [sys.executable, "-m", "modules.tmux.port", "bob"]
+        )
+        self.assertNotIn("secret", popen.call_args.args[0])
+
+    def test_transmission_rejects_unresolved_port_type(self):
+        with patch("core.service.subprocess.Popen") as popen:
+            with self.assertRaisesRegex(ValueError, "resolved port_type"):
+                transmission("bob", None, {})
+        popen.assert_not_called()
+
+    def test_main_installs_auto_reap_and_wires_production_transmission(self):
+        events = []
+        switch = MagicMock(pod="mesh", tenant="office")
+        switch.run.side_effect = lambda **kwargs: events.append("run")
+        with (
+            patch.dict(
+                os.environ,
+                {"REDIS_URL": "redis://example", "POD": "mesh", "TENANT": "office"},
+                clear=True,
+            ),
+            patch("core.service.signal.signal", side_effect=lambda *args: events.append("signal")) as set_signal,
+            patch("core.service.redis.Redis.from_url", return_value=object()),
+            patch("core.service.Switch", return_value=switch) as switch_class,
+            patch("core.service.WindowLogTailer", return_value=object()),
+            patch("core.service.RetentionTrimmer", return_value=object()),
+        ):
+            main()
+        set_signal.assert_called_once_with(signal.SIGCHLD, signal.SIG_IGN)
+        self.assertIs(switch_class.call_args.kwargs["kick"], transmission)
+        self.assertEqual(events, ["signal", "run"])
 
     def test_state_paths_follow_configured_directory(self):
         with tempfile.TemporaryDirectory() as directory:
