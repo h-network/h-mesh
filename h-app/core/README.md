@@ -36,3 +36,6 @@ Core logging uses the `H_MESH_WRITER`, `H_MESH_CUSTODY_FILE`,
 `H_MESH_LOG_FILE`, `H_MESH_LOG_QUIET`, and
 `H_MESH_LOG_FILE_AGENT_ONLY` environment variables. Switch registry refresh is
 configured with `REGISTRY_POLL_SECONDS`.
+The forwarding loop survives transient Redis connection failures: it records
+the failure, waits for its current poll interval, and lets redis-py reconnect on
+the next forwarding attempt.

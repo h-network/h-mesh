@@ -7,6 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 from unittest.mock import MagicMock
 
+import redis
+
 
 H_APP = Path(__file__).resolve().parents[1]
 if str(H_APP) not in sys.path:
@@ -135,6 +137,26 @@ class CoreAdaptationTests(unittest.TestCase):
             switch._kick("bob", "tmux", envelope)
         self.assertEqual(log.call_args.args, ("kick_deferred",))
         self.assertEqual(log.call_args.kwargs["destination"], "bob")
+
+    def test_switch_run_retries_after_redis_connection_error(self):
+        switch = Switch(object(), pod="mesh", tenant="office", poll_seconds=5)
+        switch.step = MagicMock(
+            side_effect=[redis.exceptions.ConnectionError("redis restarting"), KeyboardInterrupt]
+        )
+        with (
+            patch("core.service.time.monotonic", return_value=0),
+            patch("core.service.time.sleep") as sleep,
+            patch("core.service._emit_observation") as emit,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            switch.run()
+
+        self.assertEqual(switch.step.call_count, 2)
+        sleep.assert_called_once_with(2.0)
+        emit.assert_called_once_with(
+            "error", {},
+            reason="forwarding pass failed: ConnectionError: redis restarting",
+        )
 
     def test_broadcast_without_resolved_type_defers_before_callback(self):
         kick = MagicMock()
