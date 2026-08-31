@@ -130,11 +130,9 @@ class Watchdog:
             approximate=True,
         )
         print(raw, flush=True)
-        # ⚠ Alerts bypassed the durable mirror until 2026-08-22 in h-flock — they
-        # reached `docker logs` and the Redis stream, both of which die with the
-        # container, so a credential or stall alert left no trace after
-        # teardown. Found by diffing the evidence file against `docker logs` on
-        # a live tenant, not by reading. Carried forward here from the start.
+        # ⚠ Both `print` and `mirror` are required here. Container stdout and
+        # the Redis stream both die with the container, so without the durable
+        # mirror a credential or stall alert leaves no trace after teardown.
         mirror(raw)
 
     @staticmethod
@@ -265,12 +263,10 @@ class Watchdog:
         deliver_tmux`). Only the egress hop, which nothing was ever going to
         drain, is skipped.
 
-        ⚠ h-flock's counterpart fired a `flock.port <agent>` subprocess here —
-        a one-shot, fire-and-forget delivery process. h-mesh has no equivalent
-        standalone port CLI yet; the switch's own `kick` callback wires
-        `deliver_tmux` in-process (see `modules.tmux.__all__` and every current
-        caller of `Switch(..., kick=...)`), so this calls it the same way,
-        synchronously, instead of spawning a process that does not exist here.
+        ⚠ This calls `deliver_tmux` in-process rather than spawning a
+        subprocess: the switch's own `kick` callback already wires it the
+        same way (see `modules.tmux.__all__` and every current caller of
+        `Switch(..., kick=...)`), so this reuses that mechanism directly.
 
         ⚠ The ingress write goes through the same `admit_ingress` bound the
         switch uses for every other forward, not a plain `rpush`. Before this,
@@ -824,13 +820,11 @@ def run_observers(watchdog, jobs, agents) -> list[str]:
 
 
 def main() -> None:
-    # ⚠ WATCHDOG_ENABLED silences ALERTING, not telemetry. Until the observers
-    # moved here they lived in the switch, so this flag only ever quietened the
-    # stall and blocked alerts. Returning here would now also stop
-    # ActivityTailer, PresenceSampler and DeliveryVerifier — presence would read
-    # `unknown` forever, the activity stream would stay empty, and the Telegram
-    # bot would lose its progress indicator. Carried forward from h-flock,
-    # where the flag's name promises alerts and three clients depend on the rest.
+    # ⚠ WATCHDOG_ENABLED silences ALERTING, not telemetry. Returning here would
+    # also stop ActivityTailer, PresenceSampler and DeliveryVerifier — presence
+    # would read `unknown` forever, the activity stream would stay empty, and
+    # the Telegram bot would lose its progress indicator. The flag's name
+    # promises alerts; three other clients depend on the rest still running.
     alerting = os.environ.get("WATCHDOG_ENABLED", "1") != "0"
     interval = float(os.environ.get("WATCHDOG_INTERVAL", "30"))
     r = redis.Redis.from_url(os.environ["REDIS_URL"])
@@ -852,12 +846,12 @@ def main() -> None:
         ack_loop_threshold=int(os.environ.get("WATCHDOG_ACK_LOOP_THRESHOLD", "3")),
         ack_loop_window_seconds=float(os.environ.get("WATCHDOG_ACK_LOOP_WINDOW_SEC", "120")),
     )
-    # ⚠ These three moved out of the switch's forwarding loop, same as in
-    # h-flock. They observe agents — CLI transcripts, presence, whether a
-    # paste was followed by input — and the watchdog is already their only
-    # consumer: it reads the `presence` and `blocked` hashes they write.
-    # Sampling them here keeps file I/O and stream scans off the thread that
-    # must not block (see core/service.py's own note on the same boundary).
+    # ⚠ These three stay off the switch's forwarding loop. They observe
+    # agents — CLI transcripts, presence, whether a paste was followed by
+    # input — and the watchdog is already their only consumer: it reads the
+    # `presence` and `blocked` hashes they write. Sampling them here keeps
+    # file I/O and stream scans off the thread that must not block (see
+    # core/service.py's own note on the same boundary).
     pod, tenant = os.environ["POD"], os.environ["TENANT"]
     observers = (
         ("activity", ActivityTailer(r, pod=pod, tenant=tenant)),

@@ -1422,13 +1422,10 @@ class WatchdogMainLoopTests(unittest.TestCase):
         self.assertEqual(error["reason"], "RuntimeError: bad observations")
 
     def test_disabled_alerting_still_connects_because_observers_need_redis(self):
-        """This asserted the OPPOSITE until h-flock's 2026-08-19 fix.
-
-        It pinned "WATCHDOG_ENABLED=0 means main() exits without connecting",
-        which was correct while the flag only governed alerts. The observers
-        live in this process and read Redis, so exiting early silences
-        telemetry rather than alerts. The connection is now the evidence that
-        they still run.
+        """WATCHDOG_ENABLED=0 must still connect: the observers live in this
+        process and read Redis, so exiting early would silence telemetry
+        rather than alerts. The connection is the evidence that they still
+        run even with alerting off.
         """
         connected = []
         self._env(WATCHDOG_ENABLED="0", REDIS_URL="redis://unused", POD=POD, TENANT=TENANT)

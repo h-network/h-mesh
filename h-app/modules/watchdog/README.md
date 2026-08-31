@@ -2,8 +2,7 @@
 
 Agent observability: stalls, blocked deliveries, credential expiry, and board
 hygiene (stuck `doing`/`todo`/`hold` tickets, unanswered client messages,
-ack-loops). This is the first module ported from h-flock's `flock.watchdog`
--- read-only reference there, all changes land here.
+ack-loops).
 
 **Observe-only, by design.** `service.Watchdog`'s docstring says it plainly:
 report tenant stalls and blocked deliveries without repairing either. Nothing
@@ -47,8 +46,3 @@ Two channels, deliberately different:
 (`admit_ingress`), and `modules.tmux` (`run_tmux`, `deliver_tmux`). No new
 third-party dependency: `redis` is already ambient in h-mesh
 (`core/service.py`, `modules/tmux/reconciler.py`).
-
-Ported from h-flock's `src/flock/watchdog/{activity,presence,service,
-verification}.py`. Behavior is unchanged; only imports and the lead-delivery
-kick (h-mesh has no `flock.port`-style standalone subprocess yet, so this
-calls `deliver_tmux` directly instead of spawning one) were adapted.
