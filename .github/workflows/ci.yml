@@ -54,3 +54,5 @@ jobs:
           POD: ci-tmux
           TENANT: ci-tmux
         run: python3 h-app/tools/smoke_tmux.py
+      - name: Session smoke test (isolated tmux)
+        run: python3 h-app/tools/smoke_session.py
