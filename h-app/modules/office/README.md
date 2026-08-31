@@ -21,6 +21,8 @@ or `lib`. `hire --profile` still exists and still reaches the payload, but
 without the client-side "unknown account" check the old system had, for the
 same reason. `hire --provider NAME` likewise passes an explicit provider to
 the lifecycle payload, where the existing StartAgent validation applies.
+`hire` starts a fresh CLI session by default, including when an agent name has
+local session history; use `hire --resume` to restore that history explicitly.
 
 The receiving port delegates to the settled `lib.agentlifecycle` API.
 `lib/agentlifecycle/lifecycle.py`'s own `stop_agent` has an open

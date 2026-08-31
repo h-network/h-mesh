@@ -169,16 +169,24 @@ def test_send_builds_message_envelope(mock_send, monkeypatch, capsys):
 
 
 @patch("modules.office.cli.send")
-def test_hire_default_payload_has_no_optional_fields(mock_send, monkeypatch):
+def test_hire_defaults_to_fresh_session(mock_send, monkeypatch):
     _env(monkeypatch)
     mock_send.return_value = "stream-1"
     r = FakeRedis()
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
         office_main(["hire", "worker-1", "--cli", "claude"])
-    kwargs = mock_send.call_args[1]
+        # Reusing the name must produce the same deterministic launch request;
+        # local CLI history is deliberately irrelevant to the sending side.
+        office_main(["hire", "worker-1", "--cli", "claude"])
+    assert mock_send.call_count == 2
+    kwargs = mock_send.call_args_list[-1].kwargs
     assert kwargs["destination"] == "host"
     assert kwargs["kind"] == "StartAgent"
-    assert kwargs["payload"] == {"agent": "worker-1", "cli": "claude"}
+    assert kwargs["payload"] == {
+        "agent": "worker-1",
+        "cli": "claude",
+        "resume": False,
+    }
 
 
 @patch("modules.office.cli.send")

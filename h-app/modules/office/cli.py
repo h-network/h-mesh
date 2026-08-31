@@ -455,12 +455,12 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
                             help="provider used to start this agent")
         mode_group = parser.add_mutually_exclusive_group()
         mode_group.add_argument("--resume", action="store_true", default=None,
-                                help="resume prior session history (default when history exists)")
+                                help="resume prior session history (explicit opt-in)")
         mode_group.add_argument("--fresh", action="store_true", default=None,
-                                help="start a clean session ignoring prior history")
-        # ⚠ Both are h-agent's own knobs (base image), not h-mesh's -- omitted
-        # means h-agent decides, same as --resume/--fresh omitted means the
-        # reconciler decides. Neither flag changes default behavior.
+                                help="start a clean session ignoring prior history (default)")
+        # ⚠ These are h-agent's own permission knobs (base image), not
+        # h-mesh's. Omitted means h-agent decides; neither flag changes its
+        # default behavior.
         permission_group = parser.add_mutually_exclusive_group()
         permission_group.add_argument(
             "--skip-permissions", action="store_true", default=None,
@@ -488,10 +488,12 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
             payload["profile"] = args.profile
         if args.provider:
             payload["provider"] = args.provider
-        if args.fresh:
-            payload["resume"] = False
-        elif args.resume:
-            payload["resume"] = True
+        # A hire envelope is consumed asynchronously, so it must never leave an
+        # interactive choice waiting in the new pane. h-agent's bare --resume
+        # can open a picker when this name has multiple prior sessions. Make a
+        # clean launch the deterministic default; restoring history remains an
+        # explicit, easy opt-in.
+        payload["resume"] = bool(args.resume)
         if args.no_skip_permissions:
             payload["skip_permissions"] = False
         elif args.skip_permissions:

@@ -34,6 +34,9 @@ export AGENT_NAME=host POD=mypod TENANT=mytenant
 h-mesh-office hire <agent-name>
 ```
 
+Hiring starts a fresh CLI session by default, even when that agent name has
+local session history. Pass `--resume` to opt into restoring prior history.
+
 ## Host installation
 
 h-mesh is installed from the repository root. An editable install is useful for
