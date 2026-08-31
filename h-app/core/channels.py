@@ -1,4 +1,4 @@
-"""The switch's two channels: send into egress, receive out of ingress."""
+"""Agent/port-facing channels: send into own egress, receive from own ingress."""
 
 from collections.abc import Callable
 from datetime import datetime, timezone
