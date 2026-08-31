@@ -323,7 +323,7 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(pane_to_agent, {"%0": "architect", "%1": "sme-2", "%2": "sme-3"})
 
     def test_session_non_loopback_bind_requires_tls(self):
-        with patch.dict(os.environ, {"FLOCK_ALLOW_PLAINTEXT": "0", "H_MESH_ALLOW_PLAINTEXT": "0"}):
+        with patch.dict(os.environ, {"H_MESH_ALLOW_PLAINTEXT": "0"}):
             settings = SessionSettings(
                 tenant="office",
                 api_token="secret",
@@ -335,7 +335,7 @@ class SessionTests(unittest.TestCase):
             self.assertIn("SESSION_TLS_CERT and SESSION_TLS_KEY are required", str(ctx.exception))
 
     def test_session_partial_tls_configuration_raises_error(self):
-        with patch.dict(os.environ, {"FLOCK_ALLOW_PLAINTEXT": "0", "H_MESH_ALLOW_PLAINTEXT": "0"}):
+        with patch.dict(os.environ, {"H_MESH_ALLOW_PLAINTEXT": "0"}):
             settings = SessionSettings(
                 tenant="office",
                 api_token="secret",
@@ -347,7 +347,7 @@ class SessionTests(unittest.TestCase):
             self.assertIn("Both SESSION_TLS_CERT and SESSION_TLS_KEY must be provided", str(ctx.exception))
 
     def test_session_non_loopback_bind_with_tls_succeeds(self):
-        with patch.dict(os.environ, {"FLOCK_ALLOW_PLAINTEXT": "0", "H_MESH_ALLOW_PLAINTEXT": "0"}):
+        with patch.dict(os.environ, {"H_MESH_ALLOW_PLAINTEXT": "0"}):
             settings = SessionSettings(
                 tenant="office",
                 api_token="secret",
@@ -367,6 +367,18 @@ class SessionTests(unittest.TestCase):
                 session_bind="0.0.0.0",
             )
             settings.validate()
+
+    def test_flock_allow_plaintext_is_ignored(self):
+        with patch.dict(os.environ, {"FLOCK_ALLOW_PLAINTEXT": "1", "H_MESH_ALLOW_PLAINTEXT": "0"}):
+            settings = SessionSettings(
+                tenant="office",
+                api_token="secret",
+                session_name="office",
+                session_bind="0.0.0.0",
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                settings.validate()
+            self.assertIn("SESSION_TLS_CERT and SESSION_TLS_KEY are required", str(ctx.exception))
 
     def test_slow_viewer_queue_bounded(self):
         subscriber = Subscriber()
