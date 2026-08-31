@@ -34,4 +34,4 @@ in `control.py` converts these back to raw bytes before publishing to subscriber
 
 A non-loopback `SESSION_BIND` requires TLS certificates (`SESSION_TLS_CERT` /
 `SESSION_TLS_KEY` or `API_TLS_CERT` / `API_TLS_KEY`) unless `H_MESH_ALLOW_PLAINTEXT=1`
-(or `FLOCK_ALLOW_PLAINTEXT=1`) is explicitly set in the environment.
+is explicitly set in the environment.

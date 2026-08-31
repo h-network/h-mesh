@@ -28,7 +28,7 @@ def _plaintext_allowed() -> bool:
     by design and the port mapping that decides publication is invisible from
     here. The entrypoint judges it and sets this.
     """
-    return os.getenv("H_MESH_ALLOW_PLAINTEXT") == "1" or os.getenv("FLOCK_ALLOW_PLAINTEXT") == "1"
+    return os.getenv("H_MESH_ALLOW_PLAINTEXT") == "1"
 
 
 def _is_loopback(bind: str) -> bool:
