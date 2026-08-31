@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import shutil
 import sys
@@ -325,6 +326,56 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             ian_workdir = os.path.join(custom_workdir, "ian")
             self.assertTrue(os.path.isdir(ian_workdir))
             self.assertTrue(os.path.isfile(os.path.join(ian_workdir, "AGENTS.md")))
+
+    def test_pane_office_send_logs_to_window_log_file(self):
+        from core.windowlog import WindowLogTailer
+
+        state_dir = os.path.join(self.tmpdir, "state")
+        window_log_path = os.path.join(state_dir, "window.log.jsonl")
+
+        with unittest.mock.patch.dict(os.environ, {"H_MESH_STATE_DIR": state_dir}):
+            reconciler = TmuxReconciler(
+                pod=self.pod,
+                tenant=self.tenant,
+                redis_url=self.redis_url,
+                session_name=self.session_name,
+                socket=self.socket,
+            )
+            self.r.hset(self.registry, mapping={"jack": "tmux", "kate": "tmux"})
+            reconciler.reconcile_once(self.r)
+
+            # Send a python send() command into jack's pane
+            cmd = (
+                f"python3 -c 'import os, redis; from core.channels import send; "
+                f"r = redis.Redis.from_url(\"{self.redis_url}\"); "
+                f"os.environ[\"H_MESH_LOG_QUIET\"] = \"1\"; "
+                f"send(r, pod=\"{self.pod}\", tenant=\"{self.tenant}\", source=\"jack\", "
+                f"destination=\"kate\", payload={{\"text\": \"durable sent test\"}})'"
+            )
+            run_tmux("send-keys", "-t", f"{self.session_name}:jack", f"PYTHONPATH={H_APP} {cmd}", "Enter", socket=self.socket)
+
+            # Wait for execution and verify log file was created and written
+            for _ in range(20):
+                if os.path.exists(window_log_path) and os.path.getsize(window_log_path) > 0:
+                    break
+                time.sleep(0.1)
+
+            self.assertTrue(os.path.exists(window_log_path), "window.log.jsonl was not created")
+            content = Path(window_log_path).read_text()
+            self.assertIn('"event":"sent"', content)
+            self.assertIn('"source":"jack"', content)
+            self.assertIn('"destination":"kate"', content)
+
+            # Verify WindowLogTailer polls and mirrors the sent record
+            tailer = WindowLogTailer(self.r, pod=self.pod, tenant=self.tenant, path=window_log_path)
+            mirrored = []
+            with unittest.mock.patch("core.windowlog.mirror", side_effect=lambda line: mirrored.append(json.loads(line))):
+                tailer.poll()
+
+            self.assertEqual(len(mirrored), 1)
+            self.assertEqual(mirrored[0]["event"], "sent")
+            self.assertEqual(mirrored[0]["source"], "jack")
+            self.assertEqual(mirrored[0]["destination"], "kate")
 
 
 if __name__ == "__main__":

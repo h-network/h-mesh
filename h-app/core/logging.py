@@ -149,6 +149,9 @@ def log_record(
     try:
         agent_only = os.environ.get("H_MESH_LOG_FILE_AGENT_ONLY")
         if path and (not agent_only or os.environ.get("AGENT_NAME")):
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(path, "a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
     except Exception:
