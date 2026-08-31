@@ -47,8 +47,8 @@ def main() -> None:
                 r,
                 pod=pod,
                 tenant=tenant,
-                kick=lambda agent, envelope: kicks.append(
-                    (agent, envelope["stream_id"])
+                kick=lambda agent, port_type, envelope: kicks.append(
+                    (agent, port_type, envelope["stream_id"])
                 ),
             )
             if not switch.step(timeout=1):
@@ -61,7 +61,7 @@ def main() -> None:
             raise AssertionError(f"unexpected custody events: {events!r}")
         if any(record.get("stream_id") != stream_id for record in records):
             raise AssertionError("custody records do not share the sent stream_id")
-        if kicks != [("template-recipient", stream_id)]:
+        if kicks != [("template-recipient", "example", stream_id)]:
             raise AssertionError(f"unexpected kick callback: {kicks!r}")
         if len(opened) != 1 or opened[0].get("payload") != payload:
             raise AssertionError(f"template payload did not round-trip: {opened!r}")

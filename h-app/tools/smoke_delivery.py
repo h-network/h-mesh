@@ -65,8 +65,8 @@ def main() -> None:
                 r,
                 pod=pod,
                 tenant=tenant,
-                kick=lambda agent, envelope: kicks.append(
-                    (agent, envelope["stream_id"])
+                kick=lambda agent, port_type, envelope: kicks.append(
+                    (agent, port_type, envelope["stream_id"])
                 ),
             )
             if not switch.step(timeout=1):
@@ -88,7 +88,7 @@ def main() -> None:
             )
         if any(record.get("stream_id") != stream_id for record in records):
             raise AssertionError("custody records do not share the sent stream_id")
-        if kicks != [(recipient, stream_id)]:
+        if kicks != [(recipient, "tmux", stream_id)]:
             raise AssertionError(f"unexpected kick callback: {kicks!r}")
         if len(opened) != 1 or opened[0].get("payload") != payload:
             raise AssertionError(f"payload did not round-trip: {opened!r}")

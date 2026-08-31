@@ -10,7 +10,7 @@ from .envelope import EnvelopeError, advance_hop, header_record_fields, parse_fo
 from .keys import prefix
 from .logging import emit, log_record
 from .queues import admit_ingress
-from .registry import is_member, members
+from .registry import members, port_type
 from .retention import RetentionTrimmer
 from .windowlog import WindowLogTailer
 
@@ -45,7 +45,7 @@ class Switch:
         tenant: str,
         poll_seconds: int = 5,
         ingress_max: int = 300,
-        kick: Callable[[str, dict], None] | None = None,
+        kick: Callable[[str, str | None, dict], None] | None = None,
     ):
         if ingress_max < 1:
             raise ValueError("ingress_max must be positive")
@@ -104,7 +104,7 @@ class Switch:
             limit=self.ingress_max,
         )
 
-    def _kick(self, agent: str, envelope: dict) -> None:
+    def _kick(self, agent: str, port_type_name: str | None, envelope: dict) -> None:
         if self.kick is None:
             _log_observation(
                 "kick_deferred",
@@ -116,7 +116,7 @@ class Switch:
             )
             return
         try:
-            self.kick(agent, envelope)
+            self.kick(agent, port_type_name, envelope)
         except Exception as exc:
             _log_observation(
                 "kick_unknown",
@@ -207,9 +207,14 @@ class Switch:
                 return True
             _emit_observation("forwarded", envelope, count=len(recipients))
             for agent in recipients:
-                self._kick(agent, envelope)
+                # Broadcast enumeration remains membership-only until its own
+                # HGETALL-vs-per-recipient-HGET design is decided.
+                self._kick(agent, None, envelope)
             return True
-        if not is_member(self.r, pod=self.pod, tenant=self.tenant, agent=destination):
+        destination_type = port_type(
+            self.r, pod=self.pod, tenant=self.tenant, agent=destination
+        )
+        if destination_type is None:
             self.r.rpush(prefix(self.pod, self.tenant, sender, "dead"), raw)
             _emit_observation("dead_lettered", envelope, "destination is not in tenant registry")
             return True
@@ -225,7 +230,7 @@ class Switch:
             self._dead_letter_full(sender, destination, raw, envelope, depth)
             return True
         _emit_observation("forwarded", envelope)
-        self._kick(destination, envelope)
+        self._kick(destination, destination_type, envelope)
         return True
 
     def run(

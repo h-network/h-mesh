@@ -26,6 +26,8 @@ class FakeRedis:
     def __init__(self):
         self.lists = defaultdict(deque)
         self.hashes = defaultdict(dict)
+        self.hget_calls = []
+        self.hexists_calls = []
 
     def rpush(self, key, *values):
         self.lists[key].extend(values)
@@ -47,6 +49,7 @@ class FakeRedis:
         return 1
 
     def hget(self, key, field):
+        self.hget_calls.append((key, field))
         return self.hashes[key].get(field)
 
     def hdel(self, key, field):
@@ -56,6 +59,7 @@ class FakeRedis:
         return list(self.hashes[key])
 
     def hexists(self, key, field):
+        self.hexists_calls.append((key, field))
         return field in self.hashes[key]
 
     def eval(self, script, key_count, *args):
@@ -170,9 +174,12 @@ class ChannelTests(unittest.TestCase):
             destination="bob", payload=payload,
         )
         kicks = []
+        hgets_before_step = len(self.redis.hget_calls)
         switch = Switch(
             self.redis, pod=POD, tenant=TENANT,
-            kick=lambda agent, envelope: kicks.append((agent, envelope["stream_id"])),
+            kick=lambda agent, port_type, envelope: kicks.append(
+                (agent, port_type, envelope["stream_id"])
+            ),
         )
         with patch("core.service._emit_observation"), patch("core.service._log_observation"):
             self.assertTrue(switch.step(timeout=0))
@@ -182,13 +189,66 @@ class ChannelTests(unittest.TestCase):
             self.redis, pod=POD, tenant=TENANT, agent="bob",
             openers={"Message": opened.append}, timeout=0, blocking=False,
         )
-        self.assertEqual(kicks, [("bob", stream_id)])
+        self.assertEqual(kicks, [("bob", "tmux", stream_id)])
+        self.assertEqual(
+            self.redis.hget_calls[hgets_before_step:],
+            [(self.registry, "bob")],
+        )
+        self.assertEqual(self.redis.hexists_calls, [])
         self.assertEqual(len(opened), 1)
         self.assertEqual(opened[0]["stream_id"], stream_id)
         self.assertEqual(opened[0]["l2"], {"source": "alice", "destination": "bob"})
         self.assertEqual(opened[0]["payload"], payload)
         self.assertEqual(opened[0]["ttl"], 15)
         self.assertEqual(opened[0]["hops"], 1)
+
+    def test_broadcast_keeps_membership_only_kick_path(self):
+        self.register(alice="tmux", bob="tmux", carol="api")
+        stream_id = send(
+            self.redis, pod=POD, tenant=TENANT, source="alice",
+            destination="all", payload={"text": "broadcast"},
+        )
+        hgets_before_step = len(self.redis.hget_calls)
+        kicks = []
+        switch = Switch(
+            self.redis, pod=POD, tenant=TENANT,
+            kick=lambda agent, port_type, envelope: kicks.append(
+                (agent, port_type, envelope["stream_id"])
+            ),
+        )
+        with patch("core.service._emit_observation"), patch("core.service._log_observation"):
+            self.assertTrue(switch.step(timeout=0))
+        self.assertEqual(
+            kicks,
+            [("bob", None, stream_id), ("carol", None, stream_id)],
+        )
+        self.assertEqual(self.redis.hget_calls[hgets_before_step:], [])
+        self.assertEqual(self.redis.hexists_calls, [])
+
+    def test_unicast_missing_hget_value_dead_letters_without_kick(self):
+        self.register(alice="tmux")
+        stream_id = send(
+            self.redis, pod=POD, tenant=TENANT, source="alice",
+            destination="ghost", payload={"text": "nowhere"},
+        )
+        hgets_before_step = len(self.redis.hget_calls)
+        kicks = []
+        switch = Switch(
+            self.redis, pod=POD, tenant=TENANT,
+            kick=lambda agent, port_type, envelope: kicks.append(
+                (agent, port_type, envelope["stream_id"])
+            ),
+        )
+        with patch("core.service._emit_observation"), patch("core.service._log_observation"):
+            self.assertTrue(switch.step(timeout=0))
+        dead = self.redis.lpop(prefix(POD, TENANT, "alice", "dead"))
+        self.assertEqual(parse(dead)["stream_id"], stream_id)
+        self.assertEqual(kicks, [])
+        self.assertEqual(
+            self.redis.hget_calls[hgets_before_step:],
+            [(self.registry, "ghost")],
+        )
+        self.assertEqual(self.redis.hexists_calls, [])
 
 
 if __name__ == "__main__":

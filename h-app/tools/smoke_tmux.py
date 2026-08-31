@@ -83,12 +83,12 @@ def main() -> None:
             r,
             pod=pod,
             tenant=tenant,
-            kick=lambda agent, envelope: kicked.append(agent),
+            kick=lambda agent, port_type, envelope: kicked.append((agent, port_type)),
         )
         if not switch.step(timeout=1):
             raise AssertionError("switch did not forward the envelope")
 
-        if kicked != [recipient]:
+        if kicked != [(recipient, "tmux")]:
             raise AssertionError(f"unexpected kick: {kicked!r}")
 
         # Register tmux delivery handler with dispatch

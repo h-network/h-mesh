@@ -54,21 +54,21 @@ class CoreAdaptationTests(unittest.TestCase):
 
     def test_switch_invokes_injected_kick(self):
         calls = []
-        switch = Switch(object(), pod="mesh", tenant="office", kick=lambda agent, env: calls.append((agent, env)))
+        switch = Switch(object(), pod="mesh", tenant="office", kick=lambda agent, port_type, env: calls.append((agent, port_type, env)))
         envelope = {"stream_id": "stream", "l2": {"source": "alice"}}
         with patch("core.service._log_observation") as log:
-            switch._kick("bob", envelope)
-        self.assertEqual(calls, [("bob", envelope)])
+            switch._kick("bob", "tmux", envelope)
+        self.assertEqual(calls, [("bob", "tmux", envelope)])
         self.assertEqual(log.call_args.args, ("kick_started",))
 
     def test_switch_records_callback_failure_without_raising(self):
-        def fail(agent, envelope):
+        def fail(agent, port_type, envelope):
             raise RuntimeError("edge unavailable")
 
         switch = Switch(object(), pod="mesh", tenant="office", kick=fail)
         envelope = {"stream_id": "stream", "l2": {"source": "alice"}}
         with patch("core.service._log_observation") as log:
-            switch._kick("bob", envelope)
+            switch._kick("bob", "tmux", envelope)
         self.assertEqual(log.call_args.args, ("kick_unknown",))
         self.assertIn("edge unavailable", log.call_args.kwargs["reason"])
 
@@ -76,7 +76,7 @@ class CoreAdaptationTests(unittest.TestCase):
         switch = Switch(object(), pod="mesh", tenant="office")
         envelope = {"stream_id": "stream", "l2": {"source": "alice"}}
         with patch("core.service._log_observation") as log:
-            switch._kick("bob", envelope)
+            switch._kick("bob", "tmux", envelope)
         self.assertEqual(log.call_args.args, ("kick_deferred",))
         self.assertEqual(log.call_args.kwargs["destination"], "bob")
 

@@ -23,7 +23,7 @@ Everything else is a module that plugs into this.
 | `service.py` | the `Switch` class — BLPOP/forward/kick loop, is what "the switch" is |
 
 The tenant participant hash is the wire-visible `registry` resource. Delivery
-itself remains outside core: pass a `kick(agent, envelope)` callback to
+itself remains outside core: pass a `kick(agent, port_type, envelope)` callback to
 `Switch` when an edge module should be notified after ingress admission. With
 no callback, forwarding still completes and core records `kick_deferred`.
 
