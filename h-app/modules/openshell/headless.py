@@ -1,6 +1,6 @@
 """Per-CLI headless (non-interactive) invocation, for one-shot exec delivery.
 
-Mirrors `flock.tmux.ops.start_agent_command`, which builds the *interactive*
+Mirrors `modules.tmux.ops.start_agent_command`, which builds the *interactive*
 launch argv for a tmux pane, but for a CLI invoked once per delivered
 message inside an OpenShell sandbox via `ExecSandbox` instead of a
 persistent pane. `ExecSandbox` spawns a fresh process and returns on exit —

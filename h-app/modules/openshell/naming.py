@@ -3,8 +3,8 @@
 Both sandbox names and workspace names are capped at 19 characters by the
 real gateway — confirmed directly (`INVALID_ARGUMENT: name exceeds maximum
 length (20 > 19)` for a sandbox, `(24 > 19)` for a workspace), not assumed
-from documentation. Flock agent names allow up to 63
-(`SEGMENT_REGEX` in `src/flock/bus/keys.py`), and a `pod:tenant` pair can
+from documentation. Mesh agent names allow up to 63
+(`SEGMENT_REGEX` in `core/keys.py`), and a `pod:tenant` pair can
 easily exceed 19 too, so anything derived from either needs shortening.
 
 The real (untruncated) name always belongs in a sandbox's `labels`

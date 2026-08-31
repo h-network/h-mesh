@@ -50,7 +50,7 @@ class OpenShellUnavailable(RuntimeError):
     """The gateway could not be reached, or an RPC failed.
 
     Wraps `grpc.RpcError` and `openshell.SandboxError` so callers in
-    `flock.port`/`flock.control` depend on one error type, not on grpc or
+    Mesh port/control code depends on one error type, not on grpc or
     openshell's own exception hierarchy.
     """
 
@@ -182,7 +182,7 @@ class OpenShellClient:
         actually usable yet.
 
         `providers` names OpenShell's own credential-bundle mechanism
-        (`SandboxSpec.providers`) — unrelated to flock's own "provider"
+        (`SandboxSpec.providers`) — unrelated to Mesh's own "provider"
         concept (a model backend selected for tmux agents). See
         docs/NAMING-openshell.md for the collision.
 
@@ -314,7 +314,7 @@ class OpenShellClient:
     def stop_sandbox(self, name: str) -> SandboxRef:
         """Stop a sandbox without deleting it — its filesystem survives a
         later `start_sandbox`, unlike `delete_sandbox`. Real lifecycle
-        counterpart for `PauseAgent` (`flock.control`), which currently has
+        counterpart for `PauseAgent` (Mesh control), which currently has
         no openshell-side implementation.
         """
         try:
@@ -426,7 +426,7 @@ class OpenShellClient:
     # -- Provider CRUD ------------------------------------------------------
     # This is OpenShell's own "provider" (named credential bundle) concept
     # (see docs/NAMING-openshell.md) — always call it "openshell provider"
-    # in code/docs to avoid colliding with flock's unrelated model-backend
+    # in code/docs to avoid colliding with Mesh's unrelated model-backend
     # "provider". `create_sandbox`'s `providers` parameter only *references*
     # a provider that must already exist; these methods are what actually
     # define/manage one.

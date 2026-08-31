@@ -15,6 +15,6 @@ The continuously running entrypoint is `h-app/services/api.py`. Uvicorn owns
 the server loop. The SSE generators are connection-lived polling responses,
 not independent daemons.
 
-The external route contract intentionally matches h-flock so Telegram and web
-clients remain ordinary API consumers. Internally it uses h-mesh names:
+The external route contract intentionally preserves the predecessor's API so
+Telegram and web clients remain ordinary API consumers. Internally it uses h-mesh names:
 `core.channels`, `core.envelope`, `core.keys`, and `core.registry`.
