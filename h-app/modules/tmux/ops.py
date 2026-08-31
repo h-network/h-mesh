@@ -194,7 +194,7 @@ def ensure_claude_project_trusted(cwd: str, profile: str | None = None) -> None:
     picker and sat on it, unreachable, while presence read `idle`.
     """
     try:
-        home_dir = os.environ.get("HOME", "/home/ubuntu")
+        home_dir = os.environ.get("HOME", os.path.expanduser("~"))
         if profile:
             config_path = os.path.join(home_dir, f".claude-{profile}", ".claude.json")
             os.makedirs(os.path.dirname(config_path), exist_ok=True)
@@ -231,7 +231,7 @@ def ensure_claude_project_trusted(cwd: str, profile: str | None = None) -> None:
 def ensure_codex_project_trusted(cwd: str, profile: str | None = None) -> None:
     """Same as the Claude one: CODEX_HOME moves with the profile."""
     try:
-        home_dir = os.environ.get("HOME", "/home/ubuntu")
+        home_dir = os.environ.get("HOME", os.path.expanduser("~"))
         codex_dir = os.path.join(home_dir, f".codex-{profile}" if profile else ".codex")
         os.makedirs(codex_dir, exist_ok=True)
         config_path = os.path.join(codex_dir, "config.toml")
@@ -265,7 +265,7 @@ def ensure_codex_project_trusted(cwd: str, profile: str | None = None) -> None:
 
 def ensure_agy_project_trusted(cwd: str) -> None:
     try:
-        home_dir = os.environ.get("HOME", "/home/ubuntu")
+        home_dir = os.environ.get("HOME", os.path.expanduser("~"))
         agy_dir = os.path.join(home_dir, ".gemini", "antigravity-cli")
         os.makedirs(agy_dir, exist_ok=True)
         config_path = os.path.join(agy_dir, "settings.json")
@@ -322,9 +322,10 @@ def window_env(
         f"AGENT_GUIDE={guide_path}",
     ]
     if profile:
+        home_dir = os.environ.get("HOME", os.path.expanduser("~"))
         env_vars.extend([
-            f"CLAUDE_CONFIG_DIR=/home/ubuntu/.claude-{profile}",
-            f"CODEX_HOME=/home/ubuntu/.codex-{profile}",
+            f"CLAUDE_CONFIG_DIR={home_dir}/.claude-{profile}",
+            f"CODEX_HOME={home_dir}/.codex-{profile}",
         ])
 
     # ⚠ PER WINDOW, KEYED TO THE PROFILE — never one token for the tenant.
@@ -344,16 +345,16 @@ def window_env(
     if token:
         env_vars.append(f"CLAUDE_CODE_OAUTH_TOKEN={token}")
 
-    # ⚠ Both are `startAgent`'s own knobs (base image, not h-mesh's), threaded
+    # ⚠ Both are `h-agent`'s own knobs (base image, not h-mesh's), threaded
     # through per window rather than left tenant-wide. Absent is not the same
-    # as off/empty for either: `startAgent` reads `AGENT_SKIP_PERMISSIONS`
+    # as off/empty for either: `h-agent` reads `AGENT_SKIP_PERMISSIONS`
     # with a default of `1` and `AGENT_CLAUDE_TOOLS` with bash's `${VAR-default}`
     # (unset only), so leaving the variable out entirely is what preserves its
     # own default rather than this layer silently re-deciding it.
     if skip_permissions is not None:
         env_vars.append(f"AGENT_SKIP_PERMISSIONS={'1' if skip_permissions else '0'}")
     # ⚠ `""` is a real, distinct value here — "no restriction" — not "unset".
-    # `startAgent` only falls back to its limited default when the variable is
+    # `h-agent` only falls back to its limited default when the variable is
     # completely absent, so a hire that asked for the full tool set must set
     # the variable to empty, never omit it.
     if claude_tools is not None:
@@ -363,22 +364,23 @@ def window_env(
     # like any other — same window, same paste, same activity file.
     #
     # ⚠ It uses NO account credential. The watchdog's credential check does not
-    # apply to it, and a missing login is not a fault for this agent
-    # (LLD-watchdog). Do not seed it a profile expecting one.
+    # apply to it, and a missing login is not a fault for this agent.
+    # Do not seed it a profile expecting one.
     if provider:
-        # ⚠ STATE THE INTENT; THE BASE IMAGE TRANSLATES IT. `startAgent` turns
+        # ⚠ STATE THE INTENT; THE BASE IMAGE TRANSLATES IT. `h-agent` turns
         # these into the CLI's own variables, and it knows things h-mesh should
         # not have to: that claude wants the URL WITHOUT `/v1` because it appends
         # `/v1/messages` itself, that all three model tiers must carry the same
         # id or the others fall back to vendor names the local server does not
         # serve, and that inherited `ANTHROPIC_*` must be stripped first.
         #
-        # ⚠ **AND IT REFUSES WHAT IT CANNOT DO.** `startAgent codex` and
-        # `startAgent agy` with these set exit 3 instead of starting. h-mesh
-        # built `ANTHROPIC_*` by hand until 2026-08-23, which meant a codex agent
-        # carrying a provider ran against the VENDOR while `setup.sh` printed
-        # `(local)` beside its name — cost and privacy both differing from what
-        # the operator was told, silently. Delegating buys that refusal.
+        # ⚠ **AND IT REFUSES WHAT IT CANNOT DO.** `h-agent codex` and
+        # `h-agent agy` with these set exit 3 instead of starting, rather than
+        # silently falling back to the vendor: a codex/agy agent that thinks
+        # it's on a local provider but is actually billing and talking to the
+        # vendor is a cost and privacy difference the operator was never told
+        # about. Delegating to h-agent buys that refusal instead of building
+        # a second, separate local-provider translation here.
         url = (provider.get("url") or "").rstrip("/")
         if url:
             env_vars.append(f"AGENT_PROVIDER_URL={url}")
@@ -399,7 +401,7 @@ def has_session_history(
     home_root: str | Path | None = None,
 ) -> bool:
     """Return True if prior session history exists for the given agent/CLI/profile."""
-    home = Path(home_root) if home_root is not None else Path(os.environ.get("HOME", "/home/ubuntu"))
+    home = Path(home_root) if home_root is not None else Path(os.environ.get("HOME", os.path.expanduser("~")))
     suffix = f"-{profile}" if profile else ""
     cwd = f"/workdir/{agent}"
 
@@ -464,18 +466,18 @@ def start_agent_command(
     cli: str,
     resume: bool = False,
 ) -> list[str]:
-    """Construct the startAgent argv list for the given CLI and resume mode."""
+    """Construct the h-agent argv list for the given CLI and resume mode."""
     if not resume:
-        return ["startAgent", cli]
+        return ["h-agent", cli]
 
     if cli == "claude":
-        return ["startAgent", "claude", "--resume"]
+        return ["h-agent", "claude", "--resume"]
     elif cli == "codex":
-        return ["startAgent", "codex", "resume", "--last"]
+        return ["h-agent", "codex", "resume", "--last"]
     elif cli == "agy":
-        return ["startAgent", "agy", "--continue"]
+        return ["h-agent", "agy", "--continue"]
     else:
-        return ["startAgent", cli, "--resume"]
+        return ["h-agent", cli, "--resume"]
 
 
 def _seed_profile_dirs(profile: str | None) -> None:
