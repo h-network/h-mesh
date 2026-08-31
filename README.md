@@ -27,8 +27,10 @@ provides these process entry points:
 
 - `h-mesh-switch` — the core switch daemon
 - `h-mesh-api` — the REST API daemon
+- `h-mesh-session` — the tmux control-mode session daemon
 - `h-mesh-tmux-reconciler` — the tmux registry reconciler daemon
 - `h-mesh-tmux-port AGENT` — direct tmux delivery-port invocation
+- `office` — the operator CLI (`cloneToAll` is also installed for compatibility)
 
 Each process reads its deployment configuration from environment variables;
 the module READMEs document the required variables and external services.

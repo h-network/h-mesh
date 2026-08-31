@@ -33,15 +33,22 @@ jobs:
 
           import core.service
           import modules.api
+          import modules.office.cli
+          import modules.office.port
+          import modules.session.app
           import modules.tmux.port
           import services.api
+          import services.session
           import services.tmux_reconciler
 
           expected = {
               "h-mesh-api",
+              "h-mesh-session",
               "h-mesh-switch",
               "h-mesh-tmux-port",
               "h-mesh-tmux-reconciler",
+              "office",
+              "cloneToAll",
           }
           scripts = {
               entry.name: entry
@@ -91,3 +98,5 @@ jobs:
           POD: ci-tmux
           TENANT: ci-tmux
         run: python3 h-app/tools/smoke_tmux.py
+      - name: Session smoke test (isolated tmux)
+        run: python3 h-app/tools/smoke_session.py

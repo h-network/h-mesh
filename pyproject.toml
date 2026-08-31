@@ -16,9 +16,12 @@ dependencies = [
 
 [project.scripts]
 h-mesh-api = "services.api:main"
+h-mesh-session = "services.session:main"
 h-mesh-switch = "core.service:main"
 h-mesh-tmux-port = "modules.tmux.port:main"
 h-mesh-tmux-reconciler = "services.tmux_reconciler:main"
+office = "modules.office.cli:main"
+cloneToAll = "modules.office.cli:clone_to_all_entrypoint"
 
 [tool.setuptools]
 package-dir = {"" = "h-app"}
