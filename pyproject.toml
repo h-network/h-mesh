@@ -21,6 +21,7 @@ dependencies = [
 test = ["pytest>=8,<9"]
 
 [project.scripts]
+h-mesh = "modules.office.dispatcher:main"
 h-mesh-api = "services.api:main"
 h-mesh-openshell-port = "modules.openshell.port:main"
 h-mesh-session = "services.session:main"
