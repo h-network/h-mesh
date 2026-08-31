@@ -33,13 +33,9 @@ def __getattr__(name: str):
     """Load delivery code only when its public attribute is requested."""
     if name not in _DELIVERY_EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    if name == "deliver_tmux":
-        from .deliver import deliver_tmux
+    from . import port
 
-        return deliver_tmux
-    from . import handlers
-
-    return getattr(handlers, name)
+    return getattr(port, name)
 
 
 __all__ = [

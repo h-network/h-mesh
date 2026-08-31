@@ -10,8 +10,7 @@ same as every module owning its own daemon logic.
 | file | what it holds |
 |---|---|
 | `ops.py` | passive tmux mechanics: `run_tmux`, `create_window`, `kill_window`, `submit_text`, session-history detection, CLI trust/guide seeding |
-| `handlers.py` | terminal delivery handlers (`messages_opener`, `command_opener`, `attachment_opener`), delivery-verification marking |
-| `deliver.py` | `deliver_tmux` -- drains a tmux agent's ingress and dispatches each envelope to the right handler by kind |
+| `port.py` | `deliver_tmux` entrypoint and terminal delivery handlers (`message_opener`, `command_opener`, `attachment_opener`), delivery-verification marking |
 | `reconciler.py` | `TmuxReconciler` -- the daemon logic: compares desired tmux membership against real windows, creates/removes them |
 
 ⚠ `require_isolated_tmux()` in `ops.py` refuses to touch the ambient tmux

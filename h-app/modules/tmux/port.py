@@ -1,16 +1,13 @@
-import base64
+"""Tmux port: terminal delivery handlers and ingress dispatch."""
+
 import os
 from datetime import datetime, timezone
 
-from core.channels import DeadLetter
+from core.channels import DeadLetter, receive
 from core.keys import prefix
 from core.registry import port_type
-from lib.attachment_schema import (
-    ATTACHMENT_MAX_BASE64_CHARS,
-    ATTACHMENT_MAX_BYTES,
-    BASE64_CHARS_REGEX,
-    MIME_TYPE_REGEX,
-)
+from lib.attachment_schema import validate_attachment_payload
+from lib.board_interaction import add_ticket
 from .ops import list_windows, submit_text
 
 # The CLIs that write a session file the switch can tail. An agent running
@@ -83,53 +80,6 @@ def mark_delivery_pending(
         pass
 
 
-def messages_opener(
-    r,
-    pod: str,
-    tenant: str,
-    agent: str,
-    envelopes: list[dict],
-    session_name: str,
-    socket: str | None = None,
-) -> None:
-    if not envelopes:
-        return
-
-    windows = list_windows(session_name, socket=socket)
-    if agent not in windows:
-        raise DeadLetter("window_missing")
-
-    blocks = []
-    for envelope in envelopes:
-        source = envelope.get("l2", {}).get("source", "unknown")
-        payload = envelope.get("payload", {})
-        text = payload.get("text", "") if isinstance(payload, dict) else str(payload)
-        blocks.append(f"[message from {source}] {text}\n")
-        try:
-            pt = port_type(r, pod=pod, tenant=tenant, agent=source)
-        except Exception:
-            pt = None
-        if pt == "api":
-            blocks.append(f"[reply to {source}]\n")
-
-    combined_msg = "".join(blocks)
-
-    # ⚠ Mark BEFORE pasting. The CLI records its input the instant the text is
-    # submitted, so a marker written afterwards can carry a later timestamp than
-    # the very event meant to confirm it — a sub-second race the comparison then
-    # loses. Measured: six deliveries all landed and five read unverified.
-    #
-    # Marking first costs nothing if the paste fails: the delivery genuinely did
-    # not happen, and unverified is the right answer.
-    for envelope in envelopes:
-        stream_id = envelope.get("stream_id", "")
-        corr_id = envelope.get("correlation_id")
-        mark_delivery_pending(r, pod, tenant, agent, stream_id, correlation_id=corr_id)
-
-    primary_stream_id = envelopes[0].get("stream_id", "")
-    submit_text(session_name, agent, combined_msg, stream_id=primary_stream_id, socket=socket)
-
-
 def message_opener(
     r,
     pod: str,
@@ -139,15 +89,47 @@ def message_opener(
     session_name: str,
     socket: str | None = None,
 ) -> None:
-    messages_opener(
-        r=r,
-        pod=pod,
-        tenant=tenant,
-        agent=agent,
-        envelopes=[envelope],
-        session_name=session_name,
-        socket=socket,
-    )
+    windows = list_windows(session_name, socket=socket)
+    if agent not in windows:
+        raise DeadLetter("window_missing")
+
+    source = envelope.get("l2", {}).get("source", "unknown")
+    payload = envelope.get("payload", {})
+    text = payload.get("text", "") if isinstance(payload, dict) else str(payload)
+    blocks = [f"[message from {source}] {text}\n"]
+    try:
+        pt = port_type(r, pod=pod, tenant=tenant, agent=source)
+    except Exception:
+        pt = None
+    if pt == "api":
+        blocks.append(f"[reply to {source}]\n")
+
+    msg = "".join(blocks)
+    stream_id = envelope.get("stream_id", "")
+    corr_id = envelope.get("correlation_id")
+    mark_delivery_pending(r, pod, tenant, agent, stream_id, correlation_id=corr_id)
+    submit_text(session_name, agent, msg, stream_id=stream_id, socket=socket)
+
+
+def messages_opener(
+    r,
+    pod: str,
+    tenant: str,
+    agent: str,
+    envelopes: list[dict],
+    session_name: str,
+    socket: str | None = None,
+) -> None:
+    for envelope in envelopes:
+        message_opener(
+            r=r,
+            pod=pod,
+            tenant=tenant,
+            agent=agent,
+            envelope=envelope,
+            session_name=session_name,
+            socket=socket,
+        )
 
 
 def command_opener(
@@ -168,15 +150,8 @@ def command_opener(
     if agent not in windows:
         raise DeadLetter("window_missing")
 
-    text = payload.get("text", "")
+    text = payload.get("text", "") if isinstance(payload, dict) else str(payload)
     formatted_msg = f"{text}\n"
-    # ⚠ Mark BEFORE pasting. The CLI records its input the instant the text is
-    # submitted, so a marker written afterwards can carry a later timestamp than
-    # the very event meant to confirm it — a sub-second race the comparison then
-    # loses. Measured: six deliveries all landed and five read unverified.
-    #
-    # Marking first costs nothing if the paste fails: the delivery genuinely did
-    # not happen, and unverified is the right answer.
     mark_delivery_pending(r, pod, tenant, agent, stream_id, correlation_id=corr_id)
     submit_text(session_name, agent, formatted_msg, stream_id=stream_id, socket=socket)
 
@@ -202,77 +177,7 @@ def attachment_opener(
     source = envelope.get("l2", {}).get("source", "unknown")
 
     payload = envelope.get("payload")
-    if not isinstance(payload, dict):
-        raise DeadLetter("attachment payload must be a dict")
-
-    required_keys = {"filename", "mime_type", "content_base64"}
-    allowed_keys = {"filename", "mime_type", "content_base64", "caption"}
-
-    if not required_keys.issubset(payload.keys()):
-        raise DeadLetter("missing required attachment payload fields")
-    if not set(payload.keys()).issubset(allowed_keys):
-        raise DeadLetter("unexpected attachment payload fields")
-
-    filename = payload["filename"]
-    mime_type = payload["mime_type"]
-    content_base64 = payload["content_base64"]
-    caption = payload.get("caption")
-
-    if not isinstance(filename, str) or not isinstance(mime_type, str) or not isinstance(content_base64, str):
-        raise DeadLetter("invalid attachment payload field types")
-    if caption is not None and not isinstance(caption, str):
-        raise DeadLetter("caption must be a string if present")
-
-    # Validate filename: non-empty UTF-8 basename of at most 255 UTF-8 bytes.
-    # May not be '.' or '..', contain '/', '\\', NUL, ASCII controls (< 32), or U+007F.
-    try:
-        filename_bytes = filename.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise DeadLetter(f"filename utf-8 encoding error: {exc}") from exc
-    if not (1 <= len(filename_bytes) <= 255):
-        raise DeadLetter("filename length must be between 1 and 255 UTF-8 bytes")
-    if filename in {".", ".."}:
-        raise DeadLetter("filename cannot be '.' or '..'")
-    if "/" in filename or "\\" in filename:
-        raise DeadLetter("filename cannot contain path separators")
-    if any(ord(c) < 32 or ord(c) == 127 for c in filename):
-        raise DeadLetter("filename cannot contain ASCII control characters or DEL")
-
-    # Validate mime_type: at most 255 ASCII bytes and matches ^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*$
-    try:
-        mime_bytes = mime_type.encode("ascii")
-    except UnicodeEncodeError as exc:
-        raise DeadLetter(f"mime_type must be ASCII: {exc}") from exc
-    if not (1 <= len(mime_bytes) <= 255):
-        raise DeadLetter("mime_type length must be between 1 and 255 ASCII bytes")
-    if not MIME_TYPE_REGEX.match(mime_type):
-        raise DeadLetter(f"invalid mime_type format: {mime_type!r}")
-
-    # Validate caption: at most 65,536 UTF-8 bytes
-    if caption is not None:
-        try:
-            caption_bytes = caption.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise DeadLetter(f"caption utf-8 encoding error: {exc}") from exc
-        if len(caption_bytes) > 65536:
-            raise DeadLetter("caption exceeds 65536 UTF-8 bytes")
-
-    # Validate content_base64:
-    # RFC 4648 standard base64 with padding, decoded with strict alphabet validation.
-    # URL-safe base64 and whitespace are rejected.
-    if len(content_base64) > ATTACHMENT_MAX_BASE64_CHARS:
-        raise DeadLetter("content_base64 exceeds maximum allowed base64 length")
-    if len(content_base64) % 4 != 0:
-        raise DeadLetter("content_base64 length must be a multiple of 4")
-    if not BASE64_CHARS_REGEX.match(content_base64):
-        raise DeadLetter("content_base64 contains invalid characters or malformed padding")
-    try:
-        decoded_bytes = base64.b64decode(content_base64, validate=True)
-    except Exception as exc:
-        raise DeadLetter(f"content_base64 decode failed: {exc}") from exc
-
-    if len(decoded_bytes) > ATTACHMENT_MAX_BYTES:
-        raise DeadLetter(f"decoded attachment exceeds maximum size of {ATTACHMENT_MAX_BYTES} bytes")
+    validated = validate_attachment_payload(payload)
 
     # Check recipient tmux window exists
     windows = list_windows(session_name, socket=socket)
@@ -286,12 +191,12 @@ def attachment_opener(
     except Exception as exc:
         raise DeadLetter(f"failed to create attachment directory: {exc}") from exc
 
-    final_path = os.path.join(target_dir, filename)
+    final_path = os.path.join(target_dir, validated.filename)
     temp_path = os.path.join(target_dir, f".tmp.{os.urandom(8).hex()}")
 
     try:
         with open(temp_path, "wb") as f:
-            f.write(decoded_bytes)
+            f.write(validated.data)
             f.flush()
             os.fsync(f.fileno())
         os.replace(temp_path, final_path)
@@ -307,8 +212,71 @@ def attachment_opener(
     mark_delivery_pending(r, pod, tenant, agent, stream_id, correlation_id=corr_id)
 
     # Paste notice into window
-    notice = f"[attachment from {source}] saved to {final_path} ({mime_type}, {len(decoded_bytes)} bytes)\n"
-    if caption:
-        notice += f"[attachment caption] {caption}\n"
+    notice = f"[attachment from {source}] saved to {final_path} ({validated.mime_type}, {len(validated.data)} bytes)\n"
+    if validated.caption:
+        notice += f"[attachment caption] {validated.caption}\n"
 
     submit_text(session_name, agent, notice, stream_id=stream_id, socket=socket)
+
+
+def deliver_tmux(
+    r,
+    pod: str,
+    tenant: str,
+    agent: str,
+    session_name: str | None = None,
+    socket: str | None = None,
+    timeout: int = 0,
+    blocking: bool = False,
+    **kwargs,
+) -> None:
+    session_name = session_name or os.environ.get("TMUX_SESSION") or tenant
+    socket = socket or os.environ.get("TMUX_SOCKET")
+
+    openers = {
+        "Message": lambda env: message_opener(
+            r=r,
+            pod=pod,
+            tenant=tenant,
+            agent=agent,
+            envelope=env,
+            session_name=session_name,
+            socket=socket,
+        ),
+        "Command": lambda env: command_opener(
+            r=r,
+            pod=pod,
+            tenant=tenant,
+            agent=agent,
+            envelope=env,
+            session_name=session_name,
+            socket=socket,
+        ),
+        "AddTicket": lambda env: add_ticket(
+            r=r,
+            pod=pod,
+            tenant=tenant,
+            agent=agent,
+            envelope=env,
+        ),
+        "Attachment": lambda env: attachment_opener(
+            r=r,
+            pod=pod,
+            tenant=tenant,
+            agent=agent,
+            envelope=env,
+            session_name=session_name,
+            socket=socket,
+        ),
+    }
+
+    receive(
+        r,
+        pod=pod,
+        tenant=tenant,
+        agent=agent,
+        openers=openers,
+        timeout=timeout,
+        blocking=blocking,
+        module="tmux",
+    )
