@@ -478,13 +478,13 @@ def start_agent_command(
         return ["h-agent", cli]
 
     if cli == "claude":
-        return ["h-agent", "claude", "--resume"]
+        return ["h-agent", "claude", "--continue"]
     elif cli == "codex":
         return ["h-agent", "codex", "resume", "--last"]
     elif cli == "agy":
         return ["h-agent", "agy", "--continue"]
     else:
-        return ["h-agent", cli, "--resume"]
+        return ["h-agent", cli, "--continue"]
 
 
 def _seed_profile_dirs(profile: str | None) -> None:
