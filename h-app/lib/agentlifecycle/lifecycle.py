@@ -405,9 +405,18 @@ def stop_agent(
         committed, "registry row removed", "registry row removal",
         lambda: r.hdel(registry_key, agent),
     )
-    # TODO: purging an agent's other per-agent state on stop needs to be
-    # implemented. Deferred -- not needed to move forward, no other code
-    # depends on it.
+    # Per-agent delivery state belongs to this lifecycle instance, not to the
+    # reusable name. Purge it after removing registry visibility so a later
+    # hire cannot inherit a paused marker or messages addressed to the retired
+    # instance.
+    _write_desired(
+        committed, "ingress queue cleared", "ingress queue clear",
+        lambda: r.delete(prefix(pod, tenant, agent=agent, resource="ingress")),
+    )
+    _write_desired(
+        committed, "paused marker cleared", "paused marker clear",
+        lambda: r.delete(prefix(pod, tenant, agent=agent, resource="paused")),
+    )
     _write_desired(
         committed, "delivery lock cleared", "delivery lock clear",
         lambda: r.hdel(prefix(pod, tenant, resource="delivering"), agent),

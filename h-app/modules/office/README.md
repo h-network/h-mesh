@@ -25,7 +25,6 @@ the lifecycle payload, where the existing StartAgent validation applies.
 local session history; use `hire --resume` to restore that history explicitly.
 
 The receiving port delegates to the settled `lib.agentlifecycle` API.
-`lib/agentlifecycle/lifecycle.py`'s own `stop_agent` has an open
-`# TODO: purging an agent's other per-agent state on stop needs to be
-implemented`; until that lands, letGo followed by re-hire can inherit stale
-per-agent state. The port deliberately does not redesign lifecycle policy.
+`stop_agent` removes the retired instance's ingress queue and paused marker as
+well as its registry membership and delivery lock, so a later hire that reuses
+the name cannot inherit queued messages or paused state.
