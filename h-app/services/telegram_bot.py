@@ -18,9 +18,9 @@ from clients.telegram.bot import (
 
 
 def main() -> None:
-    api_url = os.environ.get("H_MESH_API_URL", os.environ.get("FLOCK_API_URL", "http://127.0.0.1:8080"))
-    api_token = os.environ.get("H_MESH_API_TOKEN", os.environ.get("FLOCK_API_TOKEN", os.environ.get("API_TOKEN", "")))
-    session_url = os.environ.get("H_MESH_SESSION_URL", os.environ.get("FLOCK_SESSION_URL", ""))
+    api_url = os.environ.get("H_MESH_API_URL", "http://127.0.0.1:8080")
+    api_token = os.environ.get("H_MESH_API_TOKEN", os.environ.get("API_TOKEN", ""))
+    session_url = os.environ.get("H_MESH_SESSION_URL", "")
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     target_agent = os.environ.get("TELEGRAM_TARGET_AGENT", "architect")

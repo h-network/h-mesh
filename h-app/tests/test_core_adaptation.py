@@ -71,6 +71,8 @@ class CoreAdaptationTests(unittest.TestCase):
         self.assertIn("H_MESH_API_URL", tg_bot)
         self.assertIn("H_MESH_SESSION_URL", tg_bot)
         self.assertIn("H_MESH_API_TOKEN", tg_bot)
+        self.assertNotIn("FLOCK_", tg_bot)
+        self.assertNotIn("FlockClient", tg_bot)
 
         # 2. Web console server
         web_server = (H_APP / "clients" / "web" / "server.py").read_text(encoding="utf-8")
@@ -79,11 +81,15 @@ class CoreAdaptationTests(unittest.TestCase):
         self.assertIn("H_MESH_SECRET", web_server)
         self.assertIn("H_MESH_API", web_server)
         self.assertIn("H_MESH_SESSION", web_server)
+        self.assertNotIn("HFLOCK_", web_server)
+        self.assertNotIn("hflock_session", web_server)
 
         # 3. Services launchers
         svc_tg = (H_APP / "services" / "telegram_bot.py").read_text(encoding="utf-8")
         self.assertIn("MeshClient", svc_tg)
         self.assertIn("H_MESH_API_URL", svc_tg)
+        self.assertNotIn("FLOCK_", svc_tg)
+        self.assertNotIn("FlockClient", svc_tg)
 
     def test_registry_uses_registry_wire_resource(self):
         client = RegistryRedis()
