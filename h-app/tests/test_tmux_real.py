@@ -216,6 +216,66 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         for i in range(3):
             self.assertIn(f"[message from dave] burst message #{i+1}", stdout)
 
+    def test_real_tmux_module_subprocess_invocation(self):
+        import signal
+        import subprocess
+
+        reconciler = TmuxReconciler(
+            pod=self.pod,
+            tenant=self.tenant,
+            redis_url=self.redis_url,
+            session_name=self.session_name,
+            socket=self.socket,
+        )
+        self.r.hset(self.registry, mapping={"frank": "tmux", "grace": "tmux"})
+        reconciler.reconcile_once(self.r)
+
+        sid = send(
+            self.r,
+            pod=self.pod,
+            tenant=self.tenant,
+            source="frank",
+            destination="grace",
+            payload={"text": "invoked via python -m modules.tmux.port"},
+        )
+        raw = self.r.lpop(prefix(self.pod, self.tenant, "frank", "egress"))
+        self.r.rpush(prefix(self.pod, self.tenant, "grace", "ingress"), raw)
+
+        # Set up environment for subprocess
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(H_APP)
+        env["POD"] = self.pod
+        env["TENANT"] = self.tenant
+        env["REDIS_URL"] = self.redis_url
+        env["TMUX_SESSION"] = self.session_name
+        env["TMUX_SOCKET"] = self.socket
+
+        # Simulate parent having SIGCHLD = SIG_IGN
+        old_handler = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        try:
+            res = subprocess.run(
+                [sys.executable, "-m", "modules.tmux.port", "grace"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            signal.signal(signal.SIGCHLD, old_handler)
+
+        self.assertEqual(res.returncode, 0, f"port main failed: {res.stderr}")
+
+        # Ingress drained
+        self.assertIsNone(self.r.lpop(prefix(self.pod, self.tenant, "grace", "ingress")))
+
+        # Check pane output
+        code, stdout, stderr = run_tmux("capture-pane", "-J", "-p", "-t", f"{self.session_name}:grace", socket=self.socket)
+        self.assertEqual(code, 0)
+        self.assertIn("[message from frank] invoked via python -m modules.tmux.port", stdout)
+
+        # Delivering lock released
+        delivering_key = prefix(self.pod, self.tenant, resource="delivering")
+        self.assertIsNone(self.r.hget(delivering_key, "grace"))
+
 
 if __name__ == "__main__":
     unittest.main()
