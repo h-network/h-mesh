@@ -182,17 +182,19 @@ def test_hire_default_payload_has_no_optional_fields(mock_send, monkeypatch):
 
 
 @patch("modules.office.cli.send")
-def test_hire_carries_resume_permissions_and_tools(mock_send, monkeypatch):
+def test_hire_carries_profile_provider_resume_permissions_and_tools(mock_send, monkeypatch):
     _env(monkeypatch)
     mock_send.return_value = "stream-1"
     r = FakeRedis()
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
         office_main([
             "hire", "worker-1", "--cli", "claude", "--profile", "work",
-            "--resume", "--skip-permissions", "--claude-tools", "",
+            "--provider", "anthropic", "--resume", "--skip-permissions",
+            "--claude-tools", "",
         ])
     payload = mock_send.call_args[1]["payload"]
     assert payload["profile"] == "work"
+    assert payload["provider"] == "anthropic"
     assert payload["resume"] is True
     assert payload["skip_permissions"] is True
     assert payload["claude_tools"] == ""
