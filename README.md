@@ -18,8 +18,17 @@ h-mesh is installed from the repository root. An editable install is useful for
 development; a regular install uses the same package metadata for production:
 
 ```bash
-python -m pip install -e .
+python -m venv .venv
+.venv/bin/python -m pip install -e .
 ```
+
+Contributors running the test suite should install the test extra with
+`.venv/bin/python -m pip install -e '.[test]'`.
+
+Use an isolated environment when developing or validating an install. In
+particular, do not install h-mesh into an environment that provides h-flock's
+live commands; keeping their prefixes separate prevents either application
+from replacing the other's executables.
 
 The install makes the top-level `core`, `lib`, `modules`, and `services`
 packages importable independently of the current working directory. It also
@@ -30,6 +39,7 @@ provides these process entry points:
 - `h-mesh-openshell-port AGENT` — direct OpenShell delivery-port invocation
 - `h-mesh-session` — the tmux control-mode session daemon
 - `h-mesh-tmux-reconciler` — the tmux registry reconciler daemon
+- `h-mesh-watchdog` — the delivery and presence watchdog daemon
 - `h-mesh-tmux-port AGENT` — direct tmux delivery-port invocation
 - `h-mesh-office` — the operator CLI
 - `h-mesh-clone-to-all` — the standalone clone-to-all compatibility command
