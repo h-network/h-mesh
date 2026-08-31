@@ -23,15 +23,15 @@ A Telegram bot client that talks to an **h-mesh** tenant over HTTP, allowing a u
 
 | Variable | Default | Description |
 |---|---|---|
-| `H_MESH_API_URL` (or `FLOCK_API_URL`) | `http://localhost:8080` | Base URL of the h-mesh REST API service |
-| `H_MESH_API_TOKEN` (or `FLOCK_API_TOKEN`) | *required* | Bearer API token for authentication |
+| `H_MESH_API_URL` | `http://localhost:8080` | Base URL of the h-mesh REST API service |
+| `H_MESH_API_TOKEN` | *required* | Bearer API token for authentication |
 | `TELEGRAM_BOT_TOKEN` | *optional* | Telegram Bot API token (from @BotFather) |
 | `H_MESH_CURSOR_FILE` (or `CURSOR_FILE`) | `~/.h-mesh/telegram.cursor.json` | Path to store `ReplyPusher`'s mailbox cursor |
 | `TELEGRAM_CHAT_ID` | *optional* | Fixed chat for `--prompt`/`--status` one-shots, live alert push (§2b), **and the only chat the bot will respond to** — no reply, no push, no menu action for anyone else |
 | `ALERTS_CURSOR_FILE` | derived from `CURSOR_FILE` | Path to store the alerts-stream cursor, kept separate from the mailbox cursor |
 | `NO_ALERT_PUSH` | unset | Set to `1` to disable live alert push even when `TELEGRAM_CHAT_ID` is set |
 | `NO_ACTIVITY_PUSH` | unset | Set to `1` to disable live-updating progress messages while agents execute tools |
-| `H_MESH_SESSION_URL` (or `FLOCK_SESSION_URL`) | derived from `H_MESH_API_URL` (`:8081`) | Base WebSocket URL for the Session door, used by `/watch` (§2d) |
+| `H_MESH_SESSION_URL` | derived from `H_MESH_API_URL` (`:8081`) | Base WebSocket URL for the Session door, used by `/watch` (§2d) |
 | `TELEGRAM_VOICE` | `0` | Set to `1` to enable the spoken TTS voice replies feature in this tenant |
 | `TTS_VOICE` | `en-GB-RyanNeural` | Default Microsoft neural TTS voice for spoken replies (e.g. `en-GB-RyanNeural`) via `edge-tts` |
 | `PANE_WATCH_CHROME_DEFAULT` | `4` | `/watch`: bottom pane rows cropped as UI chrome (input box, shortcut hint, separators) |
@@ -178,7 +178,7 @@ rather than sent to `--agent` as a prompt (and takes priority over a
 sticky-keyboard label, so typing a title that happens to match a button label
 is still treated as the title).
 
-Try it without a bot token: `python3 clients/telegram/bot.py --api-token "$FLOCK_API_TOKEN" --menu`.
+Try it without a bot token: `python3 clients/telegram/bot.py --api-token "$H_MESH_API_TOKEN" --menu`.
 
 ---
 
@@ -543,8 +543,8 @@ Built strictly against [`docs/API.md`](../../docs/API.md). The following gaps an
 verified by default:
 
 ```bash
---ca-cert /path/to/ca.pem     # verify against this CA        (FLOCK_CA_CERT)
---insecure                    # skip verification entirely    (FLOCK_INSECURE=1)
+--ca-cert /path/to/ca.pem     # verify against this CA        (H_MESH_CA_CERT)
+--insecure                    # skip verification entirely    (H_MESH_INSECURE=1)
 ```
 
 ⚠ **`--insecure` is for the self-signed certificate `setup.sh` generates.** It
@@ -554,4 +554,4 @@ issuer worth checking.
 
 ⚠ **Neither option touches the Telegram Bot API.** `api.telegram.org` is a
 public host with a real certificate and stays verified — the context is handed
-to the h-flock client only.
+to the h-mesh client only.

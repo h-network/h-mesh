@@ -152,7 +152,7 @@ if it takes a few seconds.
 ## 6b. The console has no access control, and that is the biggest hole
 
 ⚠ **CORRECTED — this is built, all four items below.** `clients/web/server.py`
-refuses a non-loopback `--listen` without `HFLOCK_SECRET` configured (item 1),
+refuses a non-loopback `--listen` without `H_MESH_SECRET` configured (item 1),
 the shared operator secret sets an opaque `Secure`/`HttpOnly`/`SameSite=Strict`
 session cookie (item 2), secret and session-token comparisons are constant-time
 with no credential ever in a query string (item 3), and the terminal

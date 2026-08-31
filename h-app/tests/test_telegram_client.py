@@ -14,7 +14,7 @@ import pytest
 
 from clients.telegram import bot
 from clients.telegram.bot import (
-    ActivityRender, AlertPusher, CursorStore, DryRunTelegramClient, FlockClient, PaneWatchRender,
+    ActivityRender, AlertPusher, CursorStore, DryRunTelegramClient, MeshClient, PaneWatchRender,
     ReplyPusher, TelegramBot, TelegramClient, render_alert, render_reply,
     synthesize_speech, _parse_sse_events, _derive_session_url,
     _agent_picker_keyboard, _is_transient_chrome_line, _parse_int_overrides,
@@ -327,7 +327,7 @@ def test_default_cursor_file_is_not_a_bare_relative_filename():
     check. The default must be an absolute path under a dot-directory,
     matching container/entrypoint.sh's own --cursor-file convention."""
     assert Path(DEFAULT_CURSOR_FILE).is_absolute()
-    assert ".flock" in Path(DEFAULT_CURSOR_FILE).parts
+    assert ".h-mesh" in Path(DEFAULT_CURSOR_FILE).parts
     assert CursorStore().filepath == Path(DEFAULT_CURSOR_FILE)
 
 
@@ -2005,7 +2005,7 @@ def test_poll_messages_forever_yields_and_advances_cursor():
     class _Stop(Exception):
         pass
 
-    flock = FlockClient(base_url="http://unused", token="t", app_name="telegram")
+    mesh = MeshClient(base_url="http://unused", token="t", app_name="telegram")
     calls = {"n": 0}
 
     def fake_get_messages(after=None):
@@ -2014,8 +2014,8 @@ def test_poll_messages_forever_yields_and_advances_cursor():
             return 200, {"messages": [{"cursor": "5-0", "payload": {"text": "a"}}]}
         raise _Stop
 
-    flock.get_messages = fake_get_messages
-    gen = flock.poll_messages_forever(after=None, interval=0)
+    mesh.get_messages = fake_get_messages
+    gen = mesh.poll_messages_forever(after=None, interval=0)
 
     first = next(gen)
     assert first["cursor"] == "5-0"
@@ -2239,7 +2239,7 @@ def test_telegram_bot_voice_feature_flag_disabled_by_default(tmp_path):
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     bot_instance = TelegramBot(
-        flock_client=flock,
+        mesh_client=flock,
         telegram_client=telegram,
         cursor_store=store,
         target_agent="architect",
@@ -2263,7 +2263,7 @@ def test_telegram_bot_voice_toggle_and_menu_when_feature_enabled(tmp_path):
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     bot_instance = TelegramBot(
-        flock_client=flock,
+        mesh_client=flock,
         telegram_client=telegram,
         cursor_store=store,
         target_agent="architect",
@@ -2304,7 +2304,7 @@ def test_telegram_bot_enrol_registers_voice_command(tmp_path):
     flock = DummyFlockClient()
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
-    bot_instance = TelegramBot(flock_client=flock, telegram_client=telegram, cursor_store=store)
+    bot_instance = TelegramBot(mesh_client=flock, telegram_client=telegram, cursor_store=store)
     assert bot_instance.enrol() is True
     assert len(telegram.commands_set) == 1
     cmds = {c["command"]: c["description"] for c in telegram.commands_set[0]}
@@ -2319,7 +2319,7 @@ def test_telegram_bot_chat_id_type_normalization_with_reply_pusher(monkeypatch):
     with tempfile.TemporaryDirectory() as tmpdir:
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
         bot_instance = TelegramBot(
-            flock_client=flock,
+            mesh_client=flock,
             telegram_client=telegram,
             cursor_store=store,
             allowed_chat_id="46444780",
@@ -2343,7 +2343,7 @@ def test_telegram_bot_chat_id_type_normalization_with_reply_pusher(monkeypatch):
 
         # ReplyPusher with string chat_id should see voice enabled
         pusher = ReplyPusher(
-            flock=flock,
+            mesh=flock,
             telegram=telegram,
             chat_id="46444780",
             cursor_store=store,
@@ -2381,7 +2381,7 @@ def test_telegram_bot_int_str_chat_id_in_flows(tmp_path):
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     bot_instance = TelegramBot(
-        flock_client=flock,
+        mesh_client=flock,
         telegram_client=telegram,
         cursor_store=store,
         allowed_chat_id=46444780,
@@ -2487,7 +2487,7 @@ def test_activity_render_flush_debouncing():
 
 
 def test_flock_client_stream_activity(monkeypatch):
-    flock = FlockClient("http://fake:8080", "fake-token")
+    mesh = MeshClient("http://fake:8080", "fake-token")
 
     raw_sse = (
         b"id: 100-0\n"
@@ -2506,7 +2506,7 @@ def test_flock_client_stream_activity(monkeypatch):
 
     events = []
     # Consume one event and break
-    for ev in flock.stream_activity("architect"):
+    for ev in mesh.stream_activity("architect"):
         events.append(ev)
         break
 
@@ -2521,7 +2521,7 @@ def test_telegram_bot_live_activity_with_user_prompt_and_reply_pusher(monkeypatc
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     bot_instance = TelegramBot(
-        flock_client=flock,
+        mesh_client=flock,
         telegram_client=telegram,
         cursor_store=store,
         target_agent="architect",
@@ -2554,7 +2554,7 @@ def test_telegram_bot_live_activity_with_user_prompt_and_reply_pusher(monkeypatc
 
     # ReplyPusher delivers final reply
     pusher = ReplyPusher(
-        flock=flock,
+        mesh=flock,
         telegram=telegram,
         chat_id=12345,
         cursor_store=store,
@@ -2586,7 +2586,7 @@ def test_telegram_bot_multi_output_turn_does_not_early_exit(monkeypatch, tmp_pat
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     bot_instance = TelegramBot(
-        flock_client=flock,
+        mesh_client=flock,
         telegram_client=telegram,
         cursor_store=store,
         target_agent="architect",
@@ -2639,7 +2639,7 @@ def test_telegram_bot_multi_output_turn_does_not_early_exit(monkeypatch, tmp_pat
 
     # Final reply arrives via ReplyPusher and finalizes the render
     pusher = ReplyPusher(
-        flock=flock,
+        mesh=flock,
         telegram=telegram,
         chat_id=12345,
         cursor_store=store,
@@ -2660,7 +2660,7 @@ def test_telegram_bot_no_activity_push_flag(tmp_path):
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     bot_instance = TelegramBot(
-        flock_client=flock,
+        mesh_client=flock,
         telegram_client=telegram,
         cursor_store=store,
         target_agent="architect",
@@ -2681,7 +2681,7 @@ def test_get_activity_tail_pagination_and_true_tail(tmp_path):
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     bot_instance = TelegramBot(
-        flock_client=flock,
+        mesh_client=flock,
         telegram_client=telegram,
         cursor_store=store,
     )
@@ -2710,7 +2710,7 @@ def test_reply_pusher_seed_cursor_pagination(tmp_path):
     telegram = DummyTelegramClient()
     store = CursorStore(str(tmp_path / "cursor.json"))
     pusher = ReplyPusher(
-        flock=flock,
+        mesh=flock,
         telegram=telegram,
         chat_id=123,
         cursor_store=store,
@@ -3025,8 +3025,7 @@ def test_watch_command_routes_through_text_and_callback(monkeypatch):
 
 
 def test_naming_sweep_classes_and_env_vars(monkeypatch):
-    from clients.telegram.bot import MeshClient, FlockClient, TelegramBot, CursorStore, logger
-    assert issubclass(FlockClient, MeshClient)
+    from clients.telegram.bot import MeshClient, TelegramBot, CursorStore, logger
     assert logger.name == "mesh_telegram"
 
     client = MeshClient(base_url="http://127.0.0.1:8080", token="tok123")
@@ -3034,11 +3033,6 @@ def test_naming_sweep_classes_and_env_vars(monkeypatch):
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
         b1 = TelegramBot(mesh_client=client, telegram_client=None, cursor_store=store)
         assert b1.mesh is client
-        assert b1.flock is client
-
-        b2 = TelegramBot(flock_client=client, telegram_client=None, cursor_store=store)
-        assert b2.mesh is client
-        assert b2.flock is client
 
 
 

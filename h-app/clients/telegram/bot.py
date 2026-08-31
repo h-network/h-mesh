@@ -314,10 +314,6 @@ class MeshClient:
             backoff = min(backoff * 2, 30.0)
 
 
-# Backward-compatible alias
-FlockClient = MeshClient
-
-
 def _parse_sse_events(line_iter):
     """Parse raw SSE lines into `(event_type, id, data)` tuples, one per
     blank-line-terminated frame. Pure and network-free so it is directly unit
@@ -473,8 +469,6 @@ DEFAULT_CURSOR_FILE = os.environ.get(
     os.environ.get(
         "CURSOR_FILE",
         str(pathlib.Path(os.environ.get("H_MESH_STATE_DIR", str(pathlib.Path.home() / ".h-mesh"))) / "telegram.cursor.json")
-        if not (pathlib.Path.home() / ".flock" / "telegram.cursor.json").exists()
-        else str(pathlib.Path.home() / ".flock" / "telegram.cursor.json")
     ),
 )
 
@@ -520,9 +514,8 @@ class AlertPusher:
     pane.
     """
 
-    def __init__(self, mesh: "MeshClient | None" = None, telegram=None, chat_id=None, cursor_store: CursorStore = None, flock: "MeshClient | None" = None):
-        self.mesh = mesh or flock
-        self.flock = self.mesh
+    def __init__(self, mesh: "MeshClient | None" = None, telegram=None, chat_id=None, cursor_store: CursorStore = None):
+        self.mesh = mesh
         self.telegram = telegram
         self.chat_id = chat_id
         self.cursor_store = cursor_store
@@ -618,10 +611,8 @@ class ReplyPusher:
         voice_enabled: bool = False,
         voice_enabled_fn=None,
         activity_finalizer_fn=None,
-        flock: "MeshClient | None" = None,
     ):
-        self.mesh = mesh or flock
-        self.flock = self.mesh
+        self.mesh = mesh
         self.telegram = telegram
         self.chat_id = chat_id
         self.cursor_store = cursor_store
@@ -1337,14 +1328,12 @@ class TelegramBot:
         pane_watch_max_duration_s: float = 600.0,
         mini_app_url: str | None = None,
         run_allowed_commands: "frozenset[str] | None" = None,
-        flock_client: MeshClient | None = None,
     ):
-        self.mesh = mesh_client or flock_client
-        self.flock = self.mesh
+        self.mesh = mesh_client
         self.telegram = telegram_client
         self.cursor_store = cursor_store
         self.target_agent = target_agent
-        self.session_url = session_url or os.getenv("H_MESH_SESSION_URL", os.getenv("FLOCK_SESSION_URL", ""))
+        self.session_url = session_url or os.getenv("H_MESH_SESSION_URL", "")
         # A public HTTPS URL for clients/web/mini.html — Telegram's own
         # requirement for a web_app button, not this codebase's. Unset means
         # no Mini App has been published for this tenant, so the button is
@@ -2742,12 +2731,12 @@ def _sibling_path(path: str, suffix: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="h-mesh Telegram bot client")
-    parser.add_argument("--api-url", default=os.getenv("H_MESH_API_URL", os.getenv("FLOCK_API_URL", "http://localhost:8080")), help="h-mesh API base URL")
-    parser.add_argument("--ca-cert", default=os.getenv("H_MESH_CA_CERT", os.getenv("FLOCK_CA_CERT", "")),
-                        help="verify the door's TLS certificate against this CA bundle (H_MESH_CA_CERT/FLOCK_CA_CERT)")
-    parser.add_argument("--insecure", action="store_true", default=(os.getenv("H_MESH_INSECURE") == "1" or os.getenv("FLOCK_INSECURE") == "1"),
-                        help="skip TLS verification (self-signed door certificate) (H_MESH_INSECURE=1/FLOCK_INSECURE=1)")
-    parser.add_argument("--api-token", default=os.getenv("H_MESH_API_TOKEN", os.getenv("FLOCK_API_TOKEN", os.getenv("API_TOKEN", ""))), help="h-mesh API Bearer token")
+    parser.add_argument("--api-url", default=os.getenv("H_MESH_API_URL", "http://localhost:8080"), help="h-mesh API base URL")
+    parser.add_argument("--ca-cert", default=os.getenv("H_MESH_CA_CERT", ""),
+                        help="verify the door's TLS certificate against this CA bundle (H_MESH_CA_CERT)")
+    parser.add_argument("--insecure", action="store_true", default=(os.getenv("H_MESH_INSECURE") == "1"),
+                        help="skip TLS verification (self-signed door certificate) (H_MESH_INSECURE=1)")
+    parser.add_argument("--api-token", default=os.getenv("H_MESH_API_TOKEN", os.getenv("API_TOKEN", "")), help="h-mesh API Bearer token")
     parser.add_argument("--bot-token", default=os.getenv("TELEGRAM_BOT_TOKEN", ""), help="Telegram Bot API token")
     parser.add_argument("--cursor-file", default=os.getenv("H_MESH_CURSOR_FILE", os.getenv("CURSOR_FILE", DEFAULT_CURSOR_FILE)), help="File path to store message cursor")
     parser.add_argument("--agent", default="architect", help="Target agent name")
@@ -2770,7 +2759,7 @@ def main() -> None:
                         help="Enable spoken voice replies feature for this tenant")
     parser.add_argument("--tts-voice", default=os.getenv("TTS_VOICE", DEFAULT_TTS_VOICE),
                         help=f"Default edge-tts voice for spoken replies (default: {DEFAULT_TTS_VOICE})")
-    parser.add_argument("--session-url", default=os.getenv("H_MESH_SESSION_URL", os.getenv("FLOCK_SESSION_URL", "")),
+    parser.add_argument("--session-url", default=os.getenv("H_MESH_SESSION_URL", ""),
                         help="h-mesh Session WebSocket URL (default: derived from --api-url, port 8081)")
     parser.add_argument("--pane-watch-chrome-default", type=int,
                         default=int(os.getenv("PANE_WATCH_CHROME_DEFAULT", "4")),

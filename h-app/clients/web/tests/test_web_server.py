@@ -282,7 +282,6 @@ def test_refuse_non_loopback_without_secret(monkeypatch):
     from clients.web.server import main
     monkeypatch.setattr("sys.argv", ["server.py", "--listen", "0.0.0.0", "--demo"])
     monkeypatch.setenv("H_MESH_SECRET", "")
-    monkeypatch.setenv("HFLOCK_SECRET", "")
     with pytest.raises(SystemExit) as exc_info:
         main()
     assert exc_info.value.code == 1

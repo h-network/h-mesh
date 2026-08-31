@@ -80,15 +80,15 @@ Command-line options override the corresponding environment defaults.
 |---|---|---|---|
 | listen address | `--listen` | `H_MESH_WEB_LISTEN` (or `WEB_LISTEN`) | `127.0.0.1` |
 | console port | `--port` | `H_MESH_WEB_PORT` (or `WEB_PORT`) | `8090` |
-| tenant API | `--api` | `H_MESH_API` (or `HFLOCK_API`) | `http://127.0.0.1:8080` |
-| terminal session door | `--session` | `H_MESH_SESSION` (or `HFLOCK_SESSION`) | `http://127.0.0.1:8081` |
+| tenant API | `--api` | `H_MESH_API` | `http://127.0.0.1:8080` |
+| terminal session door | `--session` | `H_MESH_SESSION` | `http://127.0.0.1:8081` |
 | tenant bearer token | `--token` | `H_MESH_TOKEN` (or `API_TOKEN`) | required |
-| console participant name | `--client` | `H_MESH_CLIENT` (or `HFLOCK_CLIENT`) | `web` |
-| shared operator secret | `--secret` | `H_MESH_SECRET` (or `HFLOCK_SECRET`) | none on loopback |
-| simultaneous terminal sockets | — | `H_MESH_MAX_SESSIONS` (or `HFLOCK_MAX_SESSIONS`) | `16` |
-| operator session lifetime, seconds | — | `H_MESH_SESSION_TTL` (or `HFLOCK_SESSION_TTL`) | `86400` (24 hours) |
-| failed logins allowed per window/IP | — | `H_MESH_MAX_LOGIN_ATTEMPTS` (or `HFLOCK_MAX_LOGIN_ATTEMPTS`) | `5` |
-| login rate-limit window, seconds | — | `H_MESH_RATE_LIMIT_WINDOW` (or `HFLOCK_RATE_LIMIT_WINDOW`) | `60` |
+| console participant name | `--client` | `H_MESH_CLIENT` | `web` |
+| shared operator secret | `--secret` | `H_MESH_SECRET` | none on loopback |
+| simultaneous terminal sockets | — | `H_MESH_MAX_SESSIONS` | `16` |
+| operator session lifetime, seconds | — | `H_MESH_SESSION_TTL` | `86400` (24 hours) |
+| failed logins allowed per window/IP | — | `H_MESH_MAX_LOGIN_ATTEMPTS` | `5` |
+| login rate-limit window, seconds | — | `H_MESH_RATE_LIMIT_WINDOW` | `60` |
 | Telegram bot token, for Mini App login | `--telegram-bot-token` | `TELEGRAM_BOT_TOKEN` | unset — feature disabled |
 | Telegram user id allowed to sign in via the Mini App | `--telegram-chat-id` | `TELEGRAM_CHAT_ID` | unset — feature disabled |
 
