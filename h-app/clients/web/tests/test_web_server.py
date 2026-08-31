@@ -281,6 +281,7 @@ def test_proxy_websocket_max_sessions_limit_returns_503():
 def test_refuse_non_loopback_without_secret(monkeypatch):
     from clients.web.server import main
     monkeypatch.setattr("sys.argv", ["server.py", "--listen", "0.0.0.0", "--demo"])
+    monkeypatch.setenv("H_MESH_SECRET", "")
     monkeypatch.setenv("HFLOCK_SECRET", "")
     with pytest.raises(SystemExit) as exc_info:
         main()
@@ -310,7 +311,7 @@ def test_auth_secret_enforcement_and_login_flow():
         # browsers report the only page they are allowed to see as a failure.
         with urllib.request.urlopen(f"http://127.0.0.1:{web_port}/") as resp:
             assert resp.status == 200
-            assert b"h-flock Operator Login" in resp.read()
+            assert b"h-mesh Operator Login" in resp.read()
 
         # 2. Unauthenticated API GET returns 401
         req = urllib.request.Request(f"http://127.0.0.1:{web_port}/api/agents")
@@ -353,12 +354,12 @@ def test_auth_secret_enforcement_and_login_flow():
         with urllib.request.urlopen(req_login) as resp:
             assert resp.status == 200
             cookie_header = resp.headers.get("Set-Cookie")
-            assert "hflock_session=" in cookie_header
+            assert "hmesh_session=" in cookie_header
             assert "HttpOnly" in cookie_header
             assert "SameSite=Strict" in cookie_header
             session_cookie = cookie_header.split(";")[0]
 
-        # 5. Authenticated API GET with cookie returns 200
+        # 6. Authenticated API GET with cookie returns 200
         req_auth = urllib.request.Request(
             f"http://127.0.0.1:{web_port}/api/agents",
             headers={"Cookie": session_cookie},
@@ -727,7 +728,7 @@ def test_auth_session_ttl_expiry():
         # Request with expired session cookie should be rejected with 401
         req_exp = urllib.request.Request(
             f"http://127.0.0.1:{web_port}/api/agents",
-            headers={"Cookie": "hflock_session=expired-token-123"},
+            headers={"Cookie": "hmesh_session=expired-token-123"},
         )
         with pytest.raises(urllib.error.HTTPError) as exc_info:
             urllib.request.urlopen(req_exp)

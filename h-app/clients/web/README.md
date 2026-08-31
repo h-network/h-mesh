@@ -40,7 +40,7 @@ intended interface:
 
 ```bash
 API_TOKEN=<tenant-token> \
-HFLOCK_SECRET=<long-random-operator-secret> \
+H_MESH_SECRET=<long-random-operator-secret> \
 python3 server.py --listen 0.0.0.0
 ```
 
@@ -61,10 +61,10 @@ docker network, fronted by a reverse proxy, rather than a bare `python3
 server.py` on an operator's own machine. `python:3.12-slim`, no pip install
 (this file is stdlib-only). Binds `WEB_LISTEN=0.0.0.0` inside its own
 container by design — the same rule `API_BIND`/`SESSION_BIND` already
-document for the tenant's doors — which means `HFLOCK_SECRET` is **required**
+document for the tenant's doors — which means `H_MESH_SECRET` is **required**
 for it to start at all (server.py refuses a non-loopback bind without one).
 `WEB_PORT` is deliberately not set in the image, so server.py's own default
-(`8090`) stays the only place that value lives. `HFLOCK_API`/`HFLOCK_SESSION`
+(`8090`) stays the only place that value lives. `H_MESH_API`/`H_MESH_SESSION`
 must point at the tenant over whatever network connects the two containers —
 `127.0.0.1` will not reach anything from inside this one. TLS is out of
 scope here; a reverse proxy in front terminates it, same pattern the api and
@@ -78,17 +78,17 @@ Command-line options override the corresponding environment defaults.
 
 | Purpose | Option | Environment | Default |
 |---|---|---|---|
-| listen address | `--listen` | `WEB_LISTEN` | `127.0.0.1` |
-| console port | `--port` | `WEB_PORT` | `8090` |
-| tenant API | `--api` | `HFLOCK_API` | `http://127.0.0.1:8080` |
-| terminal session door | `--session` | `HFLOCK_SESSION` | `http://127.0.0.1:8081` |
-| tenant bearer token | `--token` | `API_TOKEN` | required |
-| console participant name | `--client` | `HFLOCK_CLIENT` | `web` |
-| shared operator secret | `--secret` | `HFLOCK_SECRET` | none on loopback |
-| simultaneous terminal sockets | — | `HFLOCK_MAX_SESSIONS` | `16` |
-| operator session lifetime, seconds | — | `HFLOCK_SESSION_TTL` | `86400` (24 hours) |
-| failed logins allowed per window/IP | — | `HFLOCK_MAX_LOGIN_ATTEMPTS` | `5` |
-| login rate-limit window, seconds | — | `HFLOCK_RATE_LIMIT_WINDOW` | `60` |
+| listen address | `--listen` | `H_MESH_WEB_LISTEN` (or `WEB_LISTEN`) | `127.0.0.1` |
+| console port | `--port` | `H_MESH_WEB_PORT` (or `WEB_PORT`) | `8090` |
+| tenant API | `--api` | `H_MESH_API` (or `HFLOCK_API`) | `http://127.0.0.1:8080` |
+| terminal session door | `--session` | `H_MESH_SESSION` (or `HFLOCK_SESSION`) | `http://127.0.0.1:8081` |
+| tenant bearer token | `--token` | `H_MESH_TOKEN` (or `API_TOKEN`) | required |
+| console participant name | `--client` | `H_MESH_CLIENT` (or `HFLOCK_CLIENT`) | `web` |
+| shared operator secret | `--secret` | `H_MESH_SECRET` (or `HFLOCK_SECRET`) | none on loopback |
+| simultaneous terminal sockets | — | `H_MESH_MAX_SESSIONS` (or `HFLOCK_MAX_SESSIONS`) | `16` |
+| operator session lifetime, seconds | — | `H_MESH_SESSION_TTL` (or `HFLOCK_SESSION_TTL`) | `86400` (24 hours) |
+| failed logins allowed per window/IP | — | `H_MESH_MAX_LOGIN_ATTEMPTS` (or `HFLOCK_MAX_LOGIN_ATTEMPTS`) | `5` |
+| login rate-limit window, seconds | — | `H_MESH_RATE_LIMIT_WINDOW` (or `HFLOCK_RATE_LIMIT_WINDOW`) | `60` |
 | Telegram bot token, for Mini App login | `--telegram-bot-token` | `TELEGRAM_BOT_TOKEN` | unset — feature disabled |
 | Telegram user id allowed to sign in via the Mini App | `--telegram-chat-id` | `TELEGRAM_CHAT_ID` | unset — feature disabled |
 

@@ -3024,4 +3024,22 @@ def test_watch_command_routes_through_text_and_callback(monkeypatch):
         assert "pick an agent" in reply.lower()
 
 
+def test_naming_sweep_classes_and_env_vars(monkeypatch):
+    from clients.telegram.bot import MeshClient, FlockClient, TelegramBot, CursorStore, logger
+    assert issubclass(FlockClient, MeshClient)
+    assert logger.name == "mesh_telegram"
+
+    client = MeshClient(base_url="http://127.0.0.1:8080", token="tok123")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = CursorStore(str(Path(tmpdir) / "cursor.json"))
+        b1 = TelegramBot(mesh_client=client, telegram_client=None, cursor_store=store)
+        assert b1.mesh is client
+        assert b1.flock is client
+
+        b2 = TelegramBot(flock_client=client, telegram_client=None, cursor_store=store)
+        assert b2.mesh is client
+        assert b2.flock is client
+
+
+
 

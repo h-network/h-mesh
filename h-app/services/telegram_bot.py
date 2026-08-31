@@ -9,7 +9,7 @@ import sys
 from clients.telegram.bot import (
     CursorStore,
     DryRunTelegramClient,
-    FlockClient,
+    MeshClient,
     TelegramBot,
     TelegramClient,
     _derive_session_url,
@@ -31,7 +31,7 @@ def main() -> None:
         print("Error: API token required (API_TOKEN or H_MESH_API_TOKEN env var)", file=sys.stderr)
         sys.exit(1)
 
-    mesh_client = FlockClient(
+    mesh_client = MeshClient(
         base_url=api_url,
         token=api_token,
         app_name="telegram",
@@ -41,7 +41,7 @@ def main() -> None:
     cursor_store = CursorStore(filepath=cursor_file)
 
     bot = TelegramBot(
-        flock_client=mesh_client,
+        mesh_client=mesh_client,
         telegram_client=telegram,
         cursor_store=cursor_store,
         target_agent=target_agent,

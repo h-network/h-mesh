@@ -1,6 +1,6 @@
 # Telegram Bot Client (`clients/telegram/`)
 
-A Telegram bot client that talks to an **h-flock** tenant over HTTP, allowing a user to communicate with the `architect` agent from Telegram.
+A Telegram bot client that talks to an **h-mesh** tenant over HTTP, allowing a user to communicate with the `architect` agent from Telegram.
 
 ---
 
@@ -10,7 +10,7 @@ A Telegram bot client that talks to an **h-flock** tenant over HTTP, allowing a 
 - **Fire-and-forget prompts, delivery-side pushes replies:** A plain text message posts the envelope (`POST /agents/{agent}/envelopes`, always `202` immediately) and returns right away — no wait loop. `ReplyPusher`, a background thread, independently polls this bot's own mailbox (`GET /agents/telegram/messages`) and pushes each new reply into the chat as it arrives, on its own schedule. This matches how delivery actually works: nothing in the switch/port/api chain waits on anything, so nothing here should either.
   ⚠ **This replaced an earlier design that blocked inline** — `handle_user_prompt` used to poll-and-wait for a reply, unbounded, inside the same loop that read Telegram's `getUpdates`. One chat's unanswered prompt froze the *entire* bot, for every chat, until that one exchange resolved (measured live on the acceptance VM: the poller sat on one cursor for minutes while every message sent afterward went unread). Removed entirely rather than patched.
 - **`blocked` Visibility:** If `architect` is `blocked`, the bot immediately reports `"architect is not accepting messages right now"` instead of posting.
-- **Cursor Persistence:** `ReplyPusher` persists its mailbox cursor to disk (`~/.flock/telegram.cursor.json` by default — see `--cursor-file` below) as it delivers each reply, and — like `AlertPusher` — seeds a fresh cursor store from the mailbox's current tail rather than replaying history on first run.
+- **Cursor Persistence:** `ReplyPusher` persists its mailbox cursor to disk (`~/.h-mesh/telegram.cursor.json` by default — see `--cursor-file` below) as it delivers each reply, and — like `AlertPusher` — seeds a fresh cursor store from the mailbox's current tail rather than replaying history on first run.
 - **Discoverable commands:** `/menu`, `/status`, `/watch`, `/unwatch`, `/run`, and `/voice` are registered with Telegram itself via `setMyCommands` at enrol time, so they show up in the client's own `/` command picker instead of requiring the user to know and type them blind.
 - **Text-to-Speech (TTS) Voice Replies:** Spoken voice replies via Microsoft Edge's neural TTS voices (`edge-tts` package, PyPI) using Telegram's `sendVoice` endpoint. Declared dependency in `pyproject.toml`. Spoken voice replies are opt-in per tenant (`TELEGRAM_VOICE=1`, prompted during `setup.sh`) and opt-in per chat via `/voice` or the sticky menu toggle (voice-enabled chats receive both the full text reply and the spoken voice audio).
 - **Inbound messages are restricted to `--chat-id`/`TELEGRAM_CHAT_ID`.** Every real Telegram update funnels through `_dispatch_update`, which drops anything from a different chat *silently* — no reply, no answered callback query — so an unauthorized sender learns nothing, not even that a bot is listening. ⚠ **No configured chat_id refuses everything, not the reverse**: the menu now reaches hire/retire/pause/resume/broadcast, so "whoever messages first" stopped being an acceptable identity check the moment those landed. This only affects manual/ad-hoc runs without `--chat-id` — `setup.sh`'s normal flow requires both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` before it enables the bot at all, so a real deployment always has one. CLI-driven one-shots (`--prompt`/`--status`/`--menu`, dry-run mode) call handlers directly and never go through this check — they're operator shell access, not untrusted network input.
@@ -23,15 +23,15 @@ A Telegram bot client that talks to an **h-flock** tenant over HTTP, allowing a 
 
 | Variable | Default | Description |
 |---|---|---|
-| `FLOCK_API_URL` | `http://localhost:8080` | Base URL of the h-flock REST API service |
-| `FLOCK_API_TOKEN` | *required* | Bearer API token for authentication |
+| `H_MESH_API_URL` (or `FLOCK_API_URL`) | `http://localhost:8080` | Base URL of the h-mesh REST API service |
+| `H_MESH_API_TOKEN` (or `FLOCK_API_TOKEN`) | *required* | Bearer API token for authentication |
 | `TELEGRAM_BOT_TOKEN` | *optional* | Telegram Bot API token (from @BotFather) |
-| `CURSOR_FILE` | `~/.flock/telegram.cursor.json` | Path to store `ReplyPusher`'s mailbox cursor |
+| `H_MESH_CURSOR_FILE` (or `CURSOR_FILE`) | `~/.h-mesh/telegram.cursor.json` | Path to store `ReplyPusher`'s mailbox cursor |
 | `TELEGRAM_CHAT_ID` | *optional* | Fixed chat for `--prompt`/`--status` one-shots, live alert push (§2b), **and the only chat the bot will respond to** — no reply, no push, no menu action for anyone else |
 | `ALERTS_CURSOR_FILE` | derived from `CURSOR_FILE` | Path to store the alerts-stream cursor, kept separate from the mailbox cursor |
 | `NO_ALERT_PUSH` | unset | Set to `1` to disable live alert push even when `TELEGRAM_CHAT_ID` is set |
 | `NO_ACTIVITY_PUSH` | unset | Set to `1` to disable live-updating progress messages while agents execute tools |
-| `FLOCK_SESSION_URL` | derived from `FLOCK_API_URL` (`:8081`) | Base WebSocket URL for the Session door, used by `/watch` (§2d) |
+| `H_MESH_SESSION_URL` (or `FLOCK_SESSION_URL`) | derived from `H_MESH_API_URL` (`:8081`) | Base WebSocket URL for the Session door, used by `/watch` (§2d) |
 | `TELEGRAM_VOICE` | `0` | Set to `1` to enable the spoken TTS voice replies feature in this tenant |
 | `TTS_VOICE` | `en-GB-RyanNeural` | Default Microsoft neural TTS voice for spoken replies (e.g. `en-GB-RyanNeural`) via `edge-tts` |
 | `PANE_WATCH_CHROME_DEFAULT` | `4` | `/watch`: bottom pane rows cropped as UI chrome (input box, shortcut hint, separators) |
@@ -44,15 +44,15 @@ A Telegram bot client that talks to an **h-flock** tenant over HTTP, allowing a 
 
 ### Running in Dry-Run Mode (Without Telegram Token)
 
-When `TELEGRAM_BOT_TOKEN` is not supplied (or `--dry-run` is passed), the bot operates in **dry-run mode**, sending real envelopes and state requests to h-flock while printing all formatted Telegram message operations (`sendMessage`, `sendVoice`, `editMessageText`, `sendChatAction`) directly to stdout:
+When `TELEGRAM_BOT_TOKEN` is not supplied (or `--dry-run` is passed), the bot operates in **dry-run mode**, sending real envelopes and state requests to h-mesh while printing all formatted Telegram message operations (`sendMessage`, `sendVoice`, `editMessageText`, `sendChatAction`) directly to stdout:
 
 ```bash
-# Perform status check against real h-flock data
-python3 clients/telegram/bot.py --api-token "$FLOCK_API_TOKEN" --status
+# Perform status check against real h-mesh data
+python3 clients/telegram/bot.py --api-token "$H_MESH_API_TOKEN" --status
 
 # Post a prompt to architect and return immediately (fire-and-forget — see §1;
 # the reply, if any, is ReplyPusher's job, not this one-shot invocation's)
-python3 clients/telegram/bot.py --api-token "$FLOCK_API_TOKEN" --prompt "can you check the auth change?"
+python3 clients/telegram/bot.py --api-token "$H_MESH_API_TOKEN" --prompt "can you check the auth change?"
 ```
 
 ### CLI Command Options
@@ -61,9 +61,9 @@ python3 clients/telegram/bot.py --api-token "$FLOCK_API_TOKEN" --prompt "can you
 python3 clients/telegram/bot.py \
   --api-url http://localhost:8080 \
   --session-url ws://localhost:8081/session \
-  --api-token "$FLOCK_API_TOKEN" \
+  --api-token "$H_MESH_API_TOKEN" \
   --bot-token "$TELEGRAM_BOT_TOKEN" \
-  --cursor-file ~/.flock/telegram.cursor.json \
+  --cursor-file ~/.h-mesh/telegram.cursor.json \
   --agent architect \
   --voice \
   --tts-voice en-GB-RyanNeural \

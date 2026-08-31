@@ -1,6 +1,6 @@
-"""Telegram bot client for h-flock.
+"""Telegram bot client for h-mesh.
 
-Talks to an h-flock tenant REST API over HTTP, allowing users to interact with
+Talks to an h-mesh tenant REST API over HTTP, allowing users to interact with
 the 'architect' agent via Telegram.
 """
 
@@ -26,18 +26,18 @@ import uuid
 from websockets.sync.client import connect as ws_connect
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-logger = logging.getLogger("flock_telegram")
+logger = logging.getLogger("mesh_telegram")
 
 
-class FlockClient:
-    """Thin REST client for h-flock API based on API.md."""
+class MeshClient:
+    """Thin REST client for h-mesh API based on API.md."""
 
     def __init__(self, base_url: str, token: str, app_name: str = "telegram",
                  ssl_context: "ssl.SSLContext | None" = None):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.app_name = app_name
-        # ⚠ This context reaches the h-flock door and nothing else. The Telegram
+        # ⚠ This context reaches the h-mesh door and nothing else. The Telegram
         # Bot API is a public host with a real certificate — weakening
         # verification there would be a different decision entirely, so
         # TelegramClient does not take one.
@@ -87,7 +87,7 @@ class FlockClient:
 
     def send_command(self, destination: str, text: str) -> tuple[int, dict]:
         """Send a Command-kind envelope. Unlike send_message's Message-kind
-        shorthand, flock.port's command_opener pastes payload.text raw with
+        shorthand, modules.tmux.port's command_opener pastes payload.text raw with
         a trailing newline and no "[message from X]" wrapper — so a native
         CLI slash command (e.g. Claude Code's /clear) is interpreted by the
         underlying CLI instead of read as chat text saying "/clear"."""
@@ -314,6 +314,10 @@ class FlockClient:
             backoff = min(backoff * 2, 30.0)
 
 
+# Backward-compatible alias
+FlockClient = MeshClient
+
+
 def _parse_sse_events(line_iter):
     """Parse raw SSE lines into `(event_type, id, data)` tuples, one per
     blank-line-terminated frame. Pure and network-free so it is directly unit
@@ -460,11 +464,19 @@ def render_alert(alert: dict) -> str:
 
 
 # Matches the deployed convention (container/entrypoint.sh's own
-# --cursor-file "/home/ubuntu/.flock/telegram.cursor.json") rather than a
+# --cursor-file "~/.h-mesh/telegram.cursor.json") rather than a
 # bare relative filename. A bare "cursor.json" default lands wherever CWD
 # happens to be — including the repo root itself for an ad hoc local run
 # with no --cursor-file, where it sits as an untracked file forever after.
-DEFAULT_CURSOR_FILE = str(pathlib.Path.home() / ".flock" / "telegram.cursor.json")
+DEFAULT_CURSOR_FILE = os.environ.get(
+    "H_MESH_CURSOR_FILE",
+    os.environ.get(
+        "CURSOR_FILE",
+        str(pathlib.Path(os.environ.get("H_MESH_STATE_DIR", str(pathlib.Path.home() / ".h-mesh"))) / "telegram.cursor.json")
+        if not (pathlib.Path.home() / ".flock" / "telegram.cursor.json").exists()
+        else str(pathlib.Path.home() / ".flock" / "telegram.cursor.json")
+    ),
+)
 
 
 class CursorStore:
@@ -500,7 +512,7 @@ class AlertPusher:
     ⚠ Only the three kinds `GET /alerts` documents ever arrive here: blocked,
     stalled, credential. `doing_duration` and `todo_duration` — the two
     lead-only alerts watchdog added — are pasted directly into the *lead's*
-    tmux pane as an ordinary Message envelope (`flock.watchdog.service`
+    tmux pane as an ordinary Message envelope (`modules.watchdog.service`
     `_notify_lead`) and never touch the alerts stream at all (confirmed by
     reading `_check_doing_duration`/`_check_todo_duration` against `_alert`).
     They are invisible to this client and to `GET /alerts` alike — there is
@@ -508,8 +520,9 @@ class AlertPusher:
     pane.
     """
 
-    def __init__(self, flock: "FlockClient", telegram, chat_id, cursor_store: CursorStore):
-        self.flock = flock
+    def __init__(self, mesh: "MeshClient | None" = None, telegram=None, chat_id=None, cursor_store: CursorStore = None, flock: "MeshClient | None" = None):
+        self.mesh = mesh or flock
+        self.flock = self.mesh
         self.telegram = telegram
         self.chat_id = chat_id
         self.cursor_store = cursor_store
@@ -518,16 +531,16 @@ class AlertPusher:
         """On a fresh cursor store, start at the current tail rather than
         replay the whole retained history (up to 1000 alerts) as if every one
         were new — the same reasoning TelegramBot.enrol applies to mailboxes."""
-        code, data = self.flock.get_alerts(limit=1000)
+        code, data = self.mesh.get_alerts(limit=1000)
         if code == 200 and data.get("next_cursor"):
             return data["next_cursor"]
         return None
 
     def run(self, stream_fn=None) -> None:
         """Blocking; run this in its own thread. `stream_fn` defaults to
-        `self.flock.stream_alerts` and is overridable so tests can inject a
+        `self.mesh.stream_alerts` and is overridable so tests can inject a
         finite, network-free generator."""
-        stream_fn = stream_fn or self.flock.stream_alerts
+        stream_fn = stream_fn or self.mesh.stream_alerts
         cursor = self.cursor_store.load()
         if cursor is None:
             cursor = self._seed_cursor()
@@ -564,7 +577,7 @@ def synthesize_speech(
     selected_voice = voice or DEFAULT_TTS_VOICE
 
     if output_path is None:
-        fd, temp_path = tempfile.mkstemp(suffix=".mp3", prefix="flock_tts_")
+        fd, temp_path = tempfile.mkstemp(suffix=".mp3", prefix="mesh_tts_")
         os.close(fd)
         target_path = temp_path
     else:
@@ -585,7 +598,7 @@ class ReplyPusher:
 
     Same shape as AlertPusher (seed cursor from the tail, run in its own
     thread, persist cursor as it goes) — polling instead of SSE since that's
-    what `FlockClient.poll_messages_forever` wraps. This is what actually
+    what `MeshClient.poll_messages_forever` wraps. This is what actually
     delivers a reply now: `handle_user_prompt` only posts and returns,
     matching the real fire-and-forget delivery model (`POST
     /agents/{agent}/envelopes` always returns 202 immediately; nothing in
@@ -597,16 +610,18 @@ class ReplyPusher:
 
     def __init__(
         self,
-        flock: "FlockClient",
-        telegram,
-        chat_id,
-        cursor_store: CursorStore,
+        mesh: "MeshClient | None" = None,
+        telegram=None,
+        chat_id=None,
+        cursor_store: CursorStore = None,
         tts_voice: str | None = None,
         voice_enabled: bool = False,
         voice_enabled_fn=None,
         activity_finalizer_fn=None,
+        flock: "MeshClient | None" = None,
     ):
-        self.flock = flock
+        self.mesh = mesh or flock
+        self.flock = self.mesh
         self.telegram = telegram
         self.chat_id = chat_id
         self.cursor_store = cursor_store
@@ -623,7 +638,7 @@ class ReplyPusher:
         cursor = None
         try:
             while True:
-                code, data = self.flock.get_messages(after=cursor, limit=1000)
+                code, data = self.mesh.get_messages(after=cursor, limit=1000)
                 if code != 200:
                     break
                 items = data.get("messages", [])
@@ -639,9 +654,9 @@ class ReplyPusher:
 
     def run(self, stream_fn=None) -> None:
         """Blocking; run this in its own thread. `stream_fn` defaults to
-        `self.flock.poll_messages_forever` and is overridable so tests can
+        `self.mesh.poll_messages_forever` and is overridable so tests can
         inject a finite, network-free generator."""
-        stream_fn = stream_fn or self.flock.poll_messages_forever
+        stream_fn = stream_fn or self.mesh.poll_messages_forever
         cursor = self.cursor_store.load()
         if cursor is None:
             cursor = self._seed_cursor()
@@ -665,7 +680,7 @@ class ReplyPusher:
                     self._push_attachment(message, source)
                     continue
 
-                reply_text = render_reply(message, self.flock.app_name)
+                reply_text = render_reply(message, self.mesh.app_name)
                 self.telegram.send_message(self.chat_id, reply_text)
                 is_voice = (
                     self.voice_enabled_fn(self.chat_id)
@@ -704,7 +719,7 @@ class ReplyPusher:
         rules. A rejection is reported back to the chat, same as any other
         failure here — never silently dropped.
         """
-        label = source or self.flock.app_name
+        label = source or self.mesh.app_name
 
         def reject(reason: str) -> None:
             self.telegram.send_message(self.chat_id, f"{label} sent an attachment, but it was rejected: {reason}.")
@@ -802,7 +817,7 @@ class TelegramClient:
         files: dict | None = None,
     ) -> dict:
         url = f"{self.base_url}/{method}"
-        boundary = f"----FlockTelegramBoundary{uuid.uuid4().hex}"
+        boundary = f"----MeshTelegramBoundary{uuid.uuid4().hex}"
         body = bytearray()
 
         if fields:
@@ -1306,9 +1321,9 @@ class TelegramBot:
 
     def __init__(
         self,
-        flock_client: FlockClient,
-        telegram_client: TelegramClient | None,
-        cursor_store: CursorStore,
+        mesh_client: MeshClient | None = None,
+        telegram_client: TelegramClient | None = None,
+        cursor_store: CursorStore | None = None,
         target_agent: str = "architect",
         allowed_chat_id: int | str | None = None,
         default_tts_voice: str | None = None,
@@ -1322,12 +1337,14 @@ class TelegramBot:
         pane_watch_max_duration_s: float = 600.0,
         mini_app_url: str | None = None,
         run_allowed_commands: "frozenset[str] | None" = None,
+        flock_client: MeshClient | None = None,
     ):
-        self.flock = flock_client
+        self.mesh = mesh_client or flock_client
+        self.flock = self.mesh
         self.telegram = telegram_client
         self.cursor_store = cursor_store
         self.target_agent = target_agent
-        self.session_url = session_url or os.getenv("FLOCK_SESSION_URL", "")
+        self.session_url = session_url or os.getenv("H_MESH_SESSION_URL", os.getenv("FLOCK_SESSION_URL", ""))
         # A public HTTPS URL for clients/web/mini.html — Telegram's own
         # requirement for a web_app button, not this codebase's. Unset means
         # no Mini App has been published for this tenant, so the button is
@@ -1427,13 +1444,13 @@ class TelegramBot:
         deadline = time.time() + timeout_s
         backoff = 1.0
         while True:
-            code, body = self.flock.enrol()
+            code, body = self.mesh.enrol()
             if code == 202:
-                logger.info(f"Enrolled application '{self.flock.app_name}': status={code}, body={body}")
+                logger.info(f"Enrolled application '{self.mesh.app_name}': status={code}, body={body}")
                 break
             if time.time() >= deadline:
                 logger.error(
-                    f"Failed to enrol '{self.flock.app_name}' after {timeout_s:.0f}s "
+                    f"Failed to enrol '{self.mesh.app_name}' after {timeout_s:.0f}s "
                     f"(last status={code}, body={body}); sends will fail with "
                     f"\"invalid 'as' client\" until this succeeds."
                 )
@@ -1462,8 +1479,8 @@ class TelegramBot:
 
     def handle_status_command(self, chat_id: int | str) -> str:
         agent = self._target_for(chat_id)
-        code, presence_data = self.flock.get_presence(agent)
-        code_b, board_data = self.flock.get_board(agent)
+        code, presence_data = self.mesh.get_presence(agent)
+        code_b, board_data = self.mesh.get_board(agent)
 
         if code != 200:
             text = f"❌ Unable to fetch status for {agent}: {presence_data.get('detail', 'error')}"
@@ -1605,18 +1622,18 @@ class TelegramBot:
         """Enrolled agents with a terminal window — the ones a person can add a
         ticket to or pause/resume. Excludes api clients like this bot itself
         (LLD-office.md / clients/web's own port_type == "tmux" filter)."""
-        code, data = self.flock.get_agents()
+        code, data = self.mesh.get_agents()
         if code != 200:
             return []
         result = []
         for name in data.get("agents", []):
-            pcode, pdata = self.flock.get_presence(name)
+            pcode, pdata = self.mesh.get_presence(name)
             if pcode == 200 and pdata.get("port_type") == "tmux":
                 result.append(name)
         return result
 
     def handle_menu_command(self, chat_id: int | str) -> str:
-        text = "h-flock menu — pinned below, always one tap away:"
+        text = "h-mesh menu — pinned below, always one tap away:"
         if self.telegram:
             self.telegram.send_message(chat_id, text, reply_markup=self._sticky_keyboard(chat_id))
         return text
@@ -1638,7 +1655,7 @@ class TelegramBot:
         # Three calls, not one (API.md §4a): agent list, presence per agent,
         # boards in bulk. GET /agents/{agent} never carries the open ticket.
         agents = self._tmux_agents()
-        board_code, board_data = self.flock.get_all_boards()
+        board_code, board_data = self.mesh.get_all_boards()
         boards_by_agent = {}
         if board_code == 200:
             for entry in board_data.get("agents", []):
@@ -1649,7 +1666,7 @@ class TelegramBot:
         if not agents:
             lines.append("No tmux agents enrolled.")
         for agent in agents:
-            pcode, pdata = self.flock.get_presence(agent)
+            pcode, pdata = self.mesh.get_presence(agent)
             state = pdata.get("presence", {}).get("state", "unknown") if pcode == 200 else "unknown"
             doing = boards_by_agent.get(agent, {}).get("doing", [])
             ticket = "no open ticket"
@@ -1692,7 +1709,7 @@ class TelegramBot:
         del self.pending[cid]
         if self.telegram:
             self.telegram.send_chat_action(cid)
-        code, resp = self.flock.add_ticket(agent, title, description, priority)
+        code, resp = self.mesh.add_ticket(agent, title, description, priority)
         if code == 202:
             text = f"✅ Ticket added to {agent}: {title} [{priority}]"
         else:
@@ -1730,7 +1747,7 @@ class TelegramBot:
     def handle_lifecycle_control(self, chat_id: int | str, kind: str, agent: str) -> str:
         if self.telegram:
             self.telegram.send_chat_action(chat_id)
-        code, resp = self.flock.control_agent(kind, agent)
+        code, resp = self.mesh.control_agent(kind, agent)
         verb = "paused" if kind == "PauseAgent" else "resumed"
         if code == 202:
             text = f"✅ {agent} {verb}."
@@ -1950,7 +1967,7 @@ class TelegramBot:
         if not file_id or not self.telegram:
             return ""
 
-        code, presence_data = self.flock.get_presence(agent)
+        code, presence_data = self.mesh.get_presence(agent)
         state = presence_data.get("presence", {}).get("state") if code == 200 else "unknown"
         if state == "blocked":
             reply = f"{agent} is not accepting messages right now"
@@ -1991,7 +2008,7 @@ class TelegramBot:
             resolved_filename = f"telegram-{label}-{int(time.time())}-{uuid.uuid4().hex[:8]}{fallback_extension}"
         resolved_mime_type = mime_type if _valid_attachment_mime_type(mime_type) else "application/octet-stream"
 
-        code, resp = self.flock.send_attachment(
+        code, resp = self.mesh.send_attachment(
             agent, resolved_filename, resolved_mime_type, base64.b64encode(data).decode("ascii"), caption=body or None,
         )
         if code != 202:
@@ -2088,9 +2105,9 @@ class TelegramBot:
         return text
 
     def handle_alerts_command(self, chat_id: int | str, limit: int = 10) -> str:
-        # GET /alerts has no "give me the tail" query (see FlockClient.get_alerts);
+        # GET /alerts has no "give me the tail" query (see MeshClient.get_alerts);
         # fetch up to the stream's own retention cap and slice the tail here.
-        code, data = self.flock.get_alerts(limit=1000)
+        code, data = self.mesh.get_alerts(limit=1000)
         if code != 200:
             text = f"❌ Unable to fetch alerts: {data.get('detail', 'error')}"
         else:
@@ -2157,7 +2174,7 @@ class TelegramBot:
                 state["stage"] = "profile"
                 # ⚠ No picker: office profiles reads Redis directly and has no
                 # REST equivalent, so this client cannot list valid accounts
-                # ahead of time (see FlockClient.hire_agent). A bad name still
+                # ahead of time (see MeshClient.hire_agent). A bad name still
                 # gets a clear error, listing the valid ones, from the api.
                 reply = f"Profile for {name}? (account/profile name, or - for the default; /cancel to abort)"
                 if self.telegram:
@@ -2178,7 +2195,7 @@ class TelegramBot:
             del self.pending[cid]
             if self.telegram:
                 self.telegram.send_chat_action(cid)
-            code, resp = self.flock.hire_agent(name, profile=profile, provider=provider)
+            code, resp = self.mesh.hire_agent(name, profile=profile, provider=provider)
             if code == 202:
                 extras = ", ".join(f"{k} {v}" for k, v in (("profile", profile), ("provider", provider)) if v)
                 reply = f"✅ Hire accepted for {name}" + (f" ({extras})" if extras else "") + " · window and CLI follow shortly."
@@ -2198,7 +2215,7 @@ class TelegramBot:
             del self.pending[cid]
             if self.telegram:
                 self.telegram.send_chat_action(cid)
-            code, resp = self.flock.retire_agent(agent)
+            code, resp = self.mesh.retire_agent(agent)
             if code == 202:
                 reply = f"✅ {agent} retired · queues and boards retained for a later re-hire."
             else:
@@ -2212,7 +2229,7 @@ class TelegramBot:
             del self.pending[cid]
             if self.telegram:
                 self.telegram.send_chat_action(cid)
-            code, resp = self.flock.send_message("all", message)
+            code, resp = self.mesh.send_message("all", message)
             if code == 202:
                 reply = "📢 Broadcast sent."
             else:
@@ -2284,7 +2301,7 @@ class TelegramBot:
         try:
             cursor = None
             while True:
-                code, data = self.flock.get_activity(agent, after=cursor, limit=1000)
+                code, data = self.mesh.get_activity(agent, after=cursor, limit=1000)
                 if code != 200:
                     break
                 items = data.get("activity", [])
@@ -2308,7 +2325,7 @@ class TelegramBot:
         stream_fn=None,
     ) -> None:
         """Background thread consuming activity events for a prompted turn."""
-        stream_gen = stream_fn or (lambda: self.flock.stream_activity(agent, after=after_cursor))
+        stream_gen = stream_fn or (lambda: self.mesh.stream_activity(agent, after=after_cursor))
         start_time = time.time()
         try:
             for event in stream_gen():
@@ -2361,9 +2378,9 @@ class TelegramBot:
             return _pane_tail_window(_strip_ansi(data).split("\n"), chrome_lines=chrome, tail_span=tail_span)
 
         try:
-            base_url = getattr(self.flock, "base_url", "http://127.0.0.1:8080")
-            token = getattr(self.flock, "token", "")
-            ssl_ctx = getattr(self.flock, "ssl_context", None)
+            base_url = getattr(self.mesh, "base_url", "http://127.0.0.1:8080")
+            token = getattr(self.mesh, "token", "")
+            ssl_ctx = getattr(self.mesh, "ssl_context", None)
             ws_url = _derive_session_url(base_url, self.session_url or "")
 
             def _default_connect():
@@ -2406,7 +2423,7 @@ class TelegramBot:
                     if snapshot_text is not None:
                         last_window = window_from(snapshot_text)
 
-                    pcode, pdata = self.flock.get_presence(agent)
+                    pcode, pdata = self.mesh.get_presence(agent)
                     state = pdata.get("presence", {}).get("state") if pcode == 200 else None
                     if state == "working":
                         saw_working = True
@@ -2451,7 +2468,7 @@ class TelegramBot:
         is handle_mention_prompt's one-off "@name ..." destination — used for
         this call only, never written to `chat_target_agent`. `raw` is
         handle_run_command's "/run <agent> <text>" — sends a Command-kind
-        envelope instead of a Message-kind one (see FlockClient.send_command),
+        envelope instead of a Message-kind one (see MeshClient.send_command),
         otherwise identical: same presence/blocked gate, same activity
         watcher, same one-off (never persistent) destination.
 
@@ -2472,7 +2489,7 @@ class TelegramBot:
         agent = agent_override or self._target_for(cid)
         if self.telegram:
             self.telegram.send_chat_action(cid)
-        code, presence_data = self.flock.get_presence(agent)
+        code, presence_data = self.mesh.get_presence(agent)
         state = presence_data.get("presence", {}).get("state") if code == 200 else "unknown"
 
         if state == "blocked":
@@ -2500,7 +2517,7 @@ class TelegramBot:
             )
             watcher.start()
 
-        code, resp = self.flock.send_command(agent, text) if raw else self.flock.send_message(agent, text)
+        code, resp = self.mesh.send_command(agent, text) if raw else self.mesh.send_message(agent, text)
         if code != 202:
             self.finalize_activity(cid, agent)
             verb = "run on" if raw else "send message to"
@@ -2595,7 +2612,7 @@ class TelegramBot:
 
 class DryRunTelegramClient:
     """Dry-run Telegram client that prints formatted output to stdout.
-    Allows running and reviewing Telegram bot workflows against real h-flock
+    Allows running and reviewing Telegram bot workflows against real h-mesh
     data without requiring a Telegram bot token from BotFather.
     """
 
@@ -2695,7 +2712,7 @@ class DryRunTelegramClient:
 
 
 def _door_ssl_context(api_url: str, ca_cert: str, insecure: bool) -> "ssl.SSLContext | None":
-    """The context for talking to the h-flock door, or None for plain HTTP.
+    """The context for talking to the h-mesh door, or None for plain HTTP.
 
     ⚠ `--insecure` is for a door with a self-signed certificate, which is what
     `setup.sh` generates. It disables verification entirely, so it says nothing
@@ -2724,15 +2741,15 @@ def _sibling_path(path: str, suffix: str) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="h-flock Telegram bot client")
-    parser.add_argument("--api-url", default=os.getenv("FLOCK_API_URL", "http://localhost:8080"), help="h-flock API base URL")
-    parser.add_argument("--ca-cert", default=os.getenv("FLOCK_CA_CERT", ""),
-                        help="verify the door's TLS certificate against this CA bundle")
-    parser.add_argument("--insecure", action="store_true", default=os.getenv("FLOCK_INSECURE") == "1",
-                        help="skip TLS verification (self-signed door certificate)")
-    parser.add_argument("--api-token", default=os.getenv("FLOCK_API_TOKEN", os.getenv("API_TOKEN", "")), help="h-flock API Bearer token")
+    parser = argparse.ArgumentParser(description="h-mesh Telegram bot client")
+    parser.add_argument("--api-url", default=os.getenv("H_MESH_API_URL", os.getenv("FLOCK_API_URL", "http://localhost:8080")), help="h-mesh API base URL")
+    parser.add_argument("--ca-cert", default=os.getenv("H_MESH_CA_CERT", os.getenv("FLOCK_CA_CERT", "")),
+                        help="verify the door's TLS certificate against this CA bundle (H_MESH_CA_CERT/FLOCK_CA_CERT)")
+    parser.add_argument("--insecure", action="store_true", default=(os.getenv("H_MESH_INSECURE") == "1" or os.getenv("FLOCK_INSECURE") == "1"),
+                        help="skip TLS verification (self-signed door certificate) (H_MESH_INSECURE=1/FLOCK_INSECURE=1)")
+    parser.add_argument("--api-token", default=os.getenv("H_MESH_API_TOKEN", os.getenv("FLOCK_API_TOKEN", os.getenv("API_TOKEN", ""))), help="h-mesh API Bearer token")
     parser.add_argument("--bot-token", default=os.getenv("TELEGRAM_BOT_TOKEN", ""), help="Telegram Bot API token")
-    parser.add_argument("--cursor-file", default=os.getenv("CURSOR_FILE", DEFAULT_CURSOR_FILE), help="File path to store message cursor")
+    parser.add_argument("--cursor-file", default=os.getenv("H_MESH_CURSOR_FILE", os.getenv("CURSOR_FILE", DEFAULT_CURSOR_FILE)), help="File path to store message cursor")
     parser.add_argument("--agent", default="architect", help="Target agent name")
     parser.add_argument("--dry-run", action="store_true", help="Run in dry-run mode (prints Telegram operations to stdout)")
     parser.add_argument("--prompt", type=str, default="", help="Prompt text to send in dry-run mode")
@@ -2753,8 +2770,8 @@ def main() -> None:
                         help="Enable spoken voice replies feature for this tenant")
     parser.add_argument("--tts-voice", default=os.getenv("TTS_VOICE", DEFAULT_TTS_VOICE),
                         help=f"Default edge-tts voice for spoken replies (default: {DEFAULT_TTS_VOICE})")
-    parser.add_argument("--session-url", default=os.getenv("FLOCK_SESSION_URL", ""),
-                        help="h-flock Session WebSocket URL (default: derived from --api-url, port 8081)")
+    parser.add_argument("--session-url", default=os.getenv("H_MESH_SESSION_URL", os.getenv("FLOCK_SESSION_URL", "")),
+                        help="h-mesh Session WebSocket URL (default: derived from --api-url, port 8081)")
     parser.add_argument("--pane-watch-chrome-default", type=int,
                         default=int(os.getenv("PANE_WATCH_CHROME_DEFAULT", "4")),
                         help="/watch: bottom pane rows to crop as UI chrome (input box, hints) (default: 4)")
@@ -2783,12 +2800,12 @@ def main() -> None:
     args = parser.parse_args()
 
     if not args.api_token:
-        logger.error("Error: API token required (--api-token or FLOCK_API_TOKEN env var)")
+        logger.error("Error: API token required (--api-token, H_MESH_API_TOKEN, or API_TOKEN env var)")
         sys.exit(1)
 
     ssl_context = _door_ssl_context(args.api_url, args.ca_cert, args.insecure)
-    flock = FlockClient(base_url=args.api_url, token=args.api_token, app_name="telegram",
-                        ssl_context=ssl_context)
+    mesh_client = MeshClient(base_url=args.api_url, token=args.api_token, app_name="telegram",
+                             ssl_context=ssl_context)
     cursor_store = CursorStore(filepath=args.cursor_file)
 
     is_dry_run = args.dry_run or not bool(args.bot_token)
@@ -2799,7 +2816,7 @@ def main() -> None:
         telegram = TelegramClient(bot_token=args.bot_token)
 
     bot = TelegramBot(
-        flock_client=flock,
+        mesh_client=mesh_client,
         telegram_client=telegram,
         cursor_store=cursor_store,
         target_agent=args.agent,
@@ -2844,10 +2861,10 @@ def main() -> None:
             # mailbox cursor it used to track for handle_user_prompt's old
             # wait loop moved here wholesale when that loop was removed.
             reply_pusher = ReplyPusher(
-                flock,
-                telegram,
-                args.chat_id,
-                cursor_store,
+                mesh=mesh_client,
+                telegram=telegram,
+                chat_id=args.chat_id,
+                cursor_store=cursor_store,
                 tts_voice=args.tts_voice or None,
                 voice_enabled_fn=bot.is_voice_enabled,
                 activity_finalizer_fn=bot.finalize_activity,
@@ -2855,7 +2872,7 @@ def main() -> None:
             threading.Thread(target=reply_pusher.run, daemon=True, name="reply-pusher").start()
             if not args.no_alert_push:
                 alerts_cursor_file = args.alerts_cursor_file or _sibling_path(args.cursor_file, "alerts")
-                pusher = AlertPusher(flock, telegram, args.chat_id, CursorStore(filepath=alerts_cursor_file))
+                pusher = AlertPusher(mesh=mesh_client, telegram=telegram, chat_id=args.chat_id, cursor_store=CursorStore(filepath=alerts_cursor_file))
                 threading.Thread(target=pusher.run, daemon=True, name="alert-pusher").start()
         else:
             logger.info("TELEGRAM_CHAT_ID not set; live reply/alert push disabled (the menu still works on demand).")

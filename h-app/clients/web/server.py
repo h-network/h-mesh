@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve the dependency-free office UI and proxy one h-flock tenant."""
+"""Serve the dependency-free office UI and proxy one h-mesh tenant."""
 
 from __future__ import annotations
 
@@ -191,7 +191,7 @@ def _read_socket_line(sock: socket.socket) -> str:
 
 
 class OfficeHandler(SimpleHTTPRequestHandler):
-    server_version = "h-flock-web/1"
+    server_version = "h-mesh-web/1"
     MAX_BODY_SIZE = 2 * 1024 * 1024  # 2MB cap to reject oversized POST payloads
 
     def __init__(self, *args, **kwargs):
@@ -213,7 +213,7 @@ class OfficeHandler(SimpleHTTPRequestHandler):
             cookies.load(cookie_header)
         except Exception:
             return None
-        session_cookie = cookies.get("hflock_session")
+        session_cookie = cookies.get("hmesh_session") or cookies.get("hflock_session")
         return session_cookie.value if session_cookie and session_cookie.value else None
 
     def _session_is_telegram(self) -> bool:
@@ -786,7 +786,7 @@ class OfficeHandler(SimpleHTTPRequestHandler):
                 else:
                     valid_sessions[token] = now
                     login_attempts.pop(client_ip, None)
-            cookie_header = f"hflock_session={token}; Path=/; HttpOnly; SameSite=Strict"
+            cookie_header = f"hmesh_session={token}; Path=/; HttpOnly; SameSite=Strict"
             if getattr(self.server, "api_base", "").startswith("https://"):
                 cookie_header += "; Secure"
             self.send_response(200)
@@ -891,7 +891,7 @@ class OfficeHandler(SimpleHTTPRequestHandler):
                 if session_origin is not None:
                     session_origin[token] = "telegram"
                 login_attempts.pop(client_ip, None)
-        cookie_header = f"hflock_session={token}; Path=/; HttpOnly; SameSite=Strict"
+        cookie_header = f"hmesh_session={token}; Path=/; HttpOnly; SameSite=Strict"
         if getattr(self.server, "api_base", "").startswith("https://"):
             cookie_header += "; Secure"
         self.send_response(200)
@@ -921,7 +921,7 @@ class OfficeHandler(SimpleHTTPRequestHandler):
                     _forget()
             else:
                 _forget()
-        clear_cookie = "hflock_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"
+        clear_cookie = "hmesh_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Set-Cookie", clear_cookie)
@@ -935,7 +935,7 @@ class OfficeHandler(SimpleHTTPRequestHandler):
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>h-flock Operator Login</title>
+  <title>h-mesh Operator Login</title>
   <link rel="stylesheet" href="/style.css">
   <!-- Telegram's own official Mini App SDK -- same telegram.org domain
        clients/telegram/bot.py already talks to (api.telegram.org). Loaded
@@ -956,7 +956,7 @@ class OfficeHandler(SimpleHTTPRequestHandler):
 </head>
 <body>
   <div class="card" id="card">
-    <h2 id="card-title">h-flock Operator Login</h2>
+    <h2 id="card-title">h-mesh Operator Login</h2>
     <p id="telegram-status" class="hint" style="display:none;">Signing in via Telegram…</p>
     <form id="login-form">
       <label for="secret">Operator Secret</label>
@@ -1458,19 +1458,19 @@ def enrol(api_base: str, token: str, client: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Serve the h-flock browser client")
+    parser = argparse.ArgumentParser(description="Serve the h-mesh browser client")
     parser.add_argument("--config", help="Path to config file (.toml, .json, key-value)")
-    parser.add_argument("--listen", default=os.environ.get("WEB_LISTEN"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("WEB_PORT", "0")) if os.environ.get("WEB_PORT") else None)
-    parser.add_argument("--api", default=os.environ.get("HFLOCK_API"))
-    parser.add_argument("--session", default=os.environ.get("HFLOCK_SESSION"))
-    parser.add_argument("--token", default=os.environ.get("API_TOKEN"))
-    parser.add_argument("--client", default=os.environ.get("HFLOCK_CLIENT"))
-    parser.add_argument("--secret", default=os.environ.get("HFLOCK_SECRET"))
-    parser.add_argument("--tls-cert", default=os.environ.get("HFLOCK_TLS_CERT"))
-    parser.add_argument("--tls-key", default=os.environ.get("HFLOCK_TLS_KEY"))
-    parser.add_argument("--log-format", choices=["text", "json"], default=os.environ.get("HFLOCK_LOG_FORMAT", "text"))
-    parser.add_argument("--audit-log", default=os.environ.get("HFLOCK_AUDIT_LOG"))
+    parser.add_argument("--listen", default=os.environ.get("H_MESH_WEB_LISTEN", os.environ.get("WEB_LISTEN")))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("H_MESH_WEB_PORT", os.environ.get("WEB_PORT", "0"))) if (os.environ.get("H_MESH_WEB_PORT") or os.environ.get("WEB_PORT")) else None)
+    parser.add_argument("--api", default=os.environ.get("H_MESH_API", os.environ.get("HFLOCK_API")))
+    parser.add_argument("--session", default=os.environ.get("H_MESH_SESSION", os.environ.get("HFLOCK_SESSION")))
+    parser.add_argument("--token", default=os.environ.get("H_MESH_TOKEN", os.environ.get("H_MESH_API_TOKEN", os.environ.get("API_TOKEN"))))
+    parser.add_argument("--client", default=os.environ.get("H_MESH_CLIENT", os.environ.get("HFLOCK_CLIENT")))
+    parser.add_argument("--secret", default=os.environ.get("H_MESH_SECRET", os.environ.get("HFLOCK_SECRET")))
+    parser.add_argument("--tls-cert", default=os.environ.get("H_MESH_TLS_CERT", os.environ.get("HFLOCK_TLS_CERT")))
+    parser.add_argument("--tls-key", default=os.environ.get("H_MESH_TLS_KEY", os.environ.get("HFLOCK_TLS_KEY")))
+    parser.add_argument("--log-format", choices=["text", "json"], default=os.environ.get("H_MESH_LOG_FORMAT", os.environ.get("HFLOCK_LOG_FORMAT", "text")))
+    parser.add_argument("--audit-log", default=os.environ.get("H_MESH_AUDIT_LOG", os.environ.get("HFLOCK_AUDIT_LOG")))
     parser.add_argument("--demo", action="store_true", default=None)
     # Same variable names clients/telegram/bot.py already uses for the same
     # bot and the same single operator — a Mini App login is "prove you're
@@ -1508,7 +1508,7 @@ def main() -> None:
         # operator who lost a conversation that way. Pass --audit-log to move it.
         audit_log = str(Path(__file__).resolve().parent / "console-audit.jsonl")
 
-    demo_mode = args.demo if args.demo is not None else bool(cfg.get("demo", bool(os.environ.get("HFLOCK_DEMO"))))
+    demo_mode = args.demo if args.demo is not None else bool(cfg.get("demo", bool(os.environ.get("H_MESH_DEMO", os.environ.get("HFLOCK_DEMO")))))
     token = token or ("demo-secret" if demo_mode else None)
 
     if audit_log:
@@ -1528,13 +1528,13 @@ def main() -> None:
     if not _is_loopback(listen) and not secret:
         print(
             f"ERROR: Refusing to bind non-loopback interface '{listen}' without operator secret authentication.\n"
-            f"Provide --secret or set HFLOCK_SECRET or secret in config to enable access control before exposing the console over the network.",
+            f"Provide --secret or set H_MESH_SECRET (or HFLOCK_SECRET) or secret in config to enable access control before exposing the console over the network.",
             file=sys.stderr,
         )
         raise SystemExit(1)
 
     if not token and not demo_mode:
-        parser.error("provide --token, API_TOKEN, or token in --config")
+        parser.error("provide --token, API_TOKEN, H_MESH_TOKEN, or token in --config")
 
     api_base = api_url.rstrip("/")
     session_host = "127.0.0.1"
@@ -1571,11 +1571,11 @@ def main() -> None:
     server.session_origin = {}  # token -> "telegram", for sessions from _handle_telegram_auth only
     server.telegram_bot_token = args.telegram_bot_token or (str(cfg.get("telegram_bot_token")) if cfg.get("telegram_bot_token") else None)
     server.telegram_allowed_user_id = args.telegram_chat_id or (str(cfg.get("telegram_chat_id")) if cfg.get("telegram_chat_id") else None)
-    server.session_ttl = int(os.environ.get("HFLOCK_SESSION_TTL", "86400"))  # 24 hours
+    server.session_ttl = int(os.environ.get("H_MESH_SESSION_TTL", os.environ.get("HFLOCK_SESSION_TTL", "86400")))  # 24 hours
     server.login_attempts = {}  # ip -> list of timestamp attempts
-    server.max_login_attempts = int(os.environ.get("HFLOCK_MAX_LOGIN_ATTEMPTS", "5"))
-    server.rate_limit_window = int(os.environ.get("HFLOCK_RATE_LIMIT_WINDOW", "60"))
-    server.max_sessions = int(os.environ.get("HFLOCK_MAX_SESSIONS", "16"))
+    server.max_login_attempts = int(os.environ.get("H_MESH_MAX_LOGIN_ATTEMPTS", os.environ.get("HFLOCK_MAX_LOGIN_ATTEMPTS", "5")))
+    server.rate_limit_window = int(os.environ.get("H_MESH_RATE_LIMIT_WINDOW", os.environ.get("HFLOCK_RATE_LIMIT_WINDOW", "60")))
+    server.max_sessions = int(os.environ.get("H_MESH_MAX_SESSIONS", os.environ.get("HFLOCK_MAX_SESSIONS", "16")))
     server.active_sessions = 0
     server.active_sockets_set = set()
     server.sessions_lock = threading.Lock()

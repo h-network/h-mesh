@@ -7,8 +7,8 @@ by the backend (not just by browser JavaScript).
 
 import asyncio
 import json
-from flock.session.app import SessionSettings, create_app
-from flock.session.control import Subscriber
+from modules.session.app import SessionSettings, create_app
+from modules.session.control import Subscriber
 
 
 class FakeHeaders(dict):
