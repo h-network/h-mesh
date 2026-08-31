@@ -377,6 +377,56 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             self.assertEqual(mirrored[0]["source"], "jack")
             self.assertEqual(mirrored[0]["destination"], "kate")
 
+    def test_stop_agent_lifecycle_logs_window_killed(self):
+        from core.envelope import build, encode
+        from modules.office.port import deliver_office
+
+        reconciler = TmuxReconciler(
+            pod=self.pod,
+            tenant=self.tenant,
+            redis_url=self.redis_url,
+            session_name=self.session_name,
+            socket=self.socket,
+        )
+        self.r.hset(self.registry, mapping={"liam": "tmux", "noah": "tmux"})
+        reconciler.reconcile_once(self.r)
+
+        self.assertIn("liam", list_windows(self.session_name, socket=self.socket))
+        self.assertIn("noah", list_windows(self.session_name, socket=self.socket))
+
+        # Push StopAgent frame to office ingress
+        frame = build(
+            kind="StopAgent",
+            source="architect",
+            destination="office",
+            payload={"agent": "liam"},
+            pod=self.pod,
+            tenant=self.tenant,
+        )
+        ingress_key = prefix(self.pod, self.tenant, agent="office", resource="ingress")
+        self.r.rpush(ingress_key, encode(frame))
+
+        logged = []
+        with unittest.mock.patch("core.logging.mirror", side_effect=lambda line: logged.append(json.loads(line))):
+            deliver_office(
+                self.r,
+                pod=self.pod,
+                tenant=self.tenant,
+                agent="office",
+                session_name=self.session_name,
+                socket=self.socket,
+            )
+
+        # Confirm liam was killed and noah remains
+        windows = list_windows(self.session_name, socket=self.socket)
+        self.assertNotIn("liam", windows)
+        self.assertIn("noah", windows)
+
+        # Confirm window_killed was logged
+        killed_events = [rec for rec in logged if rec.get("event") == "window_killed"]
+        self.assertEqual(len(killed_events), 1)
+        self.assertEqual(killed_events[0]["destination"], "liam")
+
 
 if __name__ == "__main__":
     unittest.main()

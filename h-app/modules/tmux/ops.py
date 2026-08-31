@@ -620,7 +620,10 @@ def create_window(
 
 
 def kill_window(session_name: str, window_name: str, socket: str | None = None) -> tuple[int, str, str]:
-    return run_tmux("kill-window", "-t", f"{session_name}:{window_name}", socket=socket)
+    ret, out, err = run_tmux("kill-window", "-t", f"{session_name}:{window_name}", socket=socket)
+    if ret == 0:
+        log_record("tmux", "window_killed", destination=window_name)
+    return ret, out, err
 
 
 def submit_text(

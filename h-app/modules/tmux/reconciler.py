@@ -228,7 +228,6 @@ class TmuxReconciler:
     def kill_window(self, window_name: str) -> bool:
         ret, stdout, stderr = tmux_ops.kill_window(self.session_name, window_name, socket=self.socket)
         if ret == 0:
-            log_record("tmux_reconciler", "window_killed", destination=window_name)
             return True
         else:
             log_record("tmux_reconciler", "error", destination=window_name, reason=f"kill-window failed: {stderr}")
