@@ -58,6 +58,12 @@ class FakeRedis:
         self.hashes[key][field] = value
         return 1
 
+    def hsetnx(self, key, field, value):
+        if field in self.hashes[key]:
+            return 0
+        self.hashes[key][field] = value
+        return 1
+
     def hget(self, key, field):
         return self.hashes[key].get(field)
 
@@ -281,6 +287,43 @@ class TmuxPortTests(unittest.TestCase):
         self.redis.set(prefix(POD, TENANT, agent="bob", resource="launch"), "agy")
         mark_delivery_pending(self.redis, POD, TENANT, "bob", "sid-3")
         self.assertEqual(len(self.redis.streams[prefix(POD, TENANT, agent="bob", resource="pending.verify")]), 2)
+
+    @patch("modules.tmux.port.deliver_tmux")
+    @patch("redis.Redis.from_url")
+    @patch("signal.signal")
+    def test_main_entrypoint(self, mock_signal, mock_redis_from_url, mock_deliver):
+        import signal
+        from modules.tmux.port import main
+
+        mock_redis_from_url.return_value = self.redis
+        env = {"POD": POD, "TENANT": TENANT, "REDIS_URL": "redis://127.0.0.1:6379/0"}
+        with patch.dict(os.environ, env):
+            main(["bob"])
+
+        mock_signal.assert_called_once_with(signal.SIGCHLD, signal.SIG_DFL)
+        mock_deliver.assert_called_once_with(self.redis, pod=POD, tenant=TENANT, agent="bob")
+
+    @patch("modules.tmux.port.deliver_tmux")
+    @patch("redis.Redis.from_url")
+    @patch("signal.signal")
+    def test_main_entrypoint_skips_when_paused(self, mock_signal, mock_redis_from_url, mock_deliver):
+        from modules.tmux.port import main
+
+        mock_redis_from_url.return_value = self.redis
+        self.redis.set(prefix(POD, TENANT, agent="bob", resource="paused"), "1")
+        env = {"POD": POD, "TENANT": TENANT, "REDIS_URL": "redis://127.0.0.1:6379/0"}
+        with patch.dict(os.environ, env):
+            main(["bob"])
+
+        mock_deliver.assert_not_called()
+
+    @patch("signal.signal")
+    def test_main_entrypoint_missing_arg_exits(self, mock_signal):
+        from modules.tmux.port import main
+
+        with self.assertRaises(SystemExit) as cm:
+            main([])
+        self.assertEqual(cm.exception.code, 1)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ only the process/callback the switch's kick invokes does.
 import importlib
 import logging
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Callable, Union
 
@@ -141,6 +142,21 @@ def dispatch_ingress(r, *, pod: str, tenant: str, agent: str) -> None:
     handler(r=r, pod=pod, tenant=tenant, agent=agent)
 
 
+@contextmanager
+def delivery_lock(r, *, pod: str, tenant: str, agent: str):
+    """Serialize delivery to one destination agent using Redis HSETNX busy tag."""
+    delivering_key = prefix(pod, tenant, resource="delivering")
+    while True:
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        if r.hsetnx(delivering_key, agent, now_iso):
+            break
+        time.sleep(0.05)
+    try:
+        yield
+    finally:
+        r.hdel(delivering_key, agent)
+
+
 def run_delivery_kick(
     agent: str, *, pod: str, tenant: str, r,
 ) -> None:
@@ -149,13 +165,5 @@ def run_delivery_kick(
     Acquires a busy tag via HSETNX before calling dispatch_ingress(), and
     always releases it, even if dispatch raises.
     """
-    delivering_key = prefix(pod, tenant, resource="delivering")
-    while True:
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        if r.hsetnx(delivering_key, agent, now_iso):
-            break
-        time.sleep(0.05)
-    try:
+    with delivery_lock(r, pod=pod, tenant=tenant, agent=agent):
         dispatch_ingress(r, pod=pod, tenant=tenant, agent=agent)
-    finally:
-        r.hdel(delivering_key, agent)
