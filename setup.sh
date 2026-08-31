@@ -104,6 +104,15 @@ if [ "$SKIP_INSTALL" -eq 0 ]; then
     echo
 fi
 
+# 1.5. Persist the venv's bin dir on PATH for every future shell/pane -- a
+# hired agent's tmux pane and an attaching human both start a fresh login
+# shell, which doesn't inherit PATH from whatever shell ran this script.
+if [ "$USE_VENV" -eq 1 ]; then
+    echo "Persisting $TARGET_VENV/bin on PATH (~/.bashrc, ~/.profile)..."
+    "$PYTHON" -m services.venv_path "$TARGET_VENV"
+    echo
+fi
+
 # 2. Verify Redis connection
 echo "Checking Redis connection at $REDIS_URL..."
 if ! REDIS_URL="$REDIS_URL" "$PYTHON" -c '

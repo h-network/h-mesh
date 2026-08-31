@@ -52,8 +52,15 @@ def test_upgrade_restarts_daemons_without_duplicating_and_preserves_the_tmux_ses
         f.write("#!/usr/bin/env bash\nexec bash -il\n")
     os.chmod(fake_h_agent, 0o755)
 
+    # ⚠ setup.sh and h-mesh upgrade both write to ~/.bashrc and ~/.profile
+    # now (persisting the venv bin dir on PATH) -- HOME must be isolated or
+    # this test edits the real ones.
+    home_dir = os.path.join(tmpdir, "home")
+    os.makedirs(home_dir, exist_ok=True)
+
     env = dict(os.environ)
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["HOME"] = home_dir
     env["PYTHONPATH"] = str(REPO_ROOT / "h-app")
     env["H_MESH_RUN_DIR"] = run_dir
     env["AGENT_NAME"] = "architect"
@@ -159,6 +166,13 @@ def test_upgrade_restarts_daemons_without_duplicating_and_preserves_the_tmux_ses
         assert port_type(r, pod=pod, tenant=tenant, agent="host") == "office"
         assert port_type(r, pod=pod, tenant=tenant, agent="api") == "api"
         assert port_type(r, pod=pod, tenant=tenant, agent="worker1") == "tmux"
+
+        # Upgrade re-persists the venv bin dir on PATH too (repairs an
+        # install that predates the fix, or whose venv path changed).
+        venv_bin = os.path.join(venv_dir, "bin")
+        for rc_filename in (".bashrc", ".profile"):
+            rc_content = open(os.path.join(home_dir, rc_filename)).read()
+            assert venv_bin in rc_content, f"{rc_filename} missing venv bin on PATH after upgrade"
 
         # The tmux server/session itself was never touched -- worker1's pane
         # survives the upgrade (the documented limit: it keeps its original

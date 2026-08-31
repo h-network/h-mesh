@@ -54,8 +54,15 @@ def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
     state_dir = os.path.join(tmpdir, "state")
     os.makedirs(state_dir, exist_ok=True)
 
+    # ⚠ setup.sh now writes to ~/.bashrc and ~/.profile (persisting the venv
+    # bin dir on PATH) -- HOME must be isolated here or this test edits the
+    # real ones.
+    home_dir = os.path.join(tmpdir, "home")
+    os.makedirs(home_dir, exist_ok=True)
+
     env = dict(os.environ)
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["HOME"] = home_dir
     env["PYTHONPATH"] = str(REPO_ROOT / "h-app")
     env["H_MESH_RUN_DIR"] = run_dir
     env["H_MESH_STATE_DIR"] = state_dir
@@ -116,6 +123,13 @@ def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
         reg_key = prefix(pod, tenant, resource="registry")
         assert port_type(r, pod=pod, tenant=tenant, agent="host") == "office"
         assert port_type(r, pod=pod, tenant=tenant, agent="api") == "api"
+
+        # setup.sh persists the venv bin dir on PATH so a hired agent's pane
+        # or an attaching human can actually run h-mesh-* commands.
+        venv_bin = os.path.join(venv_dir, "bin")
+        for rc_filename in (".bashrc", ".profile"):
+            rc_content = open(os.path.join(home_dir, rc_filename)).read()
+            assert venv_bin in rc_content, f"{rc_filename} missing venv bin on PATH"
 
         # Read daemon PIDs from run_dir
         with open(os.path.join(run_dir, "switch.pid")) as f:

@@ -15,9 +15,12 @@ Every hop a message takes is logged, the same way a real packet's path can be tr
 ## Bootstrap script
 
 `./setup.sh` wraps the manual install below into one step for a fresh host or
-pod: it installs h-mesh into a venv, seeds the registry's fixed lifecycle
-participants (`host` -> office, `api` -> api) for the given pod/tenant, and
-starts the `h-mesh-switch` and `h-mesh-tmux-reconciler` daemons.
+pod: it installs h-mesh into a venv, persists that venv's `bin` dir on `PATH`
+(via `~/.bashrc` and `~/.profile`, so it's on `PATH` for every future
+shell/pane, not just the one running setup.sh), seeds the registry's fixed
+lifecycle participants (`host` -> office, `api` -> api) for the given
+pod/tenant, and starts the `h-mesh-switch` and `h-mesh-tmux-reconciler`
+daemons.
 
 ```bash
 ./setup.sh --pod mypod --tenant mytenant
@@ -51,7 +54,8 @@ h-mesh-upgrade --pod mypod --tenant mytenant
 
 Same pod/tenant/redis-url/session/tmux-tmpdir/tmux-socket/venv flags as
 setup.sh, plus `--skip-install` and `--skip-pull` (`h-mesh-upgrade --help`
-for the full list).
+for the full list). It also re-persists the venv bin dir on `PATH`, so
+running it repairs an install that predates that fix.
 
 ⚠ **Known limit:** a hired agent's tmux pane inherits its environment once,
 at creation. Upgrading restarts h-mesh's own daemons and reinstalls the code

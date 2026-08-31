@@ -7,7 +7,9 @@ daemons setup.sh already has running (services.daemons.stop_daemons, via the
 pidfiles setup.sh writes under $H_MESH_RUN_DIR), pulls and reinstalls, then
 starts fresh daemons with the current environment (services.daemons.start_daemons)
 -- so it does not double-start daemons against an already-running install,
-and a changed env var takes effect on the daemons it restarts.
+and a changed env var takes effect on the daemons it restarts. It also
+re-persists the venv bin dir on PATH (services.venv_path), to repair an
+install that predates that fix or whose venv path has since changed.
 
 ⚠ Known, deliberate limit: an agent's tmux pane inherits its environment at
 creation time only. This restarts h-mesh's own daemons and reinstalls the
@@ -31,6 +33,7 @@ from services.daemons import (
     start_daemons,
     stop_daemons,
 )
+from services.venv_path import persist_venv_on_path
 
 
 def _run(cmd: list[str]) -> None:
@@ -85,6 +88,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(f"error: pip install failed ({exc.returncode})", file=sys.stderr)
             raise SystemExit(1) from exc
         print()
+
+    print("Persisting venv bin on PATH (~/.bashrc, ~/.profile)...")
+    persist_venv_on_path(config.python.parent.parent, log=print)
+    print()
 
     print("Stopping existing daemons (if any)...")
     stop_daemons(config.run_dir)
