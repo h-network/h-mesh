@@ -1,9 +1,14 @@
-"""Tmux port: terminal delivery handlers and ingress dispatch."""
+"""Tmux port: terminal delivery handlers, ingress dispatch, and executable entrypoint."""
 
 import os
+import signal
+import sys
 from datetime import datetime, timezone
 
+import redis
+
 from core.channels import DeadLetter, receive
+from core.dispatch import delivery_lock
 from core.keys import prefix
 from core.registry import port_type
 from lib.attachment_schema import validate_attachment_payload
@@ -280,3 +285,27 @@ def deliver_tmux(
         blocking=blocking,
         module="tmux",
     )
+
+
+def main(argv: list[str] | None = None) -> None:
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    args = sys.argv[1:] if argv is None else argv
+    if not args:
+        print("usage: python -m modules.tmux.port <agent>", file=sys.stderr)
+        sys.exit(1)
+    agent = args[0]
+    pod = os.environ["POD"]
+    tenant = os.environ["TENANT"]
+    redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+
+    r = redis.Redis.from_url(redis_url)
+    with delivery_lock(r, pod=pod, tenant=tenant, agent=agent):
+        paused_key = prefix(pod, tenant, agent=agent, resource="paused")
+        if r.get(paused_key):
+            return
+        deliver_tmux(r, pod=pod, tenant=tenant, agent=agent)
+
+
+if __name__ == "__main__":
+    main()
+
