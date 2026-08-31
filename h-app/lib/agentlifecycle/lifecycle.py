@@ -1,9 +1,9 @@
 """Agent lifecycle logic: start/stop/pause/resume.
 
-This is the library a module uses to keep track of agent lifecycles
-it keeps track of which agent ran where, which profile. 
-Its used AFTER the agent has started, the starting og the agent is done by h-agent.
-This library keeps track of it. 
+This is the library a module uses to keep track of agent lifecycles --
+it keeps track of which agent ran where, which profile.
+It's used AFTER the agent has started; the starting of the agent is done by
+h-agent. This library keeps track of it.
 """
 
 import json
