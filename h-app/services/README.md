@@ -17,3 +17,8 @@ separate reconciler daemon as two different things.
 
 Nothing per-request (e.g. `agentlifecycle`) and nothing CLI-invoked (e.g.
 `office`) belongs here.
+
+| file | service |
+|---|---|
+| `api.py` | Loads API settings and runs the module's FastAPI application with uvicorn. |
+| `tmux_reconciler.py` | Loads tmux configuration and runs `TmuxReconciler.run_forever()`. |
