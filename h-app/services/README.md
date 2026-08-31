@@ -17,3 +17,10 @@ separate reconciler daemon as two different things.
 
 Nothing per-request (e.g. `agentlifecycle`) and nothing CLI-invoked (e.g.
 `office`) belongs here.
+
+| launcher | what it starts |
+|---|---|
+| `tmux_reconciler.py` | `modules.tmux.reconciler.TmuxReconciler` daemon |
+| `telegram_bot.py` | `clients.telegram.bot.TelegramBot` polling client |
+| `web_console.py` | `clients.web.server.WebConsoleServer` HTTP/WS proxy server |
+
