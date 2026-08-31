@@ -12,6 +12,66 @@ from core.keys import prefix
 from core.logging import log_record, record_task_event
 
 
+class BoardError(ValueError):
+    """A stored board entry could not be read as a ticket."""
+
+
+def _text(value) -> str:
+    if value is None:
+        return ""
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def normalize_ticket(raw, *, state: str | None = None) -> dict:
+    """Normalize a raw board-list entry (or an already-parsed dict) into the
+    one ticket shape every board caller reads and writes.
+
+    ``state`` is the fallback ``status`` for an entry that predates that
+    field, and (for callers that track it) the board list the entry was read
+    from -- callers reading a specific list already know which one.
+    """
+    if isinstance(raw, dict):
+        ticket = raw
+    else:
+        try:
+            ticket = json.loads(_text(raw))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise BoardError("board entry is not a valid ticket") from exc
+    if not isinstance(ticket, dict):
+        raise BoardError("board entry is not a valid ticket")
+    task_id = ticket.get("id")
+    title = ticket.get("title")
+    if not isinstance(task_id, str) or not task_id:
+        raise BoardError("board entry has no valid task id")
+    if not isinstance(title, str):
+        raise BoardError("board entry has no valid title")
+    normalized = {
+        "v": ticket.get("v", 1),
+        "id": task_id,
+        "title": title,
+        "description": ticket.get("description", ""),
+        "created_by": ticket.get("created_by", ticket.get("from", "unknown")),
+        "status": ticket.get("status", state),
+        "created_ts": ticket.get("created_ts", ticket.get("created_at", "")),
+        "started_ts": ticket.get("started_ts"),
+        "done_ts": ticket.get("done_ts"),
+        "held_ts": ticket.get("held_ts"),
+    }
+    if ticket.get("priority") is not None:
+        normalized["priority"] = ticket["priority"]
+    raw_related = ticket.get("related")
+    if isinstance(raw_related, list):
+        related = [value for value in raw_related if isinstance(value, str)]
+        if related:
+            normalized["related"] = related
+    return normalized
+
+
+def serialize_ticket(ticket: dict) -> str:
+    """Compact JSON for a board-list entry -- not pretty-printed, not a file."""
+    return json.dumps(ticket, separators=(",", ":"))
+
+
 def add_ticket(r, *, pod: str, tenant: str, agent: str, envelope: dict) -> None:
     """Write an AddTicket envelope to the recipient's board."""
     corr_id = envelope.get("correlation_id")
@@ -66,7 +126,7 @@ def add_ticket(r, *, pod: str, tenant: str, agent: str, envelope: dict) -> None:
 
     todo_key = prefix(pod, tenant, agent=agent, resource="tasks.todo")
     try:
-        depth = r.rpush(todo_key, json.dumps(ticket_obj))
+        depth = r.rpush(todo_key, serialize_ticket(ticket_obj))
     except Exception as exc:
         log_record(
             "board_interaction", "board_write_unknown", correlation_id=corr_id,
