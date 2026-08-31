@@ -22,7 +22,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: pip install redis
+      - run: pip install redis fastapi uvicorn
       - run: python3 -m unittest discover -s h-app/tests -v
       - name: Switch smoke test (real Redis)
         env:
@@ -54,3 +54,5 @@ jobs:
           POD: ci-tmux
           TENANT: ci-tmux
         run: python3 h-app/tools/smoke_tmux.py
+      - name: Session smoke test (isolated tmux)
+        run: python3 h-app/tools/smoke_session.py
