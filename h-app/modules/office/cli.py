@@ -451,6 +451,8 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
         parser.add_argument("--profile", metavar="ACCOUNT",
                             help="account whose config dir and credential this agent uses "
                                  "(default: the tenant's default account)")
+        parser.add_argument("--provider", metavar="NAME",
+                            help="provider used to start this agent")
         mode_group = parser.add_mutually_exclusive_group()
         mode_group.add_argument("--resume", action="store_true", default=None,
                                 help="resume prior session history (default when history exists)")
@@ -484,6 +486,8 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
         payload["cli"] = args.cli
         if args.profile:
             payload["profile"] = args.profile
+        if args.provider:
+            payload["provider"] = args.provider
         if args.fresh:
             payload["resume"] = False
         elif args.resume:

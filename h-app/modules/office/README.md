@@ -19,7 +19,8 @@ on `sys.path` and call `modules.office.cli.main`.
 (configured-accounts) read that has no h-mesh equivalent anywhere in `core`
 or `lib`. `hire --profile` still exists and still reaches the payload, but
 without the client-side "unknown account" check the old system had, for the
-same reason.
+same reason. `hire --provider NAME` likewise passes an explicit provider to
+the lifecycle payload, where the existing StartAgent validation applies.
 
 The receiving port delegates to the settled `lib.agentlifecycle` API.
 `lib/agentlifecycle/lifecycle.py`'s own `stop_agent` has an open
