@@ -9,5 +9,5 @@ none of them should own it exclusively, it goes here.
 |---|---|
 | `agentlifecycle/` | start/stop/pause/resume desired-state logic for a participant, callback-driven, no port of its own |
 | `ingress_snapshot.py` | the atomic "drain everything queued" primitive, used by any port's own delivery handler |
-| `board_interaction.py` | centralized board/ticket operations (`add_ticket`), called by whichever port needs to touch a board |
+| `board_interaction.py` | centralized board/ticket operations -- `add_ticket` (write an incoming `AddTicket` to a board), `normalize_ticket`/`serialize_ticket` (the one ticket shape every reader/writer of a board entry uses, including `office`'s own board commands) |
 | `attachment_schema.py` | attachment wire/schema limits (size, mime type, base64 validation), shared by any port that delivers attachments |
