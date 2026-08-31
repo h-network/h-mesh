@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from services.tenant_config import read_tenant_env
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Add here if setup.sh's own daemon-start step ever grows another one.
@@ -229,7 +231,12 @@ def resolve_config(args: argparse.Namespace) -> DaemonConfig:
     h_app_path = str(REPO_ROOT / "h-app")
     pythonpath = f"{existing_pythonpath}{os.pathsep}{h_app_path}" if existing_pythonpath else h_app_path
 
-    env = dict(os.environ)
+    # Persisted tenant config (PROVIDER_*/CLAUDE_OAUTH_TOKEN_*, from the
+    # setup.sh wizard) first, so daemons started fresh -- in a shell that
+    # never ran setup.sh itself -- still see them; live process env on top,
+    # so an explicit export still wins over what's on disk.
+    env = dict(read_tenant_env(args.tenant))
+    env.update(os.environ)
     env.update({
         "POD": args.pod,
         "TENANT": args.tenant,

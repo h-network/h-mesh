@@ -7,7 +7,15 @@ from pathlib import Path
 import pytest
 import redis
 
-from services.daemons import DaemonError, pid_alive, start_daemons, stop_daemons
+from services.daemons import (
+    DaemonError,
+    add_common_args,
+    pid_alive,
+    resolve_config,
+    start_daemons,
+    stop_daemons,
+)
+from services.tenant_config import write_tenant_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -134,3 +142,35 @@ def test_start_daemons_raises_daemon_error_when_module_is_broken(monkeypatch):
             start_daemons(python=python, run_dir=run_dir, env=env)
     finally:
         _kill_and_cleanup(run_dir, tmpdir, env)
+
+
+def test_resolve_config_merges_persisted_tenant_env_beneath_process_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("H_MESH_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("PROVIDER_LOCAL_URL", raising=False)
+    write_tenant_env("mytenant", {
+        "PROVIDER_LOCAL_URL": "http://10.0.0.5:8000",
+        "PROVIDER_LOCAL_MODEL": "served-model",
+    })
+
+    import argparse
+    parser = argparse.ArgumentParser()
+    add_common_args(parser)
+    args = parser.parse_args(["--tenant", "mytenant"])
+    config = resolve_config(args)
+
+    assert config.env["PROVIDER_LOCAL_URL"] == "http://10.0.0.5:8000"
+    assert config.env["PROVIDER_LOCAL_MODEL"] == "served-model"
+
+
+def test_resolve_config_live_env_overrides_persisted_tenant_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("H_MESH_STATE_DIR", str(tmp_path))
+    write_tenant_env("mytenant", {"PROVIDER_LOCAL_URL": "http://persisted:8000"})
+    monkeypatch.setenv("PROVIDER_LOCAL_URL", "http://live-override:8000")
+
+    import argparse
+    parser = argparse.ArgumentParser()
+    add_common_args(parser)
+    args = parser.parse_args(["--tenant", "mytenant"])
+    config = resolve_config(args)
+
+    assert config.env["PROVIDER_LOCAL_URL"] == "http://live-override:8000"

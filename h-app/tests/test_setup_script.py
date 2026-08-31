@@ -18,7 +18,9 @@ SETUP_SH = REPO_ROOT / "setup.sh"
 
 
 def test_setup_help():
-    res = subprocess.run([str(SETUP_SH), "--help"], capture_output=True, text=True)
+    res = subprocess.run(
+        [str(SETUP_SH), "--help"], capture_output=True, text=True, stdin=subprocess.DEVNULL
+    )
     assert res.returncode == 0
     assert "Usage: ./setup.sh" in res.stdout
     assert "--pod" in res.stdout
@@ -98,11 +100,13 @@ def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
                 "--redis-url", redis_url,
                 "--venv", venv_dir,
                 "--skip-install",
+                "--skip-deps",
             ],
             env=env,
             capture_output=True,
             text=True,
             timeout=30,
+            stdin=subprocess.DEVNULL,
         )
         if res.returncode != 0:
             sw_log = ""

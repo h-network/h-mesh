@@ -87,11 +87,13 @@ def test_upgrade_restarts_daemons_without_duplicating_and_preserves_the_tmux_ses
                 "--redis-url", redis_url,
                 "--venv", venv_dir,
                 "--skip-install",
+                "--skip-deps",
             ],
             env=env,
             capture_output=True,
             text=True,
             timeout=30,
+            stdin=subprocess.DEVNULL,
         )
         assert res.returncode == 0, f"setup.sh failed: {res.stderr}\nstdout: {res.stdout}"
 

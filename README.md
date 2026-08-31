@@ -14,26 +14,46 @@ Every hop a message takes is logged, the same way a real packet's path can be tr
 
 ## Bootstrap script
 
-`./setup.sh` wraps the manual install below into one step for a fresh host or
-pod: it installs h-mesh into a venv, persists that venv's `bin` dir on `PATH`
-(via `~/.bashrc` and `~/.profile`, so it's on `PATH` for every future
-shell/pane, not just the one running setup.sh), installs h-mesh's default
-`~/.tmux.conf` (mouse mode, status bar, pane borders -- the same UX the
-container base image otherwise bakes in, for a bare host that has none;
-never overwrites an existing `~/.tmux.conf`), seeds the registry's fixed
-lifecycle participants (`host` -> office, `api` -> api) for the given
-pod/tenant, and starts the `h-mesh-switch` and `h-mesh-tmux-reconciler`
-daemons.
+`./setup.sh` bootstraps a fresh host or pod. Run at a real terminal with no
+flags, it's an interactive wizard: pod/tenant name, how many agents and
+their names (`architect` is agent #1 by default), which CLI each runs
+(claude/codex/agy), account setup if more than one credential is needed, and
+optional local model provider config (endpoint URL and model id, verified
+with a real probe against the endpoint before it's accepted). Re-running it
+never silently wipes a prior answer -- blank at a prompt keeps whatever's
+already there.
+
+Piped, scripted, or passed `--non-interactive`, it never prompts -- flags,
+environment, and whatever's already been configured for that tenant are all
+it uses. Either way it also:
+
+- verifies/auto-installs system dependencies (`redis-server`, `python3-venv`,
+  and `h-agent` itself via its own installer) -- skip with `--skip-deps`
+- installs h-mesh into a venv and persists that venv's `bin` dir on `PATH`
+  (via `~/.bashrc` and `~/.profile`, so it's on `PATH` for every future
+  shell/pane, not just the one running setup.sh)
+- installs h-mesh's default `~/.tmux.conf` (mouse mode, status bar, pane
+  borders -- the same UX the container base image otherwise bakes in, for a
+  bare host that has none; never overwrites an existing `~/.tmux.conf`)
+- seeds the registry's fixed lifecycle participants (`host` -> office,
+  `api` -> api) for the given pod/tenant
+- starts the `h-mesh-switch` and `h-mesh-tmux-reconciler` daemons
+  (duplicate-safe: a re-run against an already-running install restarts
+  nothing that's already up)
+- hires every agent from the wizard's roster that isn't already running
 
 ```bash
-./setup.sh --pod mypod --tenant mytenant
+./setup.sh                          # interactive wizard, at a terminal
+./setup.sh --pod mypod --tenant mytenant --non-interactive   # scripted, no prompts
 ```
 
 Run `./setup.sh --help` for the full set of flags (Redis URL, tmux session
-name and socket, an existing venv, `--skip-install`, `--no-daemons`, etc.).
-Daemon logs and PID files are written under `$H_MESH_RUN_DIR`
-(default `~/.h-mesh/run/<tenant>`). Once daemons are running, hire the first
-agent as `host`:
+name and socket, an existing venv, `--skip-install`, `--skip-deps`,
+`--no-daemons`, `--non-interactive`, etc.). Daemon logs and PID files are
+written under `$H_MESH_RUN_DIR` (default `~/.h-mesh/run/<tenant>`).
+
+A host that never used the wizard (flags only, no roster ever configured)
+keeps today's manual-hire behavior:
 
 ```bash
 export AGENT_NAME=host POD=mypod TENANT=mytenant
