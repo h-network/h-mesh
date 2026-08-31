@@ -509,18 +509,27 @@ if [ "$NO_DAEMONS" -eq 0 ]; then
 
     # ⚠ Delegates to services.daemons.start_daemons(), not a hand-rolled
     # nohup here -- that function is duplicate-safe (skips any daemon
-    # already alive) and already merges persisted tenant config
-    # (PROVIDER_*/CLAUDE_OAUTH_TOKEN_*) beneath the live environment. A
-    # bare `nohup ... &` on every run, with no check first, is exactly what
-    # let a re-run of this script leave a second tmux_reconciler running
-    # beside the first -- measured while adding the wizard's re-run path.
+    # already alive). A bare `nohup ... &` on every run, with no check
+    # first, is exactly what let a re-run of this script leave a second
+    # tmux_reconciler running beside the first -- measured while adding the
+    # wizard's re-run path.
+    #
+    # ⚠ merged_daemon_env(), not a bare dict(os.environ) -- this script's
+    # own shell never exports the OAuth token/provider vars ask_token()
+    # collects (they only ever get written to the persisted tenant config,
+    # not to this process's environment), so without this the daemon
+    # hiring the roster's first agent in THIS SAME run never sees a token
+    # the wizard just asked for -- measured live, on a fresh install.
+    # python=sys.executable (not services.daemons's own venv resolution,
+    # via resolve_config()) so --no-venv's ambient-python mode -- which
+    # that resolution doesn't support -- keeps working here.
     H_MESH_SETUP_RUN_DIR="$RUN_DIR" "$PYTHON" -c '
 import os, sys
 sys.path.insert(0, "h-app")
 from pathlib import Path
-from services.daemons import DaemonError, start_daemons
+from services.daemons import DaemonError, merged_daemon_env, start_daemons
 
-env = dict(os.environ)
+env = merged_daemon_env(os.environ["TENANT"])
 try:
     start_daemons(python=Path(sys.executable), run_dir=Path(os.environ["H_MESH_SETUP_RUN_DIR"]), env=env)
 except DaemonError as exc:

@@ -268,3 +268,38 @@ def test_wizard_hires_a_per_agent_cli_exception_with_the_right_cli(wizard_env):
 
     assert architect_cli == "claude"
     assert sme2_cli == "codex"
+
+
+def test_wizard_provided_token_reaches_the_daemon_hiring_the_first_agent_in_the_same_run(wizard_env):
+    # Regression for a real bug: setup.sh's own shell never exports what
+    # ask_token() collects (only the persisted tenant config gets it), so
+    # the reconciler daemon started later in THIS SAME run needs to read
+    # that persisted config itself -- not just a future run's daemons.
+    ctx = wizard_env
+    answers = [
+        "",              # pod
+        "",              # tenant
+        "",              # how many agents -> 1 (architect)
+        "",              # use more than one account? -> n
+        "test-token-abc",  # OAuth token for 'default'
+        "",              # default CLI
+        "",              # any agents differing
+        "",              # local model provider? -> n
+    ]
+    output, code = _run_wizard(
+        cwd=str(REPO_ROOT),
+        args=["--venv", sys.prefix, "--skip-install", "--skip-deps"],
+        env=ctx["env"],
+        answers=answers,
+    )
+    assert code == 0, f"setup.sh exited {code}:\n{output}"
+
+    with open(Path(ctx["run_dir"]) / "tmux_reconciler.pid") as f:
+        reconciler_pid = int(f.read().strip())
+
+    with open(f"/proc/{reconciler_pid}/environ", "rb") as f:
+        environ_raw = f.read()
+    env_pairs = dict(
+        entry.split("=", 1) for entry in environ_raw.decode(errors="replace").split("\0") if "=" in entry
+    )
+    assert env_pairs.get("CLAUDE_OAUTH_TOKEN_DEFAULT") == "test-token-abc"
