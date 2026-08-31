@@ -1,7 +1,7 @@
 """Model token pricing and cost calculations.
 
 No `container/config/pricing.json`-equivalent deployment path exists in
-h-mesh yet (no container/ directory at all, unlike flock.office's
+h-mesh yet (no container/ directory at all, unlike the previous office module's
 predecessor). Resolution order is therefore just an explicit override, an
 `H_MESH_PRICING_FILE` environment override, then a hardcoded fallback table
 -- a candidate-paths tier can be added back once h-mesh has a real container
