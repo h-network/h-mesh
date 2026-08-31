@@ -442,6 +442,44 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         self.assertEqual(start_agent_command("custom", resume=False), ["h-agent", "custom"])
         self.assertEqual(start_agent_command("custom", resume=True), ["h-agent", "custom", "--continue"])
 
+    def test_generate_agents_md_command_derivation(self):
+        from modules.tmux.ops import generate_agents_md, window_env
+
+        # Default is h-mesh-office
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OFFICE_TOOLS", None)
+            lead_guide = generate_agents_md("architect", lead="architect")
+            self.assertIn("h-mesh-office status", lead_guide)
+            self.assertIn("h-mesh-office cloneToAll", lead_guide)
+            self.assertIn("h-mesh-office peers", lead_guide)
+            self.assertIn("h-mesh-office send", lead_guide)
+            self.assertIn("h-mesh-office list", lead_guide)
+            self.assertIn("h-mesh-office take", lead_guide)
+            self.assertIn("h-mesh-office done", lead_guide)
+            self.assertNotIn("`office ", lead_guide)
+
+            agent_guide = generate_agents_md("worker", lead="architect")
+            self.assertIn("architect is the lead of this office", agent_guide)
+            self.assertIn("h-mesh-office peers", agent_guide)
+            self.assertIn("h-mesh-office send", agent_guide)
+            self.assertNotIn("`office ", agent_guide)
+
+            env = window_env("worker")
+            self.assertIn("OFFICE_TOOLS=h-mesh-office", env)
+
+        # Explicit override via OFFICE_TOOLS env var
+        with unittest.mock.patch.dict(os.environ, {"OFFICE_TOOLS": "custom-office"}):
+            guide = generate_agents_md("worker")
+            self.assertIn("custom-office peers", guide)
+            self.assertIn("custom-office send", guide)
+            env = window_env("worker")
+            self.assertIn("OFFICE_TOOLS=custom-office", env)
+
+        # Explicit override via argument
+        guide_arg = generate_agents_md("worker", office_cmd="arg-office")
+        self.assertIn("arg-office peers", guide_arg)
+        self.assertIn("arg-office send", guide_arg)
+
 
 if __name__ == "__main__":
     unittest.main()
