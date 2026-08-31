@@ -392,14 +392,15 @@ def test_peers_verbose_reads_launch_profile_and_current_task(monkeypatch, capsys
     assert "do the thing" in out
 
 
-def test_peers_interfaces_labels_api_and_control_separately(monkeypatch, capsys):
+def test_peers_interfaces_labels_api_and_office_separately(monkeypatch, capsys):
     _env(monkeypatch)
-    r = FakeRedis(registry={"architect": "tmux", "backend": "tmux", "api": "api"})
+    r = FakeRedis(registry={"architect": "tmux", "backend": "tmux", "api": "api", "host": "office"})
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
         office_main(["peers", "-i"])
     out = capsys.readouterr().out
     assert "backend" in out.splitlines()[0]
     assert "api (api)" in out
+    assert "host (office)" in out
 
 
 def test_status_reports_unknown_with_no_activity_feed(monkeypatch, capsys):

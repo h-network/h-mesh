@@ -337,3 +337,7 @@ def main() -> None:
         ),
         maintenance_poll_seconds=float(os.environ.get("MAINTENANCE_POLL_SECONDS", "2")),
     )
+
+
+if __name__ == "__main__":
+    main()

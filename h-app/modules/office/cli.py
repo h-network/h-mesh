@@ -307,16 +307,12 @@ def _peers_command(argv: list[str]) -> None:
         print(", ".join(formatted))
 
     if args.interfaces:
-        # ⚠ "control" is a placeholder, not a settled name -- still open
-        # whether the fixed lifecycle participant's port_type should be
-        # called something else. Update here and at every other "control"
-        # literal in this file together if that lands on a different name.
         labeled = sorted(
             f"{agent} ({port_type(r, pod=pod, tenant=tenant, agent=agent)})"
             for agent in all_agents
-            if agent != source and port_type(r, pod=pod, tenant=tenant, agent=agent) in ("api", "control")
+            if agent != source and port_type(r, pod=pod, tenant=tenant, agent=agent) in ("api", "office")
         )
-        print(f"interfaces (api/control -- recognized, not tmux colleagues): {', '.join(labeled) or '(none)'}")
+        print(f"interfaces (api/office -- recognized, not tmux colleagues): {', '.join(labeled) or '(none)'}")
 
 
 def _timestamp(value) -> datetime | None:
@@ -1111,3 +1107,7 @@ def clone_to_all_entrypoint(argv: Sequence[str] | None = None) -> None:
     Delegate; do not reimplement.
     """
     main(["cloneToAll", *(sys.argv[1:] if argv is None else argv)])
+
+
+if __name__ == "__main__":
+    main()
