@@ -31,7 +31,11 @@ provides these process entry points:
 - `h-mesh-session` — the tmux control-mode session daemon
 - `h-mesh-tmux-reconciler` — the tmux registry reconciler daemon
 - `h-mesh-tmux-port AGENT` — direct tmux delivery-port invocation
-- `office` — the operator CLI (`cloneToAll` is also installed for compatibility)
+- `h-mesh-office` — the operator CLI
+- `h-mesh-clone-to-all` — the standalone clone-to-all compatibility command
+
+The `h-mesh-` prefix is intentional: h-mesh can share an installation prefix
+with h-flock without replacing h-flock's live `office` executable.
 
 Each process reads its deployment configuration from environment variables;
 the module READMEs document the required variables and external services.

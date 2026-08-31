@@ -49,8 +49,8 @@ jobs:
               "h-mesh-switch",
               "h-mesh-tmux-port",
               "h-mesh-tmux-reconciler",
-              "office",
-              "cloneToAll",
+              "h-mesh-office",
+              "h-mesh-clone-to-all",
           }
           scripts = {
               entry.name: entry
