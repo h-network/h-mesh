@@ -1,6 +1,6 @@
 """office: the agent-facing CLI -- sending half only.
 
-port.py (not built yet) will be the receiving half: a `deliver_office`
+port.py is the receiving half: a `deliver_office`
 entrypoint, shaped like `modules.tmux.port.deliver_tmux`, that calls into
 `agentlifecycle` for hire/letGo/pause/resume envelopes addressed back to the
 fixed lifecycle participant. This file only builds and sends envelopes, or
