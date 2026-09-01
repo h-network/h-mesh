@@ -176,21 +176,73 @@ always refuses" — not a real race. The property under test (does concurrent
 StartAgent for one new name produce exactly one window) is fully exercised
 by two same-cli concurrent requests.
 
-**Needs a workaround, not a clean environment:** a freshly `setup.sh`'d host
-cannot hire any real CLI at all. `modules/tmux/ops.py`'s `window_env()`
-constructs the hired pane's `PATH` explicitly and never includes wherever
-`h-agent` itself was installed — on `setup.sh`'s own documented default
-(`${PREFIX:-$HOME/.local}/bin`), every hire fails: window created, pane's
-`execvp("h-agent")` fails with ENOENT, window destroyed (`remain-on-exit` is
-off) within milliseconds, reconciler retries forever with capped backoff.
+**Needed a workaround, not a clean environment, at first:** a freshly
+`setup.sh`'d host could not hire any real CLI at all — `modules/tmux/ops.py`'s
+`window_env()` constructed the hired pane's `PATH` explicitly and never
+included wherever `h-agent` itself was installed (`setup.sh`'s own
+documented default, `${PREFIX:-$HOME/.local}/bin`): window created, pane's
+`execvp("h-agent")` failed with ENOENT, window destroyed (`remain-on-exit` is
+off) within milliseconds, reconciler retried forever with capped backoff.
 Confirmed directly (pulled the real constructed `PATH` string, `env -i
 PATH="<that>" which h-agent` → not found) and three times live via real
 `StartAgent` envelopes. Reported to architect, routed to tmux-agent as
-`d137fc18` (unfixed as of this writing). This script fails fast with a
-clear reason if the workaround isn't applied — **prepend `h-agent`'s bin
-directory to the RECONCILER daemon's own `PATH` before starting it**, since
-`window_env()` reads `os.environ` at construction time. Once that's in
-place, real hires work end to end (verified: a real `claude` pane connected
-to `nemotron-lightning`, correct workdir, permissions bypassed, fully
-interactive). **Every result from this script reflects that workaround, not
-a clean install — don't read a pass here as proof the PATH bug is fixed.**
+`d137fc18`, **fixed and merged same day** (`4238f35`,
+`build_pane_path()` in `lib/paths.py` — resolved venv bin, `$PREFIX/bin`,
+`~/.local/bin`, `~/bin`, ambient `PATH`, standard system dirs). Verified live
+post-merge with a deliberately h-agent-free daemon `PATH` (only venv bin +
+standard system dirs — no manual prepend at all): real hire came up clean,
+window created, `pane_current_command=claude`, connected to
+`nemotron-lightning`. The result recorded in this repo's own first run
+predates the fix and reflected the documented manual-`PATH`-prepend
+workaround; rerun after the merge to get a clean-install result.
+
+## lead-replacement.sh
+
+Not a port — no h-flock reference exists for this one. Built fresh against
+architect's explicit brief: retire and re-hire the office's *lead*, not an
+ordinary agent, and report per-probe rather than one pass/fail. Runs
+entirely against a synthetic lead (`synth-lead` by default) on a throwaway
+tenant — never against the real office this agent runs in.
+
+```
+TENANT=my-throwaway-tenant ./lead-replacement.sh
+```
+
+Same real-hire requirements as `tmux-concurrent-hire.sh` (a provider-backed
+`claude`). Six probes, findings summarized (full reasoning and code
+citations are in the script's own output/comments):
+
+1. **Self-retirement circularity.** Does the lead's own `letGo`+`hire`
+   sequence, issued from its own pane, survive past the pane's death?
+   **Yes** — `hire`/`letGo` are fire-and-forget bus sends
+   (`modules/office/cli.py`), not synchronous in-process actions, so both
+   envelopes are already durably enqueued before the actual (asynchronous)
+   window-kill could ever interrupt the issuing shell. Verified live: a
+   real self-issued retire+rehire produces a live replacement window.
+2. **The lead brief.** Does a re-hired lead's `AGENTS.md` regenerate the
+   lead-specific paragraph? **Yes, but only because the name is unchanged**
+   — `get_lead()` is a plain string comparison against the (dangling, see
+   probe 3) lead key, so a *differently-named* replacement would NOT
+   automatically become lead; nothing in the codebase updates the key.
+3. **The lead registry key.** Does `StopAgent` clear it? **No — confirmed
+   both by reading `stop_agent()` (purges registry/ingress/paused/
+   delivering, never the lead key) and live: it dangles at the retired
+   name.** This is exactly what makes probe 2's same-name rehire work at
+   all, and exactly what would silently misfire for a differently-named one.
+4. **Alert routing during the gap.** Two distinct cases, both confirmed live
+   by calling `Watchdog._notify_lead()` directly: while the lead is fully
+   retired (unregistered), the call returns silently at its first line
+   (`is_member()` check) — **zero log record, zero custody trace, zero
+   dead-letter**, a stronger silent-drop than a dead-letter. While
+   registered but the window is transiently missing, the alert *is*
+   durably admitted to ingress first, then immediately dead-lettered
+   (`window_missing`) — not queued for later, no automatic replay when the
+   window recovers.
+5. **Board survival.** Does `stop_agent` purge the lead's task board?
+   **No** — confirmed both by reading `stop_agent()` (never touches
+   `tasks.*` keys) and live: a seeded ticket survives retirement intact.
+6. **In-flight messages across the gap.** A normal message sent to the
+   fully-retired (unregistered) lead is dead-lettered by the switch itself
+   (`"destination is not in tenant registry"`) — never reaches an ingress
+   queue, and isn't queued for the eventual replacement either, but there
+   IS a custody record (unlike probe 4's silent case).
