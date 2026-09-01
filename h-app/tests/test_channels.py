@@ -166,6 +166,44 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(self.emit_for_recipient.call_args.args[3], "bob")
         self.assertEqual(self.emit_for_recipient.call_args.args[4], "recipient rejected payload")
 
+    def test_receive_notifies_tmux_sender_when_kind_is_rejected(self):
+        self.register(alice="tmux", host="control")
+        envelope_id = send(
+            self.redis, pod=POD, tenant=TENANT, source="alice",
+            destination="host", payload={"text": "not a lifecycle command"},
+        )
+        raw = self.redis.lpop(prefix(POD, TENANT, "alice", "egress"))
+        self.redis.rpush(prefix(POD, TENANT, "host", "ingress"), raw)
+
+        receive(
+            self.redis, pod=POD, tenant=TENANT, agent="host",
+            openers={"StartAgent": lambda envelope: None}, timeout=0, blocking=False,
+        )
+
+        feedback = parse(self.redis.lpop(prefix(POD, TENANT, "host", "egress")))
+        self.assertEqual(feedback["l2"], {"source": "host", "destination": "alice"})
+        self.assertEqual(feedback["correlation_id"], envelope_id)
+        self.assertEqual(
+            feedback["payload"]["text"],
+            f"Delivery to host failed for message {envelope_id}: unknown kind: Message",
+        )
+
+    def test_receive_does_not_notify_non_tmux_sender(self):
+        self.register(client="api", host="control")
+        send(
+            self.redis, pod=POD, tenant=TENANT, source="client",
+            destination="host", payload={"text": "wrong kind"},
+        )
+        raw = self.redis.lpop(prefix(POD, TENANT, "client", "egress"))
+        self.redis.rpush(prefix(POD, TENANT, "host", "ingress"), raw)
+
+        receive(
+            self.redis, pod=POD, tenant=TENANT, agent="host",
+            openers={}, timeout=0, blocking=False,
+        )
+
+        self.assertIsNone(self.redis.lpop(prefix(POD, TENANT, "host", "egress")))
+
     def test_send_switch_receive_integration(self):
         self.register(alice="tmux", bob="tmux")
         payload = {"text": "through the switch", "nested": {"ok": True}}

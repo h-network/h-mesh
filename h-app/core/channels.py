@@ -120,6 +120,47 @@ def _emit_for_recipient(
         pass
 
 
+def _notify_dead_letter_sender(
+    r,
+    *,
+    pod: str,
+    tenant: str,
+    recipient: str,
+    envelope: dict,
+    reason: str,
+    module: str,
+) -> None:
+    """Best-effort feedback to an agent whose envelope was rejected.
+
+    Only tmux sources can reliably open this Message. The restriction also
+    prevents feedback loops between fixed API/control participants.
+    """
+    source = envelope.get("l2", {}).get("source")
+    if not source or source == recipient:
+        return
+    try:
+        if port_type(r, pod=pod, tenant=tenant, agent=source) != "tmux":
+            return
+        stream_id = envelope.get("stream_id", "unknown")
+        send(
+            r,
+            pod=pod,
+            tenant=tenant,
+            source=recipient,
+            destination=source,
+            payload={
+                "text": f"Delivery to {recipient} failed for message {stream_id}: {reason}"
+            },
+            kind="Message",
+            correlation_id=stream_id if isinstance(stream_id, str) else None,
+            module=module,
+        )
+    except Exception:
+        # The rejected envelope is already safely in the dead-letter queue.
+        # Feedback is secondary and must not change receive custody.
+        pass
+
+
 def send(
     r,
     *,
@@ -224,21 +265,32 @@ def receive(
     _emit_for_recipient(module, "received", envelope, agent)
     opener = openers.get(envelope["kind"])
     if opener is None:
+        reason = f"unknown kind: {envelope['kind']}"
         r.rpush(prefix(pod, tenant, agent, "dead"), raw)
-        _emit_for_recipient(
-            module, "dead_lettered", envelope, agent, f"unknown kind: {envelope['kind']}"
+        _emit_for_recipient(module, "dead_lettered", envelope, agent, reason)
+        _notify_dead_letter_sender(
+            r, pod=pod, tenant=tenant, recipient=agent,
+            envelope=envelope, reason=reason, module=module,
         )
         return
     try:
         opener(envelope)
     except DeadLetter as exc:
+        reason = str(exc)
         r.rpush(prefix(pod, tenant, agent, "dead"), raw)
-        _emit_for_recipient(module, "dead_lettered", envelope, agent, str(exc))
+        _emit_for_recipient(module, "dead_lettered", envelope, agent, reason)
+        _notify_dead_letter_sender(
+            r, pod=pod, tenant=tenant, recipient=agent,
+            envelope=envelope, reason=reason, module=module,
+        )
         return
     except Exception as exc:
+        reason = f"opener failed: {exc}"
         r.rpush(prefix(pod, tenant, agent, "dead"), raw)
-        _emit_for_recipient(
-            module, "dead_lettered", envelope, agent, f"opener failed: {exc}"
+        _emit_for_recipient(module, "dead_lettered", envelope, agent, reason)
+        _notify_dead_letter_sender(
+            r, pod=pod, tenant=tenant, recipient=agent,
+            envelope=envelope, reason=reason, module=module,
         )
         return
     _emit_for_recipient(module, "opened", envelope, agent)
