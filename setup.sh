@@ -581,31 +581,55 @@ for a in "${AGENTS[@]}"; do
     [ -n "$(mget EP "$a")" ] && PROVIDER_MAP+=("${a}=$(mget EP "$a")")
 done
 
-{
-    echo "AGENTS=$(IFS=,; echo "${AGENTS[*]}")"
-    echo "DEFAULT_CLI=${DEF_CLI}"
-    echo "ACCOUNTS=$(IFS=,; echo "${PROFILES[*]}")"
-    echo "DEFAULT_ACCOUNT=${DEF_PROFILE}"
-    for tv in $TOKEN_VARS; do
-        eval "tval=\${$tv:-}"
-        [ -n "$tval" ] && echo "${tv}=${tval}"
-    done
-    [ "${#CLI_MAP[@]}"      -gt 0 ] && echo "AGENT_CLIS=$(IFS=,; echo "${CLI_MAP[*]}")"
-    [ "${#PROFILE_MAP[@]}"  -gt 0 ] && echo "AGENT_PROFILES=$(IFS=,; echo "${PROFILE_MAP[*]}")"
-    if [ "${#PROVIDER_MAP[@]}" -gt 0 ] && [ -n "$LOCAL_URL" ]; then
-        echo "AGENT_PROVIDERS=$(IFS=,; echo "${PROVIDER_MAP[*]}")"
-        echo "PROVIDER_NAME=${EP_NAME}"
-        PROVIDER_KEY_PREFIX="$(provider_key_prefix "$EP_NAME")"
-        echo "${PROVIDER_KEY_PREFIX}_URL=${LOCAL_URL}"
-        echo "${PROVIDER_KEY_PREFIX}_MODEL=${LOCAL_MODEL}"
-        echo "${PROVIDER_KEY_PREFIX}_TOKEN=local"
-        echo "${PROVIDER_KEY_PREFIX}_KIND=${LOCAL_KIND}"
+# ⚠ Never a refuse/block guard -- this script cannot tell "ambient leftover
+# in a shared shell" from "a deliberate CI/deployment pipeline exporting a
+# real token before a non-interactive run"; those look identical from
+# inside the script, and the second one is exactly what ENV_TENANT_GET's
+# env-wins precedence is *for*. Purely informational instead: names only,
+# never values, so a human running this by hand can see what just got
+# pulled from their live shell instead of finding out later. Built as
+# plain function calls (not inside the `{...} | pipe` below) on purpose --
+# a pipeline's non-last stage runs in a subshell, so a variable this
+# accumulates inside `{...} | tenant_config set` would vanish the moment
+# the pipe finished, back to empty in the parent shell.
+PERSIST_LINES=()
+ENV_SOURCED_KEYS=""
+persist_line() {
+    local key="$1" value="$2"
+    PERSIST_LINES+=("${key}=${value}")
+    if [ -n "${!key:-}" ] && [ "${!key}" = "$value" ]; then
+        ENV_SOURCED_KEYS="$ENV_SOURCED_KEYS $key"
     fi
-    [ -n "$TELEGRAM_BOT_TOKEN" ] && echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}"
-    [ -n "$TELEGRAM_CHAT_ID" ] && echo "TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}"
-    [ "$TELEGRAM_VOICE" = "1" ] && echo "TELEGRAM_VOICE=1"
-    [ -n "$API_TOKEN" ] && echo "API_TOKEN=${API_TOKEN}"
-} | "$PYTHON" -m services.tenant_config set "$TENANT"
+}
+
+persist_line AGENTS "$(IFS=,; echo "${AGENTS[*]}")"
+persist_line DEFAULT_CLI "$DEF_CLI"
+persist_line ACCOUNTS "$(IFS=,; echo "${PROFILES[*]}")"
+persist_line DEFAULT_ACCOUNT "$DEF_PROFILE"
+for tv in $TOKEN_VARS; do
+    eval "tval=\${$tv:-}"
+    [ -n "$tval" ] && persist_line "$tv" "$tval"
+done
+[ "${#CLI_MAP[@]}"      -gt 0 ] && persist_line AGENT_CLIS "$(IFS=,; echo "${CLI_MAP[*]}")"
+[ "${#PROFILE_MAP[@]}"  -gt 0 ] && persist_line AGENT_PROFILES "$(IFS=,; echo "${PROFILE_MAP[*]}")"
+if [ "${#PROVIDER_MAP[@]}" -gt 0 ] && [ -n "$LOCAL_URL" ]; then
+    persist_line AGENT_PROVIDERS "$(IFS=,; echo "${PROVIDER_MAP[*]}")"
+    persist_line PROVIDER_NAME "$EP_NAME"
+    PROVIDER_KEY_PREFIX="$(provider_key_prefix "$EP_NAME")"
+    persist_line "${PROVIDER_KEY_PREFIX}_URL" "$LOCAL_URL"
+    persist_line "${PROVIDER_KEY_PREFIX}_MODEL" "$LOCAL_MODEL"
+    persist_line "${PROVIDER_KEY_PREFIX}_TOKEN" "local"
+    persist_line "${PROVIDER_KEY_PREFIX}_KIND" "$LOCAL_KIND"
+fi
+[ -n "$TELEGRAM_BOT_TOKEN" ] && persist_line TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN"
+[ -n "$TELEGRAM_CHAT_ID" ] && persist_line TELEGRAM_CHAT_ID "$TELEGRAM_CHAT_ID"
+[ "$TELEGRAM_VOICE" = "1" ] && persist_line TELEGRAM_VOICE "1"
+[ -n "$API_TOKEN" ] && persist_line API_TOKEN "$API_TOKEN"
+
+if [ -n "$ENV_SOURCED_KEYS" ]; then
+    echo "Persisting from live environment:${ENV_SOURCED_KEYS}"
+fi
+printf '%s\n' "${PERSIST_LINES[@]}" | "$PYTHON" -m services.tenant_config set "$TENANT"
 
 # Re-read what was just persisted -- the hire step below uses the
 # *_EXISTING variables regardless of whether this run went through the
