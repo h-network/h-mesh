@@ -7,6 +7,13 @@
 # in the Redis registry, starts the required daemons (h-mesh-switch and
 # h-mesh-tmux-reconciler), and hires any agent from the wizard's roster that
 # isn't already running.
+#
+# Without a terminal (or with --non-interactive), every wizard setting is
+# instead read from a live env var of the same name if set (AGENTS,
+# DEFAULT_CLI, ACCOUNTS, AGENT_CLIS/AGENT_PROFILES/AGENT_PROVIDERS,
+# CLAUDE_OAUTH_TOKEN_<PROFILE>, PROVIDER_LOCAL_*, TELEGRAM_*, API_TOKEN),
+# falling back to whatever's already persisted -- then persisted right back,
+# same as an interactive answer would be. See ENV_TENANT_GET below.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -268,21 +275,35 @@ export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$SCRIPT_DIR/h-app"
 
 TENANT_ENV_GET() { "$PYTHON" -m services.tenant_config get "$TENANT" "$1" "${2:-}"; }
 
+# ⚠ Same precedence as services.daemons.merged_daemon_env()/resolve_config()
+# elsewhere in this project: an explicit, non-empty live env var always wins
+# over whatever is already persisted; a blank/unset one keeps the persisted
+# value (or the hardcoded default) rather than clearing it. Used below for
+# every wizard setting's *initial* value -- interactive mode still lets a
+# human override it at the prompt; non-interactive mode has no prompt, so
+# this env-or-persisted value is the final one.
+ENV_TENANT_GET() {
+    local key="$1" def="${2:-}" val
+    val="${!key:-}"
+    if [ -n "$val" ]; then printf '%s' "$val"; else TENANT_ENV_GET "$key" "$def"; fi
+}
+
 echo "Pod:          $POD"
 echo "Tenant:       $TENANT"
 echo "Redis URL:    $REDIS_URL"
 echo
 
-# Everything below the pod/tenant prompt reads existing tenant config as its
+# Everything below the pod/tenant prompt reads existing tenant config (or a
+# live env var of the same name, which wins -- see ENV_TENANT_GET) as its
 # defaults -- re-running never silently wipes a prior answer. Blank keeps it.
-AGENTS_CSV_EXISTING="$(TENANT_ENV_GET AGENTS "")"
+AGENTS_CSV_EXISTING="$(ENV_TENANT_GET AGENTS "")"
 IFS=',' read -r -a AGENTS <<< "$AGENTS_CSV_EXISTING"
 [ "${#AGENTS[@]}" -eq 1 ] && [ -z "${AGENTS[0]}" ] && AGENTS=()
 
-DEF_CLI="$(TENANT_ENV_GET DEFAULT_CLI claude)"
-ACCOUNTS_CSV_EXISTING="$(TENANT_ENV_GET ACCOUNTS default)"
+DEF_CLI="$(ENV_TENANT_GET DEFAULT_CLI claude)"
+ACCOUNTS_CSV_EXISTING="$(ENV_TENANT_GET ACCOUNTS default)"
 IFS=',' read -r -a PROFILES <<< "$ACCOUNTS_CSV_EXISTING"
-DEF_PROFILE="$(TENANT_ENV_GET DEFAULT_ACCOUNT "${PROFILES[0]:-default}")"
+DEF_PROFILE="$(ENV_TENANT_GET DEFAULT_ACCOUNT "${PROFILES[0]:-default}")"
 
 # ⚠ No associative arrays -- matches the reference project's own reasoning
 # (see its setup.sh): a bash without `declare -A` (macOS ships 3.2) would
@@ -296,11 +317,11 @@ mget() { eval "printf '%s' \"\${$(_mk "$1" "$2"):-}\""; }
 # a re-run's defaults reflect prior answers even for agents not touched this
 # time.
 for a in "${AGENTS[@]}"; do mset CLI "$a" "$DEF_CLI"; mset PROF "$a" "$DEF_PROFILE"; done
-CLI_MAP_EXISTING="$(TENANT_ENV_GET AGENT_CLIS "")"
+CLI_MAP_EXISTING="$(ENV_TENANT_GET AGENT_CLIS "")"
 for pair in ${CLI_MAP_EXISTING//,/ }; do mset CLI "${pair%%=*}" "${pair#*=}"; done
-PROFILE_MAP_EXISTING="$(TENANT_ENV_GET AGENT_PROFILES "")"
+PROFILE_MAP_EXISTING="$(ENV_TENANT_GET AGENT_PROFILES "")"
 for pair in ${PROFILE_MAP_EXISTING//,/ }; do mset PROF "${pair%%=*}" "${pair#*=}"; done
-PROVIDER_MAP_EXISTING="$(TENANT_ENV_GET AGENT_PROVIDERS "")"
+PROVIDER_MAP_EXISTING="$(ENV_TENANT_GET AGENT_PROVIDERS "")"
 for pair in ${PROVIDER_MAP_EXISTING//,/ }; do mset EP "${pair%%=*}" "${pair#*=}"; done
 
 TOKEN_VAR() { printf 'CLAUDE_OAUTH_TOKEN_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
@@ -308,7 +329,7 @@ TOKEN_VARS=""
 ask_token() {
     local profile="$1" var existing prompt entered
     var="$(TOKEN_VAR "$profile")"
-    existing="$(TENANT_ENV_GET "$var" "")"
+    existing="$(ENV_TENANT_GET "$var" "")"
     if [ -n "$existing" ]; then
         prompt="  OAuth token for '$profile' [keep existing]: "
     else
@@ -320,15 +341,51 @@ ask_token() {
     TOKEN_VARS="$TOKEN_VARS $var"
 }
 
-LOCAL_URL="$(TENANT_ENV_GET PROVIDER_LOCAL_URL "")"
-LOCAL_MODEL="$(TENANT_ENV_GET PROVIDER_LOCAL_MODEL "")"
-LOCAL_KIND="$(TENANT_ENV_GET PROVIDER_LOCAL_KIND vllm)"
+# Non-interactive equivalent of ask_token(): no prompt, just an env-or-
+# persisted read (same CLAUDE_OAUTH_TOKEN_<PROFILE> var merged_daemon_env()
+# already layers onto a *running* daemon's env -- this is what makes that
+# also land in the tenant config file, so a later clean-shell run sees it too).
+resolve_token_noninteractive() {
+    local profile="$1" var val
+    var="$(TOKEN_VAR "$profile")"
+    val="$(ENV_TENANT_GET "$var" "")"
+    eval "$var=\$val"
+    TOKEN_VARS="$TOKEN_VARS $var"
+}
+
+LOCAL_URL="$(ENV_TENANT_GET PROVIDER_LOCAL_URL "")"
+LOCAL_MODEL="$(ENV_TENANT_GET PROVIDER_LOCAL_MODEL "")"
+LOCAL_KIND="$(ENV_TENANT_GET PROVIDER_LOCAL_KIND vllm)"
 EP_NAME="local"
 
-TELEGRAM_BOT_TOKEN="$(TENANT_ENV_GET TELEGRAM_BOT_TOKEN "")"
-TELEGRAM_CHAT_ID="$(TENANT_ENV_GET TELEGRAM_CHAT_ID "")"
-TELEGRAM_VOICE="$(TENANT_ENV_GET TELEGRAM_VOICE "")"
-API_TOKEN="$(TENANT_ENV_GET API_TOKEN "")"
+TELEGRAM_BOT_TOKEN="$(ENV_TENANT_GET TELEGRAM_BOT_TOKEN "")"
+TELEGRAM_CHAT_ID="$(ENV_TENANT_GET TELEGRAM_CHAT_ID "")"
+TELEGRAM_VOICE="$(ENV_TENANT_GET TELEGRAM_VOICE "")"
+API_TOKEN="$(ENV_TENANT_GET API_TOKEN "")"
+
+# Shared by both modes -- interactive only reaches this after a human opts
+# in via "Run the Telegram bot?"; non-interactive has no such prompt, so it
+# runs this unconditionally on whatever env/persisted state resolved above.
+# elif (not else): a genuinely unconfigured pair (both blank) is not an
+# error, just "not using Telegram" -- only a *partial* pair warns.
+finalize_telegram() {
+    if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+        # ⚠ The bot talks to h-mesh's own REST API (see
+        # clients/telegram/README.md) -- there's no separate "enable the
+        # API" setting, a configured bot enables both. A bare-token
+        # API_TOKEN, generated once and persisted like every other secret
+        # here, not typed/exported by anyone.
+        if [ -z "$API_TOKEN" ]; then
+            API_TOKEN="$("$PYTHON" -c 'import secrets; print(secrets.token_hex(16))')"
+        fi
+        echo "  (h-mesh's REST API will be started too -- the Telegram bot talks to it)"
+    elif [ -n "$TELEGRAM_BOT_TOKEN" ] || [ -n "$TELEGRAM_CHAT_ID" ]; then
+        echo "  ⚠ Both a Telegram Bot Token and Chat ID are required -- Telegram bot not enabled." >&2
+        TELEGRAM_BOT_TOKEN=""
+        TELEGRAM_CHAT_ID=""
+        TELEGRAM_VOICE=""
+    fi
+}
 
 if [ "$INTERACTIVE" -eq 1 ]; then
     read -rp "How many agents? [${#AGENTS[@]}${AGENTS[0]:+ (${AGENTS[*]})}]: " N
@@ -396,16 +453,6 @@ if [ "$INTERACTIVE" -eq 1 ]; then
         fi
     done
 
-    # ⚠ agy keeps its state in ~/.gemini/antigravity-cli with no equivalent
-    # of CLAUDE_CONFIG_DIR/CODEX_HOME -- it cannot be pointed at a second
-    # account.
-    for a in "${AGENTS[@]}"; do
-        if [ "$(mget CLI "$a")" = "agy" ] && [ "$(mget PROF "$a")" != "default" ]; then
-            echo "  warning: $a runs agy, which supports only one account -- ignoring account '$(mget PROF "$a")'" >&2
-            mset PROF "$a" default
-        fi
-    done
-
     read -rp "Point any agent at a local model provider? [y/N]: " USE_PROVIDER
     if check_bool "$USE_PROVIDER" "n"; then
         read -rp "  Endpoint type -- vllm or ollama [$LOCAL_KIND]: " IN_KIND
@@ -465,80 +512,109 @@ if [ "$INTERACTIVE" -eq 1 ]; then
                 read -rp "  Enable spoken voice replies? [y/N]: " WANT_VOICE
                 if check_bool "$WANT_VOICE" "n"; then TELEGRAM_VOICE=1; else TELEGRAM_VOICE=0; fi
             fi
-            # ⚠ The bot talks to h-mesh's own REST API (see
-            # clients/telegram/README.md) -- there's no separate "enable the
-            # API" question, a configured bot enables both. A bare-token
-            # API_TOKEN, generated once and persisted like every other
-            # secret here, not typed by anyone.
-            if [ -z "$API_TOKEN" ]; then
-                API_TOKEN="$("$PYTHON" -c 'import secrets; print(secrets.token_hex(16))')"
-            fi
-            echo "  (h-mesh's REST API will be started too -- the Telegram bot talks to it)"
-        else
-            echo "  ⚠ Both a Telegram Bot Token and Chat ID are required -- Telegram bot not enabled." >&2
-            TELEGRAM_BOT_TOKEN=""
-            TELEGRAM_CHAT_ID=""
-            TELEGRAM_VOICE=""
         fi
+        # Validation (both required), and API_TOKEN generation if so, happen
+        # below unconditionally, in finalize_telegram -- same call non-
+        # interactive mode uses, so a human declining here can't diverge
+        # from what a non-interactive run with the same env would resolve to.
     fi
-
-    # Persist everything the wizard just collected -- only exceptions travel
-    # for CLI/account/provider, so the file stays small and readable.
-    CLI_MAP=(); PROFILE_MAP=(); PROVIDER_MAP=()
-    for a in "${AGENTS[@]}"; do
-        [ "$(mget CLI "$a")" != "$DEF_CLI" ] && CLI_MAP+=("${a}=$(mget CLI "$a")")
-        [ "$(mget PROF "$a")" != "$DEF_PROFILE" ] && PROFILE_MAP+=("${a}=$(mget PROF "$a")")
-        [ -n "$(mget EP "$a")" ] && PROVIDER_MAP+=("${a}=$(mget EP "$a")")
-    done
-
-    {
-        echo "AGENTS=$(IFS=,; echo "${AGENTS[*]}")"
-        echo "DEFAULT_CLI=${DEF_CLI}"
-        echo "ACCOUNTS=$(IFS=,; echo "${PROFILES[*]}")"
-        echo "DEFAULT_ACCOUNT=${DEF_PROFILE}"
-        for tv in $TOKEN_VARS; do
-            eval "tval=\${$tv:-}"
-            [ -n "$tval" ] && echo "${tv}=${tval}"
-        done
-        [ "${#CLI_MAP[@]}"      -gt 0 ] && echo "AGENT_CLIS=$(IFS=,; echo "${CLI_MAP[*]}")"
-        [ "${#PROFILE_MAP[@]}"  -gt 0 ] && echo "AGENT_PROFILES=$(IFS=,; echo "${PROFILE_MAP[*]}")"
-        if [ "${#PROVIDER_MAP[@]}" -gt 0 ] && [ -n "$LOCAL_URL" ]; then
-            echo "AGENT_PROVIDERS=$(IFS=,; echo "${PROVIDER_MAP[*]}")"
-            PR_UPPER="$(echo "$EP_NAME" | tr '[:lower:]-' '[:upper:]_')"
-            echo "PROVIDER_${PR_UPPER}_URL=${LOCAL_URL}"
-            echo "PROVIDER_${PR_UPPER}_MODEL=${LOCAL_MODEL}"
-            echo "PROVIDER_${PR_UPPER}_TOKEN=local"
-            echo "PROVIDER_${PR_UPPER}_KIND=${LOCAL_KIND}"
-        fi
-        [ -n "$TELEGRAM_BOT_TOKEN" ] && echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}"
-        [ -n "$TELEGRAM_CHAT_ID" ] && echo "TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}"
-        [ "$TELEGRAM_VOICE" = "1" ] && echo "TELEGRAM_VOICE=1"
-        [ -n "$API_TOKEN" ] && echo "API_TOKEN=${API_TOKEN}"
-    } | "$PYTHON" -m services.tenant_config set "$TENANT"
-
-    # Re-read what was just persisted -- the hire step below uses the
-    # *_EXISTING variables regardless of whether this run went through the
-    # wizard or not, so they must reflect whatever the wizard just wrote,
-    # not the pre-wizard values read at the top of this script.
-    CLI_MAP_EXISTING="$(TENANT_ENV_GET AGENT_CLIS "")"
-    PROFILE_MAP_EXISTING="$(TENANT_ENV_GET AGENT_PROFILES "")"
-    PROVIDER_MAP_EXISTING="$(TENANT_ENV_GET AGENT_PROVIDERS "")"
-
-    echo
-    printf '  %-16s %-8s %-10s\n' AGENT CLI ACCOUNT
-    for a in "${AGENTS[@]}"; do
-        printf '  %-16s %-8s %-10s\n' "$a" "$(mget CLI "$a")" "$(mget PROF "$a")"
-    done
-    echo
-    if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-        voice_note=""
-        [ "$TELEGRAM_VOICE" = "1" ] && voice_note=" (voice replies enabled)"
-        echo "  Telegram bot: enabled, chat id ${TELEGRAM_CHAT_ID}${voice_note}"
-    else
-        echo "  Telegram bot: not enabled"
-    fi
-    echo
 fi
+
+# ── Settings that apply regardless of how AGENTS/CLI/PROF/TELEGRAM_* above
+# got their values -- an interactive human's answers, or (INTERACTIVE=0)
+# straight env-or-persisted reads with no prompt to override them. Runs
+# once, after the wizard block, so it sees the final state either way.
+
+# ⚠ agy keeps its state in ~/.gemini/antigravity-cli with no equivalent of
+# CLAUDE_CONFIG_DIR/CODEX_HOME -- it cannot be pointed at a second account.
+# Real invariant, not just interactive-prompt UX -- applies whether the
+# agy+non-default-account combination came from a human's answers or from
+# AGENT_CLIS/AGENT_PROFILES env vars in a non-interactive run.
+for a in "${AGENTS[@]}"; do
+    if [ "$(mget CLI "$a")" = "agy" ] && [ "$(mget PROF "$a")" != "default" ]; then
+        echo "  warning: $a runs agy, which supports only one account -- ignoring account '$(mget PROF "$a")'" >&2
+        mset PROF "$a" default
+    fi
+done
+
+# Non-interactive has no ask_token() prompt -- resolve each account's OAuth
+# token from CLAUDE_OAUTH_TOKEN_<PROFILE> env (or whatever's already
+# persisted) instead, so it lands in the tenant config file the same way an
+# interactive answer would, not just in a running daemon's live env (see
+# services.daemons.merged_daemon_env, which already layers env on top of the
+# persisted file for a *running* daemon -- this is what makes a later
+# clean-shell run see it too).
+if [ "$INTERACTIVE" -eq 0 ]; then
+    for p in "${PROFILES[@]}"; do
+        resolve_token_noninteractive "$p"
+    done
+fi
+
+finalize_telegram
+
+# Persist everything resolved above -- only exceptions travel for
+# CLI/account/provider, so the file stays small and readable. Runs every
+# time (not just after the interactive wizard) so a non-interactive run's
+# env-derived settings converge on the same stored state an interactive
+# answer would have produced, instead of only taking effect for daemons
+# started in this one process's environment (see services.daemons.
+# merged_daemon_env -- without this, a later "h-mesh start"/upgrade run
+# from a clean shell would silently come up without whatever only ever
+# lived in this run's exported env).
+CLI_MAP=(); PROFILE_MAP=(); PROVIDER_MAP=()
+for a in "${AGENTS[@]}"; do
+    [ "$(mget CLI "$a")" != "$DEF_CLI" ] && CLI_MAP+=("${a}=$(mget CLI "$a")")
+    [ "$(mget PROF "$a")" != "$DEF_PROFILE" ] && PROFILE_MAP+=("${a}=$(mget PROF "$a")")
+    [ -n "$(mget EP "$a")" ] && PROVIDER_MAP+=("${a}=$(mget EP "$a")")
+done
+
+{
+    echo "AGENTS=$(IFS=,; echo "${AGENTS[*]}")"
+    echo "DEFAULT_CLI=${DEF_CLI}"
+    echo "ACCOUNTS=$(IFS=,; echo "${PROFILES[*]}")"
+    echo "DEFAULT_ACCOUNT=${DEF_PROFILE}"
+    for tv in $TOKEN_VARS; do
+        eval "tval=\${$tv:-}"
+        [ -n "$tval" ] && echo "${tv}=${tval}"
+    done
+    [ "${#CLI_MAP[@]}"      -gt 0 ] && echo "AGENT_CLIS=$(IFS=,; echo "${CLI_MAP[*]}")"
+    [ "${#PROFILE_MAP[@]}"  -gt 0 ] && echo "AGENT_PROFILES=$(IFS=,; echo "${PROFILE_MAP[*]}")"
+    if [ "${#PROVIDER_MAP[@]}" -gt 0 ] && [ -n "$LOCAL_URL" ]; then
+        echo "AGENT_PROVIDERS=$(IFS=,; echo "${PROVIDER_MAP[*]}")"
+        PR_UPPER="$(echo "$EP_NAME" | tr '[:lower:]-' '[:upper:]_')"
+        echo "PROVIDER_${PR_UPPER}_URL=${LOCAL_URL}"
+        echo "PROVIDER_${PR_UPPER}_MODEL=${LOCAL_MODEL}"
+        echo "PROVIDER_${PR_UPPER}_TOKEN=local"
+        echo "PROVIDER_${PR_UPPER}_KIND=${LOCAL_KIND}"
+    fi
+    [ -n "$TELEGRAM_BOT_TOKEN" ] && echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}"
+    [ -n "$TELEGRAM_CHAT_ID" ] && echo "TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}"
+    [ "$TELEGRAM_VOICE" = "1" ] && echo "TELEGRAM_VOICE=1"
+    [ -n "$API_TOKEN" ] && echo "API_TOKEN=${API_TOKEN}"
+} | "$PYTHON" -m services.tenant_config set "$TENANT"
+
+# Re-read what was just persisted -- the hire step below uses the
+# *_EXISTING variables regardless of whether this run went through the
+# wizard or not, so they must reflect whatever was just written, not
+# whatever pre-wizard values were read at the top of this script.
+CLI_MAP_EXISTING="$(TENANT_ENV_GET AGENT_CLIS "")"
+PROFILE_MAP_EXISTING="$(TENANT_ENV_GET AGENT_PROFILES "")"
+PROVIDER_MAP_EXISTING="$(TENANT_ENV_GET AGENT_PROVIDERS "")"
+
+echo
+printf '  %-16s %-8s %-10s\n' AGENT CLI ACCOUNT
+for a in "${AGENTS[@]}"; do
+    printf '  %-16s %-8s %-10s\n' "$a" "$(mget CLI "$a")" "$(mget PROF "$a")"
+done
+echo
+if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+    voice_note=""
+    [ "$TELEGRAM_VOICE" = "1" ] && voice_note=" (voice replies enabled)"
+    echo "  Telegram bot: enabled, chat id ${TELEGRAM_CHAT_ID}${voice_note}"
+else
+    echo "  Telegram bot: not enabled"
+fi
+echo
 
 # 2. Install h-mesh package
 if [ "$SKIP_INSTALL" -eq 0 ]; then
