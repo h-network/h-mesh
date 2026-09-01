@@ -1,5 +1,6 @@
 import json
 import sys
+import threading
 from collections import defaultdict
 from pathlib import Path
 from unittest.mock import patch
@@ -77,6 +78,12 @@ class FakeRedis:
             return self.lists[key].pop(0)
         return None
 
+    def lindex(self, key, index):
+        try:
+            return self.lists[key][index]
+        except IndexError:
+            return None
+
     def lrange(self, key, start, end):
         items = self.lists[key]
         if end == -1:
@@ -92,6 +99,29 @@ class FakeRedis:
             items.remove(value)
             return 1
         return 0
+
+    def eval(self, script, key_count, *args):
+        keys = args[:key_count]
+        argv = args[key_count:]
+        if "office atomic take" in script:
+            source_key, doing_key = keys
+            raw, serialized = argv
+            if self.lists[doing_key]:
+                return [0, "busy"]
+            if raw not in self.lists[source_key]:
+                return [0, "changed"]
+            self.lists[source_key].remove(raw)
+            self.lists[doing_key].append(serialized)
+            return [1, "ok"]
+        if "office quarantine invalid ticket" in script:
+            source_key, invalid_key = keys
+            raw = argv[0]
+            if raw not in self.lists[source_key]:
+                return 0
+            self.lists[source_key].remove(raw)
+            self.lists[invalid_key].append(raw)
+            return 1
+        raise AssertionError("unexpected Lua script")
 
     # --- streams (usage) ---
     def xrange(self, key, min="-", max="+"):
@@ -308,12 +338,24 @@ def test_hold_then_list_shows_priority_and_age(monkeypatch, capsys):
     doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
     r.lists[doing_key].append(json.dumps(_ticket("architect", status="doing", priority="high")))
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
-        office_main(["hold"])
+        office_main(["hold", "--reason", "waiting for dependency"])
         capsys.readouterr()
         office_main(["list"])
     out = capsys.readouterr().out
     assert "p:high" in out
     assert "a1b2c3d4  do the thing" in out
+
+
+def test_hold_requires_and_lists_reason(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis()
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    r.lists[doing_key].append(json.dumps(_ticket("architect", status="doing")))
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["hold", "--reason", "waiting for API credentials"])
+        capsys.readouterr()
+        office_main(["list"])
+    assert "reason:waiting for API credentials" in capsys.readouterr().out
 
 
 def test_malformed_board_entry_raises_office_error_not_board_error(monkeypatch, capsys):
@@ -325,6 +367,99 @@ def test_malformed_board_entry_raises_office_error_not_board_error(monkeypatch, 
         with pytest.raises(SystemExit):
             office_main(["take"])
     assert "office: error:" in capsys.readouterr().err
+    invalid_key = prefix(POD, TENANT, "architect", "tasks.invalid")
+    assert r.lists[todo_key] == []
+    assert r.lists[invalid_key] == [json.dumps({"title": "no id here"})]
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["list"])
+    listed = capsys.readouterr().out
+    assert "invalid:" in listed
+    assert "malformed ticket preserved" in listed
+
+
+def test_take_by_id_quarantines_malformed_entries_without_blocking_valid_match(monkeypatch):
+    _env(monkeypatch)
+    r = FakeRedis()
+    todo_key = prefix(POD, TENANT, "architect", "tasks.todo")
+    invalid_key = prefix(POD, TENANT, "architect", "tasks.invalid")
+    malformed = json.dumps({"title": "no id here"})
+    r.lists[todo_key].extend([
+        malformed,
+        json.dumps(_ticket("architect", task_id="valid-id")),
+    ])
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["take", "valid"])
+
+    assert r.lists[invalid_key] == [malformed]
+    assert r.lists[todo_key] == []
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    assert json.loads(r.lists[doing_key][0])["id"] == "valid-id"
+
+
+def test_take_quarantines_invalid_utf8_bytes(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis()
+    todo_key = prefix(POD, TENANT, "architect", "tasks.todo")
+    invalid_key = prefix(POD, TENANT, "architect", "tasks.invalid")
+    malformed = b"\xffnot-a-ticket"
+    r.lists[todo_key].append(malformed)
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit):
+            office_main(["take"])
+
+    assert "not a valid ticket" in capsys.readouterr().err
+    assert r.lists[todo_key] == []
+    assert r.lists[invalid_key] == [malformed]
+
+
+def test_concurrent_takes_leave_exactly_one_doing_ticket(monkeypatch):
+    _env(monkeypatch)
+    r = FakeRedis()
+    todo_key = prefix(POD, TENANT, "architect", "tasks.todo")
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    r.lists[todo_key].extend([
+        json.dumps(_ticket("architect", task_id="aaaaaaaa")),
+        json.dumps(_ticket("architect", task_id="bbbbbbbb")),
+    ])
+    barrier = threading.Barrier(2)
+    original_llen = r.llen
+
+    def racing_llen(key):
+        result = original_llen(key)
+        if key == doing_key:
+            barrier.wait(timeout=2)
+        return result
+
+    r.llen = racing_llen
+    errors = []
+
+    def take(reference):
+        try:
+            office_cli._take_command([reference])
+        except BaseException as exc:
+            errors.append(exc)
+
+    with (
+        patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")),
+        patch("modules.office.cli.record_task_event"),
+        patch("modules.office.cli._log_task"),
+        patch("builtins.print"),
+    ):
+        threads = [
+            threading.Thread(target=take, args=("aaaaaaaa",)),
+            threading.Thread(target=take, args=("bbbbbbbb",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(r.lists[doing_key]) == 1
+    assert len(r.lists[todo_key]) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], office_cli.OfficeError)
+    assert "already have one open task" in str(errors[0])
 
 
 # ---------------------------------------------------------------------------

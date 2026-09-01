@@ -35,7 +35,7 @@ def normalize_ticket(raw, *, state: str | None = None) -> dict:
     else:
         try:
             ticket = json.loads(_text(raw))
-        except (json.JSONDecodeError, TypeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
             raise BoardError("board entry is not a valid ticket") from exc
     if not isinstance(ticket, dict):
         raise BoardError("board entry is not a valid ticket")
@@ -57,6 +57,8 @@ def normalize_ticket(raw, *, state: str | None = None) -> dict:
         "done_ts": ticket.get("done_ts"),
         "held_ts": ticket.get("held_ts"),
     }
+    if isinstance(ticket.get("hold_reason"), str) and ticket["hold_reason"]:
+        normalized["hold_reason"] = ticket["hold_reason"]
     if ticket.get("priority") is not None:
         normalized["priority"] = ticket["priority"]
     raw_related = ticket.get("related")
