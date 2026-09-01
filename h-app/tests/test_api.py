@@ -267,8 +267,8 @@ class RealApiPortSubprocessTests(unittest.TestCase):
         delivered = json.loads(entries[0][1][b"envelope"])
         self.assertEqual(delivered["payload"], {"text": "invoked via python -m modules.api.port"})
 
-        delivering_key = prefix(self.pod, self.tenant, resource="delivering")
-        self.assertIsNone(self.r.hget(delivering_key, "ivy"))
+        delivering_key = prefix(self.pod, self.tenant, agent="ivy", resource="delivering")
+        self.assertIsNone(self.r.get(delivering_key))
 
 
 if __name__ == "__main__":

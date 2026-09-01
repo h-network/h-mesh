@@ -58,6 +58,11 @@ return items
 """
 
 
+def delivery_lock_key(pod: str, tenant: str, agent: str) -> str:
+    """Canonical Redis key for one destination's delivery lease."""
+    return prefix(pod, tenant, agent=agent, resource="delivering")
+
+
 def register_type(port_type_name: str, handler: HandlerSpec) -> None:
     """Register or override a delivery handler for a port_type.
 
@@ -183,7 +188,7 @@ def delivery_lock(
     """
     if lease_ms <= 0 or acquire_timeout < 0 or poll_interval <= 0:
         raise ValueError("delivery lock timings must be positive")
-    lock_key = prefix(pod, tenant, agent=agent, resource="delivering")
+    lock_key = delivery_lock_key(pod, tenant, agent)
     token = uuid.uuid4().hex
     deadline = time.monotonic() + acquire_timeout
     while not r.set(lock_key, token, nx=True, px=lease_ms):

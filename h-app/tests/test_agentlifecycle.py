@@ -32,6 +32,6 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
         call.hdel(prefix(POD, TENANT, resource="registry"), "worker-1"),
         call.delete(prefix(POD, TENANT, agent="worker-1", resource="ingress")),
         call.delete(prefix(POD, TENANT, agent="worker-1", resource="paused")),
-        call.hdel(prefix(POD, TENANT, resource="delivering"), "worker-1"),
+        call.delete(prefix(POD, TENANT, agent="worker-1", resource="delivering")),
     ]
     kill_window.assert_called_once_with("worker-1")
