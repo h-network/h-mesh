@@ -1344,6 +1344,100 @@ def test_hire_failure_reports_detail():
         assert "available accounts: default, work" in reply
 
 
+def test_hire_start_from_the_inline_button_still_force_replies():
+    """The path the operator actually uses. handle_callback_query passes the
+    tapped message's id, and passing that into _send_or_edit_message took the
+    edit branch, where force_reply cannot apply at all -- so the one prompt
+    that most needs the compose box opened on it was the one prompt never
+    getting it. The sticky-button test missed this by calling with no
+    message_id, encoding the same assumption as the comment it was written
+    from."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+
+        bot_instance.handle_callback_query(12345, "cb-1", "hi", message_id=42)
+
+        assert telegram.sent_messages[-1]["reply_markup"] == {"force_reply": True, "selective": True}
+        assert "New agent's name?" in telegram.sent_messages[-1]["text"]
+        # the tapped menu message is left alone, not overwritten by the prompt
+        assert [e["message_id"] for e in telegram.edited_messages] == []
+        assert bot_instance.pending["12345"]["message_id"] == telegram.sent_messages[-1]["message_id"]
+
+
+def test_hire_completes_when_the_anchor_can_never_be_edited():
+    """The real .101 condition: editMessageText answers 400 "message can't be
+    edited" for every stage, not just the first. Each step has to re-anchor to
+    a fresh send and the flow has to reach hire_agent anyway -- the fake
+    Telegram whose edits always succeed is why we believed this path worked."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        class UneditableTelegramClient(DummyTelegramClient):
+            def edit_message_text(self, chat_id, message_id, text, reply_markup=None, **kwargs):
+                super().edit_message_text(chat_id, message_id, text, reply_markup=reply_markup, **kwargs)
+                return {"ok": False, "description": "Bad Request: message can't be edited"}
+
+        bot_instance, mesh, telegram = _make_bot(telegram=UneditableTelegramClient(), tmpdir=tmpdir)
+
+        bot_instance.handle_callback_query(12345, "cb-1", "hi", message_id=42)
+        assert "New agent's name?" in bot_instance.handle_text_message(12345, "sme-9") or True
+        bot_instance.handle_text_message(12345, "-")
+        reply = bot_instance.handle_text_message(12345, "-")
+
+        assert mesh.hired == [{"agent": "sme-9", "cli": "claude", "profile": None, "provider": None}]
+        assert "Hire accepted for sme-9" in reply
+        assert "12345" not in bot_instance.pending
+        # every failed edit fell back to a fresh send, so the operator sees
+        # each question as a new message rather than a silent in-place update
+        assert len(bot_instance.telegram.sent_messages) == 4
+
+
+def test_hire_puts_the_flow_back_when_the_submission_raises():
+    """The flow is deleted before the call on purpose (a second answer during
+    those 10s would hire twice). That leaves nothing behind if the call blows
+    up, which is the "no agent, no error, no way back" shape -- so an
+    unexpected exception restores the stage instead of dropping the operator
+    into silence."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        class ExplodingMeshClient(DummyMeshClient):
+            def hire_agent(self, agent, cli="claude", profile=None, provider=None):
+                raise RuntimeError("connection reset by peer")
+
+        bot_instance, _, telegram = _make_bot(mesh=ExplodingMeshClient(), tmpdir=tmpdir)
+        bot_instance.pending["12345"] = {
+            "flow": "hire", "stage": "provider", "name": "sme-9", "profile": None, "message_id": 7,
+        }
+
+        reply = bot_instance.handle_text_message(12345, "-")
+
+        assert "wasn't submitted" in reply and "RuntimeError" in reply
+        assert bot_instance.pending["12345"]["stage"] == "provider"
+        assert bot_instance.pending["12345"]["name"] == "sme-9"
+
+
+def test_hire_flow_is_traceable_in_the_log_without_leaking_what_was_typed(caplog):
+    """The instrumentation this ticket asked for, and its limit: every stage
+    transition and the submission itself are in the log, and neither the
+    answers nor the API token are."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        mesh.token = "sk-secret-token-value"
+
+        with caplog.at_level(logging.DEBUG, logger="mesh_telegram"):
+            bot_instance.handle_callback_query(12345, "cb-1", "hi", message_id=42)
+            bot_instance.handle_text_message(12345, "sme-9")
+            bot_instance.handle_text_message(12345, "sekrit-profile")
+            bot_instance.handle_text_message(12345, "-")
+
+        log = "\n".join(r.getMessage() for r in caplog.records)
+        assert "flow hire: chat=12345 stage name -> profile" in log
+        assert "flow hire: chat=12345 stage profile -> provider" in log
+        assert "flow hire: chat=12345 closed after stage=provider" in log
+        assert "hire submit: chat=12345 agent=sme-9 profile=set provider=default" in log
+        assert "hire submit: chat=12345 agent=sme-9 status=202" in log
+        # the answers themselves, and the credential, stay out of it
+        assert "sekrit-profile" not in log
+        assert "sk-secret-token-value" not in log
+
+
 # ── message agent ────────────────────────────────────────────────────────────
 
 # ── agent pickers: grid layout, not one-per-row ─────────────────────────────

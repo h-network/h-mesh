@@ -87,14 +87,20 @@ class MeshClient:
         }
 
     def request(self, method: str, path: str, data: dict | None = None) -> tuple[int, dict]:
+        """⚠ The logging here is method, path, byte count and status code —
+        never the body and never a header. The body carries chat text and the
+        headers carry the bearer token; a request line is meant to answer "did
+        this call happen, and what did the door say", which needs neither."""
         url = f"{self.base_url}{path}"
         body = json.dumps(data).encode("utf-8") if data is not None else None
         req = urllib.request.Request(url, data=body, headers=self._headers(), method=method)
+        logger.debug(f"api -> {method} {path} ({len(body) if body else 0} bytes)")
         try:
             # context is ignored for http:// urls, so this needs no branch
             with urllib.request.urlopen(req, timeout=10, context=self.ssl_context) as resp:
                 resp_body = resp.read().decode("utf-8")
                 parsed = json.loads(resp_body) if resp_body else {}
+                logger.debug(f"api <- {method} {path} {resp.status}")
                 return resp.status, parsed
         except urllib.error.HTTPError as err:
             err_body = err.read().decode("utf-8")
@@ -102,8 +108,13 @@ class MeshClient:
                 parsed = json.loads(err_body)
             except Exception:
                 parsed = {"detail": err_body}
+            logger.debug(f"api <- {method} {path} {err.code}")
             return err.code, parsed
         except Exception as exc:
+            # Transport failure, not an answer: the caller sees a synthesized
+            # 500 that is indistinguishable from the door returning one, so
+            # this is the only place the difference is recorded at all.
+            logger.warning(f"api !! {method} {path} failed before any status: {exc}")
             return 500, {"detail": str(exc)}
 
     def enrol(self) -> tuple[int, dict]:
@@ -2274,11 +2285,19 @@ class TelegramBot:
     def handle_hire_start(self, chat_id: int | str, message_id: int | None = None) -> str:
         cid = str(chat_id)
         text = "New agent's name? (lowercase letters, digits, hyphens; not all digits; /cancel to abort)"
-        # This is always the *first* message of the flow (Hire has no
-        # picker screen before it) -- a fresh send in every real invocation,
-        # so ForceReply reliably opens the compose box with a "Reply to:"
-        # tag right on this prompt, not a step or two later.
-        anchor_id = self._send_or_edit_message(cid, text, message_id=message_id, force_reply=True)
+        # ⚠ `message_id` is accepted and deliberately NOT edited. Every menu
+        # entry point passes the tapped message's id uniformly
+        # (_dispatch_menu_action), and passing it through here quietly cost
+        # the ForceReply: `_send_or_edit_message` takes the edit branch
+        # whenever it has an id, and force_reply only ever applies to a fresh
+        # send (see its docstring — editMessageText cannot attach a
+        # ForceReply at all). The comment this replaces claimed Hire was
+        # "a fresh send in every real invocation"; the inline button
+        # (handle_callback_query -> "hi") is the path the operator actually
+        # uses and it always has an id, so the prompt that most needs the
+        # compose box opened on it was the one prompt never getting it.
+        # A fresh send every time; the menu message stays where it was.
+        anchor_id = self._send_or_edit_message(cid, text, force_reply=True)
         self.pending[cid] = {"flow": "hire", "stage": "name", "message_id": anchor_id}
         return text
 
@@ -2308,8 +2327,41 @@ class TelegramBot:
 
     def handle_pending_text(self, chat_id: int | str, text: str) -> str | None:
         """Consume `text` as an answer to a pending flow's prompt. Returns None
-        (leaving `text` untouched by the caller) when the chat has no flow open."""
+        (leaving `text` untouched by the caller) when the chat has no flow open.
+
+        ⚠ This wrapper exists to make the flow observable and nothing else —
+        `_advance_pending_flow` below is the flow. A multi-step flow that
+        "just stops" is undiagnosable without knowing which stage consumed
+        which answer and where the anchor went, and that is exactly the state
+        this logs: stage before, stage after, anchor before, anchor after.
+        The answer's LENGTH, never its text: the stage names say what the
+        operator was asked, which is what a log needs to know."""
         cid = str(chat_id)
+        before = self.pending.get(cid)
+        if not before:
+            logger.debug(f"pending: chat={cid} has no open flow ({len(text.strip())} chars fall through)")
+            return None
+        flow = before.get("flow")
+        stage_before, anchor_before = before.get("stage"), before.get("message_id")
+        logger.info(
+            f"flow {flow}: chat={cid} stage={stage_before} anchor={anchor_before} "
+            f"consuming an answer of {len(text.strip())} chars"
+        )
+        reply = self._advance_pending_flow(cid, text)
+        after = self.pending.get(cid)
+        if after is None:
+            logger.info(f"flow {flow}: chat={cid} closed after stage={stage_before}")
+        else:
+            logger.info(
+                f"flow {flow}: chat={cid} stage {stage_before} -> {after.get('stage')}, "
+                f"anchor {anchor_before} -> {after.get('message_id')}"
+            )
+        return reply
+
+    def _advance_pending_flow(self, cid: str, text: str) -> str | None:
+        """One step of an open flow. Called only by `handle_pending_text`,
+        which owns the logging around it; `cid` is already normalised and the
+        chat is known to have a flow open."""
         state = self.pending.get(cid)
         if not state:
             return None
@@ -2383,10 +2435,38 @@ class TelegramBot:
             # stage == "provider"
             provider = None if text.strip() == "-" else text.strip()
             name, profile = state["name"], state["profile"]
+            # ⚠ Dropped BEFORE the call, deliberately. hire_agent blocks for up
+            # to 10s, and a second answer landing in that window (each update
+            # runs on its own thread — see run_polling) would otherwise be read
+            # as another provider answer and hire the same agent twice. The
+            # cost is that anything failing past this line leaves the operator
+            # with no flow, so the except below puts it back rather than
+            # dropping them into silence.
             del self.pending[cid]
             if self.telegram:
                 self.telegram.send_chat_action(cid)
-            code, resp = self.mesh.hire_agent(name, profile=profile, provider=provider)
+            logger.info(
+                f"hire submit: chat={cid} agent={name} "
+                f"profile={'set' if profile else 'default'} provider={'set' if provider else 'default'}"
+            )
+            try:
+                code, resp = self.mesh.hire_agent(name, profile=profile, provider=provider)
+            except Exception as exc:
+                # MeshClient.request turns transport failures into (500, ...)
+                # itself, so reaching here means something broke outside that
+                # contract entirely. Before, this killed the dispatch thread
+                # with the flow already deleted: no agent, no message, no way
+                # back except starting over — the exact shape of "it does
+                # nothing" this ticket is about.
+                logger.error(f"hire submit raised before any status: chat={cid} agent={name}: {exc}")
+                self.pending[cid] = dict(state, stage="provider", message_id=anchor_id)
+                reply = (
+                    f"❌ Hire for {name} wasn't submitted ({type(exc).__name__}). "
+                    "Send the provider again to retry, or /cancel."
+                )
+                self._send_or_edit_message(cid, reply, message_id=anchor_id)
+                return reply
+            logger.info(f"hire submit: chat={cid} agent={name} status={code}")
             if code == 202:
                 extras = ", ".join(f"{k} {v}" for k, v in (("profile", profile), ("provider", provider)) if v)
                 reply = f"✅ Hire accepted for {name}" + (f" ({extras})" if extras else "") + " · window and CLI follow shortly."
@@ -2484,12 +2564,20 @@ class TelegramBot:
         (`@mention` and the plain-prompt fallback), to react on it; every
         other branch here is a menu action or command, not a turn to a CLI
         agent that could run long enough for the reaction to matter."""
+        # ⚠ Which BRANCH, not which text. "Nothing happened" is always one of
+        # these branches having been taken instead of the expected one, and
+        # the branch name says that without putting a chat's contents in a
+        # log file. The sticky code ("hi", "at") is this bot's own menu
+        # vocabulary, so it is logged as-is.
         pending_reply = self.handle_pending_text(chat_id, text)
         if pending_reply is not None:
             return pending_reply
         if text in self.STICKY_LABELS:
-            return self._dispatch_menu_action(chat_id, self.STICKY_LABELS[text])
+            code = self.STICKY_LABELS[text]
+            logger.debug(f"text: chat={chat_id} -> sticky menu action {code!r}")
+            return self._dispatch_menu_action(chat_id, code)
         if text.startswith(self.STICKY_TARGET_PREFIX):
+            logger.debug(f"text: chat={chat_id} -> target-agent picker")
             return self.handle_message_agent_start(chat_id)
         if text.startswith("🔊 Voice") or text.startswith("🔇 Voice") or text in ("/voice", "/tts"):
             return self.handle_voice_toggle(chat_id)
@@ -2508,7 +2596,9 @@ class TelegramBot:
         if text.startswith("@"):
             mention = _parse_mention(text)
             if mention is not None:
+                logger.debug(f"text: chat={chat_id} -> @mention prompt")
                 return self.handle_mention_prompt(chat_id, *mention, message_id=message_id)
+        logger.debug(f"text: chat={chat_id} -> prompt for {self.target_agent}")
         return self.handle_user_prompt(chat_id, text, message_id=message_id)
 
     def _get_activity_tail(self, agent: str) -> str | None:
@@ -2788,13 +2878,25 @@ class TelegramBot:
         return reply_text
 
     def _dispatch_update(self, update: dict) -> None:
+        """⚠ Logs the SHAPE of an update, never its text: update id, kind,
+        chat, message id, and how many characters arrived. A callback's `data`
+        is logged in full because it is one of this bot's own short codes
+        ("hi", "at:agent"), not something a person typed."""
+        update_id = update.get("update_id")
         callback = update.get("callback_query")
         if callback:
             chat_id = str(callback["message"]["chat"]["id"])
+            logger.debug(
+                f"update {update_id}: callback data={callback.get('data', '')!r} "
+                f"chat={chat_id} msg={callback['message'].get('message_id')}"
+            )
             if not self._chat_allowed(chat_id):
                 # ⚠ No reply, no answered callback query, nothing — silence
                 # tells an unauthorized sender less than a rejection would
-                # (not even that a bot is listening on the other end).
+                # (not even that a bot is listening on the other end). Silent
+                # to the sender, not to the log: an ignored chat id is the
+                # first thing to rule out when "the button does nothing".
+                logger.info(f"update {update_id}: callback from chat={chat_id} ignored (not the allowed chat)")
                 return
             message_id = callback["message"].get("message_id")
             self.handle_callback_query(chat_id, callback["id"], callback.get("data", ""), message_id)
@@ -2802,10 +2904,18 @@ class TelegramBot:
 
         msg = update.get("message") or update.get("edited_message")
         if not msg:
+            logger.debug(f"update {update_id}: no message or callback in it, nothing to dispatch")
             return
 
         chat_id = str(msg["chat"]["id"])
+        logger.debug(
+            f"update {update_id}: message chat={chat_id} msg={msg.get('message_id')} "
+            f"text={len(msg.get('text', '').strip())} chars "
+            f"photo={bool(msg.get('photo'))} document={bool(msg.get('document'))} "
+            f"reply_to={bool(msg.get('reply_to_message'))}"
+        )
         if not self._chat_allowed(chat_id):
+            logger.info(f"update {update_id}: message from chat={chat_id} ignored (not the allowed chat)")
             return
 
         photo_sizes = msg.get("photo")
@@ -2820,6 +2930,7 @@ class TelegramBot:
 
         text = msg.get("text", "").strip()
         if not text:
+            logger.debug(f"update {update_id}: message chat={chat_id} has no text, dropped")
             return
 
         self.handle_text_message(chat_id, text, msg.get("message_id"))
