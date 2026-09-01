@@ -7,7 +7,7 @@ from typing import Set
 
 from core.config import state_path
 from core.logging import log_record
-from lib.paths import get_agent_workdir, get_workdir_root, resolve_venv_bin
+from lib.paths import build_pane_path, get_agent_workdir, get_workdir_root, resolve_venv_bin
 from services.claude_statusline import install_statusline
 
 
@@ -340,16 +340,10 @@ def window_env(
 
     # ⚠ INJECT PATH DIRECTLY INTO THE CONSTRUCTED ENV.
     # A hired agent's CLI process is spawned directly by tmux without sourcing
-    # rc files (~/.bashrc/~/.profile). Prepend the virtualenv bin dir to PATH so
-    # all office tools (e.g. h-mesh-office, h-mesh) and python binaries are accessible.
-    resolved_bin = resolve_venv_bin(venv_bin)
-    ambient_path = os.environ.get("PATH", "")
-    path_entries = [p for p in ambient_path.split(":") if p]
-    if resolved_bin:
-        if resolved_bin in path_entries:
-            path_entries.remove(resolved_bin)
-        path_entries.insert(0, resolved_bin)
-    constructed_path = ":".join(path_entries) if path_entries else resolved_bin
+    # rc files (~/.bashrc/~/.profile). Construct a complete PATH from known-required
+    # locations (virtualenv bin, ~/.local/bin where h-agent is installed, ambient PATH,
+    # and system directories) so all tools, h-agent, and python binaries are accessible.
+    constructed_path = build_pane_path(venv_bin=venv_bin)
 
     env_vars = [
         "env",
