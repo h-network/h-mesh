@@ -1,13 +1,12 @@
-"""Persist a venv's bin dir on PATH durably, for every future shell/pane.
+"""Persist a venv's bin dir on PATH durably, for interactive shells.
 
 setup.sh only affects the process that runs it -- exporting PATH there does
-nothing for anyone else. A hired agent's tmux pane starts a fresh login
-shell (`bash -il`, see modules/tmux/ops.py's start_agent_command), and a
-human attaching to the session gets one too; neither inherits PATH from
-whatever shell happened to run setup.sh. The only way h-mesh-* commands
-(including the unified `h-mesh` dispatcher) are on PATH for those is a PATH
-export written into a shell startup file every new shell/pane actually
-reads.
+nothing for anyone else. While hired agent panes get PATH injected directly into
+their window environment via modules.tmux.ops.window_env, a human attaching
+to the session gets a fresh login shell; they do not inherit PATH from
+whatever shell happened to run setup.sh. The way h-mesh-* commands
+(including the unified `h-mesh` dispatcher) are on PATH for attaching users is
+a PATH export written into shell startup files (~/.bashrc and ~/.profile).
 
 `h-mesh upgrade` calls this too: to repair an install that predates this
 fix, and in case the venv path itself ever changes.

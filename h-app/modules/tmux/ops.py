@@ -7,7 +7,7 @@ from typing import Set
 
 from core.config import state_path
 from core.logging import log_record
-from lib.paths import get_agent_workdir, get_workdir_root
+from lib.paths import get_agent_workdir, get_workdir_root, resolve_venv_bin
 
 
 # Seconds between the paste and the Enter. `paste-buffer -p` only emits the
@@ -321,6 +321,7 @@ def window_env(
     skip_permissions: bool | None = None,
     claude_tools: str | None = None,
     log_file: str | Path | None = None,
+    venv_bin: str | Path | None = None,
 ) -> list[str]:
     """Single place where a window environment is constructed for all execution paths."""
     cwd = get_agent_workdir(agent_name, cwd)
@@ -331,6 +332,20 @@ def window_env(
     # ambient H_MESH_LOG_FILE causes test windows and nested processes to write
     # into whatever production or parent office log happens to be in the environment.
     log_path = str(log_file) if log_file is not None else str(state_path("window.log.jsonl"))
+
+    # ⚠ INJECT PATH DIRECTLY INTO THE CONSTRUCTED ENV.
+    # A hired agent's CLI process is spawned directly by tmux without sourcing
+    # rc files (~/.bashrc/~/.profile). Prepend the virtualenv bin dir to PATH so
+    # all office tools (e.g. h-mesh-office, h-mesh) and python binaries are accessible.
+    resolved_bin = resolve_venv_bin(venv_bin)
+    ambient_path = os.environ.get("PATH", "")
+    path_entries = [p for p in ambient_path.split(":") if p]
+    if resolved_bin:
+        if resolved_bin in path_entries:
+            path_entries.remove(resolved_bin)
+        path_entries.insert(0, resolved_bin)
+    constructed_path = ":".join(path_entries) if path_entries else resolved_bin
+
     env_vars = [
         "env",
         f"AGENT_NAME={agent_name}",
@@ -338,6 +353,7 @@ def window_env(
         f"H_MESH_LOG_FILE={log_path}",
         f"OFFICE_TOOLS={os.environ.get('OFFICE_TOOLS', 'h-mesh-office')}",
         f"AGENT_GUIDE={guide_path}",
+        f"PATH={constructed_path}",
     ]
     if profile:
         home_dir = os.environ.get("HOME", os.path.expanduser("~"))
