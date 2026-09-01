@@ -2,6 +2,7 @@
 
 from .ops import (
     AmbientTmuxError,
+    EmptyRosterError,
     TmuxCommandError,
     create_window,
     ensure_agy_project_trusted,
@@ -41,6 +42,7 @@ def __getattr__(name: str):
 
 __all__ = [
     "AmbientTmuxError",
+    "EmptyRosterError",
     "TmuxCommandError",
     "require_isolated_tmux",
     "create_window",

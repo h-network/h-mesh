@@ -25,6 +25,7 @@ class TmuxReconciler:
         session_name: str | None = None,
         socket: str | None = None,
         log_file: str | Path | None = None,
+        allow_empty_roster: bool | None = None,
     ):
         self.pod = pod
         self.tenant = tenant
@@ -33,6 +34,11 @@ class TmuxReconciler:
         self.session_name = session_name or tenant
         self.socket = socket or os.environ.get("TMUX_SOCKET")
         self.log_file = log_file
+        self.allow_empty_roster = (
+            allow_empty_roster
+            if allow_empty_roster is not None
+            else os.environ.get("TMUX_ALLOW_EMPTY_ROSTER", "0").lower() in ("1", "true", "yes")
+        )
         self._spawned_agents: dict[str, float] = {}
         self._known_windows: Set[str] = set()
         self._failure_counts: dict[str, int] = {}
@@ -376,6 +382,16 @@ class TmuxReconciler:
         # When the roster has active agents, any window not in roster_agents
         # (including __init__) is stale and should be removed.
         if not roster_agents:
+            active_windows = {w for w in existing_windows if w != "__init__"}
+            if active_windows and not self.allow_empty_roster:
+                msg = (
+                    f"Refusing to reap {len(active_windows)} window(s) ({', '.join(sorted(active_windows))}) "
+                    f"in session '{self.session_name}': roster is empty. "
+                    f"Set allow_empty_roster=True or TMUX_ALLOW_EMPTY_ROSTER=1 to override."
+                )
+                log_record("tmux_reconciler", "error", reason=msg)
+                raise tmux_ops.EmptyRosterError(msg)
+
             placeholder = "__init__"
             if placeholder not in existing_windows:
                 ret, _, stderr = tmux_ops.create_window(

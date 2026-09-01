@@ -18,6 +18,7 @@ def main() -> None:
     poll_seconds = float(os.environ.get("REGISTRY_POLL_SECONDS", "5"))
     session_name = os.environ.get("TMUX_SESSION", tenant)
     socket = os.environ.get("TMUX_SOCKET")
+    allow_empty_roster = os.environ.get("TMUX_ALLOW_EMPTY_ROSTER", "0").lower() in ("1", "true", "yes")
 
     reconciler = TmuxReconciler(
         pod=pod,
@@ -26,6 +27,7 @@ def main() -> None:
         poll_seconds=poll_seconds,
         session_name=session_name,
         socket=socket,
+        allow_empty_roster=allow_empty_roster,
     )
     reconciler.run_forever()
 

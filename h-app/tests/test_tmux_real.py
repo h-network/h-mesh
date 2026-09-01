@@ -19,6 +19,7 @@ from core.channels import send
 from core.keys import prefix
 from modules.tmux import (
     AmbientTmuxError,
+    EmptyRosterError,
     deliver_tmux,
     list_windows,
     require_isolated_tmux,
@@ -188,8 +189,14 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         self.assertNotIn("alice", windows_after)
         self.assertIn("bob", windows_after)
 
-        # 5. Test removing all agents -> placeholder __init__
+        # 5. Test removing all agents -> EmptyRosterError without override
         self.r.hdel(self.registry, "bob")
+        with self.assertRaises(EmptyRosterError):
+            reconciler.reconcile_once(self.r)
+        self.assertIn("bob", list_windows(self.session_name, socket=self.socket))
+
+        # With explicit override allow_empty_roster=True, placeholder __init__ is created and bob is reaped
+        reconciler.allow_empty_roster = True
         reconciler.reconcile_once(self.r)
 
         windows_final = list_windows(self.session_name, socket=self.socket)
@@ -325,8 +332,13 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             reconciler.reconcile_once(self.r)
             self.assertEqual(list_windows(self.session_name, socket=self.socket), {"helen"})
 
-        # 3. Remove agent: should recreate __init__ and remove agent window without churn
+        # 3. Remove agent: should recreate __init__ and remove agent window without churn (requires allow_empty_roster=True)
         self.r.hdel(self.registry, "helen")
+        with self.assertRaises(EmptyRosterError):
+            reconciler.reconcile_once(self.r)
+        self.assertEqual(list_windows(self.session_name, socket=self.socket), {"helen"})
+
+        reconciler.allow_empty_roster = True
         reconciler.reconcile_once(self.r)
         self.assertEqual(list_windows(self.session_name, socket=self.socket), {"__init__"})
 
@@ -693,6 +705,47 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             self.assertEqual(len(died_events), 1)
             self.assertEqual(died_events[0]["count"], 1)
             self.assertEqual(reconciler._failure_counts.get("runner"), 1)
+
+    def test_empty_roster_refusal_and_override(self):
+        reconciler = TmuxReconciler(
+            pod=self.pod,
+            tenant=self.tenant,
+            redis_url=self.redis_url,
+            session_name=self.session_name,
+            socket=self.socket,
+        )
+        self.r.hset(self.registry, mapping={"w1": "tmux", "w2": "tmux"})
+        reconciler.reconcile_once(self.r)
+
+        self.assertIn("w1", list_windows(self.session_name, socket=self.socket))
+        self.assertIn("w2", list_windows(self.session_name, socket=self.socket))
+
+        # Empty the Redis roster completely
+        self.r.delete(self.registry)
+
+        logged = []
+        with unittest.mock.patch("core.logging.mirror", side_effect=lambda line: logged.append(json.loads(line))):
+            # 1. reconcile_once with empty roster and allow_empty_roster=False (default) raises EmptyRosterError
+            with self.assertRaises(EmptyRosterError):
+                reconciler.reconcile_once(self.r)
+
+            # Confirm no windows were killed
+            windows = list_windows(self.session_name, socket=self.socket)
+            self.assertIn("w1", windows)
+            self.assertIn("w2", windows)
+
+            # Confirm error was logged
+            errors = [rec for rec in logged if rec.get("event") == "error" and "Refusing to reap" in rec.get("reason", "")]
+            self.assertEqual(len(errors), 1)
+
+            # 2. With allow_empty_roster=True, the reap succeeds down to placeholder __init__
+            reconciler.allow_empty_roster = True
+            reconciler.reconcile_once(self.r)
+
+            windows_after = list_windows(self.session_name, socket=self.socket)
+            self.assertNotIn("w1", windows_after)
+            self.assertNotIn("w2", windows_after)
+            self.assertIn("__init__", windows_after)
 
 
 if __name__ == "__main__":
