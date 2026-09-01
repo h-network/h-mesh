@@ -55,12 +55,54 @@ a paused destination) and `BROADCAST69` (fan-out conservation) modes — both
 are opt-in in the original (`BUILD67=1` / `BROADCAST69=1`), not part of its
 default run, left for a follow-up once the default flow's value is confirmed.
 
-**Known live finding from the first real run (2026-09-01, reported to
-architect separately):** `core/dispatch.py`'s `delivery_lock()` is a bare
-Redis `HSETNX` with no lease/TTL. A port process killed while holding it
-(exactly what a `port-kill` injection does) never releases it — every
-subsequent kicked delivery to that agent spins forever in the lock's retry
-loop, and the message(s) queued for it never drain. In a 60-message/6-station
-run this stranded 28 messages (47%) permanently, with the queue depth flat
-for the rest of the run. Not fixed here, per this ticket's scope — reported
-for architect to route.
+**Live finding from the first real run (2026-09-01):** `core/dispatch.py`'s
+`delivery_lock()` was a bare Redis `HSETNX` with no lease/TTL. A port process
+killed while holding it (exactly what a `port-kill` injection does) never
+released it — every subsequent kicked delivery to that agent spun forever in
+the lock's retry loop, and the message(s) queued for it never drained. In a
+60-message/6-station run this stranded 28 messages (47%) permanently, queue
+depth flat for the rest of the run. **Fixed and reverified same day** —
+`switch-agent/delivery-lock-lease` (leased `delivering` entries) reduces the
+same 60-message run to `stranded=0 lost_unexplained=0`, negative controls
+still pass, total run time ~10min → ~30s.
+
+## payload-ack.sh
+
+Send-and-verify-receipt: a bespoke consumer (`payload-ack-port.py`) checksum-
+verifies each message and Acks it back to the sender; `payload-ack-judge.py`
+reconciles five stages (sent → opened → verified → ack_sent → ack_opened)
+from custody alone, gated by a harness-known expected count so a dropped
+record can't make the books look clean by accident.
+
+```
+TENANT=my-throwaway-tenant COUNT=4 ROUNDS=20 \
+  ./payload-ack.sh
+```
+
+Same daemon/Python requirements as `conservation.sh`. `payload-ack-judge.py`
+is copied unmodified (pure custody-log reasoning, no `flock` imports).
+
+**A real finding surfaced and fixed here too:** the first run showed
+`verified=19` against `expected=20` — not a dropped write. Byte-level
+inspection (`cat -A`) after full process exit showed the record was present
+but glued onto the tail of an *unrelated* line with no separating newline —
+stderr from the switch's own kick attempt (this scenario originally routed
+its synthetic stations through a port_type with no real module, letting the
+kick fail on import) landed on the same shared log fd, at the same instant,
+as this scenario's own JSON write, tearing one legitimate line into two
+processes' output glued together with no boundary — unparseable by both
+`payload-ack-judge.py` and `reconcile-unicast.py`'s naive line-by-line
+`json.loads`. Confirmed via `strace` that both writers use a single atomic
+`write()` syscall each; the collision is a framing race between two
+*independent* processes sharing one fd (the switch's kick children inherit
+its stdout/stderr — `core/service.py`'s `transmission()` — with nothing
+coordinating them against unstructured output). Not h-mesh-specific to this
+port: h-flock has the identical exposure (all processes share one container
+stdout via `docker logs`); this harness just made it deterministic by giving
+the switch a guaranteed-failing import on every single kick. Fixed *in this
+script* by installing a real, silent no-op at the module path instead of
+relying on the import failure (see the header comment) — reruns since are
+clean (`5/5` stages matching, `rc=0`, verified at `COUNT=2..4`,
+`ROUNDS=10..20`). The underlying fd-sharing exposure is real and general;
+reported to architect to decide whether it needs closing at the framing
+level (e.g. length-prefixed writes) rather than just avoided here.
