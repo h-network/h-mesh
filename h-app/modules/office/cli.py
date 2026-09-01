@@ -278,6 +278,11 @@ def _peers_command(argv: list[str]) -> None:
     raw_lead = r.get(prefix(pod, tenant, resource="lead"))
     lead = raw_lead.decode() if isinstance(raw_lead, bytes) else str(raw_lead) if raw_lead else None
     all_agents = sorted(members(r, pod=pod, tenant=tenant))
+    if lead and lead not in all_agents:
+        print(
+            f"office: warning: configured lead {lead!r} is not an enrolled agent",
+            file=sys.stderr,
+        )
     peer_names = [
         agent
         for agent in all_agents
@@ -453,6 +458,10 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
                                  "(default: the tenant's default account)")
         parser.add_argument("--provider", metavar="NAME",
                             help="provider used to start this agent")
+        parser.add_argument(
+            "--lead", action="store_true",
+            help="make this agent the office lead (transfers leadership)",
+        )
         mode_group = parser.add_mutually_exclusive_group()
         mode_group.add_argument("--resume", action="store_true", default=None,
                                 help="resume prior session history (explicit opt-in)")
@@ -488,6 +497,8 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
             payload["profile"] = args.profile
         if args.provider:
             payload["provider"] = args.provider
+        if args.lead:
+            payload["lead"] = True
         # A hire envelope is consumed asynchronously, so it must never leave an
         # interactive choice waiting in the new pane. h-agent's bare --resume
         # can open a picker when this name has multiple prior sessions. Make a

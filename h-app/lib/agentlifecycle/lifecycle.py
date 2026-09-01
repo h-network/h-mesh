@@ -24,6 +24,7 @@ _START_AGENT_KEYS = frozenset(
     {
         "agent", "port_type", "cli", "profile", "provider", "export", "import", "resume",
         "skip_permissions", "claude_tools", "hmac_secret", "kid", "revoke_kid",
+        "lead",
     }
 )
 _MIN_HMAC_SECRET_LEN = 16
@@ -32,6 +33,23 @@ _TARGET_ONLY_KEYS = frozenset({"agent"})
 _PUBLISH_WINDOW_CAUSE_LUA = """
 redis.call('HSET', KEYS[2], ARGV[2], ARGV[3])
 redis.call('SET', KEYS[1], ARGV[1])
+return 1
+"""
+
+_PUBLISH_LEAD_MEMBERSHIP_LUA = """
+if ARGV[3] ~= '' then
+    redis.call('SET', KEYS[3], ARGV[3])
+end
+redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
+redis.call('SET', KEYS[1], ARGV[1])
+return 1
+"""
+
+_REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA = """
+redis.call('HDEL', KEYS[1], ARGV[1])
+if redis.call('GET', KEYS[2]) == ARGV[1] then
+    redis.call('DEL', KEYS[2])
+end
 return 1
 """
 
@@ -177,6 +195,12 @@ def start_agent(
     agent_port_type = payload.get("port_type", "tmux")
     if agent_port_type not in _STARTABLE_VABS:
         raise ValueError(f"StartAgent payload.port_type must be one of: {', '.join(sorted(_STARTABLE_VABS))}")
+
+    make_lead = payload.get("lead", False)
+    if not isinstance(make_lead, bool):
+        raise ValueError("StartAgent payload.lead must be a boolean")
+    if make_lead and agent_port_type != "tmux":
+        raise ValueError("StartAgent payload.lead only applies to port_type 'tmux'")
 
     hmac_secret = payload.get("hmac_secret")
     kid = payload.get("kid")
@@ -352,7 +376,26 @@ def start_agent(
                 ),
             )
     correlation_id = envelope.get("correlation_id")
-    if existing_port_type != "tmux" and isinstance(correlation_id, str) and correlation_id:
+    cause = correlation_id if (
+        existing_port_type != "tmux" and isinstance(correlation_id, str) and correlation_id
+    ) else ""
+    if make_lead:
+        _write_desired(
+            committed,
+            "lead and registry row published",
+            "lead and registry row publish",
+            lambda: r.eval(
+                _PUBLISH_LEAD_MEMBERSHIP_LUA,
+                3,
+                prefix(pod, tenant, resource="lead"),
+                registry_key,
+                prefix(pod, tenant, agent=agent, resource="window.cause"),
+                agent,
+                agent_port_type,
+                cause,
+            ),
+        )
+    elif cause:
         # A fresh tmux membership makes a later window necessary. Publish its
         # cause before registry visibility so tmuxhost cannot observe the hire
         # without also observing the join key. Idempotent starts do not replace
@@ -367,7 +410,7 @@ def start_agent(
                 2,
                 cause_key,
                 registry_key,
-                correlation_id,
+                cause,
                 agent,
                 agent_port_type,
             ),
@@ -403,8 +446,14 @@ def stop_agent(
     agent_port_type = port_type(r, pod=pod, tenant=tenant, agent=agent)
     committed: list[str] = []
     _write_desired(
-        committed, "registry row removed", "registry row removal",
-        lambda: r.hdel(registry_key, agent),
+        committed, "registry row removed and owned lead cleared", "registry/lead removal",
+        lambda: r.eval(
+            _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
+            2,
+            registry_key,
+            prefix(pod, tenant, resource="lead"),
+            agent,
+        ),
     )
     # Per-agent delivery state belongs to this lifecycle instance, not to the
     # reusable name. Purge it after removing registry visibility so a later
