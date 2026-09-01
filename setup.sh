@@ -476,6 +476,13 @@ echo "Installing default tmux.conf (unless one already exists)..."
 "$PYTHON" -m services.tmux_conf
 echo
 
+# 2.7. Install the claude context-usage statusline for the default account.
+# Profiled accounts get it at hire time instead (their config dir doesn't
+# exist yet, until an agent using that profile is actually hired).
+echo "Installing claude statusline (context-usage progress bar)..."
+"$PYTHON" -m services.claude_statusline "$HOME/.claude"
+echo
+
 # 3. Verify Redis connection
 echo "Checking Redis connection at $REDIS_URL..."
 if ! REDIS_URL="$REDIS_URL" "$PYTHON" -c '
