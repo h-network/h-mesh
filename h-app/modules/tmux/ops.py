@@ -194,6 +194,15 @@ yourself, only enough git credential to push your own branch (SSH or
 whatever's already set up). `develop` moves to `main` on its own release
 cadence, separately from any individual merge.
 
+Before you ask the lead to merge an h-mesh branch, run the authoritative local
+suite from the installed development environment:
+
+    python -m tools.run_tests
+
+Report both the collected count and the passed count. Topic-branch pushes do
+not run authoritative CI. An old branch can still display a green result from
+the workflow stored in that old commit; that result is non-authoritative.
+
 Your git identity is your own agent name — that is how the office knows
 which agent did which work. No co-author line, no "generated with" trailer,
 no other identity in a commit: only the one you are authenticated as.
