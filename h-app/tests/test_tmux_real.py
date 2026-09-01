@@ -403,16 +403,20 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             self.assertIn('"source":"jack"', content)
             self.assertIn('"destination":"kate"', content)
 
-            # Verify WindowLogTailer polls and mirrors the sent record
+            # Verify WindowLogTailer validates and publishes the sent record.
+            # publish() is the single stdout-plus-durable-mirror seam.
             tailer = WindowLogTailer(self.r, pod=self.pod, tenant=self.tenant, path=window_log_path)
-            mirrored = []
-            with unittest.mock.patch("core.windowlog.mirror", side_effect=lambda line: mirrored.append(json.loads(line))):
+            published = []
+            with unittest.mock.patch(
+                "core.windowlog.publish",
+                side_effect=lambda line: published.append(json.loads(line)),
+            ):
                 tailer.poll()
 
-            self.assertEqual(len(mirrored), 1)
-            self.assertEqual(mirrored[0]["event"], "sent")
-            self.assertEqual(mirrored[0]["source"], "jack")
-            self.assertEqual(mirrored[0]["destination"], "kate")
+            self.assertEqual(len(published), 1)
+            self.assertEqual(published[0]["event"], "sent")
+            self.assertEqual(published[0]["source"], "jack")
+            self.assertEqual(published[0]["destination"], "kate")
 
     def test_stop_agent_lifecycle_logs_window_killed(self):
         from core.envelope import build, encode
