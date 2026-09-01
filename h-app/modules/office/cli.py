@@ -30,13 +30,13 @@ from core.logging import log_record, record_task_event
 from core.registry import is_member, members, port_type
 from lib.attachment_schema import ATTACHMENT_MAX_BYTES, MIME_TYPE_REGEX
 from lib.board_interaction import BoardError, normalize_ticket, serialize_ticket
+from lib.paths import get_workdir_root
 
 from .pricing import calculate_cost, load_pricing
 
 # ⚠ A tenant with a Redis password exports REDIS_URL carrying it. Without one
 # this is unchanged, and an agent window still has no REDIS_URL to find.
 _REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
-_WORKDIR_ROOT = Path("/workdir")
 ATTACHMENT_MAX_CAPTION_BYTES = 65_536
 
 
@@ -817,7 +817,8 @@ def _clone_to_all_command(argv: list[str]) -> None:
     r, pod, tenant, _ = _context()
     agents = _clone_agents(r, pod=pod, tenant=tenant, requested=args.agents)
     repo_name = _repo_name(args.repo_url)
-    targets = [(agent, _WORKDIR_ROOT / agent / repo_name) for agent in agents]
+    workdir_root = Path(get_workdir_root())
+    targets = [(agent, workdir_root / agent / repo_name) for agent in agents]
 
     if args.dry_run:
         skipped = 0
