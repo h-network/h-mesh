@@ -684,6 +684,10 @@ class ReplyPusher:
                         if isinstance(message.get("payload"), dict)
                         else None
                     ) or self.tts_voice or DEFAULT_TTS_VOICE
+                    # "record_voice", not the generic "typing" every other
+                    # reply here uses -- edge_tts synthesis is a real network
+                    # call, not instant, and this is what it actually is.
+                    self.telegram.send_chat_action(self.chat_id, "record_voice")
                     voice_file = synthesize_speech(reply_text, msg_voice)
                     try:
                         self.telegram.send_voice(self.chat_id, voice_file)
@@ -753,6 +757,7 @@ class ReplyPusher:
             return
 
         caption = f"from {label}" + (f": {caption_field}" if caption_field else "")
+        self.telegram.send_chat_action(self.chat_id, "upload_document")
         result = self.telegram.send_document(self.chat_id, filename, data, mime_type=mime_type, caption=caption)
         if not result.get("ok"):
             self.telegram.send_message(
@@ -937,14 +942,54 @@ class TelegramClient:
     def send_chat_action(self, chat_id: int | str, action: str = "typing") -> dict:
         return self.request("sendChatAction", {"chat_id": chat_id, "action": action})
 
-    def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> dict:
+    def answer_callback_query(
+        self, callback_query_id: str, text: str | None = None, show_alert: bool = False
+    ) -> dict:
         """Stop the inline button's loading spinner. Telegram expects one of
         these per callback_query within its own short timeout, regardless of
-        whether the tap led to a visible reply."""
+        whether the tap led to a visible reply. `show_alert` pops `text` as a
+        real modal dialog instead of the small toast — for a tap that can't
+        be honored at all (e.g. the agent it names is no longer enrolled),
+        so the failure is impossible to miss the way a toast that overlaps
+        the next screen edit could be."""
         data = {"callback_query_id": callback_query_id}
         if text:
             data["text"] = text
+        if show_alert:
+            data["show_alert"] = True
         return self.request("answerCallbackQuery", data)
+
+    def edit_message_reply_markup(self, chat_id: int | str, message_id: int, reply_markup: dict | None = None) -> dict:
+        """Change only a message's inline keyboard, leaving its text
+        untouched — lighter than `edit_message_text` when nothing about the
+        message's content actually changed, only what can still be tapped on
+        it (e.g. clearing a just-tapped button before its action resolves,
+        so a slow response can't be double-tapped)."""
+        data = {"chat_id": chat_id, "message_id": message_id}
+        if reply_markup is not None:
+            data["reply_markup"] = reply_markup
+        return self.request("editMessageReplyMarkup", data)
+
+    def set_message_reaction(self, chat_id: int | str, message_id: int, emoji: str | None) -> dict:
+        """Attach (or, with `emoji=None`, clear) a single emoji reaction on
+        `message_id` — a lighter, persistent "seen and acted on" signal than
+        `send_chat_action`'s few-second, easy-to-miss typing indicator,
+        especially for a turn that can run far longer than typing ever
+        would."""
+        reaction = [{"type": "emoji", "emoji": emoji}] if emoji else []
+        return self.request("setMessageReaction", {"chat_id": chat_id, "message_id": message_id, "reaction": reaction})
+
+    def set_chat_menu_button(self, chat_id: int | str | None = None, menu_button: dict | None = None) -> dict:
+        """Set the persistent button glued to the compose bar — distinct from
+        both the sticky `ReplyKeyboardMarkup` menu and the `/` command list.
+        `chat_id=None` sets the global default for every private chat;
+        passing one scopes it to that chat only."""
+        data: dict = {}
+        if chat_id is not None:
+            data["chat_id"] = chat_id
+        if menu_button is not None:
+            data["menu_button"] = menu_button
+        return self.request("setChatMenuButton", data)
 
     def set_my_commands(self, commands: list[dict]) -> dict:
         """Register the bot's `/` command list with Telegram itself, so it
@@ -1039,6 +1084,24 @@ def _agent_picker_keyboard(
     rows = [cells[i : i + columns] for i in range(0, len(cells), columns)]
     rows.append([{"text": "◀ Back", "callback_data": back_callback}])
     return {"inline_keyboard": rows}
+
+
+_AGENT_CALLBACK_PREFIXES = ("wp:", "at:", "lc:", "lp:", "lr:", "lret:", "ta:")
+
+# `selective: True` scopes the forced reply to whichever user tapped or was
+# addressed, not everyone in the chat -- irrelevant for a bot locked to one
+# chat_id today, but the correct flag regardless of who else could be in it.
+FORCE_REPLY = {"force_reply": True, "selective": True}
+
+
+def _callback_agent(data: str) -> str | None:
+    """The agent name a callback references, for the prefixes that carry
+    one — `None` for everything else (menu codes, `ap:<priority>`, the bare
+    `lc`/`ws:<agent>` stop-watching tap, which needs no roster check)."""
+    for prefix in _AGENT_CALLBACK_PREFIXES:
+        if data.startswith(prefix):
+            return data[len(prefix):]
+    return None
 
 
 def _derive_session_url(api_url: str, session_url: str = "") -> str:
@@ -1464,6 +1527,22 @@ class TelegramBot:
             if not res.get("ok", True):
                 logger.warning(f"setMyCommands failed: {res}")
 
+            # A one-tap launcher glued to the compose bar itself — distinct
+            # from both the sticky keyboard and the "/" command list above.
+            # Only when there's somewhere for it to go (MINI_APP_URL, same
+            # "configured or omitted entirely" rule the sticky keyboard's
+            # own 📊 Dashboard button follows) and someone specific to scope
+            # it to (an unset allowed_chat_id would set this globally for
+            # every private chat this token ever talks to, not just the one
+            # this tenant is locked to).
+            if self.mini_app_url and self.allowed_chat_id:
+                menu_res = self.telegram.set_chat_menu_button(
+                    chat_id=self.allowed_chat_id,
+                    menu_button={"type": "web_app", "text": "Dashboard", "web_app": {"url": self.mini_app_url}},
+                )
+                if not menu_res.get("ok", True):
+                    logger.warning(f"setChatMenuButton failed: {menu_res}")
+
         return True
 
     def handle_status_command(self, chat_id: int | str) -> str:
@@ -1587,6 +1666,7 @@ class TelegramBot:
         message_id: int | None = None,
         reply_markup: dict | None = None,
         clear_markup: bool = False,
+        force_reply: bool = False,
     ) -> int | None:
         """Edit `message_id` in place when the caller has one (an inline
         sub-flow screen, or a typed-reply continuation of one, being
@@ -1596,15 +1676,20 @@ class TelegramBot:
         update. `reply_markup` here is always an inline keyboard or None —
         editMessageText cannot attach a ReplyKeyboardMarkup, only replace
         an existing inline one (`clear_markup` sends an empty one to drop
-        stale buttons)."""
+        stale buttons). `force_reply` only ever takes effect on a fresh
+        send for the same reason: `ForceReply` is its own distinct
+        reply_markup type, and editMessageText cannot attach one either —
+        an edited prompt just goes without it rather than silently
+        swallowing the flag."""
         if not self.telegram:
             return message_id
-        markup = {"inline_keyboard": []} if clear_markup else reply_markup
         if message_id is not None:
+            markup = {"inline_keyboard": []} if clear_markup else reply_markup
             resp = self.telegram.edit_message_text(chat_id, message_id, text, reply_markup=markup)
             if isinstance(resp, dict) and not resp.get("ok", False) and "not modified" not in str(resp.get("description", "")):
                 logger.debug(f"editMessageText failed (chat={chat_id}, msg={message_id}): {resp.get('description')}")
             return message_id
+        markup = FORCE_REPLY if force_reply else ({"inline_keyboard": []} if clear_markup else reply_markup)
         resp = self.telegram.send_message(chat_id, text, reply_markup=markup)
         return resp.get("result", {}).get("message_id") if isinstance(resp, dict) else None
 
@@ -1760,15 +1845,35 @@ class TelegramBot:
         return text
 
     def handle_lifecycle_control(self, chat_id: int | str, kind: str, agent: str, message_id: int | None = None) -> str:
+        if message_id is not None and self.telegram:
+            # Clear the tapped button the instant it's tapped, before the
+            # (network) control call resolves -- editMessageReplyMarkup,
+            # not editMessageText, since nothing about the message's text is
+            # known yet and shouldn't change until the result is in. Mainly
+            # guards against a double-tap on a slow response; a stale-tap
+            # alert (see _callback_agent) already caught the case where the
+            # agent is gone entirely, so this is only ever a live one.
+            self.telegram.edit_message_reply_markup(chat_id, message_id, reply_markup={"inline_keyboard": []})
         if self.telegram:
             self.telegram.send_chat_action(chat_id)
         code, resp = self.mesh.control_agent(kind, agent)
         verb = "paused" if kind == "PauseAgent" else "resumed"
         if code == 202:
             text = f"✅ {agent} {verb}."
+            # Undo is just the other lifecycle action, addressed at this
+            # same agent -- Pause and Resume are both safe, idempotent-ish
+            # calls, so there's no expiry to track or invalidate here.
+            undo_data = f"lr:{agent}" if kind == "PauseAgent" else f"lp:{agent}"
+            reply_markup = {
+                "inline_keyboard": [[
+                    {"text": "↩ Undo", "callback_data": undo_data},
+                    {"text": "📋 Copy name", "copy_text": {"text": agent}},
+                ]]
+            }
+            self._send_or_edit_message(chat_id, text, message_id=message_id, reply_markup=reply_markup)
         else:
             text = f"❌ Failed to {verb[:-1]} {agent}: {resp.get('detail', 'error')}"
-        self._send_or_edit_message(chat_id, text, message_id=message_id, clear_markup=True)
+            self._send_or_edit_message(chat_id, text, message_id=message_id, clear_markup=True)
         return text
 
     def handle_retire_start(self, chat_id: int | str, agent: str, message_id: int | None = None) -> str:
@@ -1827,7 +1932,9 @@ class TelegramBot:
             return f"@{name} isn't a known agent to message. Use /menu to see who's enrolled."
         return None
 
-    def handle_mention_prompt(self, chat_id: int | str, name: str, rest: str) -> str:
+    def handle_mention_prompt(
+        self, chat_id: int | str, name: str, rest: str, *, message_id: int | None = None
+    ) -> str:
         """A leading "@name ..." — one-off destination override for this
         message only; `chat_target_agent` is untouched, so the next plain
         message still goes to whatever it was already set to."""
@@ -1842,9 +1949,9 @@ class TelegramBot:
             if self.telegram:
                 self.telegram.send_message(cid, error)
             return error
-        return self.handle_user_prompt(cid, rest, agent_override=name)
+        return self.handle_user_prompt(cid, rest, agent_override=name, message_id=message_id)
 
-    def handle_run_command(self, chat_id: int | str, rest: str) -> str:
+    def handle_run_command(self, chat_id: int | str, rest: str, message_id: int | None = None) -> str:
         """`/run <agent> <command>` — raw, unwrapped pane injection: a
         Command-kind envelope instead of the Message-kind shorthand every
         other text path uses, so a native CLI slash command (e.g. Claude
@@ -1896,7 +2003,7 @@ class TelegramBot:
         if command_text not in self.run_allowed_commands:
             allowed = ", ".join(sorted(self.run_allowed_commands)) or "(none configured)"
             return _reject(f"'{command_text}' isn't an allowed /run command. Allowed: {allowed}")
-        return self.handle_user_prompt(cid, command_text, agent_override=name, raw=True)
+        return self.handle_user_prompt(cid, command_text, agent_override=name, raw=True, message_id=message_id)
 
     def handle_photo_message(self, chat_id: int | str, photo_sizes: list[dict], caption: str) -> str:
         """A photo update never carries `text` — `_dispatch_update`'s
@@ -2112,7 +2219,11 @@ class TelegramBot:
     def handle_hire_start(self, chat_id: int | str, message_id: int | None = None) -> str:
         cid = str(chat_id)
         text = "New agent's name? (lowercase letters, digits, hyphens; not all digits; /cancel to abort)"
-        anchor_id = self._send_or_edit_message(cid, text, message_id=message_id)
+        # This is always the *first* message of the flow (Hire has no
+        # picker screen before it) -- a fresh send in every real invocation,
+        # so ForceReply reliably opens the compose box with a "Reply to:"
+        # tag right on this prompt, not a step or two later.
+        anchor_id = self._send_or_edit_message(cid, text, message_id=message_id, force_reply=True)
         self.pending[cid] = {"flow": "hire", "stage": "name", "message_id": anchor_id}
         return text
 
@@ -2222,9 +2333,14 @@ class TelegramBot:
             if code == 202:
                 extras = ", ".join(f"{k} {v}" for k, v in (("profile", profile), ("provider", provider)) if v)
                 reply = f"✅ Hire accepted for {name}" + (f" ({extras})" if extras else "") + " · window and CLI follow shortly."
+                # A fresh name is the one thing here worth handing back
+                # verbatim -- to @mention it, or type it into another chat --
+                # without retyping it by hand.
+                markup = {"inline_keyboard": [[{"text": "📋 Copy name", "copy_text": {"text": name}}]]}
+                self._send_or_edit_message(cid, reply, message_id=anchor_id, reply_markup=markup)
             else:
                 reply = f"❌ Failed to hire {name}: {resp.get('detail', 'error')}"
-            self._send_or_edit_message(cid, reply, message_id=anchor_id, clear_markup=True)
+                self._send_or_edit_message(cid, reply, message_id=anchor_id, clear_markup=True)
             return reply
 
         if state["flow"] == "retire":
@@ -2267,6 +2383,18 @@ class TelegramBot:
         from `callback_query.message.message_id` — is how every sub-flow
         handler below knows to edit that screen in place instead of posting
         a new one; see `_send_or_edit_message`."""
+        agent = _callback_agent(data)
+        if agent is not None and agent not in self._tmux_agents():
+            # Edit-in-place means a screen can outlive the agent it names —
+            # retired between the picker showing and this tap landing. A
+            # real popup here, not a small toast that could be masked by
+            # the very edit this tap would otherwise trigger, and no edit
+            # to what's very likely an already-stale screen.
+            if self.telegram:
+                self.telegram.answer_callback_query(
+                    callback_id, text=f"⚠️ {agent} is no longer enrolled.", show_alert=True
+                )
+            return ""
         if self.telegram:
             self.telegram.answer_callback_query(callback_id)
         if data in ("menu", "ov", "at", "lc", "al", "hi", "ta", "vt", "wa"):
@@ -2291,10 +2419,14 @@ class TelegramBot:
             return self.handle_addticket_priority(chat_id, data[len("ap:"):])
         return ""
 
-    def handle_text_message(self, chat_id: int | str, text: str) -> str:
+    def handle_text_message(self, chat_id: int | str, text: str, message_id: int | None = None) -> str:
         """Entry point for a plain (non-callback) chat message: a pending
         flow's answer, a sticky-keyboard tap, a known command, or a prompt
-        for this chat's target agent."""
+        for this chat's target agent. `message_id` — the incoming message's
+        own id — only matters past this point for the last two branches
+        (`@mention` and the plain-prompt fallback), to react on it; every
+        other branch here is a menu action or command, not a turn to a CLI
+        agent that could run long enough for the reaction to matter."""
         pending_reply = self.handle_pending_text(chat_id, text)
         if pending_reply is not None:
             return pending_reply
@@ -2315,12 +2447,12 @@ class TelegramBot:
         if text == "/unwatch":
             return self.handle_watch_stop_command(chat_id)
         if text == "/run" or text.startswith("/run "):
-            return self.handle_run_command(chat_id, text[len("/run"):].strip())
+            return self.handle_run_command(chat_id, text[len("/run"):].strip(), message_id)
         if text.startswith("@"):
             mention = _parse_mention(text)
             if mention is not None:
-                return self.handle_mention_prompt(chat_id, *mention)
-        return self.handle_user_prompt(chat_id, text)
+                return self.handle_mention_prompt(chat_id, *mention, message_id=message_id)
+        return self.handle_user_prompt(chat_id, text, message_id=message_id)
 
     def _get_activity_tail(self, agent: str) -> str | None:
         """Fetch the current latest activity cursor for an agent before prompting."""
@@ -2487,7 +2619,13 @@ class TelegramBot:
             render.flush(self.telegram, force=True)
 
     def handle_user_prompt(
-        self, chat_id: int | str, text: str, *, agent_override: str | None = None, raw: bool = False
+        self,
+        chat_id: int | str,
+        text: str,
+        *,
+        agent_override: str | None = None,
+        raw: bool = False,
+        message_id: int | None = None,
     ) -> str:
         """Post `text` to this chat's target agent (§ 🎯 Message agent,
         default target_agent/--agent) and return immediately. `agent_override`
@@ -2496,7 +2634,12 @@ class TelegramBot:
         handle_run_command's "/run <agent> <text>" — sends a Command-kind
         envelope instead of a Message-kind one (see MeshClient.send_command),
         otherwise identical: same presence/blocked gate, same activity
-        watcher, same one-off (never persistent) destination.
+        watcher, same one-off (never persistent) destination. `message_id` —
+        the incoming prompt's own id — gets a 👀 reaction the moment the
+        envelope is actually dispatched: a persistent marker on the message
+        itself, unlike `send_chat_action`'s few-second typing indicator, for
+        a turn whose real reply (via ReplyPusher, separately) can arrive
+        much later than any typing indicator would ever suggest.
 
         ⚠ No wait, no reply capture here — that used to be a `while not
         completed` loop polling for target_agent's reply, unbounded, run
@@ -2552,6 +2695,9 @@ class TelegramBot:
                 self.telegram.send_message(cid, reply_text)
             return reply_text
 
+        if message_id is not None and self.telegram:
+            self.telegram.set_message_reaction(cid, message_id, "👀")
+
         reply_text = f"✅ Ran on {agent}." if raw else f"✅ Sent to {agent}."
         if self.telegram:
             self.telegram.send_message(cid, reply_text)
@@ -2592,7 +2738,7 @@ class TelegramBot:
         if not text:
             return
 
-        self.handle_text_message(chat_id, text)
+        self.handle_text_message(chat_id, text, msg.get("message_id"))
 
     def run_polling(self) -> None:
         """Run long-polling loop for Telegram updates.
@@ -2726,8 +2872,23 @@ class DryRunTelegramClient:
         print(f"[DRY-RUN Telegram] sendChatAction (chat={chat_id}, action={action})")
         return {"ok": True}
 
-    def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> dict:
-        print(f"[DRY-RUN Telegram] answerCallbackQuery ({callback_query_id}){f': {text}' if text else ''}")
+    def answer_callback_query(
+        self, callback_query_id: str, text: str | None = None, show_alert: bool = False
+    ) -> dict:
+        kind = "alert" if show_alert else "toast"
+        print(f"[DRY-RUN Telegram] answerCallbackQuery ({callback_query_id}) [{kind}]{f': {text}' if text else ''}")
+        return {"ok": True}
+
+    def edit_message_reply_markup(self, chat_id: int | str, message_id: int, reply_markup: dict | None = None) -> dict:
+        print(f"[DRY-RUN Telegram] editMessageReplyMarkup (chat={chat_id}, msg_id={message_id}):\n[keyboard: {reply_markup}]\n")
+        return {"ok": True, "result": {"message_id": message_id, "chat": {"id": chat_id}}}
+
+    def set_message_reaction(self, chat_id: int | str, message_id: int, emoji: str | None) -> dict:
+        print(f"[DRY-RUN Telegram] setMessageReaction (chat={chat_id}, msg_id={message_id}): {emoji!r}")
+        return {"ok": True}
+
+    def set_chat_menu_button(self, chat_id: int | str | None = None, menu_button: dict | None = None) -> dict:
+        print(f"[DRY-RUN Telegram] setChatMenuButton (chat={chat_id}): {menu_button}")
         return {"ok": True}
 
     def set_my_commands(self, commands: list[dict]) -> dict:

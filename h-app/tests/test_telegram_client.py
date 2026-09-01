@@ -143,6 +143,9 @@ class DummyTelegramClient:
         self.download_response = b"fake-jpeg-bytes"
         self.sent_documents = []
         self.send_document_response = {"ok": True}
+        self.edited_reply_markups = []
+        self.reactions_set = []
+        self.menu_buttons_set = []
 
     def send_message(self, chat_id, text, reply_to_message_id=None, reply_markup=None, **kwargs):
         msg_id = len(self.sent_messages) + len(self.sent_voices) + 1
@@ -177,8 +180,23 @@ class DummyTelegramClient:
         self.chat_actions.append({"chat_id": chat_id, "action": action})
         return {"ok": True}
 
-    def answer_callback_query(self, callback_query_id, text=None):
-        self.answered_callbacks.append({"callback_query_id": callback_query_id, "text": text})
+    def answer_callback_query(self, callback_query_id, text=None, show_alert=False):
+        self.answered_callbacks.append(
+            {"callback_query_id": callback_query_id, "text": text, "show_alert": show_alert}
+        )
+        return {"ok": True}
+
+    def edit_message_reply_markup(self, chat_id, message_id, reply_markup=None):
+        entry = {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup}
+        self.edited_reply_markups.append(entry)
+        return {"ok": True, "result": entry}
+
+    def set_message_reaction(self, chat_id, message_id, emoji):
+        self.reactions_set.append({"chat_id": chat_id, "message_id": message_id, "emoji": emoji})
+        return {"ok": True}
+
+    def set_chat_menu_button(self, chat_id=None, menu_button=None):
+        self.menu_buttons_set.append({"chat_id": chat_id, "menu_button": menu_button})
         return {"ok": True}
 
     def set_my_commands(self, commands):
@@ -455,10 +473,12 @@ def test_handle_user_prompt_when_refused_by_policy():
         store = CursorStore(str(Path(tmpdir) / "cursor.json"))
         bot_instance = TelegramBot(mesh, telegram, store, target_agent="architect")
 
-        reply = bot_instance.handle_user_prompt(12345, "hello architect")
+        reply = bot_instance.handle_user_prompt(12345, "hello architect", message_id=7)
         assert "policy denied" in reply
         assert len(telegram.sent_messages) == 1
         assert "policy denied" in telegram.sent_messages[0]["text"]
+        # never dispatched -- no reaction on a prompt the agent never received
+        assert telegram.reactions_set == []
 
 
 # ── inline menu ──────────────────────────────────────────────────────────────
@@ -517,6 +537,18 @@ def test_dispatch_update_processes_a_message_from_the_allowed_chat():
         assert len(telegram.sent_messages) == 1
 
 
+def test_dispatch_update_reacts_to_a_dispatched_prompt_using_its_own_message_id():
+    """A plain prompt is a real update.message.message_id in production --
+    _dispatch_update has to pull it out for the 👀 reaction to land on the
+    right message, same as it does for a callback's message_id."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
+        bot_instance._dispatch_update({
+            "message": {"chat": {"id": 42}, "text": "how's it going?", "message_id": 555},
+        })
+        assert telegram.reactions_set == [{"chat_id": "42", "message_id": 555, "emoji": "👀"}]
+
+
 def test_dispatch_update_ignores_a_callback_from_the_wrong_chat():
     """Not even answer_callback_query -- an unauthorized tap gets nothing
     back, not even acknowledgement that a bot is listening."""
@@ -535,7 +567,7 @@ def test_dispatch_update_processes_a_callback_from_the_allowed_chat():
         bot_instance._dispatch_update({
             "callback_query": {"id": "cb-1", "data": "ov", "message": {"chat": {"id": 42}}},
         })
-        assert telegram.answered_callbacks == [{"callback_query_id": "cb-1", "text": None}]
+        assert telegram.answered_callbacks == [{"callback_query_id": "cb-1", "text": None, "show_alert": False}]
         assert len(telegram.sent_messages) == 1
 
 
@@ -675,7 +707,7 @@ def test_callback_query_dispatch_answers_and_routes():
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.handle_callback_query(12345, "cbid-1", "ov")
-        assert telegram.answered_callbacks == [{"callback_query_id": "cbid-1", "text": None}]
+        assert telegram.answered_callbacks == [{"callback_query_id": "cbid-1", "text": None, "show_alert": False}]
         assert "Office overview" in telegram.sent_messages[-1]["text"]
 
 
@@ -820,16 +852,37 @@ def test_lifecycle_full_flow_via_callbacks():
 
 
 def test_lifecycle_control_failure_reports_detail():
+    """Still-enrolled agent, but the control call itself fails -- distinct
+    from the stale-tap case below, where the agent isn't enrolled at all."""
     with tempfile.TemporaryDirectory() as tmpdir:
         class FailingMeshClient(DummyMeshClient):
             def control_agent(self, kind, agent):
-                return 422, {"detail": "unknown agent"}
+                return 422, {"detail": "agent is not paused"}
 
         mesh = FailingMeshClient()
         bot_instance, _, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
-        reply = bot_instance.handle_callback_query(12345, "cb-1", "lr:ghost")
-        assert "Failed to resume ghost" in reply
-        assert "unknown agent" in reply
+        reply = bot_instance.handle_callback_query(12345, "cb-1", "lr:architect")
+        assert "Failed to resume architect" in reply
+        assert "agent is not paused" in reply
+
+
+def test_callback_query_on_a_retired_agent_pops_an_alert_instead_of_acting():
+    """Edit-in-place means a lifecycle/add-ticket/watch/message screen can
+    outlive the agent it names -- retired between the picker showing and a
+    later tap on that same screen landing. That tap should never reach the
+    mesh API at all, just a real popup (`show_alert=True`), since a small
+    toast could be masked by the very edit a stale tap could otherwise
+    trigger."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        reply = bot_instance.handle_callback_query(12345, "cb-1", "lp:ghost")
+        assert reply == ""
+        assert telegram.answered_callbacks == [
+            {"callback_query_id": "cb-1", "text": "⚠️ ghost is no longer enrolled.", "show_alert": True}
+        ]
+        assert telegram.sent_messages == []
+        assert telegram.edited_messages == []
+        assert mesh.control_calls == []
 
 
 def test_lifecycle_picker_includes_retire():
@@ -861,10 +914,46 @@ def test_lifecycle_flow_edits_the_same_message_including_back_and_forth():
         reply = bot_instance.handle_callback_query(12345, "cb-5", "lp:architect", picker_id)
         assert reply == "✅ architect paused."
         assert telegram.edited_messages[-1] == {
-            "chat_id": 12345, "message_id": picker_id, "text": reply, "reply_markup": {"inline_keyboard": []},
+            "chat_id": 12345,
+            "message_id": picker_id,
+            "text": reply,
+            "reply_markup": {
+                "inline_keyboard": [[
+                    {"text": "↩ Undo", "callback_data": "lr:architect"},
+                    {"text": "📋 Copy name", "copy_text": {"text": "architect"}},
+                ]]
+            },
         }
         # One send for the picker; every screen after it was an edit.
         assert len(telegram.sent_messages) == 1
+
+
+def test_lifecycle_control_debounces_the_tapped_button_before_the_result_is_known():
+    """editMessageReplyMarkup clears the keyboard the instant the tap
+    arrives -- before the control call resolves -- so a slow response
+    can't be double-tapped. Text is untouched by that first edit; only the
+    later, full edit (editMessageText) sets the result."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance.handle_callback_query(12345, "cb-1", "lp:architect", 42)
+        assert telegram.edited_reply_markups[0] == {
+            "chat_id": 12345, "message_id": 42, "reply_markup": {"inline_keyboard": []},
+        }
+        assert telegram.edited_messages[-1]["text"] == "✅ architect paused."
+
+
+def test_lifecycle_undo_button_reverses_the_action():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance.handle_callback_query(12345, "cb-1", "lp:architect", 42)
+        undo_data = telegram.edited_messages[-1]["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+        assert undo_data == "lr:architect"
+
+        reply = bot_instance.handle_callback_query(12345, "cb-2", undo_data, 42)
+        assert reply == "✅ architect resumed."
+        assert mesh.control_calls == [
+            {"kind": "PauseAgent", "agent": "architect"}, {"kind": "ResumeAgent", "agent": "architect"},
+        ]
 
 
 def test_retire_requires_typing_the_exact_name():
@@ -952,6 +1041,17 @@ def test_broadcast_failure_reports_detail():
 
 # ── hire ─────────────────────────────────────────────────────────────────────
 
+def test_hire_start_force_replies_since_it_has_no_prior_message_to_edit():
+    """Hire's opening prompt is always a fresh send in real usage (no
+    picker screen precedes it), so it's the one flow prompt that can
+    actually carry ForceReply -- editMessageText, used by every other
+    typed-prompt continuation, cannot attach one at all."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance.handle_text_message(12345, "➕ Hire")
+        assert telegram.sent_messages[-1]["reply_markup"] == {"force_reply": True, "selective": True}
+
+
 def test_hire_full_flow_via_sticky_button_and_text():
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
@@ -974,6 +1074,9 @@ def test_hire_full_flow_via_sticky_button_and_text():
         assert "Hire accepted for sme-9" in reply
         assert 12345 not in bot_instance.pending
         assert mesh.hired == [{"agent": "sme-9", "cli": "claude", "profile": None, "provider": None}]
+        assert telegram.edited_messages[-1]["reply_markup"] == {
+            "inline_keyboard": [[{"text": "📋 Copy name", "copy_text": {"text": "sme-9"}}]]
+        }
 
 
 def test_hire_flow_edits_the_initial_prompt_through_every_stage():
@@ -1195,9 +1298,11 @@ def test_mention_routes_a_single_message_without_changing_the_persistent_target(
         # persistent target starts as the default ("architect")
         assert bot_instance._target_for(12345) == "architect"
 
-        reply = bot_instance.handle_text_message(12345, "@sme-2 can you check this?")
+        reply = bot_instance.handle_text_message(12345, "@sme-2 can you check this?", message_id=99)
         assert reply == "✅ Sent to sme-2."
         assert mesh.sent_envelopes[-1]["destination"] == "sme-2"
+        # reacted on the originating message once the envelope actually dispatched
+        assert telegram.reactions_set == [{"chat_id": "12345", "message_id": 99, "emoji": "👀"}]
 
         # one-off only: the persistent target for a later plain message is unchanged
         assert bot_instance._target_for(12345) == "architect"
@@ -1256,11 +1361,12 @@ def test_mention_mid_sentence_is_not_routing_just_message_content():
 def test_run_sends_a_command_envelope_not_a_message_one():
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
-        reply = bot_instance.handle_text_message(12345, "/run sme-2 /clear")
+        reply = bot_instance.handle_text_message(12345, "/run sme-2 /clear", message_id=88)
         assert reply == "✅ Ran on sme-2."
         assert mesh.sent_commands == [{"destination": "sme-2", "text": "/clear"}]
         # never goes through the Message-kind path
         assert mesh.sent_envelopes == []
+        assert telegram.reactions_set == [{"chat_id": "12345", "message_id": 88, "emoji": "👀"}]
 
 
 def test_run_is_one_off_and_does_not_change_the_persistent_target():
@@ -1764,7 +1870,7 @@ def test_callback_query_alerts_routes_to_handler():
         bot_instance, _, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
         reply = bot_instance.handle_callback_query(12345, "cb-1", "al")
         assert "blocked" in reply
-        assert telegram.answered_callbacks == [{"callback_query_id": "cb-1", "text": None}]
+        assert telegram.answered_callbacks == [{"callback_query_id": "cb-1", "text": None, "show_alert": False}]
 
 
 def test_parse_sse_events_single_frame():
@@ -1934,6 +2040,7 @@ def test_reply_pusher_delivers_an_attachment_via_send_document():
         assert sent["mime_type"] == "application/pdf"
         assert sent["caption"] == "from architect: Q3 numbers"
         assert telegram.sent_messages == []  # no ordinary-reply fallback text
+        assert {"chat_id": 999, "action": "upload_document"} in telegram.chat_actions
 
 
 def test_reply_pusher_attachment_caption_omits_colon_when_none_sent():
@@ -2337,6 +2444,7 @@ def test_reply_pusher_voice_reply_success(monkeypatch):
         assert telegram.sent_voices[0]["chat_id"] == 999
         assert store.load() == "20-0"
         assert not saved_files[0].exists()
+        assert {"chat_id": 999, "action": "record_voice"} in telegram.chat_actions
 
 
 def test_reply_pusher_text_only_when_voice_disabled():
@@ -2480,6 +2588,42 @@ def test_telegram_bot_enrol_registers_voice_command(tmp_path):
     assert "menu" in cmds
     assert "status" in cmds
     assert "voice" in cmds
+
+
+def test_telegram_bot_enrol_sets_the_chat_menu_button_when_mini_app_configured(tmp_path):
+    mesh = DummyMeshClient()
+    telegram = DummyTelegramClient()
+    store = CursorStore(str(tmp_path / "cursor.json"))
+    bot_instance = TelegramBot(
+        mesh_client=mesh, telegram_client=telegram, cursor_store=store,
+        allowed_chat_id=42, mini_app_url="https://example.com/mini.html",
+    )
+    assert bot_instance.enrol() is True
+    assert telegram.menu_buttons_set == [{
+        "chat_id": "42",
+        "menu_button": {"type": "web_app", "text": "Dashboard", "web_app": {"url": "https://example.com/mini.html"}},
+    }]
+
+
+def test_telegram_bot_enrol_skips_the_menu_button_without_mini_app_url(tmp_path):
+    mesh = DummyMeshClient()
+    telegram = DummyTelegramClient()
+    store = CursorStore(str(tmp_path / "cursor.json"))
+    bot_instance = TelegramBot(mesh_client=mesh, telegram_client=telegram, cursor_store=store, allowed_chat_id=42)
+    assert bot_instance.enrol() is True
+    assert telegram.menu_buttons_set == []
+
+
+def test_telegram_bot_enrol_skips_the_menu_button_without_an_allowed_chat_id(tmp_path):
+    mesh = DummyMeshClient()
+    telegram = DummyTelegramClient()
+    store = CursorStore(str(tmp_path / "cursor.json"))
+    bot_instance = TelegramBot(
+        mesh_client=mesh, telegram_client=telegram, cursor_store=store,
+        mini_app_url="https://example.com/mini.html",
+    )
+    assert bot_instance.enrol() is True
+    assert telegram.menu_buttons_set == []
 
 
 def test_telegram_bot_chat_id_type_normalization_with_reply_pusher(monkeypatch):

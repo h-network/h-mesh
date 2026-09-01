@@ -95,6 +95,13 @@ own (narrower) argparse surface, per office-sme:
 - **⏯ Lifecycle** — pick an agent from an inline sub-menu, then Pause, Resume,
   or Retire:
   - Pause/Resume post `PauseAgent`/`ResumeAgent` to `POST /agents/host/envelopes`.
+    The tapped button is cleared immediately (`editMessageReplyMarkup`,
+    keyboard-only — the result text isn't known yet) so a slow response can't
+    be double-tapped; the eventual result carries **↩ Undo** (the other
+    action, addressed at the same agent — Pause and Resume are both safe and
+    idempotent-ish, so there's no window to expire or invalidate) and
+    **📋 Copy name**, a `copy_text` button that puts the agent's name on the
+    clipboard with no message sent.
   - **🗑 Retire** requires **typing the agent's name exactly** to confirm — the
     same pattern `clients/web/ui/lifecycle.js` uses, not a yes/no tap.
     `StopAgent` removes roster membership and identity state; queues and
@@ -125,7 +132,13 @@ own (narrower) argparse surface, per office-sme:
   digits, not a reserved word), then optional profile, then optional
   provider (`-` to skip either). Posts `StartAgent` with `port_type: "tmux"`,
   `cli: "claude"`. Unlike retire, hiring is not destructive — no identity or
-  queues are ever removed — so it skips a type-the-name confirmation.
+  queues are ever removed — so it skips a type-the-name confirmation. Its
+  opening prompt is sent with `ForceReply` (compose box auto-opens, tagged
+  "Reply to:" this message) — the one flow prompt that can, since it's
+  always the first message of the flow (no picker precedes it, so nothing to
+  edit yet) and `editMessageText`, which every later step in this flow uses,
+  cannot attach a `ForceReply` at all. A successful hire's result carries a
+  **📋 Copy name** button for the agent name that was just created.
   ⚠ **No profile picker**: `office profiles` reads Redis directly and has no
   REST equivalent, so this client cannot list valid accounts ahead of time. A
   bad profile name still comes back as a clear `422` — and the api's error
@@ -191,6 +204,25 @@ The top-level sticky `ReplyKeyboardMarkup` menu itself is not part of any of
 this — Telegram has no API to edit a custom reply keyboard in place, so
 `/menu` and the sticky-keyboard taps that swap targets or toggle voice always
 remain fresh sends.
+
+⚠ **A screen can outlive the agent it names.** Edit-in-place means a picker
+or an action screen can sit untouched in a chat for as long as the user
+leaves it there; if the agent it references gets retired in the meantime, a
+later tap on that same screen (`handle_callback_query`, via `_callback_agent`)
+is caught before it ever reaches the mesh API — a real popup
+(`answerCallbackQuery`'s `show_alert=True`), not a small toast that the very
+edit a live tap would trigger could mask, and the stale screen is left
+exactly as it was rather than edited into a misleading error.
+
+Other Telegram-native touches, all elsewhere in this file: `record_voice`/
+`upload_document` chat actions (§2c/2f — more accurate than the generic
+`typing` for those specific waits), a 👀 reaction on a prompt's own message
+the moment it's actually dispatched (a persistent, easy-to-spot marker,
+unlike `send_chat_action`'s few-second indicator, for a reply that can
+arrive much later via `ReplyPusher`), and `setChatMenuButton` pointing the
+compose bar's own persistent button at the Mini App dashboard when
+`MINI_APP_URL` and a chat id are both configured — set once at `enrol()`
+time, alongside `setMyCommands`.
 
 While a chat has an open multi-step flow (Add Ticket, Hire, Retire,
 Broadcast), its next plain text message is consumed as that flow's answer
