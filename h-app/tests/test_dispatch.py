@@ -171,6 +171,28 @@ class DispatchTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "invalid delivery handler"):
                     register_type("invalid", handler)
 
+    def test_a_spec_that_stops_resolving_is_logged_at_error(self):
+        """Registration validates the spec once; lookup resolves it again, so
+        a handler can pass registration and still be gone (or no longer
+        callable) at delivery time. Both branches return None to a caller that
+        cannot tell why -- the log line IS the explanation, and it stays at
+        ERROR so the process's own threshold never decides whether an
+        undeliverable port_type is explained or not."""
+        module = sys.modules[__name__]
+        handler = sample_lazy_handler
+        self.addCleanup(setattr, module, "sample_lazy_handler", handler)
+        register_type("lazy", (__name__, "sample_lazy_handler"))
+
+        delattr(module, "sample_lazy_handler")
+        with self.assertLogs("core.dispatch", level="ERROR") as captured:
+            self.assertIsNone(get_handler("lazy"))
+        self.assertIn("failed to import delivery handler", captured.output[0])
+
+        setattr(module, "sample_lazy_handler", "no longer callable")
+        with self.assertLogs("core.dispatch", level="ERROR") as captured:
+            self.assertIsNone(get_handler("lazy"))
+        self.assertIn("is not callable", captured.output[0])
+
     def test_register_rejects_falsy_port_type_names(self):
         for name in ("", None, 0):
             with self.subTest(name=name):

@@ -18,6 +18,7 @@ import redis
 from core.channels import DeadLetter, receive, send
 from core.dispatch import delivery_lock
 from core.keys import prefix
+from core.logging import configure_logging
 from lib.attachment_schema import validate_attachment_payload
 from lib.board_interaction import add_ticket
 
@@ -278,6 +279,9 @@ def deliver_openshell(
 
 
 def main(argv: list[str] | None = None) -> None:
+    # First thing in the process, and only in the process: this is the entry
+    # point, so it is the one place allowed to set the root logger's level.
+    configure_logging()
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     args = sys.argv[1:] if argv is None else argv
     if not args:
