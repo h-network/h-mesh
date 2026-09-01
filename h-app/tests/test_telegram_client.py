@@ -634,6 +634,71 @@ def test_send_or_edit_message_swallows_message_not_modified():
         assert returned_id == 7  # no exception, no crash
 
 
+def test_send_or_edit_message_falls_back_to_a_fresh_send_when_the_edit_cannot_succeed():
+    """Regression: a genuinely un-editable anchor (message too old, deleted,
+    or left over from a wiped install) used to be logged at DEBUG and
+    dropped with no fallback -- the tap produced literally nothing, no
+    updated screen, no new message, no error shown. It must now re-anchor
+    to a fresh message instead of failing closed."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+
+        class UneditableTelegramClient(DummyTelegramClient):
+            def edit_message_text(self, chat_id, message_id, text, reply_markup=None, **kwargs):
+                super().edit_message_text(chat_id, message_id, text, reply_markup=reply_markup, **kwargs)
+                return {"ok": False, "description": "Bad Request: message can't be edited"}
+
+        bot_instance.telegram = UneditableTelegramClient()
+        returned_id = bot_instance._send_or_edit_message(
+            12345, "Priority?", message_id=999, reply_markup={"inline_keyboard": [[{"text": "x"}]]}
+        )
+        # a real message actually reached the chat, with a real (different) id
+        assert returned_id != 999
+        assert bot_instance.telegram.sent_messages == [{
+            "chat_id": 12345, "text": "Priority?", "message_id": returned_id,
+            "reply_markup": {"inline_keyboard": [[{"text": "x"}]]},
+        }]
+
+
+def test_addticket_flow_recovers_when_the_anchor_becomes_uneditable_mid_flow():
+    """End-to-end version of the same regression: if an edit fails partway
+    through a flow, the *next* step must retry against the message that
+    fallback actually created, not keep hammering the same broken id
+    forever."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance.handle_callback_query(12345, "cb-1", "at")
+        picker_id = telegram.sent_messages[-1]["message_id"]
+        bot_instance.handle_callback_query(12345, "cb-2", "at:sme-2", picker_id)
+        broken_id = bot_instance.pending["12345"]["message_id"]
+        assert broken_id == picker_id
+
+        class UneditableOnceTelegramClient(DummyTelegramClient):
+            def __init__(self):
+                super().__init__()
+                self.broke_once = False
+
+            def edit_message_text(self, chat_id, message_id, text, reply_markup=None, **kwargs):
+                if message_id == broken_id and not self.broke_once:
+                    self.broke_once = True
+                    return {"ok": False, "description": "Bad Request: message can't be edited"}
+                return super().edit_message_text(chat_id, message_id, text, reply_markup=reply_markup, **kwargs)
+
+        bot_instance.telegram = UneditableOnceTelegramClient()
+        reply = bot_instance.handle_text_message(12345, "Fix the flaky test")
+        assert "Description?" in reply
+        # re-anchored to a real, freshly-sent message, not the broken one
+        assert len(bot_instance.telegram.sent_messages) == 1
+        new_anchor = bot_instance.telegram.sent_messages[0]["message_id"]
+        assert bot_instance.pending["12345"]["message_id"] == new_anchor
+
+        # The next step edits the NEW anchor, not the broken one -- no more
+        # silent no-ops against a message that can never be edited again.
+        reply = bot_instance.handle_text_message(12345, "Seen twice in CI this week")
+        assert "Priority?" in reply
+        assert bot_instance.telegram.edited_messages[-1]["message_id"] == new_anchor
+
+
 def test_menu_command_sends_sticky_keyboard():
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
@@ -1121,7 +1186,9 @@ def test_hire_rejects_invalid_name_without_consuming_the_flow():
 
         reply = bot_instance.handle_text_message(12345, "123")  # all-digits, refused
         assert "won't work" in reply
-        assert bot_instance.pending[12345] == {"flow": "hire", "stage": "name"}  # still open
+        # still open -- and now anchored, since the reprompt had to send fresh
+        # (the manually-seeded state above had no message_id to edit)
+        assert bot_instance.pending[12345] == {"flow": "hire", "stage": "name", "message_id": 1}
         assert mesh.hired == []
 
         reply = bot_instance.handle_text_message(12345, "all")  # reserved
