@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_TEST_COUNT = 660
+EXPECTED_MINIMUM_TEST_COUNT = 660
 
 
 def main() -> int:
@@ -32,11 +32,12 @@ def main() -> int:
         return 1
 
     collected = int(summary.group(1))
-    if collected != EXPECTED_TEST_COUNT:
+    if collected < EXPECTED_MINIMUM_TEST_COUNT:
         print(
-            f"error: expected {EXPECTED_TEST_COUNT} tests, but pytest collected {collected}.\n"
-            "If tests were intentionally added or removed, update "
-            "EXPECTED_TEST_COUNT in h-app/tools/run_tests.py.",
+            f"error: expected at least {EXPECTED_MINIMUM_TEST_COUNT} tests, "
+            f"but pytest collected {collected}.\n"
+            "If tests were intentionally removed, update "
+            "EXPECTED_MINIMUM_TEST_COUNT in h-app/tools/run_tests.py.",
             file=sys.stderr,
         )
         return 1

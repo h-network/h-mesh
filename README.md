@@ -172,9 +172,10 @@ python -m tools.run_tests
 ```
 
 The configured test path covers the entire `h-app` source tree, including
-tests colocated under `clients/web`. The runner asserts the expected collection
-count before executing pytest, so under-collection fails loudly. When tests are
-intentionally added or removed, update `EXPECTED_TEST_COUNT` in the runner.
+tests colocated under `clients/web`. The runner asserts a minimum collection
+count before executing pytest, so under-collection fails loudly while normal
+test additions require no maintenance. If tests are intentionally removed,
+update `EXPECTED_MINIMUM_TEST_COUNT` in the runner.
 Passing an explicit path such as `pytest tests/` overrides configured discovery
 and intentionally runs only the selected subtree; do not use a narrowed path
 as evidence that the complete suite passes.
