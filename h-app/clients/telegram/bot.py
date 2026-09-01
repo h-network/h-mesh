@@ -2358,27 +2358,48 @@ class TelegramBot:
             )
         return reply
 
+    def _send_typed_answer_reply(
+        self, chat_id: int | str, text: str, *, reply_markup: dict | None = None
+    ) -> int | None:
+        """A flow's response to something the operator TYPED: always a fresh
+        send, never an edit, and the new message id becomes the flow's anchor.
+
+        ⚠ An edit never notifies. The moment the operator types, their own
+        message is the newest thing in the chat, so a prompt edited in place
+        lands ABOVE it unannounced — indistinguishable, from the chat, from
+        the flow having died. That is what "the Hire button does nothing"
+        looked like. Edit-in-place remains correct for a screen answered by a
+        BUTTON, where the operator is looking at the message they just
+        tapped: this narrows that decision to that case rather than
+        reversing it."""
+        return self._send_or_edit_message(chat_id, text, reply_markup=reply_markup)
+
     def _advance_pending_flow(self, cid: str, text: str) -> str | None:
         """One step of an open flow. Called only by `handle_pending_text`,
         which owns the logging around it; `cid` is already normalised and the
-        chat is known to have a flow open."""
+        chat is known to have a flow open.
+
+        ⚠ Everything this function answers was TYPED — that is what having a
+        pending flow means — so every reply below goes out through
+        `_send_typed_answer_reply` and none of them edit. `message_id` in the
+        pending state is still the flow's anchor, but it now means "the last
+        message this flow posted" (what a button-answered screen edits, e.g.
+        addticket's priority buttons) rather than "the one message the whole
+        flow edits in place"."""
         state = self.pending.get(cid)
         if not state:
             return None
-        # addticket/hire/retire each anchor to the one inline-flow message
-        # that started them (`message_id` in their pending state, set by
-        # handle_addticket_pick_agent/handle_hire_start/handle_retire_start)
-        # and edit it through every remaining step; broadcast has no such
-        # anchor (its "bc" entry point isn't reachable via an inline button
-        # at all, see handle_callback_query) and keeps sending fresh.
         anchor_id = state.get("message_id")
         if text.strip() == "/cancel":
             del self.pending[cid]
             reply = "Cancelled."
-            if anchor_id is not None:
-                self._send_or_edit_message(cid, reply, message_id=anchor_id, clear_markup=True)
-            elif self.telegram:
-                self.telegram.send_message(cid, reply)
+            # Fresh send so the operator actually sees it, plus a best-effort
+            # clear of whatever the last screen was: addticket's priority
+            # screen carries live buttons, and a cancelled flow must not stay
+            # tappable. Cosmetic, so a failure here changes nothing.
+            self._send_typed_answer_reply(cid, reply)
+            if anchor_id is not None and self.telegram:
+                self.telegram.edit_message_reply_markup(cid, anchor_id, {"inline_keyboard": []})
             return reply
 
         if state["flow"] == "addticket":
@@ -2386,7 +2407,7 @@ class TelegramBot:
                 state["title"] = text.strip()
                 state["stage"] = "description"
                 reply = "Description? (send - to skip, /cancel to abort)"
-                state["message_id"] = self._send_or_edit_message(cid, reply, message_id=anchor_id)
+                state["message_id"] = self._send_typed_answer_reply(cid, reply)
                 return reply
             if state["stage"] == "description":
                 state["description"] = "" if text.strip() == "-" else text.strip()
@@ -2397,15 +2418,15 @@ class TelegramBot:
                     {"text": "🔴 High", "callback_data": "ap:high"},
                 ]]
                 reply = "Priority?"
-                state["message_id"] = self._send_or_edit_message(
-                    cid, reply, message_id=anchor_id, reply_markup={"inline_keyboard": buttons}
+                state["message_id"] = self._send_typed_answer_reply(
+                    cid, reply, reply_markup={"inline_keyboard": buttons}
                 )
                 return reply
             # stage == "priority": this step is answered by tapping a button
             # (handle_addticket_priority), not typed text — stray text here
             # just gets pointed back at the buttons rather than silently lost.
             reply = "Tap a priority button above, or /cancel."
-            state["message_id"] = self._send_or_edit_message(cid, reply, message_id=anchor_id)
+            state["message_id"] = self._send_typed_answer_reply(cid, reply)
             return reply
 
         if state["flow"] == "hire":
@@ -2413,7 +2434,7 @@ class TelegramBot:
                 name = text.strip()
                 if not _AGENT_NAME.match(name) or name in _RESERVED_AGENT_NAMES:
                     reply = "That name won't work — lowercase letters, digits and hyphens, not all digits, not a reserved word. Try again, or /cancel."
-                    state["message_id"] = self._send_or_edit_message(cid, reply, message_id=anchor_id)
+                    state["message_id"] = self._send_typed_answer_reply(cid, reply)
                     return reply  # stay in "name" stage; do not consume the pending flow
                 state["name"] = name
                 state["stage"] = "profile"
@@ -2422,14 +2443,14 @@ class TelegramBot:
                 # ahead of time (see MeshClient.hire_agent). A bad name still
                 # gets a clear error, listing the valid ones, from the api.
                 reply = f"Profile for {name}? (account/profile name, or - for the default; /cancel to abort)"
-                state["message_id"] = self._send_or_edit_message(cid, reply, message_id=anchor_id)
+                state["message_id"] = self._send_typed_answer_reply(cid, reply)
                 return reply
 
             if state["stage"] == "profile":
                 state["profile"] = None if text.strip() == "-" else text.strip()
                 state["stage"] = "provider"
                 reply = f"Provider for {state['name']}? (named local model endpoint, or - for the default; /cancel to abort)"
-                state["message_id"] = self._send_or_edit_message(cid, reply, message_id=anchor_id)
+                state["message_id"] = self._send_typed_answer_reply(cid, reply)
                 return reply
 
             # stage == "provider"
@@ -2459,12 +2480,15 @@ class TelegramBot:
                 # back except starting over — the exact shape of "it does
                 # nothing" this ticket is about.
                 logger.error(f"hire submit raised before any status: chat={cid} agent={name}: {exc}")
-                self.pending[cid] = dict(state, stage="provider", message_id=anchor_id)
                 reply = (
                     f"❌ Hire for {name} wasn't submitted ({type(exc).__name__}). "
                     "Send the provider again to retry, or /cancel."
                 )
-                self._send_or_edit_message(cid, reply, message_id=anchor_id)
+                # Anchor to the message that just told them, not to the one
+                # they last saw before it — the retry is answered by typing,
+                # so this reply is a fresh send like every other one here.
+                self.pending[cid] = dict(state, stage="provider",
+                                         message_id=self._send_typed_answer_reply(cid, reply))
                 return reply
             logger.info(f"hire submit: chat={cid} agent={name} status={code}")
             if code == 202:
@@ -2474,17 +2498,17 @@ class TelegramBot:
                 # verbatim -- to @mention it, or type it into another chat --
                 # without retyping it by hand.
                 markup = {"inline_keyboard": [[{"text": "📋 Copy name", "copy_text": {"text": name}}]]}
-                self._send_or_edit_message(cid, reply, message_id=anchor_id, reply_markup=markup)
+                self._send_typed_answer_reply(cid, reply, reply_markup=markup)
             else:
                 reply = f"❌ Failed to hire {name}: {resp.get('detail', 'error')}"
-                self._send_or_edit_message(cid, reply, message_id=anchor_id, clear_markup=True)
+                self._send_typed_answer_reply(cid, reply)
             return reply
 
         if state["flow"] == "retire":
             agent = state["agent"]
             if text.strip() != agent:
                 reply = f"That doesn't match '{agent}' — type it exactly to confirm, or /cancel."
-                state["message_id"] = self._send_or_edit_message(cid, reply, message_id=anchor_id)
+                state["message_id"] = self._send_typed_answer_reply(cid, reply)
                 return reply  # stay open for retry, same as the web console's disabled-until-match button
             del self.pending[cid]
             if self.telegram:
@@ -2494,7 +2518,7 @@ class TelegramBot:
                 reply = f"✅ {agent} retired · queues and boards retained for a later re-hire."
             else:
                 reply = f"❌ Failed to retire {agent}: {resp.get('detail', 'error')}"
-            self._send_or_edit_message(cid, reply, message_id=anchor_id, clear_markup=True)
+            self._send_typed_answer_reply(cid, reply)
             return reply
 
         if state["flow"] == "broadcast":

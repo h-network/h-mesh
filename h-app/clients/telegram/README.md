@@ -244,22 +244,35 @@ Pause/Resume/Retire choice, Message-agent, Add Ticket's priority buttons) stay
 what inline keyboards are for; the sticky keyboard is for top-level nav that
 should always be one tap away without re-sending `/menu`.
 
-⚠ **Inline sub-flows edit one message in place rather than posting a new one
-per tap.** Add Ticket, Lifecycle (including its Pause/Resume/Retire screen and
-"◀ Back"), Message-agent, and Watch's agent picker all reuse the same
-message — `_send_or_edit_message`, keyed off `callback_query.message.message_id`
-— from the first picker tap through to the final result, so a chat doesn't
-fill up with one throwaway message per step. Two things that stay fresh sends
-regardless: Broadcast (its entry point is a sticky-keyboard tap, never an
-inline button, so there's never a message to edit into), and the very last
-step of Message-agent (its confirmation re-sends the sticky keyboard, and
-`editMessageText` can only ever carry an inline keyboard, never a
-`ReplyKeyboardMarkup` — the picker message still gets edited to acknowledge
-the tap, but the sticky-keyboard refresh is necessarily a second, new
-message). Hire's opening prompt is fresh too — deliberately, for the
-`ForceReply` above, whether it was reached from the sticky keyboard or the
-inline button — but every stage after that initial send edits that first
-message rather than sending a new prompt each time.
+⚠ **A step answered by a BUTTON edits in place; a step answered by TYPING
+posts a new message.** That split is the whole rule, and the reason is that
+**an edit never notifies**: the moment the operator types, their own message
+is the newest thing in the chat, so a prompt edited into an older message
+lands above it silently. From the chat that is indistinguishable from the flow
+having died — which is exactly how the Hire flow presented before this was
+fixed: name asked, one follow-up seen, then apparently nothing.
+
+- **Button-answered screens edit** — Add Ticket's agent picker and its
+  priority buttons, Lifecycle (including Pause/Resume/Retire and "◀ Back"),
+  Message-agent's picker, Watch's picker: `_send_or_edit_message` keyed off
+  `callback_query.message.message_id`, so the screen the operator is looking
+  at is the screen that changes, and a chat doesn't fill up with a throwaway
+  message per tap.
+- **Typed-answer replies send fresh** — every reply produced by
+  `_advance_pending_flow` (`_send_typed_answer_reply`): Hire's three prompts
+  and its result, Add Ticket's description and priority prompts, Retire's
+  confirmation retry and its result, `/cancel`'s acknowledgement. The flow's
+  `message_id` still tracks its most recent message, so a later button tap
+  edits *that* one.
+- `/cancel` also clears the abandoned screen's inline keyboard
+  (`editMessageReplyMarkup`), so a cancelled flow can't be resumed by tapping
+  a button left behind on it.
+
+Two more that stay fresh sends for their own reasons: Broadcast (its entry
+point is a sticky-keyboard tap, never an inline button, so there's never a
+message to edit into) and the last step of Message-agent (its confirmation
+re-sends the sticky keyboard, and `editMessageText` can only carry an inline
+keyboard, never a `ReplyKeyboardMarkup`).
 The top-level sticky `ReplyKeyboardMarkup` menu itself is not part of any of
 this — Telegram has no API to edit a custom reply keyboard in place, so
 `/menu` and the sticky-keyboard taps that swap targets or toggle voice always
