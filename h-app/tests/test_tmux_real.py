@@ -487,6 +487,10 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             self.assertIn("architect is the lead of this office", agent_guide)
             self.assertIn("h-mesh-office peers", agent_guide)
             self.assertIn("h-mesh-office send", agent_guide)
+            self.assertIn("Interface entries may only accept specific envelope kinds", agent_guide)
+            self.assertIn("not arbitrary messages", agent_guide)
+            self.assertNotIn("still a valid", agent_guide)
+            self.assertNotIn("still a valid", lead_guide)
             self.assertNotIn("`office ", agent_guide)
 
             env = window_env("worker")
