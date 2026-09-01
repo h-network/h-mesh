@@ -1491,6 +1491,13 @@ class TelegramBot:
         self.pane_watch_refresh_s = pane_watch_refresh_s
         self.pane_watch_max_duration_s = pane_watch_max_duration_s
         self.pane_watches: dict = ChatDict()
+        # ⚠ One lock per chat, guarding every read-then-write on the per-chat
+        # state above. run_polling gives each update its own thread (it must —
+        # handling inline froze the whole bot), so two updates for one chat run
+        # concurrently and every "look at the state, then change it" sequence
+        # here is a race. See _chat_lock.
+        self._chat_locks: dict[str, threading.RLock] = {}
+        self._chat_locks_guard = threading.Lock()
         # `/run <agent> <command>` — see DEFAULT_RUN_ALLOWED_COMMANDS for why
         # this is global rather than per-CLI.
         self.run_allowed_commands = (
@@ -1498,6 +1505,31 @@ class TelegramBot:
             if run_allowed_commands is not None
             else frozenset(DEFAULT_RUN_ALLOWED_COMMANDS)
         )
+
+    def _chat_lock(self, chat_id: int | str) -> "threading.RLock":
+        """The lock for one chat's state. Hold it across any sequence that
+        reads per-chat state and then writes it.
+
+        ⚠ Per CHAT, not one global lock: a global one would make a chat
+        mid-hire (up to 10s inside `hire_agent`) stall every other chat's
+        traffic, which is a worse behaviour than the race it closes. Chats
+        never interact, so they never need to wait on each other.
+
+        ⚠ Created under its own guard, because "get the lock, and make one if
+        there isn't one" is itself the check-then-mutate this class of bug is
+        about — two threads for a chat's first two updates would otherwise
+        each build a lock and each hold a different one.
+
+        RLock rather than Lock: nothing re-enters today, but a handler calling
+        another handler for the same chat is an ordinary refactor, and it
+        should not deadlock the bot to discover that.
+        """
+        cid = str(chat_id)
+        with self._chat_locks_guard:
+            lock = self._chat_locks.get(cid)
+            if lock is None:
+                lock = self._chat_locks[cid] = threading.RLock()
+            return lock
 
     def is_voice_enabled(self, chat_id: int | str) -> bool:
         return self.voice_feature_enabled and self.chat_voice_enabled.get(str(chat_id), False)
@@ -2247,9 +2279,13 @@ class TelegramBot:
             daemon=True,
             name=f"pane-watch-{agent}",
         )
-        self.pane_watches[cid] = {
-            "agent": agent, "stop_event": stop_event, "render": render, "thread": thread,
-        }
+        # Paired with the compare-and-pop in _run_pane_watch: installing the
+        # new slot and a finishing watcher clearing the old one must not
+        # interleave.
+        with self._chat_lock(cid):
+            self.pane_watches[cid] = {
+                "agent": agent, "stop_event": stop_event, "render": render, "thread": thread,
+            }
         thread.start()
         return f"👁 Watching {agent}…"
 
@@ -2335,28 +2371,39 @@ class TelegramBot:
         which answer and where the anchor went, and that is exactly the state
         this logs: stage before, stage after, anchor before, anchor after.
         The answer's LENGTH, never its text: the stage names say what the
-        operator was asked, which is what a log needs to know."""
+        operator was asked, which is what a log needs to know.
+
+        ⚠ THE WHOLE STEP RUNS UNDER THIS CHAT'S LOCK, network calls included.
+        Reading the stage and then acting on it is only correct if no other
+        thread can act on the same stage in between, and hire's submission
+        blocks for up to 10s inside `hire_agent` — the widest possible window
+        for a second answer to arrive and submit the same agent again. Holding
+        the lock across that means a chat's answers queue up behind each other
+        (bounded: every outbound call here has a 10s timeout) and are then
+        evaluated against the state the previous one actually left. Other
+        chats are unaffected — the lock is per chat."""
         cid = str(chat_id)
-        before = self.pending.get(cid)
-        if not before:
-            logger.debug(f"pending: chat={cid} has no open flow ({len(text.strip())} chars fall through)")
-            return None
-        flow = before.get("flow")
-        stage_before, anchor_before = before.get("stage"), before.get("message_id")
-        logger.info(
-            f"flow {flow}: chat={cid} stage={stage_before} anchor={anchor_before} "
-            f"consuming an answer of {len(text.strip())} chars"
-        )
-        reply = self._advance_pending_flow(cid, text)
-        after = self.pending.get(cid)
-        if after is None:
-            logger.info(f"flow {flow}: chat={cid} closed after stage={stage_before}")
-        else:
+        with self._chat_lock(cid):
+            before = self.pending.get(cid)
+            if not before:
+                logger.debug(f"pending: chat={cid} has no open flow ({len(text.strip())} chars fall through)")
+                return None
+            flow = before.get("flow")
+            stage_before, anchor_before = before.get("stage"), before.get("message_id")
             logger.info(
-                f"flow {flow}: chat={cid} stage {stage_before} -> {after.get('stage')}, "
-                f"anchor {anchor_before} -> {after.get('message_id')}"
+                f"flow {flow}: chat={cid} stage={stage_before} anchor={anchor_before} "
+                f"consuming an answer of {len(text.strip())} chars"
             )
-        return reply
+            reply = self._advance_pending_flow(cid, text)
+            after = self.pending.get(cid)
+            if after is None:
+                logger.info(f"flow {flow}: chat={cid} closed after stage={stage_before}")
+            else:
+                logger.info(
+                    f"flow {flow}: chat={cid} stage {stage_before} -> {after.get('stage')}, "
+                    f"anchor {anchor_before} -> {after.get('message_id')}"
+                )
+            return reply
 
     def _send_typed_answer_reply(
         self, chat_id: int | str, text: str, *, reply_markup: dict | None = None
@@ -2777,9 +2824,14 @@ class TelegramBot:
                 clear_markup=True, force=True,
             )
             # Only clear this chat's slot if a newer /watch hasn't already
-            # replaced it — see handle_watch_pick.
-            if self.pane_watches.get(cid, {}).get("stop_event") is stop_event:
-                self.pane_watches.pop(cid, None)
+            # replaced it — see handle_watch_pick. ⚠ The identity test and the
+            # pop are one compare-and-swap and must not be separable: without
+            # the lock, a /watch replacing the slot between them makes this
+            # thread delete the NEW watch's entry, leaving a live watcher
+            # nothing can stop.
+            with self._chat_lock(cid):
+                if self.pane_watches.get(cid, {}).get("stop_event") is stop_event:
+                    self.pane_watches.pop(cid, None)
 
     def finalize_activity(self, chat_id: int | str, agent: str) -> None:
         """Finalize and flush any live activity message for (chat_id, agent)."""
@@ -2857,11 +2909,20 @@ class TelegramBot:
             tail_cursor = self._get_activity_tail(agent)
             render = ActivityRender(cid, agent)
             key = f"{cid}:{agent}"
-            old_render = self.activity_renders.get(key)
+            # Swap under the chat's lock: get-then-set is the same race as the
+            # flow's, and two prompts to one agent in quick succession could
+            # otherwise both read no render, both install one, and leave the
+            # loser running with a live thread and no one left to finalize it.
+            # ⚠ Only the SWAP is guarded. Finalizing flushes over the network,
+            # and holding a chat's lock across that would stall its next
+            # message for no benefit — by then the old render is already
+            # unreachable from the map, so nothing else can touch it.
+            with self._chat_lock(cid):
+                old_render = self.activity_renders.get(key)
+                self.activity_renders[key] = render
             if old_render:
                 old_render.finalize()
                 old_render.flush(self.telegram, force=True)
-            self.activity_renders[key] = render
 
             watcher = threading.Thread(
                 target=self._watch_activity,

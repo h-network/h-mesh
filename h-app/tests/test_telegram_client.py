@@ -1355,6 +1355,132 @@ def test_hire_cancel_at_any_stage():
         assert mesh.hired == []
 
 
+def test_two_answers_racing_one_flow_neither_double_submit_nor_crash():
+    """A real race between two real threads, not a mock asserting a lock was
+    taken.
+
+    ⚠ The window this closes is genuinely narrow: between _advance_pending_flow
+    reading the flow state and the submission branch deleting it, with no I/O
+    in between, so a plain barrier never hits it -- I checked, and a version of
+    this test written that way passed with the lock removed, which would have
+    been a test of nothing. The window is widened here by making the state
+    READ slow (the shim below blocks the first thread inside its second get),
+    which is timing simulation, not a change in what is asserted: two threads
+    answer the same stage, and afterwards exactly one hire must have been sent
+    and neither thread may have died.
+
+    Without the per-chat lock the loser's `del self.pending[cid]` raises
+    KeyError against an entry the winner already removed -- in production that
+    is a dispatch thread dying silently, with nothing in the chat."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        entered_window = threading.Event()
+        release_window = threading.Event()
+
+        class SlowReadPending(bot.ChatDict):
+            """Blocks the first thread to reach its SECOND read -- the read
+            inside _advance_pending_flow, which is where the window opens."""
+
+            reads = 0
+            gate = threading.Lock()
+
+            def get(self, key, default=None):
+                value = super().get(key, default)
+                with SlowReadPending.gate:
+                    SlowReadPending.reads += 1
+                    mine = SlowReadPending.reads
+                if mine == 2 and value:
+                    entered_window.set()
+                    release_window.wait(timeout=2)
+                return value
+
+        class SlowMeshClient(DummyMeshClient):
+            def hire_agent(self, agent, cli="claude", profile=None, provider=None):
+                time.sleep(0.1)
+                return super().hire_agent(agent, cli=cli, profile=profile, provider=provider)
+
+        bot_instance, mesh, telegram = _make_bot(mesh=SlowMeshClient(), tmpdir=tmpdir)
+        bot_instance.pending = SlowReadPending()
+        bot_instance.pending["12345"] = {
+            "flow": "hire", "stage": "provider", "name": "sme-9", "profile": None, "message_id": 1,
+        }
+
+        errors = []
+
+        def answer():
+            try:
+                bot_instance.handle_text_message(12345, "-")
+            except BaseException as exc:  # a dispatch thread dying is the bug
+                errors.append(exc)
+
+        first = threading.Thread(target=answer)
+        first.start()
+        assert entered_window.wait(timeout=5), "first thread never reached the window"
+        second = threading.Thread(target=answer)
+        second.start()
+        time.sleep(0.2)  # let the second thread get as far as it can
+        release_window.set()
+        for t in (first, second):
+            t.join(timeout=10)
+
+        assert [t.is_alive() for t in (first, second)] == [False, False]
+        assert errors == []
+        assert mesh.hired == [{"agent": "sme-9", "cli": "claude", "profile": None, "provider": None}]
+        assert "12345" not in bot_instance.pending
+
+
+def test_a_chat_lock_is_one_object_no_matter_which_thread_asks_first():
+    """The lock map is itself check-then-mutate: two threads on a chat's first
+    two updates must not each build a lock and each hold a different one."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        ready = threading.Barrier(8)
+        seen = []
+
+        def grab():
+            ready.wait(timeout=5)
+            seen.append(bot_instance._chat_lock(4242))
+
+        threads = [threading.Thread(target=grab) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert len(seen) == 8
+        assert len({id(lock) for lock in seen}) == 1
+
+
+def test_racing_flows_in_different_chats_do_not_wait_on_each_other():
+    """Per chat, not global: a chat stuck in a 10s hire must not stall every
+    other chat's traffic. Chat B completes while chat A is still blocked."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        release_a = threading.Event()
+
+        class BlockingMeshClient(DummyMeshClient):
+            def hire_agent(self, agent, cli="claude", profile=None, provider=None):
+                if agent == "slow-agent":
+                    release_a.wait(timeout=5)
+                return super().hire_agent(agent, cli=cli, profile=profile, provider=provider)
+
+        bot_instance, mesh, telegram = _make_bot(mesh=BlockingMeshClient(), tmpdir=tmpdir)
+        bot_instance.pending["111"] = {
+            "flow": "hire", "stage": "provider", "name": "slow-agent", "profile": None, "message_id": 1,
+        }
+        bot_instance.pending["222"] = {
+            "flow": "hire", "stage": "provider", "name": "quick-agent", "profile": None, "message_id": 2,
+        }
+
+        blocked = threading.Thread(target=lambda: bot_instance.handle_text_message(111, "-"))
+        blocked.start()
+        try:
+            bot_instance.handle_text_message(222, "-")  # would hang if the lock were global
+            assert [h["agent"] for h in mesh.hired] == ["quick-agent"]
+        finally:
+            release_a.set()
+            blocked.join(timeout=5)
+        assert [h["agent"] for h in mesh.hired] == ["quick-agent", "slow-agent"]
+
+
 def test_hire_failure_reports_detail():
     with tempfile.TemporaryDirectory() as tmpdir:
         class FailingMeshClient(DummyMeshClient):

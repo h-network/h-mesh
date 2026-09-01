@@ -316,6 +316,28 @@ rather than sent to `--agent` as a prompt (and takes priority over a
 sticky-keyboard label, so typing a title that happens to match a button label
 is still treated as the title).
 
+⚠ **One lock per chat, around every read-then-write of that chat's state.**
+`run_polling` hands each update to its own thread — it has to, since a prompt
+can block unboundedly and handling updates inline once froze the whole bot —
+so two updates for one chat run at the same time, and every "look at the
+state, then change it" sequence is a race. `TelegramBot._chat_lock(chat_id)`
+returns that chat's lock (an `RLock`, created under its own guard, because
+"fetch a lock or make one" is the same race one level up). Three places hold
+it: the whole of a pending-flow step, network calls included, because the
+stage you read must still be the stage when you act on it and `hire_agent`
+can block for 10s; the activity-render swap, though only the swap, since
+finalizing flushes over the network and the losing render is already
+unreachable by then; and `/watch`'s install and its compare-and-pop, which
+must not interleave or a finishing watcher deletes a newer watch's entry and
+leaves a live watcher nothing can stop.
+
+Per chat rather than one global lock: chats never interact, and a global lock
+would let a chat mid-hire stall every other chat's traffic — a worse
+behaviour than the race it closes. A chat's own updates do queue behind each
+other, bounded by the 10s timeout on every outbound call, and are then
+evaluated against the state the previous one actually left, which is the
+point.
+
 Try it without a bot token: `python3 clients/telegram/bot.py --api-token "$H_MESH_API_TOKEN" --menu`.
 
 ---
