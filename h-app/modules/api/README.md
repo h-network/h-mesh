@@ -31,3 +31,38 @@ Popen'd, cannot.
 The external route contract intentionally preserves the predecessor's API so
 Telegram and web clients remain ordinary API consumers. Internally it uses h-mesh names:
 `core.channels`, `core.envelope`, `core.keys`, and `core.registry`.
+
+## SSE idle keepalive
+
+`/agents/{agent}/activity/stream` and `/alerts/stream` (both routed through
+`_stream_response`) send a bare `: keepalive\n\n` SSE comment line whenever
+the stream has gone `SSE_KEEPALIVE_INTERVAL_S` (3s) without a real event.
+Comment lines are ignored by `EventSource` and by
+`clients/telegram/bot.py`'s parser (any line starting with `:` is skipped)
+-- their only job is to put a byte on the wire so an idle connection isn't
+byte-silent to whatever sits between the client and this process.
+
+This exists because a fully idle stream previously sent nothing at all, and
+on a real install the connection was observed dropping and reconnecting
+every 5-7 seconds -- burying unrelated log lines under a churn of
+`disconnected, retrying in 1s` warnings. `uvicorn`'s `timeout_keep_alive`
+(default 5s) was suspected but does not explain it: that timer only starts
+after a response completes (`on_response_complete` in uvicorn's H11
+protocol), and a live reproduction of the exact reported topology (bare
+`uvicorn.run()`, no reverse proxy, telegram bot on loopback, run on an
+isolated VM) held an idle stream open past 30s with zero disconnects, both
+via curl and via `clients/telegram/bot.py`'s actual `urllib` client path.
+
+**What actually severs the connection at 5-7s on that install is
+unidentified.** This fix is deliberately independent of that cause, not a
+diagnosis of it: the periodic keepalive resolves the symptom regardless of
+which layer enforces an idle cutoff, since the connection is never
+actually idle long enough to reach it. If the reconnect spam persists on a
+real install after this ships, the cause is still an open question.
+
+Separately: the idle-poll loop in `_stream_response` calls
+`_read_stream_entries` (one Redis `XRANGE`) every 100ms per open connection
+regardless of whether anything is queued -- measured at exactly ~10
+`XRANGE`/s per idle stream against a real Redis. This is not addressed
+here; see the commit that added this section for the measurement and why
+it was left alone.

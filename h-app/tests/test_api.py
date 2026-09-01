@@ -5,6 +5,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import redis
 
@@ -15,6 +16,7 @@ if str(H_APP) not in sys.path:
 from core.channels import send
 from core.envelope import build, encode, parse
 from core.keys import prefix
+from modules.api import server as server_module
 from modules.api.port import deliver_api
 from modules.api.server import ApiSettings, create_app
 
@@ -206,6 +208,64 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(self.redis.streams[inbox]), 1)
         self.assertEqual(json.loads(self.redis.streams[inbox][0][1]["envelope"])["payload"], {"text": "reply"})
         self.assertEqual(self.redis.lists[dead], ["not an envelope"])
+
+    def test_idle_sse_stream_emits_keepalive_without_new_entries(self):
+        """No existing test opened an SSE stream and left it idle -- every
+        prior test either never connects to /alerts/stream or /agents/{a}/
+        activity/stream at all (test_external_route_contract just checks the
+        route is registered), or the client-side bot.py tests feed entries
+        into a mocked stream_fn immediately. So the silent-idle path -- an
+        open connection with nothing ever written to the underlying Redis
+        stream -- was never exercised by anything. This drives the real
+        ASGI app with a receive() that never signals disconnect, shrinks the
+        keepalive interval so the test doesn't wait multiple real seconds,
+        and asserts a comment line actually reaches the wire while idle.
+        """
+        first = True
+
+        async def receive():
+            nonlocal first
+            if first:
+                first = False
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await asyncio.sleep(3600)
+            return {"type": "http.disconnect"}
+
+        body_chunks = []
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                body_chunks.append(message.get("body", b""))
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/alerts/stream",
+            "raw_path": b"/alerts/stream",
+            "query_string": b"",
+            "headers": [(b"authorization", b"Bearer secret")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("127.0.0.1", 8080),
+            "root_path": "",
+        }
+
+        async def run():
+            with patch.object(server_module, "SSE_KEEPALIVE_INTERVAL_S", 0.05):
+                task = asyncio.ensure_future(self.app(scope, receive, send))
+                await asyncio.sleep(0.3)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        asyncio.run(run())
+
+        combined = b"".join(body_chunks)
+        self.assertIn(b": keepalive\n\n", combined)
 
 
 class RealApiPortSubprocessTests(unittest.TestCase):
