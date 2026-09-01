@@ -28,6 +28,170 @@ def test_setup_help():
     assert "--redis-url" in res.stdout
 
 
+def _fake_h_agent_installer(tmpdir: str, *, behavior: str) -> str:
+    """Write a fake h-agent installer and return a file:// URL to it (curl
+    reads file:// directly, no network needed -- setup.sh always prefers
+    curl when both are present, so this never exercises the wget branch).
+
+    behavior:
+      "succeed"           -- places a working h-agent and exits 0, always.
+      "fail_always"        -- exits 1 without placing h-agent, always.
+      "fail_then_succeed"  -- exits 1 with no binary on the first
+                              invocation, then succeeds on the second --
+                              the exact shape confirmed live on the VM,
+                              where re-running the same installer by hand
+                              right after a failure succeeded with no
+                              other change.
+    """
+    script_path = os.path.join(tmpdir, "fake_h_agent_install.sh")
+    counter_path = os.path.join(tmpdir, "h_agent_install_attempts")
+    place_binary = """
+mkdir -p "$bindir"
+printf '#!/usr/bin/env bash\\nexec bash -il\\n' > "$bindir/h-agent"
+chmod +x "$bindir/h-agent"
+exit 0
+"""
+    if behavior == "succeed":
+        body = place_binary
+    elif behavior == "fail_always":
+        body = "exit 1\n"
+    elif behavior == "fail_then_succeed":
+        body = f'if [ "$count" -eq 1 ]; then exit 1; fi\n{place_binary}'
+    else:
+        raise ValueError(behavior)
+
+    script = f"""#!/usr/bin/env bash
+set -euo pipefail
+count_file="{counter_path}"
+count=0
+[ -f "$count_file" ] && count=$(cat "$count_file")
+count=$((count + 1))
+echo "$count" > "$count_file"
+bindir="${{PREFIX:-$HOME/.local}}/bin"
+{body}
+"""
+    with open(script_path, "w") as f:
+        f.write(script)
+    os.chmod(script_path, 0o755)
+    return f"file://{script_path}", counter_path
+
+
+def _dep_check_env(tmpdir: str, *, h_agent_url: str) -> dict:
+    # No fake h-agent pre-placed on PATH -- deliberately runs the real
+    # detect-missing/install/verify path in setup.sh's section 0, not
+    # --skip-deps like the other tests here. redis-server, curl, and a
+    # usable python3-venv are all real and already present on the test
+    # host, so section 0 never touches apt-get; only H_AGENT_INSTALL_URL
+    # is faked.
+    home_dir = os.path.join(tmpdir, "home")
+    os.makedirs(home_dir, exist_ok=True)
+    env = dict(os.environ)
+    env["HOME"] = home_dir
+    env["PYTHONPATH"] = str(REPO_ROOT / "h-app")
+    env["H_AGENT_INSTALL_URL"] = h_agent_url
+    for k in list(env.keys()):
+        if k.startswith("CLAUDE_OAUTH_TOKEN_") or k == "CLAUDE_CODE_OAUTH_TOKEN":
+            del env[k]
+    return env
+
+
+def test_setup_fails_loudly_when_h_agent_installer_fails_twice():
+    # The bug this replaced: setup.sh never checked curl|bash's exit status
+    # at all, so a failed h-agent install was silently swallowed and the
+    # script printed success anyway. Confirm the opposite now: a clear,
+    # non-zero failure, before anything downstream (venv/daemons) even
+    # starts.
+    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_setup_h_agent_")
+    try:
+        h_agent_url, counter_path = _fake_h_agent_installer(tmpdir, behavior="fail_always")
+        run_dir = os.path.join(tmpdir, "run")
+        env = _dep_check_env(tmpdir, h_agent_url=h_agent_url)
+        env["H_MESH_RUN_DIR"] = run_dir
+        res = subprocess.run(
+            [str(SETUP_SH), "--pod", "p", "--tenant", "t", "--non-interactive"],
+            env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+        assert res.returncode != 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+        assert "h-agent installer failed twice" in res.stderr, res.stderr
+        assert "✓ h-agent installed" not in res.stdout
+        assert "✓ Daemons are healthy" not in res.stdout, (
+            "setup.sh must not proceed past a failed h-agent install:\n" + res.stdout
+        )
+        assert os.path.exists(counter_path)
+        assert open(counter_path).read().strip() == "2", "expected exactly 2 attempts"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_setup_retries_once_after_a_transient_h_agent_install_failure():
+    redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+    try:
+        redis.Redis.from_url(redis_url).ping()
+    except Exception:
+        pytest.skip("Redis server not available at REDIS_URL")
+    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_setup_h_agent_")
+    pod, tenant = f"p-{os.urandom(4).hex()}", f"t-{os.urandom(4).hex()}"
+    try:
+        h_agent_url, counter_path = _fake_h_agent_installer(tmpdir, behavior="fail_then_succeed")
+        run_dir = os.path.join(tmpdir, "run")
+        env = _dep_check_env(tmpdir, h_agent_url=h_agent_url)
+        env["H_MESH_RUN_DIR"] = run_dir
+        env["REDIS_URL"] = redis_url
+        res = subprocess.run(
+            [str(SETUP_SH), "--pod", pod, "--tenant", tenant,
+             "--non-interactive", "--skip-install", "--no-daemons", "--venv", sys.prefix],
+            env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+        assert res.returncode == 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+        assert "attempt 1/2" in res.stdout
+        assert "attempt 2/2" in res.stdout
+        assert "✓ h-agent installed" in res.stdout
+        assert open(counter_path).read().strip() == "2"
+        h_agent_bin = os.path.join(env["HOME"], ".local", "bin", "h-agent")
+        assert os.path.isfile(h_agent_bin) and os.access(h_agent_bin, os.X_OK)
+    finally:
+        try:
+            keys = redis.Redis.from_url(redis_url).keys(f"pod:{pod}:tenant:{tenant}:*") or []
+            if keys:
+                redis.Redis.from_url(redis_url).delete(*keys)
+        except Exception:
+            pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_setup_installs_h_agent_on_first_try_when_missing():
+    redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+    try:
+        redis.Redis.from_url(redis_url).ping()
+    except Exception:
+        pytest.skip("Redis server not available at REDIS_URL")
+    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_setup_h_agent_")
+    pod, tenant = f"p-{os.urandom(4).hex()}", f"t-{os.urandom(4).hex()}"
+    try:
+        h_agent_url, counter_path = _fake_h_agent_installer(tmpdir, behavior="succeed")
+        run_dir = os.path.join(tmpdir, "run")
+        env = _dep_check_env(tmpdir, h_agent_url=h_agent_url)
+        env["H_MESH_RUN_DIR"] = run_dir
+        env["REDIS_URL"] = redis_url
+        res = subprocess.run(
+            [str(SETUP_SH), "--pod", pod, "--tenant", tenant,
+             "--non-interactive", "--skip-install", "--no-daemons", "--venv", sys.prefix],
+            env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+        assert res.returncode == 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+        assert "attempt 2/2" not in res.stdout
+        assert "✓ h-agent installed" in res.stdout
+        assert open(counter_path).read().strip() == "1"
+    finally:
+        try:
+            keys = redis.Redis.from_url(redis_url).keys(f"pod:{pod}:tenant:{tenant}:*") or []
+            if keys:
+                redis.Redis.from_url(redis_url).delete(*keys)
+        except Exception:
+            pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
     r = redis.Redis.from_url(redis_url)
