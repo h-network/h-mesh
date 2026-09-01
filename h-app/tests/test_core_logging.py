@@ -84,3 +84,29 @@ def test_every_port_entry_point_configures_logging():
     for module in (api_port, office_port, openshell_port, tmux_port):
         source = inspect.getsource(module.main)
         assert "configure_logging()" in source, f"{module.__name__}.main does not configure logging"
+
+
+def test_every_long_running_daemon_entry_point_configures_logging():
+    """The daemons `h-mesh start` leaves running, plus the two started by
+    hand. Same rule as the ports: the process that starts is the process that
+    picks the threshold, so a logger line added inside any of them later is
+    raisable instead of invisible below WARNING."""
+    import inspect
+
+    from core import service as switch
+    from services import api, session, tmux_reconciler, web_console
+
+    for module in (switch, api, session, tmux_reconciler, web_console):
+        source = inspect.getsource(module.main)
+        assert "configure_logging()" in source, f"{module.__name__}.main does not configure logging"
+
+
+def test_the_telegram_bot_launcher_does_not_configure_logging_a_second_time():
+    """services/telegram_bot.py imports clients.telegram.bot, which already
+    configures at import from the same variable. A second basicConfig here
+    would be a no-op that reads like the real thing."""
+    import inspect
+
+    from services import telegram_bot
+
+    assert "configure_logging()" not in inspect.getsource(telegram_bot.main)

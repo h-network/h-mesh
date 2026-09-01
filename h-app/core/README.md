@@ -60,15 +60,39 @@ Telegram client — that client keeps its own copy of the resolver because it
 imports nothing from `core`, so the two move together or not at all.
 
 ⚠ **`configure_logging()` belongs in an entry point, never at import of a
-library module.** Each port's `main()` calls it (`modules/{api,office,
-openshell,tmux}/port.py`), which covers both `python -m modules.<type>.port`
-as the switch spawns it and `h-mesh <type>-port`, which imports the module and
-calls the same `main()`. `core/dispatch.py` deliberately does not configure
-anything: it is imported by processes core does not own, including the test
-suite, and a library that sets the root logger's level decides verbosity for
-all of them. Without a configuring entry point, stdlib logging's lastResort
-handler prints WARNING and above as a bare message — no timestamp, no logger
-name — and silently drops everything below it.
+library module.** `core/dispatch.py` deliberately does not configure anything:
+it is imported by processes core does not own, including the test suite, and a
+library that sets the root logger's level decides verbosity for all of them.
+Without a configuring entry point, stdlib logging's lastResort handler prints
+WARNING and above as a bare message — no timestamp, no logger name — and
+silently drops everything below it.
+
+Every entry point that starts a process of ours calls it as its first
+statement:
+
+| entry point | process |
+|---|---|
+| `core/service.py` `main()` | the switch (`h-mesh switch`) |
+| `modules/{api,office,openshell,tmux}/port.py` `main()` | one-shot delivery per kick — covers both `python -m modules.<type>.port` as the switch spawns it and `h-mesh <type>-port`, which imports the module and calls the same `main()` |
+| `services/tmux_reconciler.py` `main()` | the tmux reconciler |
+| `services/api.py` `main()` | the REST API (see the uvicorn note below) |
+| `services/session.py` `main()` | the session WebSocket door |
+| `services/web_console.py` `main()` | the web console / Mini App gateway |
+| `tools/smoke_tmux.py` `main()` | the tmux smoke tool, the one caller that reaches `dispatch`'s handler resolution today |
+
+`services/telegram_bot.py` is the deliberate exception: it imports
+`clients.telegram.bot`, which configures itself at import from the same
+variable, and a second `basicConfig` there would be a no-op that reads like
+the real thing. `clients/web/server.py` is configured by its
+`services/web_console.py` launcher and not by itself — running that server
+directly gets stdlib's unconfigured default, the price of `clients/` importing
+nothing from `core`.
+
+⚠ In `services/api.py` the call goes **before** `uvicorn.run`. Uvicorn's own
+`dictConfig` sets `disable_existing_loggers: False` and never touches the root
+logger, so the threshold survives it — but it does not reach uvicorn's own
+`uvicorn.*` loggers, which take their level from uvicorn's `log_level`
+argument rather than from root.
 
 The threshold is the verbosity knob and nothing else: a real failure keeps its
 own severity. Note that `basicConfig` sets the **root** level, so `DEBUG` also
