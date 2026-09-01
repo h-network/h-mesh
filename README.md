@@ -1,5 +1,11 @@
 <p align="center">
-  <img src="assets/banner.svg" alt="H-MESH // agentic office framework // h-network" width="600">
+  <img src="docs/assets/banner.svg" alt="H-MESH // agentic office framework // h-network" width="600">
+
+  [![LICENSE: POLYFORM NC 1.0](docs/assets/badges/license.svg)](LICENSE)
+  ![AGENTS: CLAUDE CODEX AGY](docs/assets/badges/agents.svg)
+  ![TMUX: CONFIGURED](docs/assets/badges/tmux.svg)
+  ![PYTHON: 3.12+](docs/assets/badges/python.svg)
+  ![REDIS: REQUIRED](docs/assets/badges/redis.svg)
 </p>
 
 # h-mesh
@@ -179,3 +185,9 @@ with another application without replacing its live `office` executable.
 
 Each process reads its deployment configuration from environment variables;
 the module READMEs document the required variables and external services.
+
+## License
+
+PolyForm Noncommercial 1.0.0 -- see [`LICENSE`](LICENSE). Third-party
+dependency licenses are credited in [`NOTICE`](NOTICE). "h-mesh" and
+"h-network" naming/branding are covered by [`TRADEMARKS.md`](TRADEMARKS.md).

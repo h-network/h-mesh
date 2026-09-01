@@ -1,0 +1,28 @@
+This project is licensed by H-Network under the terms in `LICENSE`.
+
+It depends on the following third-party components, which are licensed
+separately under their own terms and are NOT covered by this project's
+license:
+
+- fastapi (https://github.com/fastapi/fastapi) — MIT
+  Copyright (c) Sebastián Ramírez
+
+- uvicorn (https://github.com/encode/uvicorn) — BSD-3-Clause
+  Copyright (c) Tom Christie
+
+- websockets (https://github.com/python-websockets/websockets) — BSD-3-Clause
+  Copyright (c) Aymeric Augustin
+
+- redis-py (https://github.com/redis/redis-py) — MIT
+  Copyright (c) Redis Inc.
+
+- openshell (https://github.com/NVIDIA/openshell) — Apache-2.0
+  Copyright (c) NVIDIA Corporation
+
+- edge-tts (https://github.com/rany2/edge-tts) — LGPL-3.0
+  Copyright (c) rany
+
+This project does not modify or redistribute the source of the above
+components — they are used as unmodified dependencies. No rights are
+claimed over them, and their own license terms continue to apply to
+them in full.

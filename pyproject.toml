@@ -7,6 +7,8 @@ name = "h-mesh"
 version = "0.1.0"
 description = "Host-installed message mesh for stateful agent offices"
 readme = "README.md"
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
   "edge-tts>=6,<8",
