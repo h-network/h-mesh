@@ -414,21 +414,22 @@ def _parse_mention(text: str) -> tuple[str, str] | None:
 
 
 # `/run <agent> <command>` — a policy-reviewed exception to Command being
-# "deliberately not exposed" (README §2a, web/SPEC.md §6): a full Command
-# passthrough is unbounded remote execution from a phone with no live view
-# of the pane, exactly what that note objected to. This is bounded to a
-# fixed, pre-vetted set of native CLI slash commands instead — see
-# handle_run_command for the full reasoning and the single-line
-# requirement (an allowed command's own text could otherwise carry a
-# newline, submitting a second, unvetted line of raw input on delivery).
-# Global rather than per-CLI: the api exposes no field for which CLI an
-# agent runs (same limitation PANE_WATCH_CHROME_OVERRIDES exists for), and
-# claude/codex/agy's actual command grammars are not something this client
-# can verify without a live agent of each kind to check against — an
-# operator who runs CLIs where these two names mean something else, or
-# wants more, sets --run-allowed-commands/RUN_ALLOWED_COMMANDS instead of
-# this default.
-DEFAULT_RUN_ALLOWED_COMMANDS = ("/clear", "/compact")
+# "deliberately not exposed" (README §2a, web/SPEC.md §6). Unrestricted by
+# default (empty allowlist), not bounded to a fixed set: this bot is
+# already locked to one TELEGRAM_CHAT_ID (§1), and an agent already runs
+# with permissions skipped, so whoever holds that chat already has the
+# equivalent of a live terminal to it — an allowlist here would be
+# restricting the same operator from themselves, not adding a boundary
+# against anyone else. `/run` still requires typing an agent name and a
+# command by hand (see handle_run_command for the one structural
+# requirement that remains: single-line only). An operator who *does* want
+# to bound this — a shared chat, a CLI whose commands need vetting, whatever
+# the reason — sets --run-allowed-commands/RUN_ALLOWED_COMMANDS to a
+# non-empty list; a non-empty allowlist is still enforced as an exact,
+# whole-string match, same as before this default changed. That knob is
+# global rather than per-CLI: the api exposes no field for which CLI an
+# agent runs (same limitation PANE_WATCH_CHROME_OVERRIDES exists for).
+DEFAULT_RUN_ALLOWED_COMMANDS: tuple[str, ...] = ()
 
 
 def _parse_command_allowlist(spec: str) -> frozenset[str]:
@@ -1976,23 +1977,20 @@ class TelegramBot:
         read as chat text saying "/clear". One-off, same as `@mention` —
         `chat_target_agent` is never touched by this.
 
-        ⚠ Bounded to `self.run_allowed_commands` (`DEFAULT_RUN_ALLOWED_COMMANDS`
-        unless overridden), an exact, whole-string match — not a prefix a
-        caller can tack arguments onto. A full Command passthrough here was
-        the first design and was deliberately rejected: unlike README §2a's
-        "not exposed at all" objection, which was about a one-tap *button*,
-        this is typed by hand — but it is still unbounded remote execution
-        with no live view of the pane, exactly the property that objection
-        cared about. A fixed, pre-vetted allowlist of session-hygiene
-        commands is the resolution, not a loophole around it.
+        ⚠ Unrestricted by default (`self.run_allowed_commands` empty unless
+        `--run-allowed-commands`/`RUN_ALLOWED_COMMANDS` configures one) — see
+        `DEFAULT_RUN_ALLOWED_COMMANDS` for why an allowlist isn't the default
+        boundary here: this bot is already locked to one chat_id, and the
+        agent it runs on already has permissions skipped, so there is no
+        second party for a default allowlist to actually protect. When an
+        allowlist *is* configured, it's an exact, whole-string match — not a
+        prefix a caller can tack arguments onto.
 
-        ⚠ Single-line only, checked before the allowlist. `command_opener`
-        pastes the text with one trailing newline appended — an allowed
-        command's own text carrying an embedded newline would submit it as
-        one line and then paste a second, completely unvetted line of raw
-        input right after, defeating the allowlist entirely. None of
-        `DEFAULT_RUN_ALLOWED_COMMANDS`' own entries need one; a rejection
-        here only ever fires on something a caller added deliberately.
+        ⚠ Single-line only, checked unconditionally, allowlist configured or
+        not. `command_opener` pastes the text with one trailing newline
+        appended — a command's own text carrying an embedded newline would
+        submit it as one line and then paste a second, completely
+        independent line of raw input right after it, on delivery.
 
         ⚠ No separate operator/chat_id restriction here beyond the existing
         single `allowed_chat_id` gate every command already goes through
@@ -2017,8 +2015,11 @@ class TelegramBot:
             return _reject(error)
         if "\n" in command_text or "\r" in command_text:
             return _reject("/run commands must be a single line.")
-        if command_text not in self.run_allowed_commands:
-            allowed = ", ".join(sorted(self.run_allowed_commands)) or "(none configured)"
+        # An empty allowlist (the default) means unrestricted -- see
+        # DEFAULT_RUN_ALLOWED_COMMANDS. Only a configured, non-empty one is
+        # actually enforced.
+        if self.run_allowed_commands and command_text not in self.run_allowed_commands:
+            allowed = ", ".join(sorted(self.run_allowed_commands))
             return _reject(f"'{command_text}' isn't an allowed /run command. Allowed: {allowed}")
         return self.handle_user_prompt(cid, command_text, agent_override=name, raw=True, message_id=message_id)
 
@@ -3001,8 +3002,9 @@ def main() -> None:
     parser.add_argument("--run-allowed-commands",
                         default=os.getenv("RUN_ALLOWED_COMMANDS", ",".join(DEFAULT_RUN_ALLOWED_COMMANDS)),
                         help="/run: comma-separated exact-match allowlist of native CLI slash commands "
-                             f"(default: {','.join(DEFAULT_RUN_ALLOWED_COMMANDS)}) — global, not per-CLI, "
-                             "since the api exposes no field for which CLI an agent runs")
+                             "(default: unrestricted -- this bot is already locked to one chat_id and the "
+                             "agent already runs with permissions skipped); set this to bound /run to "
+                             "specific commands instead")
 
     args = parser.parse_args()
 

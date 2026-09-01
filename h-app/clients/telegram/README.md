@@ -40,7 +40,7 @@ A Telegram bot client that talks to an **h-mesh** tenant over HTTP, allowing a u
 | `PANE_WATCH_REFRESH_SECONDS` | `2.0` | `/watch`: seconds between pane refreshes |
 | `PANE_WATCH_MAX_DURATION_SECONDS` | `600` | `/watch`: auto-stop a forgotten watch after this many seconds |
 | `MINI_APP_URL` | unset | Public HTTPS URL for `clients/web/mini.html` — adds a 📊 Dashboard `web_app` button to the sticky menu (§2a) when set, omitted entirely otherwise. See `clients/web/README.md`'s Telegram Mini App section — that server is not started here and needs its own `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` to accept the button's login |
-| `RUN_ALLOWED_COMMANDS` | `/clear,/compact` | `/run` (§2h): comma-separated exact-match allowlist of native CLI slash commands — global, not per-CLI/per-agent, see §2h |
+| `RUN_ALLOWED_COMMANDS` | unset (unrestricted) | `/run` (§2h): comma-separated exact-match allowlist of native CLI slash commands, only enforced when set — global, not per-CLI/per-agent, see §2h |
 
 ### Running in Dry-Run Mode (Without Telegram Token)
 
@@ -511,7 +511,7 @@ always JPEG.
 
 ---
 
-## 2h. `/run` — an Allowlisted Exception to "`Command` Is Not Exposed"
+## 2h. `/run` — an Exception to "`Command` Is Not Exposed", Unrestricted by Default
 
 `/run <agent> <command>` sends a `Command`-kind envelope instead of the
 `Message`-kind shorthand every other text path uses: `command_opener` pastes
@@ -521,35 +521,23 @@ CLI instead of read as chat text saying "/clear". One-off, same as
 [`@mention`](#2a-menu-a-pinned-keyboard-not-a-one-off-message) —
 `chat_target_agent` is never touched by this.
 
-⚠ **This is a narrow, deliberate exception to §2a/`clients/web/SPEC.md`
-§6's "`Command` is not exposed", not a reversal of it.** Full passthrough —
-any text, executed bare in the pane — was the first shape this feature
-took, and was rejected: it's unbounded remote execution from a phone with
-no live view of the pane, exactly what that note was worried about, typed
-command or not. What actually ships is bounded to a small, fixed allowlist
-of native CLI slash commands (`RUN_ALLOWED_COMMANDS`/
-`--run-allowed-commands`, default `/clear,/compact`), matched as an
-**exact, whole-string** comparison — `/clear extra` is not `/clear` and is
-refused, not passed through with an argument attached. Anything not on the
-allowlist is refused with a plain-text reply naming what *is* allowed,
-never silently dropped.
+⚠ **Unrestricted by default (`RUN_ALLOWED_COMMANDS`/`--run-allowed-commands`
+empty), not bounded to a fixed set.** An earlier draft here (a small,
+fixed allowlist of native CLI slash commands, `/clear,/compact`) was too
+narrow in practice — the user hit it immediately trying `/run architect
+/context` — and, on reflection, wasn't actually adding a real boundary: this
+bot is already locked to one `TELEGRAM_CHAT_ID` (§1), and the agent it runs
+on already has permissions skipped, so whoever holds that chat already has
+the practical equivalent of a live terminal to it. An allowlist here would
+have been restricting that same operator from themselves, not protecting
+against anyone else. What remains structural, allowlist or not:
 
-- **Global, not per-CLI or per-agent.** `GET /agents/{agent}` exposes no
-  field for which CLI an agent runs (the same limitation
-  `PANE_WATCH_CHROME_OVERRIDES`, §2d, exists for), and `claude`/`codex`/
-  `agy`'s actual slash-command grammars are not something this client can
-  verify without a live agent of each kind to check against. An operator
-  running CLIs where `/clear`/`/compact` mean something else, or wanting a
-  larger set, sets `RUN_ALLOWED_COMMANDS` instead of trusting an unverified
-  per-CLI table here.
-- **Single-line only, checked before the allowlist.** `command_opener`
-  pastes the matched command with one trailing newline appended. An
-  allowed command's own text carrying an embedded newline would submit it
-  as one line and then paste a second, completely unvetted line of raw
-  input right after — defeating the allowlist entirely. Refused with
-  "`/run commands must be a single line.`" before the allowlist check even
-  runs; none of the default entries need one, so this only ever fires on
-  something added deliberately.
+- **Single-line only, always checked.** `command_opener` pastes the command
+  with one trailing newline appended. A command's own text carrying an
+  embedded newline would submit it as one line and then paste a second,
+  completely independent line of raw input right after it, on delivery.
+  Refused with "`/run commands must be a single line.`" regardless of
+  whether an allowlist is configured.
 - **Presence-gated and activity-visible exactly like a normal prompt** — a
   `blocked` target agent is refused the same way `handle_user_prompt`
   refuses one, and the live activity progress message (§2c) starts the
@@ -558,6 +546,16 @@ never silently dropped.
   `allowed_chat_id` gate** every command already goes through — there is
   no concept of distinct "operators" for one `chat_id` to be restricted
   relative to another yet. Revisit if/when that lands.
+
+**The allowlist mechanism itself still works** for anyone who wants to bound
+`/run` — a shared chat, a CLI whose commands need vetting, whatever the
+reason. Set `RUN_ALLOWED_COMMANDS`/`--run-allowed-commands` to a
+comma-separated list and it's enforced as an **exact, whole-string** match —
+`/clear extra` is not `/clear` and is refused, not passed through with an
+argument attached — with a plain-text reply naming what *is* allowed,
+never silently dropped. Global, not per-CLI or per-agent, when set: `GET
+/agents/{agent}` exposes no field for which CLI an agent runs (the same
+limitation `PANE_WATCH_CHROME_OVERRIDES`, §2d, exists for).
 
 ---
 
