@@ -133,7 +133,9 @@ h-mesh-upgrade --pod mypod --tenant mytenant
 
 Same pod/tenant/redis-url/session/tmux-tmpdir/tmux-socket/venv flags as
 setup.sh, plus `--skip-install` and `--skip-pull` (`h-mesh-upgrade --help`
-for the full list). It also re-persists the venv bin dir on `PATH`,
+for the full list). Pod and tenant must be valid non-empty h-mesh names; an
+invalid value is rejected before the upgrade stops or starts anything. It
+also re-persists the venv bin dir on `PATH`,
 re-installs the default `tmux.conf`, and re-installs the default account's
 statusline, so running it repairs an install that predates any of those
 fixes.
@@ -148,7 +150,11 @@ that refresh would mean killing live agent sessions on every upgrade.
 `h-mesh-start` (`services.daemons`) starts the same daemons without pulling
 or reinstalling -- useful after a crash, or on a host where they aren't
 running yet. It's also duplicate-safe: a daemon it finds already alive (via
-its pidfile) is left running rather than started a second time.
+its pidfile) is left running rather than started a second time. A start is
+atomic with respect to processes that invocation creates: they are reported
+as started only after surviving the startup health window, and if any one
+fails, all newly created siblings are stopped. Processes found running before
+the invocation are never part of that rollback.
 
 ```bash
 h-mesh-start --pod mypod --tenant mytenant

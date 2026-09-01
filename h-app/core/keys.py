@@ -24,12 +24,17 @@ _SEGMENT = SEGMENT_REGEX
 _RESERVED = RESERVED
 
 
-def _validate(value: str | None) -> str:
+def validate_segment(value: str | None) -> str:
+    """Validate one public pod, tenant, agent, or resource-name segment."""
     if not isinstance(value, str) or not _SEGMENT.fullmatch(value) or value in _RESERVED:
         raise KeyError(value)
     if ALL_DIGITS.fullmatch(value):
         raise KeyError(value)
     return value
+
+
+# Private compatibility name for the internal resource/agent helpers below.
+_validate = validate_segment
 
 
 def _validate_resource(value: str | None) -> str:

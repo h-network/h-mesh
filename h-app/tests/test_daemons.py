@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import ANY, call, patch
 
 import pytest
 import redis
@@ -152,6 +153,102 @@ def test_start_daemons_raises_daemon_error_when_module_is_broken(monkeypatch):
             start_daemons(python=python, run_dir=run_dir, env=env)
     finally:
         _kill_and_cleanup(run_dir, tmpdir, env)
+
+
+def test_failed_start_rolls_back_only_daemons_started_by_this_call(monkeypatch, tmp_path):
+    import services.daemons as daemons_mod
+
+    monkeypatch.setattr(daemons_mod, "HEALTH_CHECK_SECONDS", 0)
+    monkeypatch.setattr(
+        daemons_mod,
+        "_start_one",
+        lambda name, *_args: {"new-a": 101, "new-b": 102}[name],
+    )
+    (tmp_path / "existing.pid").write_text("99\n")
+    alive = {99: True, 101: True, 102: False}
+    monkeypatch.setattr(daemons_mod, "pid_alive", lambda pid: alive[pid])
+
+    logs = []
+    with patch.object(daemons_mod, "_stop_one") as stop_one:
+        with pytest.raises(DaemonError, match="new-b failed to start"):
+            start_daemons(
+                python=Path(sys.executable),
+                run_dir=tmp_path,
+                env=_env("testpod", "testtenant", str(tmp_path)),
+                daemon_modules={
+                    "existing": "example.existing",
+                    "new-a": "example.a",
+                    "new-b": "example.b",
+                },
+                log=logs.append,
+            )
+
+    assert stop_one.call_args_list == [
+        call("new-a", tmp_path / "new-a.pid", log=ANY),
+        call("new-b", tmp_path / "new-b.pid", log=ANY),
+    ]
+    assert not any(": started" in message for message in logs)
+
+
+def test_delayed_process_failure_rolls_back_live_sibling(monkeypatch, tmp_path):
+    import re
+    import services.daemons as daemons_mod
+
+    (tmp_path / "healthy_daemon.py").write_text("import time\ntime.sleep(60)\n")
+    (tmp_path / "delayed_failure.py").write_text("import time\ntime.sleep(0.2)\n")
+    run_dir = tmp_path / "run"
+    env = _env("testpod", "testtenant", str(tmp_path))
+    env["PYTHONPATH"] = os.pathsep.join((str(tmp_path), env["PYTHONPATH"]))
+    monkeypatch.setattr(daemons_mod, "HEALTH_CHECK_SECONDS", 0.6)
+    monkeypatch.setattr(daemons_mod, "HEALTH_POLL_SECONDS", 0.02)
+    logs = []
+
+    with pytest.raises(DaemonError, match="delayed failed to start"):
+        start_daemons(
+            python=Path(sys.executable),
+            run_dir=run_dir,
+            env=env,
+            daemon_modules={
+                "healthy": "healthy_daemon",
+                "delayed": "delayed_failure",
+            },
+            log=logs.append,
+        )
+
+    launched_pids = [
+        int(match.group(1))
+        for message in logs
+        if (match := re.search(r"starting \(pid: (\d+)\)", message))
+    ]
+    assert len(launched_pids) == 2
+    assert all(not pid_alive(pid) for pid in launched_pids)
+    assert not (run_dir / "healthy.pid").exists()
+    assert not (run_dir / "delayed.pid").exists()
+    assert not any(": started" in message for message in logs)
+
+
+@pytest.mark.parametrize(
+    ("entrypoint", "work_patch"),
+    (
+        ("services.tmux_reconciler.main", "services.tmux_reconciler.TmuxReconciler"),
+        ("modules.watchdog.service.main", "modules.watchdog.service.Watchdog"),
+        ("services.telegram_bot.main", "services.telegram_bot.MeshClient"),
+        ("core.service.main", "core.service.Switch"),
+    ),
+)
+def test_daemon_entrypoints_reject_empty_identity_before_work(
+    entrypoint, work_patch, monkeypatch
+):
+    from importlib import import_module
+
+    monkeypatch.setenv("POD", "")
+    monkeypatch.setenv("TENANT", "")
+    module_name, function_name = entrypoint.rsplit(".", 1)
+    main = getattr(import_module(module_name), function_name)
+
+    with patch(work_patch, side_effect=AssertionError("daemon work began")):
+        with pytest.raises(SystemExit, match="POD and TENANT"):
+            main()
 
 
 def test_resolve_config_merges_persisted_tenant_env_beneath_process_env(monkeypatch, tmp_path):

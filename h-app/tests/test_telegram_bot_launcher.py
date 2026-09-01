@@ -136,6 +136,8 @@ def test_telegram_bot_launcher_exits_cleanly_with_a_clear_error_when_api_token_m
         import subprocess
         env = dict(os.environ)
         env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2] / "h-app")
+        env["POD"] = "testpod"
+        env["TENANT"] = "testtenant"
         env.pop("API_TOKEN", None)
         env.pop("H_MESH_API_TOKEN", None)
         res = subprocess.run(
