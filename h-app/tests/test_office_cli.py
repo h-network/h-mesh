@@ -209,6 +209,27 @@ def test_hire_carries_profile_provider_resume_permissions_and_tools(mock_send, m
 
 
 @patch("modules.office.cli.send")
+def test_hire_can_transfer_leadership(mock_send, monkeypatch):
+    _env(monkeypatch)
+    mock_send.return_value = "stream-1"
+    r = FakeRedis()
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["hire", "replacement", "--lead"])
+    assert mock_send.call_args.kwargs["payload"]["lead"] is True
+
+
+def test_peers_warns_when_configured_lead_is_not_enrolled(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis(registry={"architect": "tmux", "worker": "tmux"})
+    r.values[prefix(POD, TENANT, resource="lead")] = "retired-lead"
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["peers"])
+    captured = capsys.readouterr()
+    assert "worker" in captured.out
+    assert "configured lead 'retired-lead' is not an enrolled agent" in captured.err
+
+
+@patch("modules.office.cli.send")
 def test_hire_fresh_and_no_skip_permissions(mock_send, monkeypatch):
     _env(monkeypatch)
     mock_send.return_value = "stream-1"
