@@ -223,3 +223,44 @@ def test_non_interactive_agy_with_non_default_account_env_falls_back_to_default(
     assert persisted.get("AGENT_CLIS") == "worker1=agy"
     # worker1's account exception must have been reset to default, not kept.
     assert "AGENT_PROFILES" not in persisted or "worker1" not in persisted.get("AGENT_PROFILES", "")
+
+
+def test_non_interactive_names_which_settings_came_from_live_env(noninteractive_env, monkeypatch):
+    # Not a guard -- purely informational, so a human running this by hand
+    # can see what got pulled from their live shell. Names only, never a
+    # value (including for the fake tokens this test itself sets).
+    ctx = noninteractive_env
+    output, code = _run_setup(ctx, {
+        "DEFAULT_CLI": "codex",
+        "API_TOKEN": "test-api-token-for-env-line",
+    })
+    assert code == 0, f"setup.sh exited {code}:\n{output}"
+    assert "Persisting from live environment:" in output
+    line = next(l for l in output.splitlines() if l.startswith("Persisting from live environment:"))
+    assert "DEFAULT_CLI" in line
+    assert "API_TOKEN" in line
+    assert "test-api-token-for-env-line" not in output
+
+
+def test_non_interactive_says_nothing_when_nothing_came_from_env(noninteractive_env, monkeypatch):
+    ctx = noninteractive_env
+    output, code = _run_setup(ctx, {})
+    assert code == 0, f"setup.sh exited {code}:\n{output}"
+    assert "Persisting from live environment:" not in output
+
+
+def test_non_interactive_env_line_omits_a_value_a_second_run_reuses_from_persisted_config(noninteractive_env, monkeypatch):
+    # A value that's already persisted and simply gets re-read back (no live
+    # env override this run) must not be reported as "from live environment"
+    # -- only a genuine env override counts.
+    ctx = noninteractive_env
+    output1, code1 = _run_setup(ctx, {"DEFAULT_CLI": "codex"})
+    assert code1 == 0, output1
+    assert "DEFAULT_CLI" in next(
+        l for l in output1.splitlines() if l.startswith("Persisting from live environment:")
+    )
+
+    output2, code2 = _run_setup(ctx, {})
+    assert code2 == 0, output2
+    assert "Persisting from live environment:" not in output2
+    assert _read_persisted(ctx, monkeypatch).get("DEFAULT_CLI") == "codex"
