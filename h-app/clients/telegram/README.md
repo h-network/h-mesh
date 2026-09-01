@@ -172,6 +172,26 @@ Pause/Resume/Retire choice, Message-agent, Add Ticket's priority buttons) stay
 what inline keyboards are for; the sticky keyboard is for top-level nav that
 should always be one tap away without re-sending `/menu`.
 
+⚠ **Inline sub-flows edit one message in place rather than posting a new one
+per tap.** Add Ticket, Lifecycle (including its Pause/Resume/Retire screen and
+"◀ Back"), Message-agent, and Watch's agent picker all reuse the same
+message — `_send_or_edit_message`, keyed off `callback_query.message.message_id`
+— from the first picker tap through to the final result, so a chat doesn't
+fill up with one throwaway message per step. Two things that stay fresh sends
+regardless: Broadcast (its entry point is a sticky-keyboard tap, never an
+inline button, so there's never a message to edit into), and the very last
+step of Message-agent (its confirmation re-sends the sticky keyboard, and
+`editMessageText` can only ever carry an inline keyboard, never a
+`ReplyKeyboardMarkup` — the picker message still gets edited to acknowledge
+the tap, but the sticky-keyboard refresh is necessarily a second, new
+message). Hire only ever *starts* fresh too (its "➕ Hire" entry is a
+sticky-keyboard tap, same as Broadcast), but every stage after that initial
+send edits that first message rather than sending a new prompt each time.
+The top-level sticky `ReplyKeyboardMarkup` menu itself is not part of any of
+this — Telegram has no API to edit a custom reply keyboard in place, so
+`/menu` and the sticky-keyboard taps that swap targets or toggle voice always
+remain fresh sends.
+
 While a chat has an open multi-step flow (Add Ticket, Hire, Retire,
 Broadcast), its next plain text message is consumed as that flow's answer
 rather than sent to `--agent` as a prompt (and takes priority over a

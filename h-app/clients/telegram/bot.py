@@ -1579,26 +1579,58 @@ class TelegramBot:
             self.telegram.send_message(cid, text, reply_markup=self._sticky_keyboard(cid))
         return text
 
-    def _dispatch_menu_action(self, chat_id: int | str, code: str) -> str:
-        """Shared by the sticky keyboard (text label tap) and any inline
-        button still using these same short codes (e.g. a sub-flow's "◀
-        Back" — see handle_callback_query)."""
+    def _send_or_edit_message(
+        self,
+        chat_id: int | str,
+        text: str,
+        *,
+        message_id: int | None = None,
+        reply_markup: dict | None = None,
+        clear_markup: bool = False,
+    ) -> int | None:
+        """Edit `message_id` in place when the caller has one (an inline
+        sub-flow screen, or a typed-reply continuation of one, being
+        updated) — otherwise send a fresh message and return its id so a
+        flow can anchor later steps to it. Same send-once/edit-after shape
+        as `PaneWatchRender.flush`, applied per-tap instead of per-stream
+        update. `reply_markup` here is always an inline keyboard or None —
+        editMessageText cannot attach a ReplyKeyboardMarkup, only replace
+        an existing inline one (`clear_markup` sends an empty one to drop
+        stale buttons)."""
+        if not self.telegram:
+            return message_id
+        markup = {"inline_keyboard": []} if clear_markup else reply_markup
+        if message_id is not None:
+            resp = self.telegram.edit_message_text(chat_id, message_id, text, reply_markup=markup)
+            if isinstance(resp, dict) and not resp.get("ok", False) and "not modified" not in str(resp.get("description", "")):
+                logger.debug(f"editMessageText failed (chat={chat_id}, msg={message_id}): {resp.get('description')}")
+            return message_id
+        resp = self.telegram.send_message(chat_id, text, reply_markup=markup)
+        return resp.get("result", {}).get("message_id") if isinstance(resp, dict) else None
+
+    def _dispatch_menu_action(self, chat_id: int | str, code: str, message_id: int | None = None) -> str:
+        """Shared by the sticky keyboard (text label tap, no message to
+        edit) and any inline button still using these same short codes
+        (e.g. a sub-flow's "◀ Back" — see handle_callback_query). `message_id`
+        is only ever non-None for "lc", the one code currently reachable
+        both ways; passed through uniformly regardless so a future inline
+        entry point to any of these doesn't need this dispatcher touched."""
         if code == "menu":
             return self.handle_menu_command(chat_id)
         if code == "ov":
             return self.handle_overview_command(chat_id)
         if code == "at":
-            return self.handle_addticket_start(chat_id)
+            return self.handle_addticket_start(chat_id, message_id)
         if code == "lc":
-            return self.handle_lifecycle_start(chat_id)
+            return self.handle_lifecycle_start(chat_id, message_id)
         if code == "al":
             return self.handle_alerts_command(chat_id)
         if code == "hi":
-            return self.handle_hire_start(chat_id)
+            return self.handle_hire_start(chat_id, message_id)
         if code == "ta":
-            return self.handle_message_agent_start(chat_id)
+            return self.handle_message_agent_start(chat_id, message_id)
         if code == "wa":
-            return self.handle_watch_start(chat_id)
+            return self.handle_watch_start(chat_id, message_id)
         if code == "bc":
             return self.handle_broadcast_start(chat_id)
         if code == "vt":
@@ -1668,24 +1700,21 @@ class TelegramBot:
             self.telegram.send_message(chat_id, text)
         return text
 
-    def handle_addticket_start(self, chat_id: int | str) -> str:
+    def handle_addticket_start(self, chat_id: int | str, message_id: int | None = None) -> str:
         agents = self._tmux_agents()
         if not agents:
             text = "No agents enrolled to add a ticket to."
-            if self.telegram:
-                self.telegram.send_message(chat_id, text)
+            self._send_or_edit_message(chat_id, text, message_id=message_id, clear_markup=True)
             return text
         text = "Add a ticket — pick an agent:"
-        if self.telegram:
-            self.telegram.send_message(chat_id, text, reply_markup=_agent_picker_keyboard(agents, "at"))
+        self._send_or_edit_message(chat_id, text, message_id=message_id, reply_markup=_agent_picker_keyboard(agents, "at"))
         return text
 
-    def handle_addticket_pick_agent(self, chat_id: int | str, agent: str) -> str:
+    def handle_addticket_pick_agent(self, chat_id: int | str, agent: str, message_id: int | None = None) -> str:
         cid = str(chat_id)
-        self.pending[cid] = {"flow": "addticket", "agent": agent, "stage": "title"}
         text = f"Ticket title for {agent}? (/cancel to abort)"
-        if self.telegram:
-            self.telegram.send_message(cid, text)
+        anchor_id = self._send_or_edit_message(cid, text, message_id=message_id, clear_markup=True)
+        self.pending[cid] = {"flow": "addticket", "agent": agent, "stage": "title", "message_id": anchor_id}
         return text
 
     def handle_addticket_priority(self, chat_id: int | str, priority: str) -> str:
@@ -1695,6 +1724,7 @@ class TelegramBot:
             return ""
         agent, title = state["agent"], state["title"]
         description = state.get("description", "")
+        anchor_id = state.get("message_id")
         del self.pending[cid]
         if self.telegram:
             self.telegram.send_chat_action(cid)
@@ -1703,23 +1733,20 @@ class TelegramBot:
             text = f"✅ Ticket added to {agent}: {title} [{priority}]"
         else:
             text = f"❌ Failed to add ticket: {resp.get('detail', 'error')}"
-        if self.telegram:
-            self.telegram.send_message(cid, text)
+        self._send_or_edit_message(cid, text, message_id=anchor_id, clear_markup=True)
         return text
 
-    def handle_lifecycle_start(self, chat_id: int | str) -> str:
+    def handle_lifecycle_start(self, chat_id: int | str, message_id: int | None = None) -> str:
         agents = self._tmux_agents()
         if not agents:
             text = "No agents enrolled."
-            if self.telegram:
-                self.telegram.send_message(chat_id, text)
+            self._send_or_edit_message(chat_id, text, message_id=message_id, clear_markup=True)
             return text
         text = "Lifecycle — pick an agent:"
-        if self.telegram:
-            self.telegram.send_message(chat_id, text, reply_markup=_agent_picker_keyboard(agents, "lc"))
+        self._send_or_edit_message(chat_id, text, message_id=message_id, reply_markup=_agent_picker_keyboard(agents, "lc"))
         return text
 
-    def handle_lifecycle_pick_agent(self, chat_id: int | str, agent: str) -> str:
+    def handle_lifecycle_pick_agent(self, chat_id: int | str, agent: str, message_id: int | None = None) -> str:
         buttons = [
             [
                 {"text": "⏸ Pause", "callback_data": f"lp:{agent}"},
@@ -1729,11 +1756,10 @@ class TelegramBot:
             [{"text": "◀ Back", "callback_data": "lc"}],
         ]
         text = f"{agent} — pause, resume, or retire?"
-        if self.telegram:
-            self.telegram.send_message(chat_id, text, reply_markup={"inline_keyboard": buttons})
+        self._send_or_edit_message(chat_id, text, message_id=message_id, reply_markup={"inline_keyboard": buttons})
         return text
 
-    def handle_lifecycle_control(self, chat_id: int | str, kind: str, agent: str) -> str:
+    def handle_lifecycle_control(self, chat_id: int | str, kind: str, agent: str, message_id: int | None = None) -> str:
         if self.telegram:
             self.telegram.send_chat_action(chat_id)
         code, resp = self.mesh.control_agent(kind, agent)
@@ -1742,37 +1768,41 @@ class TelegramBot:
             text = f"✅ {agent} {verb}."
         else:
             text = f"❌ Failed to {verb[:-1]} {agent}: {resp.get('detail', 'error')}"
-        if self.telegram:
-            self.telegram.send_message(chat_id, text)
+        self._send_or_edit_message(chat_id, text, message_id=message_id, clear_markup=True)
         return text
 
-    def handle_retire_start(self, chat_id: int | str, agent: str) -> str:
+    def handle_retire_start(self, chat_id: int | str, agent: str, message_id: int | None = None) -> str:
         # ⚠ Same confirm-by-typing-the-name pattern clients/web/ui/lifecycle.js
         # uses for retire, not a yes/no tap — StopAgent removes roster
         # membership and identity state (queues and boards are kept), and a
         # single misplaced tap is too cheap a way to do that.
         cid = str(chat_id)
-        self.pending[cid] = {"flow": "retire", "agent": agent}
         text = f"Type '{agent}' exactly to confirm retiring them (queues and boards are kept; /cancel to abort)."
-        if self.telegram:
-            self.telegram.send_message(cid, text)
+        anchor_id = self._send_or_edit_message(cid, text, message_id=message_id, clear_markup=True)
+        self.pending[cid] = {"flow": "retire", "agent": agent, "message_id": anchor_id}
         return text
 
-    def handle_message_agent_start(self, chat_id: int | str) -> str:
+    def handle_message_agent_start(self, chat_id: int | str, message_id: int | None = None) -> str:
         agents = self._tmux_agents()
         if not agents:
             text = "No agents enrolled to message."
-            if self.telegram:
-                self.telegram.send_message(chat_id, text)
+            self._send_or_edit_message(chat_id, text, message_id=message_id, clear_markup=True)
             return text
         text = f"Currently messaging {self._target_for(chat_id)} — pick a different agent:"
-        if self.telegram:
-            self.telegram.send_message(chat_id, text, reply_markup=_agent_picker_keyboard(agents, "ta"))
+        self._send_or_edit_message(chat_id, text, message_id=message_id, reply_markup=_agent_picker_keyboard(agents, "ta"))
         return text
 
-    def handle_message_agent_pick(self, chat_id: int | str, agent: str) -> str:
+    def handle_message_agent_pick(self, chat_id: int | str, agent: str, message_id: int | None = None) -> str:
         cid = str(chat_id)
         self.chat_target_agent[cid] = agent
+        if message_id is not None:
+            # Acknowledge the tap on the picker itself so its buttons don't
+            # linger, stale and still-tappable, once a target is picked.
+            # editMessageText can't carry the ReplyKeyboardMarkup refresh
+            # below (edit only ever accepts an inline keyboard, never a
+            # custom reply keyboard), so that part still has to be a fresh
+            # message no matter what.
+            self._send_or_edit_message(cid, f"🎯 Selected {agent}.", message_id=message_id, clear_markup=True)
         text = f"🎯 Now messaging {agent}. Send any message to reach them."
         if self.telegram:
             # Re-send the sticky keyboard too -- its "🎯 Message: ..." button
@@ -2014,26 +2044,28 @@ class TelegramBot:
     # agent, or a new /watch of the same one, replaces whatever is already
     # running there rather than stacking watchers.
 
-    def handle_watch_start(self, chat_id: int | str) -> str:
+    def handle_watch_start(self, chat_id: int | str, message_id: int | None = None) -> str:
         agents = self._tmux_agents()
         if not agents:
             text = "No agents enrolled to watch."
-            if self.telegram:
-                self.telegram.send_message(chat_id, text)
+            self._send_or_edit_message(chat_id, text, message_id=message_id, clear_markup=True)
             return text
         text = "Watch — pick an agent's live terminal:"
-        if self.telegram:
-            self.telegram.send_message(chat_id, text, reply_markup=_agent_picker_keyboard(agents, "wp"))
+        self._send_or_edit_message(chat_id, text, message_id=message_id, reply_markup=_agent_picker_keyboard(agents, "wp"))
         return text
 
-    def handle_watch_pick(self, chat_id: int | str, agent: str) -> str:
+    def handle_watch_pick(self, chat_id: int | str, agent: str, message_id: int | None = None) -> str:
         cid = str(chat_id)
         if agent not in self._tmux_agents():
             text = f"Unknown agent: {agent}"
-            if self.telegram:
-                self.telegram.send_message(cid, text)
+            self._send_or_edit_message(cid, text, message_id=message_id, clear_markup=True)
             return text
         self._stop_pane_watch(cid)
+        text = f"👁 Watching {agent}…"
+        # Acknowledge the tap on the picker itself, in place — the live tail
+        # that follows is its own new message (PaneWatchRender), a separate,
+        # high-frequency channel this one shouldn't be merged into.
+        self._send_or_edit_message(cid, text, message_id=message_id, clear_markup=True)
         render = PaneWatchRender(cid, agent)
         stop_event = threading.Event()
         thread = threading.Thread(
@@ -2077,12 +2109,11 @@ class TelegramBot:
             self.telegram.send_message(cid, text)
         return text
 
-    def handle_hire_start(self, chat_id: int | str) -> str:
+    def handle_hire_start(self, chat_id: int | str, message_id: int | None = None) -> str:
         cid = str(chat_id)
-        self.pending[cid] = {"flow": "hire", "stage": "name"}
         text = "New agent's name? (lowercase letters, digits, hyphens; not all digits; /cancel to abort)"
-        if self.telegram:
-            self.telegram.send_message(cid, text)
+        anchor_id = self._send_or_edit_message(cid, text, message_id=message_id)
+        self.pending[cid] = {"flow": "hire", "stage": "name", "message_id": anchor_id}
         return text
 
     def handle_broadcast_start(self, chat_id: int | str) -> str:
@@ -2116,10 +2147,19 @@ class TelegramBot:
         state = self.pending.get(cid)
         if not state:
             return None
+        # addticket/hire/retire each anchor to the one inline-flow message
+        # that started them (`message_id` in their pending state, set by
+        # handle_addticket_pick_agent/handle_hire_start/handle_retire_start)
+        # and edit it through every remaining step; broadcast has no such
+        # anchor (its "bc" entry point isn't reachable via an inline button
+        # at all, see handle_callback_query) and keeps sending fresh.
+        anchor_id = state.get("message_id")
         if text.strip() == "/cancel":
             del self.pending[cid]
             reply = "Cancelled."
-            if self.telegram:
+            if anchor_id is not None:
+                self._send_or_edit_message(cid, reply, message_id=anchor_id, clear_markup=True)
+            elif self.telegram:
                 self.telegram.send_message(cid, reply)
             return reply
 
@@ -2128,8 +2168,7 @@ class TelegramBot:
                 state["title"] = text.strip()
                 state["stage"] = "description"
                 reply = "Description? (send - to skip, /cancel to abort)"
-                if self.telegram:
-                    self.telegram.send_message(cid, reply)
+                self._send_or_edit_message(cid, reply, message_id=anchor_id)
                 return reply
             if state["stage"] == "description":
                 state["description"] = "" if text.strip() == "-" else text.strip()
@@ -2140,15 +2179,13 @@ class TelegramBot:
                     {"text": "🔴 High", "callback_data": "ap:high"},
                 ]]
                 reply = "Priority?"
-                if self.telegram:
-                    self.telegram.send_message(cid, reply, reply_markup={"inline_keyboard": buttons})
+                self._send_or_edit_message(cid, reply, message_id=anchor_id, reply_markup={"inline_keyboard": buttons})
                 return reply
             # stage == "priority": this step is answered by tapping a button
             # (handle_addticket_priority), not typed text — stray text here
             # just gets pointed back at the buttons rather than silently lost.
             reply = "Tap a priority button above, or /cancel."
-            if self.telegram:
-                self.telegram.send_message(cid, reply)
+            self._send_or_edit_message(cid, reply, message_id=anchor_id)
             return reply
 
         if state["flow"] == "hire":
@@ -2156,8 +2193,7 @@ class TelegramBot:
                 name = text.strip()
                 if not _AGENT_NAME.match(name) or name in _RESERVED_AGENT_NAMES:
                     reply = "That name won't work — lowercase letters, digits and hyphens, not all digits, not a reserved word. Try again, or /cancel."
-                    if self.telegram:
-                        self.telegram.send_message(cid, reply)
+                    self._send_or_edit_message(cid, reply, message_id=anchor_id)
                     return reply  # stay in "name" stage; do not consume the pending flow
                 state["name"] = name
                 state["stage"] = "profile"
@@ -2166,16 +2202,14 @@ class TelegramBot:
                 # ahead of time (see MeshClient.hire_agent). A bad name still
                 # gets a clear error, listing the valid ones, from the api.
                 reply = f"Profile for {name}? (account/profile name, or - for the default; /cancel to abort)"
-                if self.telegram:
-                    self.telegram.send_message(cid, reply)
+                self._send_or_edit_message(cid, reply, message_id=anchor_id)
                 return reply
 
             if state["stage"] == "profile":
                 state["profile"] = None if text.strip() == "-" else text.strip()
                 state["stage"] = "provider"
                 reply = f"Provider for {state['name']}? (named local model endpoint, or - for the default; /cancel to abort)"
-                if self.telegram:
-                    self.telegram.send_message(cid, reply)
+                self._send_or_edit_message(cid, reply, message_id=anchor_id)
                 return reply
 
             # stage == "provider"
@@ -2190,16 +2224,14 @@ class TelegramBot:
                 reply = f"✅ Hire accepted for {name}" + (f" ({extras})" if extras else "") + " · window and CLI follow shortly."
             else:
                 reply = f"❌ Failed to hire {name}: {resp.get('detail', 'error')}"
-            if self.telegram:
-                self.telegram.send_message(cid, reply)
+            self._send_or_edit_message(cid, reply, message_id=anchor_id, clear_markup=True)
             return reply
 
         if state["flow"] == "retire":
             agent = state["agent"]
             if text.strip() != agent:
                 reply = f"That doesn't match '{agent}' — type it exactly to confirm, or /cancel."
-                if self.telegram:
-                    self.telegram.send_message(cid, reply)
+                self._send_or_edit_message(cid, reply, message_id=anchor_id)
                 return reply  # stay open for retry, same as the web console's disabled-until-match button
             del self.pending[cid]
             if self.telegram:
@@ -2209,8 +2241,7 @@ class TelegramBot:
                 reply = f"✅ {agent} retired · queues and boards retained for a later re-hire."
             else:
                 reply = f"❌ Failed to retire {agent}: {resp.get('detail', 'error')}"
-            if self.telegram:
-                self.telegram.send_message(cid, reply)
+            self._send_or_edit_message(cid, reply, message_id=anchor_id, clear_markup=True)
             return reply
 
         if state["flow"] == "broadcast":
@@ -2229,27 +2260,33 @@ class TelegramBot:
 
         return None
 
-    def handle_callback_query(self, chat_id: int | str, callback_id: str, data: str) -> str:
+    def handle_callback_query(
+        self, chat_id: int | str, callback_id: str, data: str, message_id: int | None = None
+    ) -> str:
+        """`message_id` — the id of the message the tapped button lives on,
+        from `callback_query.message.message_id` — is how every sub-flow
+        handler below knows to edit that screen in place instead of posting
+        a new one; see `_send_or_edit_message`."""
         if self.telegram:
             self.telegram.answer_callback_query(callback_id)
         if data in ("menu", "ov", "at", "lc", "al", "hi", "ta", "vt", "wa"):
-            return self._dispatch_menu_action(chat_id, data)
+            return self._dispatch_menu_action(chat_id, data, message_id)
         if data.startswith("wp:"):
-            return self.handle_watch_pick(chat_id, data[len("wp:"):])
+            return self.handle_watch_pick(chat_id, data[len("wp:"):], message_id)
         if data.startswith("ws:"):
             return self.handle_watch_stop(chat_id, data[len("ws:"):])
         if data.startswith("at:"):
-            return self.handle_addticket_pick_agent(chat_id, data[len("at:"):])
+            return self.handle_addticket_pick_agent(chat_id, data[len("at:"):], message_id)
         if data.startswith("lc:"):
-            return self.handle_lifecycle_pick_agent(chat_id, data[len("lc:"):])
+            return self.handle_lifecycle_pick_agent(chat_id, data[len("lc:"):], message_id)
         if data.startswith("lp:"):
-            return self.handle_lifecycle_control(chat_id, "PauseAgent", data[len("lp:"):])
+            return self.handle_lifecycle_control(chat_id, "PauseAgent", data[len("lp:"):], message_id)
         if data.startswith("lr:"):
-            return self.handle_lifecycle_control(chat_id, "ResumeAgent", data[len("lr:"):])
+            return self.handle_lifecycle_control(chat_id, "ResumeAgent", data[len("lr:"):], message_id)
         if data.startswith("lret:"):
-            return self.handle_retire_start(chat_id, data[len("lret:"):])
+            return self.handle_retire_start(chat_id, data[len("lret:"):], message_id)
         if data.startswith("ta:"):
-            return self.handle_message_agent_pick(chat_id, data[len("ta:"):])
+            return self.handle_message_agent_pick(chat_id, data[len("ta:"):], message_id)
         if data.startswith("ap:"):
             return self.handle_addticket_priority(chat_id, data[len("ap:"):])
         return ""
@@ -2529,7 +2566,8 @@ class TelegramBot:
                 # tells an unauthorized sender less than a rejection would
                 # (not even that a bot is listening on the other end).
                 return
-            self.handle_callback_query(chat_id, callback["id"], callback.get("data", ""))
+            message_id = callback["message"].get("message_id")
+            self.handle_callback_query(chat_id, callback["id"], callback.get("data", ""), message_id)
             return
 
         msg = update.get("message") or update.get("edited_message")
