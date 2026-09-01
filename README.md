@@ -86,12 +86,16 @@ it uses. Either way it also:
   their own statusline mechanisms, or none
 - seeds the registry's fixed lifecycle participants (`host` -> office,
   `api` -> api) for the given pod/tenant
-- starts the `h-mesh-switch` and `h-mesh-tmux-reconciler` daemons, and --
-  only if a Telegram bot was configured -- the REST API and Telegram bot
-  daemons too (the bot needs the API; there's no separate "enable the API"
-  question, a configured bot enables both). All duplicate-safe: a re-run
-  against an already-running install restarts nothing that's already up,
-  and a daemon disabled since a previous run gets stopped, not orphaned
+- starts the `h-mesh-switch`, `h-mesh-tmux-reconciler` and `h-mesh-watchdog`
+  daemons (always-on -- watchdog needs no credentials, and every
+  multi-agent office wants presence sampling and stall/silence alerting
+  from the first hire on), and -- only if a Telegram bot was configured --
+  the REST API, Telegram bot, and session daemons too (the bot needs the
+  API to talk to and session to back its `/watch` command; there's no
+  separate "enable the API" question, a configured bot enables all three).
+  All duplicate-safe: a re-run against an already-running install restarts
+  nothing that's already up, and a daemon disabled since a previous run
+  gets stopped, not orphaned
 - hires every agent from the wizard's roster that isn't already running
 
 ```bash

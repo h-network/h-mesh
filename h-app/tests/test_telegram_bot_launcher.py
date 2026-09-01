@@ -84,7 +84,7 @@ def test_telegram_bot_launcher_starts_and_stays_alive_against_a_real_api():
     daemon_modules = {**DAEMON_MODULES, "api": "services.api", "telegram_bot": "services.telegram_bot"}
     try:
         pids = start_daemons(python=python, run_dir=run_dir, env=env, daemon_modules=daemon_modules)
-        assert set(pids) == {"switch", "tmux_reconciler", "api", "telegram_bot"}
+        assert set(pids) == set(DAEMON_MODULES) | {"api", "telegram_bot"}
 
         # The original bug crashed within ~0.3s. Staying alive for several
         # seconds is real evidence main() didn't hit an unhandled exception,

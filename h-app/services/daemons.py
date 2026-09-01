@@ -1,15 +1,45 @@
 """Start/stop lifecycle for h-mesh's own background daemons.
 
-The switch and tmux-reconciler are always-on -- setup.sh starts and pidfiles
-them unconditionally (see its "5. Start required daemons" step). The REST
-API and Telegram bot are optional: they only start when the wizard's
-persisted config actually asks for them (see enabled_daemon_modules). This
-module is the one place that knows which daemons exist, where their
-pidfiles live, how to resolve the config (pod/tenant/venv/tmux dir/env) they
-run with, and how to bring them up or down cleanly -- shared by `h-mesh
-upgrade` (services.upgrade), `h-mesh start` (this module's own main()), and
-`h-mesh stop`, so there is one daemon-lifecycle implementation and one
-config-resolution path, not one per caller.
+The switch, tmux-reconciler and watchdog are always-on -- setup.sh starts
+and pidfiles them unconditionally (see its "5. Start required daemons"
+step). The REST API, Telegram bot, and session door are optional: they only
+start when the wizard's persisted config actually asks for them (see
+enabled_daemon_modules). This module is the one place that knows which
+daemons exist, where their pidfiles live, how to resolve the config
+(pod/tenant/venv/tmux dir/env) they run with, and how to bring them up or
+down cleanly -- shared by `h-mesh upgrade` (services.upgrade), `h-mesh
+start` (this module's own main()), and `h-mesh stop`, so there is one
+daemon-lifecycle implementation and one config-resolution path, not one per
+caller.
+
+⚠ Every console script in pyproject.toml's [project.scripts] belongs in
+exactly one of three buckets, and it's worth checking a new one against
+these before assuming it's covered:
+  - a background daemon that belongs here (DAEMON_MODULES or
+    OPTIONAL_DAEMON_MODULES) -- switch, tmux_reconciler, watchdog, api,
+    telegram_bot, session.
+  - a short-lived, per-message process the reconciler spawns on demand, not
+    a persistent daemon at all -- modules.tmux.port and
+    modules.openshell.port (see modules/office/port.py's own
+    subprocess.Popen call). Never belongs here; it isn't missing, it's
+    never meant to run unprompted.
+  - a CLI a human or another script invokes directly, not something
+    setup.sh starts in the background -- h-mesh (the dispatcher),
+    h-mesh-office, h-mesh-clone-to-all, h-mesh-upgrade, h-mesh-start.
+  - services.web_console (the browser console / Mini App gateway) is a
+    real, persistent daemon-shaped process, but it isn't in
+    pyproject.toml's scripts at all and has its own separate, documented
+    deployment path (a Compose service, see clients/web/README.md) rather
+    than setup.sh's bare-host bootstrap -- deliberately not added here; a
+    future ticket that actually wires that deployment path would decide
+    this, not a silent inclusion alongside the tmux-based daemons above.
+
+This inventory is exactly how the watchdog and session gaps were found
+(2026-09 -- neither was in DAEMON_MODULES/OPTIONAL_DAEMON_MODULES, so
+setup.sh/h-mesh start/h-mesh upgrade never started them, and
+h-mesh-watchdog/h-mesh-session existed as console scripts nothing in the
+documented install path ever invoked) -- the same audit is the fastest way
+to catch a third instance before a user does.
 """
 
 import argparse
@@ -28,17 +58,32 @@ from services.tenant_config import read_tenant_env
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Add here if setup.sh's own daemon-start step ever grows another one.
+# ⚠ watchdog needs no credentials -- just POD/TENANT/REDIS_URL, same as
+# switch/tmux_reconciler -- and every multi-agent office wants presence
+# sampling and stall/silence alerting from the first hire on, not only once
+# someone happens to configure Telegram. That's what makes it always-on
+# rather than folded into OPTIONAL_DAEMON_MODULES below.
 DAEMON_MODULES = {
     "switch": "core.service",
     "tmux_reconciler": "services.tmux_reconciler",
+    "watchdog": "services.watchdog",
 }
 
 # Started only when the wizard's collected config asks for them (see
 # enabled_daemon_modules below) -- unlike DAEMON_MODULES, not every install
 # wants these running.
+# ⚠ session (the WebSocket terminal-streaming door behind the Telegram
+# bot's "watch" command, and the web console's terminal view) is NOT
+# always-on like watchdog: modules.session.app.SessionSettings.from_env()
+# hard-raises RuntimeError without API_TOKEN, and today API_TOKEN is only
+# ever set when Telegram is configured (see the API_TOKEN auto-generation
+# in setup.sh) -- an always-on session would just crash-loop on every
+# install that never configured Telegram. Gated on the same condition as
+# api/telegram_bot for that reason, not folded into DAEMON_MODULES.
 OPTIONAL_DAEMON_MODULES = {
     "api": "services.api",
     "telegram_bot": "services.telegram_bot",
+    "session": "services.session",
 }
 
 # The full universe of daemons this install could ever have running, past or
@@ -60,6 +105,11 @@ def enabled_daemon_modules(env: dict) -> dict[str, str]:
     if env.get("TELEGRAM_BOT_TOKEN") and env.get("TELEGRAM_CHAT_ID"):
         modules["api"] = OPTIONAL_DAEMON_MODULES["api"]
         modules["telegram_bot"] = OPTIONAL_DAEMON_MODULES["telegram_bot"]
+        # session backs the bot's "watch" command -- needs API_TOKEN, which
+        # only exists once Telegram is configured (see the module docstring
+        # above), so it rides the same condition rather than getting one of
+        # its own.
+        modules["session"] = OPTIONAL_DAEMON_MODULES["session"]
     return modules
 
 STOP_TIMEOUT_SECONDS = 10
@@ -328,7 +378,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     """`h-mesh start` -- start h-mesh's own daemons if they aren't already running."""
     parser = argparse.ArgumentParser(
         prog="h-mesh start",
-        description="Start h-mesh's daemons (switch, tmux-reconciler) if not already running.",
+        description="Start h-mesh's daemons (switch, tmux-reconciler, watchdog) if not already running.",
     )
     add_common_args(parser)
     args = parser.parse_args(argv)

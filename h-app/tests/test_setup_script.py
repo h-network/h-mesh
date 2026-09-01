@@ -392,6 +392,16 @@ def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
                     os.kill(pid, signal.SIGTERM)
                 except OSError:
                     pass
+        # ⚠ Also sweep every pidfile still under run_dir, not just the
+        # explicitly-tracked switch/reconciler pids above -- setup.sh
+        # starts every daemon in DAEMON_MODULES (now including watchdog),
+        # and a fixed pid list here silently orphaned it on every run once
+        # that set grew. Measured: it did.
+        for pidfile in Path(run_dir).glob("*.pid"):
+            try:
+                os.kill(int(pidfile.read_text().strip()), signal.SIGTERM)
+            except (ValueError, OSError):
+                pass
 
         # Kill test tmux server
         try:
