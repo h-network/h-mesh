@@ -125,13 +125,16 @@ def wizard_env():
         run_tmux("kill-server", socket=socket_path)
     except Exception:
         pass
-    for name in ("switch", "tmux_reconciler"):
-        pidfile = Path(run_dir) / f"{name}.pid"
-        if pidfile.exists():
-            try:
-                os.kill(int(pidfile.read_text().strip()), signal.SIGKILL)
-            except (ValueError, OSError):
-                pass
+    # ⚠ Every pidfile actually under run_dir, not a hardcoded name list --
+    # setup.sh starts every daemon in DAEMON_MODULES (now including
+    # watchdog), and a fixed ("switch", "tmux_reconciler") list here
+    # silently orphaned it on every wizard test run once that set grew.
+    # Measured: it did.
+    for pidfile in Path(run_dir).glob("*.pid"):
+        try:
+            os.kill(int(pidfile.read_text().strip()), signal.SIGKILL)
+        except (ValueError, OSError):
+            pass
     try:
         keys = r.keys(f"pod:{pod}:tenant:{tenant}:*") or []
         if keys:
