@@ -39,34 +39,73 @@ class TmuxCommandError(RuntimeError):
         super().__init__(f"{command} failed ({code}): {stderr or 'no error output'}")
 
 
+def resolve_tmux_socket(socket: str | None = None) -> str | None:
+    """Resolve the target tmux socket path from explicit argument or environment.
+
+    Priority:
+    1. Explicit socket argument
+    2. TMUX_SOCKET environment variable
+    3. TMUX_TMPDIR environment variable ($TMUX_TMPDIR/default)
+    4. None (unisolated / ambient)
+    """
+    if socket:
+        return socket
+    if os.environ.get("TMUX_SOCKET"):
+        return os.environ["TMUX_SOCKET"]
+    if os.environ.get("TMUX_TMPDIR"):
+        return os.path.join(os.environ["TMUX_TMPDIR"], "default")
+    return None
+
+
 def require_isolated_tmux(socket: str | None = None) -> None:
     """Refuse to touch whatever tmux server happens to be ambient.
 
-    With no explicit socket and no TMUX_TMPDIR, tmux uses /tmp/tmux-$UID/default
+    With no explicit socket, no TMUX_SOCKET, and no TMUX_TMPDIR, tmux would
+    drive /tmp/tmux-$UID/default (or $TMUX when running inside an existing session)
     — which, for anything developed inside an office, is the office's own server.
     A reconcile then deletes every window not in the roster it was given, and a
     control-mode client can drive every pane on it. That has destroyed this
-    office twice, both times with a warning already written in the docs.
+    office repeatedly, both times with a warning already written in the docs.
 
     The container always sets TMUX_TMPDIR, so this costs nothing in production
     and stops the accident everywhere else.
     """
-    if socket or os.environ.get("TMUX_SOCKET") or os.environ.get("TMUX_TMPDIR"):
-        return
-    inside = " You are inside a tmux session right now." if os.environ.get("TMUX") else ""
-    raise AmbientTmuxError(
-        "refusing to use the ambient tmux server: neither TMUX_TMPDIR nor an "
-        "explicit socket is set, so this would drive /tmp/tmux-$UID/default."
-        + inside
-        + " Set TMUX_TMPDIR=$(mktemp -d) for a scratch server, or pass socket=."
-    )
+    target_socket = resolve_tmux_socket(socket)
+    if not target_socket:
+        inside = " You are inside a tmux session right now." if os.environ.get("TMUX") else ""
+        raise AmbientTmuxError(
+            "refusing to use the ambient tmux server: neither TMUX_TMPDIR nor an "
+            "explicit socket is set, so this would drive /tmp/tmux-$UID/default."
+            + inside
+            + " Set TMUX_TMPDIR=$(mktemp -d) for a scratch server, or pass socket=."
+        )
+
+    tmux_env = os.environ.get("TMUX")
+    if tmux_env:
+        ambient_socket = tmux_env.split(",")[0]
+        same_server = False
+        try:
+            if os.path.realpath(target_socket) == os.path.realpath(ambient_socket):
+                same_server = True
+        except Exception:
+            pass
+        if not same_server and target_socket == ambient_socket:
+            same_server = True
+
+        if same_server:
+            raise AmbientTmuxError(
+                f"refusing to use the ambient tmux server: target socket '{target_socket}' "
+                f"matches the ambient session socket ($TMUX). "
+                f"Set TMUX_TMPDIR or TMUX_SOCKET to an isolated location."
+            )
 
 
 def run_tmux(*args: str, socket: str | None = None, input_data: str | None = None) -> tuple[int, str, str]:
-    require_isolated_tmux(socket)
+    target_socket = resolve_tmux_socket(socket)
+    require_isolated_tmux(target_socket)
     cmd = ["tmux"]
-    if socket:
-        cmd.extend(["-S", socket])
+    if target_socket:
+        cmd.extend(["-S", target_socket])
     cmd.extend(args)
     proc = subprocess.run(cmd, input=input_data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()

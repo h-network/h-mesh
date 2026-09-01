@@ -32,7 +32,7 @@ class TmuxReconciler:
         self.redis_url = redis_url
         self.poll_seconds = poll_seconds
         self.session_name = session_name or tenant
-        self.socket = socket or os.environ.get("TMUX_SOCKET")
+        self.socket = tmux_ops.resolve_tmux_socket(socket)
         self.log_file = log_file
         self.allow_empty_roster = (
             allow_empty_roster

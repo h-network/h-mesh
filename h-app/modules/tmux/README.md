@@ -13,12 +13,8 @@ same as every module owning its own daemon logic.
 | `port.py` | `deliver_tmux` entrypoint and terminal delivery handlers (`message_opener`, `command_opener`, `attachment_opener`), delivery-verification marking |
 | `reconciler.py` | `TmuxReconciler` -- the daemon logic: compares desired tmux membership against real windows, creates/removes them |
 
-⚠ `require_isolated_tmux()` in `ops.py` refuses to touch the ambient tmux
-server unless `TMUX_SOCKET`/`TMUX_TMPDIR` is explicitly set -- this exists
-because driving the wrong server has destroyed a live office before. Never
-run anything in this module against an unset/ambient tmux server, including
-for manual testing.
-
-This module has not been run against a real tmux server yet -- only
-imported and syntax-checked. Real verification (an isolated `TMUX_TMPDIR`,
-an actual reconcile pass, an actual delivery) is still open work.
+⚠ `require_isolated_tmux()` and `run_tmux()` in `ops.py` enforce strict isolation:
+- `resolve_tmux_socket()` resolves the target socket in priority order (explicit argument, `TMUX_SOCKET`, or `$TMUX_TMPDIR/default`).
+- `run_tmux()` always passes `-S <socket>` explicitly so that ambient `$TMUX` in the environment cannot override `TMUX_TMPDIR`.
+- `require_isolated_tmux()` refuses execution if no isolated socket/tmpdir is set, or if the resolved target matches the ambient `$TMUX` socket.
+Never run anything in this module against an unset or ambient tmux server.

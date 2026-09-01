@@ -9,7 +9,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any
 
-from modules.tmux import require_isolated_tmux
+from modules.tmux import require_isolated_tmux, resolve_tmux_socket
 
 _CONTROL_ESCAPE = re.compile(rb"\\(\\|[0-7]{3})")
 
@@ -74,10 +74,11 @@ class ControlModeClient:
         self.broken_reason = None
         self._ready = asyncio.Event()
         self._pending.clear()
-        require_isolated_tmux(self.socket)
+        target_socket = resolve_tmux_socket(self.socket)
+        require_isolated_tmux(target_socket)
         command = ["tmux"]
-        if self.socket:
-            command.extend(["-S", self.socket])
+        if target_socket:
+            command.extend(["-S", target_socket])
         command.extend(
             ["-C", "attach-session", "-f", "ignore-size", "-t", self.session_name]
         )

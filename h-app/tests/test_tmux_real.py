@@ -2,6 +2,7 @@ import base64
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -769,6 +770,47 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             self.assertNotIn("w1", windows_after)
             self.assertNotIn("w2", windows_after)
             self.assertIn("__init__", windows_after)
+
+    def test_require_isolated_tmux_with_both_tmux_tmpdir_and_ambient_tmux_env(self):
+        # Setup an ambient tmux server to simulate running inside a tmux session
+        ambient_socket = os.path.join(self.tmpdir, "ambient_server.sock")
+        ambient_sess = "ambient-office-sess"
+        run_tmux("new-session", "-d", "-s", ambient_sess, "-n", "pane1", "bash", socket=ambient_socket)
+
+        # Set TMUX pointing to ambient, but TMUX_TMPDIR pointing to an isolated directory
+        isolated_tmpdir = os.path.join(self.tmpdir, "isolated_tmpdir")
+        os.makedirs(isolated_tmpdir, exist_ok=True)
+        isolated_socket = os.path.join(isolated_tmpdir, "default")
+
+        with unittest.mock.patch.dict(os.environ, {
+            "TMUX": f"{ambient_socket},9999,0",
+            "TMUX_PANE": "%0",
+            "TMUX_TMPDIR": isolated_tmpdir,
+        }, clear=False):
+            # Clear TMUX_SOCKET if present to force TMUX_TMPDIR resolution
+            os.environ.pop("TMUX_SOCKET", None)
+
+            # run_tmux without explicit socket argument should target isolated_tmpdir/default
+            ret, _, err = run_tmux("new-session", "-d", "-s", "tenant-session", "-n", "tenant-win", "bash")
+            self.assertEqual(ret, 0, f"run_tmux failed: {err}")
+
+            # Verify tenant-session landed on isolated_socket and NOT ambient_socket
+            res_ambient = subprocess.run(["tmux", "-S", ambient_socket, "list-windows", "-t", ambient_sess, "-F", "#{window_name}"], capture_output=True, text=True)
+            self.assertEqual(set(res_ambient.stdout.splitlines()), {"pane1"})
+
+            isolated_windows = list_windows("tenant-session", socket=isolated_socket)
+            self.assertEqual(isolated_windows, {"tenant-win"})
+
+            # Also verify that calling run_tmux directly with socket=ambient_socket while TMUX=ambient_socket raises AmbientTmuxError
+            with self.assertRaises(AmbientTmuxError):
+                run_tmux("list-windows", "-t", ambient_sess, socket=ambient_socket)
+
+            # Clean up servers
+            try:
+                run_tmux("kill-server", socket=isolated_socket)
+                run_tmux("kill-server", socket=ambient_socket)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
