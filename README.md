@@ -60,10 +60,11 @@ cd h-mesh
 is what `install.sh` above hands off to). Run at a real terminal with no
 flags, it's an interactive wizard: pod/tenant name, how many agents and
 their names (`architect` is agent #1 by default), which CLI each runs
-(claude/codex/agy), account setup if more than one credential is needed, and
+(claude/codex/agy), account setup if more than one credential is needed,
 optional local model provider config (endpoint URL and model id, verified
-with a real probe against the endpoint before it's accepted). Re-running it
-never silently wipes a prior answer -- blank at a prompt keeps whatever's
+with a real probe against the endpoint before it's accepted), and optional
+Telegram bot config (bot token, chat ID, spoken voice replies). Re-running
+it never silently wipes a prior answer -- blank at a prompt keeps whatever's
 already there.
 
 Piped, scripted, or passed `--non-interactive`, it never prompts -- flags,
@@ -85,9 +86,12 @@ it uses. Either way it also:
   their own statusline mechanisms, or none
 - seeds the registry's fixed lifecycle participants (`host` -> office,
   `api` -> api) for the given pod/tenant
-- starts the `h-mesh-switch` and `h-mesh-tmux-reconciler` daemons
-  (duplicate-safe: a re-run against an already-running install restarts
-  nothing that's already up)
+- starts the `h-mesh-switch` and `h-mesh-tmux-reconciler` daemons, and --
+  only if a Telegram bot was configured -- the REST API and Telegram bot
+  daemons too (the bot needs the API; there's no separate "enable the API"
+  question, a configured bot enables both). All duplicate-safe: a re-run
+  against an already-running install restarts nothing that's already up,
+  and a daemon disabled since a previous run gets stopped, not orphaned
 - hires every agent from the wizard's roster that isn't already running
 
 ```bash
