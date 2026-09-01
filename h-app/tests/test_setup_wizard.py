@@ -401,3 +401,89 @@ def test_wizard_requires_both_bot_token_and_chat_id(wizard_env, monkeypatch):
     assert "TELEGRAM_BOT_TOKEN" not in persisted
     assert "TELEGRAM_CHAT_ID" not in persisted
     assert "API_TOKEN" not in persisted
+
+
+def test_wizard_round_trips_a_custom_provider_name_through_a_re_run(wizard_env, monkeypatch):
+    # Regression for a real bug: the wizard let you name a provider away
+    # from the default "local" and persisted it correctly under that name
+    # (PROVIDER_OFFICE_GPU_*), but its own re-read of its own prompt
+    # defaults was hardcoded to "local" regardless -- a re-run (e.g. to add
+    # another agent) showed the provider section as blank/unconfigured even
+    # though PROVIDER_OFFICE_GPU_URL was sitting right there in the tenant
+    # config, and accepting "y" again without noticing would have created a
+    # second, redundant "local"-named entry alongside the real one.
+    #
+    # 127.0.0.1:1 (nothing listens there) -- refused instantly, not the real
+    # network -- and the model-id prompt is left blank so the (up to 90s)
+    # messages probe never runs; this test is about name round-tripping,
+    # not about actually probing a live provider.
+    ctx = wizard_env
+    run1_answers = [
+        "",                   # pod
+        "",                   # tenant
+        "",                   # how many agents -> 1 (architect)
+        "",                   # use more than one account? -> n
+        "",                   # OAuth token for 'default'
+        "",                   # default CLI
+        "",                   # any agents differing
+        "y",                  # local model provider? -> y
+        "",                   # endpoint type [vllm] -> vllm
+        "http://127.0.0.1:1",  # endpoint base URL
+        "",                   # model id -> blank, skips the probe
+        "office-gpu",         # endpoint name
+        "architect",          # which agents use it
+        "",                   # Telegram bot? -> n
+    ]
+    output1, code1 = _run_wizard(
+        cwd=str(REPO_ROOT),
+        args=["--venv", sys.prefix, "--skip-install", "--skip-deps", "--no-daemons"],
+        env=ctx["env"],
+        answers=run1_answers,
+        timeout=30,
+    )
+    assert code1 == 0, f"setup.sh exited {code1}:\n{output1}"
+
+    monkeypatch.setenv("H_MESH_STATE_DIR", ctx["env"]["H_MESH_STATE_DIR"])
+    persisted1 = read_tenant_env(ctx["tenant"])
+    assert persisted1.get("PROVIDER_NAME") == "office-gpu"
+    assert persisted1.get("PROVIDER_OFFICE_GPU_URL") == "http://127.0.0.1:1"
+    assert persisted1.get("AGENT_PROVIDERS") == "architect=office-gpu"
+    assert "PROVIDER_LOCAL_URL" not in persisted1, (
+        "must persist under the chosen name, not also/instead under the hardcoded default"
+    )
+
+    # Re-run: accept every default (including the provider prompt's own
+    # default) -- this is exactly "add another agent later" from the bug
+    # report. Before the fix, "Endpoint name [local]" and a blank URL
+    # default would have shown here instead of the real, already-configured
+    # values.
+    run2_answers = [
+        "",  # pod
+        "",  # tenant
+        "2",  # how many agents -> add a second
+        "",  # agent #1 name -> architect
+        "",  # agent #2 name -> sme-2
+        "",  # use more than one account? -> n
+        "",  # OAuth token for 'default'
+        "",  # default CLI
+        "",  # any agents differing
+        "n",  # local model provider? -> n this time (already configured, nothing to add)
+        "",  # Telegram bot? -> n
+    ]
+    output2, code2 = _run_wizard(
+        cwd=str(REPO_ROOT),
+        args=["--venv", sys.prefix, "--skip-install", "--skip-deps", "--no-daemons"],
+        env=ctx["env"],
+        answers=run2_answers,
+        timeout=30,
+    )
+    assert code2 == 0, f"setup.sh exited {code2}:\n{output2}"
+
+    persisted2 = read_tenant_env(ctx["tenant"])
+    assert persisted2.get("PROVIDER_NAME") == "office-gpu"
+    assert persisted2.get("PROVIDER_OFFICE_GPU_URL") == "http://127.0.0.1:1"
+    assert persisted2.get("AGENT_PROVIDERS") == "architect=office-gpu"
+    assert "PROVIDER_LOCAL_URL" not in persisted2, (
+        "declining the provider prompt on a re-run must not create a redundant "
+        "'local'-named entry alongside the real one"
+    )
