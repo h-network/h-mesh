@@ -33,6 +33,10 @@ class TmuxReconciler:
         self.session_name = session_name or tenant
         self.socket = socket or os.environ.get("TMUX_SOCKET")
         self.log_file = log_file
+        self._spawned_agents: dict[str, float] = {}
+        self._known_windows: Set[str] = set()
+        self._failure_counts: dict[str, int] = {}
+        self._next_retry: dict[str, float] = {}
 
     def get_agent_cli(self, r: redis.Redis, agent: str) -> str | None:
         launch_key = prefix(self.pod, self.tenant, agent=agent, resource="launch")
@@ -176,6 +180,7 @@ class TmuxReconciler:
                 tmux_ops.run_tmux("set-window-option", "-t", f"{self.session_name}:{initial_window}", "allow-rename", "off", socket=self.socket)
                 if initial_window != "__init__":
                     self.log_window_created(r, initial_window)
+                    self._spawned_agents[initial_window] = time.monotonic()
 
         # Set session & server options
         tmux_ops.run_tmux("set-option", "-g", "exit-empty", "off", socket=self.socket)
@@ -185,7 +190,10 @@ class TmuxReconciler:
         tmux_ops.run_tmux("set-option", "-g", "allow-rename", "off", socket=self.socket)
 
     def get_windows(self) -> Set[str]:
-        return tmux_ops.list_windows(self.session_name, socket=self.socket)
+        try:
+            return tmux_ops.list_windows(self.session_name, socket=self.socket)
+        except Exception:
+            return set()
 
     def create_window(
         self,
@@ -223,6 +231,7 @@ class TmuxReconciler:
         )
         if ret == 0:
             self.log_window_created(r, agent_name)
+            self._spawned_agents[agent_name] = time.monotonic()
             return True
         else:
             log_record("tmux_reconciler", "error", destination=agent_name, reason=f"new-window failed: {stderr}")
@@ -231,10 +240,53 @@ class TmuxReconciler:
     def kill_window(self, window_name: str) -> bool:
         ret, stdout, stderr = tmux_ops.kill_window(self.session_name, window_name, socket=self.socket)
         if ret == 0:
+            self._spawned_agents.pop(window_name, None)
+            self._known_windows.discard(window_name)
             return True
         else:
             log_record("tmux_reconciler", "error", destination=window_name, reason=f"kill-window failed: {stderr}")
             return False
+
+    def _check_dead_windows(self, existing_windows: Set[str], roster_agents: Set[str], now: float) -> None:
+        # Check recently spawned agents
+        for agent in list(self._spawned_agents.keys()):
+            spawn_time = self._spawned_agents[agent]
+            if agent in existing_windows:
+                if now - spawn_time >= self.poll_seconds:
+                    self._failure_counts.pop(agent, None)
+                    self._next_retry.pop(agent, None)
+                    self._spawned_agents.pop(agent, None)
+            else:
+                self._spawned_agents.pop(agent, None)
+                if agent in roster_agents:
+                    failures = self._failure_counts.get(agent, 0) + 1
+                    self._failure_counts[agent] = failures
+                    backoff = min(60.0, self.poll_seconds * (2 ** (failures - 1)))
+                    self._next_retry[agent] = now + backoff
+                    log_record(
+                        "tmux_reconciler",
+                        "window_died",
+                        destination=agent,
+                        reason=f"window died immediately or exited; retry in {backoff:.0f}s (failure #{failures})",
+                        count=failures,
+                        waited=backoff,
+                    )
+
+        # Check agents that were known to be running previously, but are no longer in existing_windows
+        for agent in list(self._known_windows):
+            if agent not in existing_windows and agent in roster_agents and agent not in self._spawned_agents:
+                failures = self._failure_counts.get(agent, 0) + 1
+                self._failure_counts[agent] = failures
+                backoff = min(60.0, self.poll_seconds * (2 ** (failures - 1)))
+                self._next_retry[agent] = now + backoff
+                log_record(
+                    "tmux_reconciler",
+                    "window_died",
+                    destination=agent,
+                    reason=f"window died or exited unexpectedly; retry in {backoff:.0f}s (failure #{failures})",
+                    count=failures,
+                    waited=backoff,
+                )
 
     def reconcile_once(self, r: redis.Redis) -> None:
         all_members = members(r, pod=self.pod, tenant=self.tenant)
@@ -242,8 +294,20 @@ class TmuxReconciler:
             a for a in all_members
             if port_type(r, pod=self.pod, tenant=self.tenant, agent=a) == "tmux"
         }
+        now = time.monotonic()
+
+        # Clean state for retired agents
+        for agent in list(self._failure_counts.keys()):
+            if agent not in roster_agents:
+                self._failure_counts.pop(agent, None)
+                self._next_retry.pop(agent, None)
+                self._spawned_agents.pop(agent, None)
+
         lead = self.get_lead(r)
-        first_agent = sorted(list(roster_agents))[0] if roster_agents else "__init__"
+
+        # Prefer an agent not currently in backoff as the initial session window
+        ready_roster = [a for a in sorted(list(roster_agents)) if now >= self._next_retry.get(a, 0)]
+        first_agent = ready_roster[0] if ready_roster else "__init__"
         first_cli = self.get_agent_cli(r, first_agent) if first_agent != "__init__" else None
         first_profile = self.get_agent_profile(r, first_agent) if first_agent != "__init__" else None
         first_provider = self.get_agent_provider(r, first_agent) if first_agent != "__init__" else None
@@ -269,10 +333,13 @@ class TmuxReconciler:
         )
 
         existing_windows = self.get_windows()
+        self._check_dead_windows(existing_windows, roster_agents, now)
 
-        # Create missing agent windows first
+        # Create missing agent windows first (respecting backoff)
         for agent in sorted(list(roster_agents)):
             if agent not in existing_windows:
+                if now < self._next_retry.get(agent, 0):
+                    continue
                 cli = self.get_agent_cli(r, agent)
                 profile = self.get_agent_profile(r, agent)
                 provider = self.get_agent_provider(r, agent)
@@ -290,8 +357,9 @@ class TmuxReconciler:
         for agent in roster_agents & existing_windows:
             self.consume_creation_correlation(r, agent)
 
-        # Re-fetch after creations to decide cleanup
+        # Re-fetch after creations to decide cleanup and dead window detection
         existing_windows = self.get_windows()
+        self._check_dead_windows(existing_windows, roster_agents, now)
 
         # Remove windows that are no longer in roster.
         #
@@ -319,6 +387,8 @@ class TmuxReconciler:
             if len(existing_windows) > 1:
                 if self.kill_window(window):
                     existing_windows.remove(window)
+
+        self._known_windows = set(existing_windows)
 
     def run_forever(self) -> None:
         r = redis.Redis.from_url(self.redis_url)
