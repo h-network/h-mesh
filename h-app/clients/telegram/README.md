@@ -41,6 +41,39 @@ A Telegram bot client that talks to an **h-mesh** tenant over HTTP, allowing a u
 | `PANE_WATCH_MAX_DURATION_SECONDS` | `600` | `/watch`: auto-stop a forgotten watch after this many seconds |
 | `MINI_APP_URL` | unset | Public HTTPS URL for `clients/web/mini.html` — adds a 📊 Dashboard `web_app` button to the sticky menu (§2a) when set, omitted entirely otherwise. See `clients/web/README.md`'s Telegram Mini App section — that server is not started here and needs its own `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` to accept the button's login |
 | `RUN_ALLOWED_COMMANDS` | unset (unrestricted) | `/run` (§2h): comma-separated exact-match allowlist of native CLI slash commands, only enforced when set — global, not per-CLI/per-agent, see §2h |
+| `H_MESH_LOG_LEVEL` | `INFO` | Logging threshold for this client — see "Log Verbosity" below |
+
+### Log Verbosity
+
+`H_MESH_LOG_LEVEL` sets the threshold `logging.basicConfig` is called with, at
+import, once. Level **names** only — `DEBUG`, `INFO`, `WARNING`, `ERROR`,
+`CRITICAL` (`WARN`/`FATAL` accepted as the stdlib aliases they are), case- and
+whitespace-insensitive. Numbers are not names: `H_MESH_LOG_LEVEL=10` is an
+unrecognised value, not DEBUG.
+
+Anything unrecognised falls back to `INFO` and says so with a `WARNING` on the
+way past, rather than crashing the daemon over a typo in a deploy's env. That
+warning matters: a silently-demoted `DEGUB` would leave you believing you are
+at DEBUG while every debug line is still dropped.
+
+```bash
+# One noisy run in the foreground
+H_MESH_LOG_LEVEL=DEBUG python3 clients/telegram/bot.py --api-token "$H_MESH_API_TOKEN"
+```
+
+For the daemon started by `h-mesh start`, set it in the tenant env file
+(`~/.h-mesh/<tenant>/env`, `H_MESH_LOG_LEVEL=DEBUG` on its own line) or export
+it in the shell you start from — the daemon environment is the tenant file with
+the live environment layered on top, so either reaches the bot, and the live
+one wins.
+
+⚠ This is the verbosity knob and nothing else. A failure that is genuinely a
+failure keeps its own severity, even when it is handled with a fallback — a
+failed `editMessageText` (falls back to a fresh send) and a failed
+`setMessageReaction` (falls back to the text confirmation, §2a) are both
+`WARNING`, because both are a real Telegram call failing. Turning a level down
+to make a log quieter is how the button bug stayed invisible; the fix was this
+variable, not a demotion.
 
 ### Running in Dry-Run Mode (Without Telegram Token)
 

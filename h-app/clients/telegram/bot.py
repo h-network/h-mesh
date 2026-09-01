@@ -25,8 +25,45 @@ import urllib.request
 import uuid
 from websockets.sync.client import connect as ws_connect
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+LOG_LEVEL_ENV_VAR = "H_MESH_LOG_LEVEL"
+# The five standard names, plus the two stdlib aliases, so a deploy that writes
+# the obvious WARN is not silently demoted to INFO for a spelling.
+LOG_LEVEL_NAMES = ("CRITICAL", "FATAL", "ERROR", "WARNING", "WARN", "INFO", "DEBUG")
+
 logger = logging.getLogger("mesh_telegram")
+
+
+def _resolve_log_level(raw: str | None) -> int:
+    """The threshold `H_MESH_LOG_LEVEL` asks for, INFO when it says nothing usable.
+
+    Level NAMES only, case- and whitespace-insensitive; a numeric string is not
+    a name and falls back like any other unrecognised value.
+
+    ⚠ Never raises. This decides verbosity at import, before the bot can report
+    anything at all, so a typo in a fresh VM's env must cost log detail and not
+    the whole daemon.
+    """
+    name = (raw or "").strip().upper()
+    return getattr(logging, name) if name in LOG_LEVEL_NAMES else logging.INFO
+
+
+def _configure_logging(raw: str | None) -> int:
+    """`basicConfig` at the requested threshold, returning what was applied."""
+    level = _resolve_log_level(raw)
+    logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    if (raw or "").strip() and (raw or "").strip().upper() not in LOG_LEVEL_NAMES:
+        # Loud on purpose, and emitted at the fallback level so it survives it:
+        # a mistyped DEGUB that quietly resolved to INFO would rebuild the exact
+        # blind spot this knob exists to remove — someone believing they are
+        # running at DEBUG while every debug line is still dropped on the floor.
+        logger.warning(
+            f"{LOG_LEVEL_ENV_VAR}={raw!r} is not a level name "
+            f"({', '.join(LOG_LEVEL_NAMES)}); logging at INFO instead"
+        )
+    return level
+
+
+_configure_logging(os.environ.get(LOG_LEVEL_ENV_VAR))
 
 
 class MeshClient:
@@ -2734,9 +2771,15 @@ class TelegramBot:
             resp = self.telegram.set_message_reaction(cid, message_id, "👀")
             reacted = isinstance(resp, dict) and resp.get("ok", False)
             if not reacted:
-                logger.debug(
+                # WARNING, matching `_send_or_edit_message`'s failed
+                # editMessageText: both are a real Telegram call failing and
+                # both recover (here, by keeping the text confirmation below).
+                # Handled is not invisible — a chat that never accepts a
+                # reaction should be readable in an ordinary log.
+                logger.warning(
                     f"setMessageReaction failed (chat={cid}, msg={message_id}): "
-                    f"{resp.get('description') if isinstance(resp, dict) else resp}"
+                    f"{resp.get('description') if isinstance(resp, dict) else resp}; "
+                    "confirming by text instead"
                 )
 
         reply_text = f"✅ Ran on {agent}." if raw else f"✅ Sent to {agent}."
