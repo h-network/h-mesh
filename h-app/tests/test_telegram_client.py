@@ -481,6 +481,53 @@ def test_handle_user_prompt_when_refused_by_policy():
         assert telegram.reactions_set == []
 
 
+def test_handle_user_prompt_skips_the_redundant_text_confirmation_once_reacted():
+    """The reaction is the acknowledgement once it actually lands -- a
+    second, separate "✅ Sent to X" text underneath it would just be a
+    duplicate of the same information."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        reply = bot_instance.handle_user_prompt(12345, "hello architect", message_id=7)
+        assert reply == "✅ Sent to architect."
+        assert telegram.reactions_set == [{"chat_id": "12345", "message_id": 7, "emoji": "👀"}]
+        assert telegram.sent_messages == []
+
+
+def test_handle_user_prompt_confirms_by_text_when_there_is_no_message_id():
+    """The CLI's own --prompt one-shot (main()'s `bot.handle_user_prompt(chat_id,
+    args.prompt)`) has no inbound Telegram message to react to at all --
+    message_id is always None there, so it must keep getting a text reply,
+    the only feedback that path has ever had."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        reply = bot_instance.handle_user_prompt(12345, "hello architect")
+        assert reply == "✅ Sent to architect."
+        assert telegram.reactions_set == []
+        assert telegram.sent_messages == [{
+            "chat_id": "12345", "text": "✅ Sent to architect.", "message_id": 1, "reply_markup": None,
+        }]
+
+
+def test_handle_user_prompt_falls_back_to_text_when_the_reaction_itself_fails():
+    """A chat can have reactions disabled entirely -- Telegram reports that
+    as an ordinary failed API call, not a silent no-op, and the reaction
+    would otherwise have been the *only* feedback for a successful send."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+
+        class ReactionsDisabledTelegramClient(DummyTelegramClient):
+            def set_message_reaction(self, chat_id, message_id, emoji):
+                super().set_message_reaction(chat_id, message_id, emoji)
+                return {"ok": False, "description": "Bad Request: REACTION_INVALID"}
+
+        bot_instance.telegram = ReactionsDisabledTelegramClient()
+        reply = bot_instance.handle_user_prompt(12345, "hello architect", message_id=7)
+        assert reply == "✅ Sent to architect."
+        assert bot_instance.telegram.sent_messages == [{
+            "chat_id": "12345", "text": "✅ Sent to architect.", "message_id": 1, "reply_markup": None,
+        }]
+
+
 # ── inline menu ──────────────────────────────────────────────────────────────
 
 def _make_bot(mesh=None, telegram=None, tmpdir=None, allowed_chat_id=None, **kwargs):

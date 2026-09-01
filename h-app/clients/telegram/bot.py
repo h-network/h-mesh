@@ -2661,6 +2661,20 @@ class TelegramBot:
         a turn whose real reply (via ReplyPusher, separately) can arrive
         much later than any typing indicator would ever suggest.
 
+        ⚠ The "✅ Sent to X"/"✅ Ran on X" text confirmation only disappears
+        when the reaction actually landed — confirmed by checking
+        `setMessageReaction`'s own response, not assumed from having tried.
+        Two real ways it might not: `message_id` is None (every caller not
+        tied to a live Telegram message — the CLI's own `--prompt` one-shot
+        being the one that matters, since it has no inbound message to react
+        to at all), or the call itself fails (a chat can have reactions
+        disabled entirely; Telegram reports that as an ordinary API error,
+        not a silent no-op). Either way this falls back to the text, the
+        same "don't fail closed" lesson `_send_or_edit_message` learned.
+        Failure/blocked replies below are untouched regardless — a reaction
+        only ever means "dispatched", never "failed", so there is nothing
+        for it to stand in for on those paths.
+
         ⚠ No wait, no reply capture here — that used to be a `while not
         completed` loop polling for target_agent's reply, unbounded, run
         inline in the polling loop. It matched nothing about how delivery
@@ -2715,11 +2729,18 @@ class TelegramBot:
                 self.telegram.send_message(cid, reply_text)
             return reply_text
 
+        reacted = False
         if message_id is not None and self.telegram:
-            self.telegram.set_message_reaction(cid, message_id, "👀")
+            resp = self.telegram.set_message_reaction(cid, message_id, "👀")
+            reacted = isinstance(resp, dict) and resp.get("ok", False)
+            if not reacted:
+                logger.debug(
+                    f"setMessageReaction failed (chat={cid}, msg={message_id}): "
+                    f"{resp.get('description') if isinstance(resp, dict) else resp}"
+                )
 
         reply_text = f"✅ Ran on {agent}." if raw else f"✅ Sent to {agent}."
-        if self.telegram:
+        if not reacted and self.telegram:
             self.telegram.send_message(cid, reply_text)
         return reply_text
 

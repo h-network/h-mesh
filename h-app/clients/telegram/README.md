@@ -224,6 +224,19 @@ compose bar's own persistent button at the Mini App dashboard when
 `MINI_APP_URL` and a chat id are both configured — set once at `enrol()`
 time, alongside `setMyCommands`.
 
+⚠ **The "✅ Sent to X"/"✅ Ran on X" text confirmation only disappears once
+the 👀 reaction above actually lands** — verified by checking
+`setMessageReaction`'s own response, not assumed from the call having been
+made. Two things that fall back to the text instead: no `message_id` to
+react to at all (every caller not tied to a live inbound Telegram
+message — the CLI's own `--prompt` one-shot, which has no message to react
+to, is the one that matters here and always gets the text), or the
+reaction call itself failing (a chat can have reactions disabled entirely;
+Telegram reports that as an ordinary API error, not a silent no-op, so it's
+caught rather than assumed to have worked). A failed or blocked prompt was
+never a candidate for this either way — the reaction only ever means
+"dispatched", never "failed", so those replies are untouched.
+
 While a chat has an open multi-step flow (Add Ticket, Hire, Retire,
 Broadcast), its next plain text message is consumed as that flow's answer
 rather than sent to `--agent` as a prompt (and takes priority over a
