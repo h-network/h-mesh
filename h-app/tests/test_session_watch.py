@@ -61,7 +61,19 @@ def test_session_daemon_streams_a_real_hired_agents_pane():
         f.write(f"#!/usr/bin/env bash\necho {marker}\nexec bash -il\n")
     os.chmod(fake_h_agent, 0o755)
 
+    # ⚠ Isolated, not inherited -- capture-pane for a fresh subscribe/refresh
+    # is deliberately the VISIBLE screen only, not scrollback (see
+    # modules/session/control.py's own comment on why). A real ~/.bashrc
+    # can print enough on an interactive login shell to scroll the marker
+    # off a 32-row pane before this test ever subscribes -- measured, the
+    # marker never arrived on a host with a non-trivial .bashrc even though
+    # the fix itself was correct. Same lesson as HOME isolation elsewhere
+    # (test_setup_wizard.py's wizard_env): never trust the ambient one.
+    home_dir = os.path.join(tmpdir, "home")
+    os.makedirs(home_dir, exist_ok=True)
+
     env = dict(os.environ)
+    env["HOME"] = home_dir
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
     env["PYTHONPATH"] = str(REPO_ROOT / "h-app")
     env["POD"] = pod
