@@ -3,6 +3,7 @@
 import base64
 import inspect
 import json
+import logging
 import os
 import ssl
 import tempfile
@@ -16,7 +17,7 @@ from clients.telegram import bot
 from clients.telegram.bot import (
     ActivityRender, AlertPusher, CursorStore, DryRunTelegramClient, MeshClient, PaneWatchRender,
     ReplyPusher, TelegramBot, TelegramClient, render_alert, render_reply,
-    synthesize_speech, _parse_sse_events, _derive_session_url,
+    synthesize_speech, _configure_logging, _parse_sse_events, _derive_session_url, _resolve_log_level,
     _agent_picker_keyboard, _is_transient_chrome_line, _parse_int_overrides,
     _parse_mention, _pane_tail_window, _strip_ansi, _valid_attachment_filename, _valid_attachment_mime_type,
     ATTACHMENT_ALLOWED_PAYLOAD_KEYS, ATTACHMENT_MAX_BYTES, ATTACHMENT_MAX_CAPTION_BYTES, DEFAULT_CURSOR_FILE,
@@ -526,6 +527,70 @@ def test_handle_user_prompt_falls_back_to_text_when_the_reaction_itself_fails():
         assert bot_instance.telegram.sent_messages == [{
             "chat_id": "12345", "text": "✅ Sent to architect.", "message_id": 1, "reply_markup": None,
         }]
+
+
+def test_failed_reaction_is_logged_at_warning_like_a_failed_edit(caplog):
+    """Handled is not invisible. This used to be DEBUG -- i.e. invisible at
+    the only level the daemon could run at -- while the equivalent failed
+    editMessageText was WARNING. Both are a real Telegram call failing with
+    a fallback behind it, so both are WARNING."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+
+        class ReactionsDisabledTelegramClient(DummyTelegramClient):
+            def set_message_reaction(self, chat_id, message_id, emoji):
+                super().set_message_reaction(chat_id, message_id, emoji)
+                return {"ok": False, "description": "Bad Request: REACTION_INVALID"}
+
+        bot_instance.telegram = ReactionsDisabledTelegramClient()
+        with caplog.at_level(logging.DEBUG, logger="mesh_telegram"):
+            bot_instance.handle_user_prompt(12345, "hello architect", message_id=7)
+        reaction_records = [r for r in caplog.records if "setMessageReaction failed" in r.getMessage()]
+        assert [r.levelno for r in reaction_records] == [logging.WARNING]
+        assert "REACTION_INVALID" in reaction_records[0].getMessage()
+
+
+# ── log verbosity (H_MESH_LOG_LEVEL) ─────────────────────────────────────────
+
+def test_resolve_log_level_accepts_the_standard_names_however_they_are_written():
+    assert _resolve_log_level("DEBUG") == logging.DEBUG
+    assert _resolve_log_level("debug") == logging.DEBUG
+    assert _resolve_log_level("  Warning\n") == logging.WARNING
+    assert _resolve_log_level("ERROR") == logging.ERROR
+    assert _resolve_log_level("CRITICAL") == logging.CRITICAL
+    # stdlib's own aliases, so an obvious spelling is not a silent demotion
+    assert _resolve_log_level("WARN") == logging.WARNING
+    assert _resolve_log_level("FATAL") == logging.CRITICAL
+
+
+def test_resolve_log_level_falls_back_to_info_rather_than_raising():
+    """This runs at import, before the bot can report anything at all -- a
+    typo in a fresh VM's env must cost log detail, not the daemon."""
+    assert _resolve_log_level(None) == logging.INFO
+    assert _resolve_log_level("") == logging.INFO
+    assert _resolve_log_level("   ") == logging.INFO
+    assert _resolve_log_level("DEGUB") == logging.INFO
+    # a number is not a name; nothing here maps 10 onto DEBUG
+    assert _resolve_log_level("10") == logging.INFO
+
+
+def test_configure_logging_says_so_when_it_falls_back(caplog):
+    """A silently-demoted DEGUB rebuilds the exact blind spot the knob
+    removes: someone believing they run at DEBUG while debug is dropped."""
+    root_level = logging.getLogger().level
+    try:
+        with caplog.at_level(logging.DEBUG, logger="mesh_telegram"):
+            assert _configure_logging("DEGUB") == logging.INFO
+        warnings = [r for r in caplog.records if "H_MESH_LOG_LEVEL" in r.getMessage()]
+        assert [r.levelno for r in warnings] == [logging.WARNING]
+
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="mesh_telegram"):
+            assert _configure_logging("DEBUG") == logging.DEBUG
+            assert _configure_logging(None) == logging.INFO
+        assert [r for r in caplog.records if "H_MESH_LOG_LEVEL" in r.getMessage()] == []
+    finally:
+        logging.getLogger().setLevel(root_level)
 
 
 # ── inline menu ──────────────────────────────────────────────────────────────
