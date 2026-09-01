@@ -353,10 +353,23 @@ resolve_token_noninteractive() {
     TOKEN_VARS="$TOKEN_VARS $var"
 }
 
-LOCAL_URL="$(ENV_TENANT_GET PROVIDER_LOCAL_URL "")"
-LOCAL_MODEL="$(ENV_TENANT_GET PROVIDER_LOCAL_MODEL "")"
-LOCAL_KIND="$(ENV_TENANT_GET PROVIDER_LOCAL_KIND vllm)"
-EP_NAME="local"
+# ⚠ EP_NAME itself must round-trip through persisted config, not just its
+# URL/model/kind -- modules.tmux.reconciler.get_agent_provider() already
+# looks up PROVIDER_<NAME>_* using whatever name is registered per agent
+# (it slugs the exact same way, see provider_key_prefix below), so a custom
+# name has always worked for a *hired* agent. What was broken is purely
+# this script's own re-read of its own prompt defaults: a hardcoded "local"
+# here meant a re-run (e.g. to add another agent) showed the provider
+# section as blank/unconfigured even though PROVIDER_OFFICE_GPU_URL (or
+# whatever name was chosen) was sitting right there in the tenant config --
+# and answering "y" again without noticing would persist a second,
+# redundant "local"-named entry alongside the real one.
+provider_key_prefix() { printf 'PROVIDER_%s' "$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"; }
+EP_NAME="$(ENV_TENANT_GET PROVIDER_NAME local)"
+PROVIDER_KEY_PREFIX="$(provider_key_prefix "$EP_NAME")"
+LOCAL_URL="$(ENV_TENANT_GET "${PROVIDER_KEY_PREFIX}_URL" "")"
+LOCAL_MODEL="$(ENV_TENANT_GET "${PROVIDER_KEY_PREFIX}_MODEL" "")"
+LOCAL_KIND="$(ENV_TENANT_GET "${PROVIDER_KEY_PREFIX}_KIND" vllm)"
 
 TELEGRAM_BOT_TOKEN="$(ENV_TENANT_GET TELEGRAM_BOT_TOKEN "")"
 TELEGRAM_CHAT_ID="$(ENV_TENANT_GET TELEGRAM_CHAT_ID "")"
@@ -581,11 +594,12 @@ done
     [ "${#PROFILE_MAP[@]}"  -gt 0 ] && echo "AGENT_PROFILES=$(IFS=,; echo "${PROFILE_MAP[*]}")"
     if [ "${#PROVIDER_MAP[@]}" -gt 0 ] && [ -n "$LOCAL_URL" ]; then
         echo "AGENT_PROVIDERS=$(IFS=,; echo "${PROVIDER_MAP[*]}")"
-        PR_UPPER="$(echo "$EP_NAME" | tr '[:lower:]-' '[:upper:]_')"
-        echo "PROVIDER_${PR_UPPER}_URL=${LOCAL_URL}"
-        echo "PROVIDER_${PR_UPPER}_MODEL=${LOCAL_MODEL}"
-        echo "PROVIDER_${PR_UPPER}_TOKEN=local"
-        echo "PROVIDER_${PR_UPPER}_KIND=${LOCAL_KIND}"
+        echo "PROVIDER_NAME=${EP_NAME}"
+        PROVIDER_KEY_PREFIX="$(provider_key_prefix "$EP_NAME")"
+        echo "${PROVIDER_KEY_PREFIX}_URL=${LOCAL_URL}"
+        echo "${PROVIDER_KEY_PREFIX}_MODEL=${LOCAL_MODEL}"
+        echo "${PROVIDER_KEY_PREFIX}_TOKEN=local"
+        echo "${PROVIDER_KEY_PREFIX}_KIND=${LOCAL_KIND}"
     fi
     [ -n "$TELEGRAM_BOT_TOKEN" ] && echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}"
     [ -n "$TELEGRAM_CHAT_ID" ] && echo "TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}"
