@@ -281,6 +281,132 @@ def test_wizard_hires_a_per_agent_cli_exception_with_the_right_cli(wizard_env):
     assert sme2_cli == "codex"
 
 
+def test_wizard_rerun_preserves_a_per_agent_cli_exception(wizard_env, monkeypatch):
+    # Real bug, reported live: re-running the wizard and accepting every
+    # default (including the "Default CLI" prompt's own shown default)
+    # silently reverted a per-agent CLI override back to the default CLI --
+    # the "Default CLI" step unconditionally reset every agent's CLI map
+    # entry, not just agents that were actually following the default. No
+    # prior test drove the wizard twice AND checked an exception survived --
+    # test_wizard_rerun_is_idempotent_and_does_not_rehire only re-runs the
+    # trivial single-agent default path and only checks AGENTS, not
+    # AGENT_CLIS.
+    ctx = wizard_env
+    setup_answers = [
+        "",           # pod
+        "",           # tenant
+        "2",          # how many agents
+        "",           # agent #1 name -> architect
+        "observer",   # agent #2 name
+        "",           # use more than one account? -> n
+        "",           # OAuth token for 'default'
+        "",           # default CLI -> claude
+        "observer",   # any agents differing
+        "codex",      # observer -- CLI
+        "",           # local model provider? -> n
+        "",           # Telegram bot? -> n
+    ]
+    output1, code1 = _run_wizard(
+        cwd=str(REPO_ROOT),
+        args=["--venv", sys.prefix, "--skip-install", "--skip-deps", "--no-daemons"],
+        env=ctx["env"],
+        answers=setup_answers,
+        timeout=60,
+    )
+    assert code1 == 0, f"setup.sh exited {code1}:\n{output1}"
+
+    monkeypatch.setenv("H_MESH_STATE_DIR", ctx["env"]["H_MESH_STATE_DIR"])
+    assert read_tenant_env(ctx["tenant"]).get("AGENT_CLIS") == "observer=codex"
+
+    # Re-run, accepting every default -- exactly the "add nothing, change
+    # nothing, just re-run it" path a user would take.
+    output2, code2 = _run_wizard(
+        cwd=str(REPO_ROOT),
+        args=["--venv", sys.prefix, "--skip-install", "--skip-deps", "--no-daemons"],
+        env=ctx["env"],
+        answers=DEFAULT_PATH_ANSWERS,
+        timeout=60,
+    )
+    assert code2 == 0, f"setup.sh exited {code2}:\n{output2}"
+
+    persisted2 = read_tenant_env(ctx["tenant"])
+    assert persisted2.get("AGENT_CLIS") == "observer=codex", (
+        f"per-agent CLI override reverted on re-run -- full output:\n{output2}"
+    )
+
+
+def test_wizard_rerun_preserves_a_per_agent_account_exception(wizard_env, monkeypatch):
+    # Same shape, one level down: AGENT_PROFILES's own "Default account for
+    # every agent" step has the identical unconditional-reset bug, only
+    # reachable once more than one account is configured. Checked
+    # separately, not assumed, per the ticket that reported the CLI case.
+    ctx = wizard_env
+    setup_answers = [
+        "",           # pod
+        "",           # tenant
+        "2",          # how many agents
+        "",           # agent #1 name -> architect
+        "observer",   # agent #2 name
+        "y",          # use more than one account? -> y
+        "2",          # how many accounts
+        "",           # account #1 name -> default
+        "",           # OAuth token for 'default'
+        "backup",     # account #2 name
+        "",           # OAuth token for 'backup'
+        "",           # default CLI -> claude
+        "",           # default account for every agent -> default
+        "observer",   # any agents differing
+        "",           # observer -- CLI [claude] -> keep
+        "backup",     # observer -- account
+        "",           # local model provider? -> n
+        "",           # Telegram bot? -> n
+    ]
+    output1, code1 = _run_wizard(
+        cwd=str(REPO_ROOT),
+        args=["--venv", sys.prefix, "--skip-install", "--skip-deps", "--no-daemons"],
+        env=ctx["env"],
+        answers=setup_answers,
+        timeout=60,
+    )
+    assert code1 == 0, f"setup.sh exited {code1}:\n{output1}"
+
+    monkeypatch.setenv("H_MESH_STATE_DIR", ctx["env"]["H_MESH_STATE_DIR"])
+    assert read_tenant_env(ctx["tenant"]).get("AGENT_PROFILES") == "observer=backup"
+
+    # Re-run: keep the same two-account setup (answer "y" again, accept
+    # every shown default) -- exactly the "add nothing, change nothing"
+    # path, but for the multi-account branch specifically.
+    rerun_answers = [
+        "",  # pod
+        "",  # tenant
+        "",  # how many agents -> keeps existing roster (2)
+        "y",  # use more than one account? -> y again
+        "",  # how many accounts [2] -> keep
+        "",  # account #1 name [default] -> keep
+        "",  # OAuth token for 'default' [keep existing]
+        "",  # account #2 name [backup] -> keep
+        "",  # OAuth token for 'backup' [keep existing]
+        "",  # default CLI -> claude
+        "",  # default account for every agent [default] -> keep
+        "",  # any agents differing -> blank, no exceptions re-typed
+        "",  # local model provider? -> n
+        "",  # Telegram bot? -> n
+    ]
+    output2, code2 = _run_wizard(
+        cwd=str(REPO_ROOT),
+        args=["--venv", sys.prefix, "--skip-install", "--skip-deps", "--no-daemons"],
+        env=ctx["env"],
+        answers=rerun_answers,
+        timeout=60,
+    )
+    assert code2 == 0, f"setup.sh exited {code2}:\n{output2}"
+
+    persisted2 = read_tenant_env(ctx["tenant"])
+    assert persisted2.get("AGENT_PROFILES") == "observer=backup", (
+        f"per-agent account override reverted on re-run -- full output:\n{output2}"
+    )
+
+
 def test_wizard_provided_token_reaches_the_daemon_hiring_the_first_agent_in_the_same_run(wizard_env):
     # Regression for a real bug: setup.sh's own shell never exports what
     # ask_token() collects (only the persisted tenant config gets it), so
