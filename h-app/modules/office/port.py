@@ -10,6 +10,7 @@ import redis
 from core.channels import receive
 from core.dispatch import delivery_lock
 from core.keys import prefix
+from core.logging import configure_logging
 from lib.agentlifecycle.lifecycle import pause_agent, resume_agent, start_agent, stop_agent
 from modules.tmux.ops import kill_window, run_tmux
 
@@ -106,6 +107,9 @@ def deliver_office(
 
 
 def main(argv: list[str] | None = None) -> None:
+    # First thing in the process, and only in the process: this is the entry
+    # point, so it is the one place allowed to set the root logger's level.
+    configure_logging()
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     args = sys.argv[1:] if argv is None else argv
     if not args:

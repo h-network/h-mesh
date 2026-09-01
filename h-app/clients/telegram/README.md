@@ -67,6 +67,11 @@ it in the shell you start from — the daemon environment is the tenant file wit
 the live environment layered on top, so either reaches the bot, and the live
 one wins.
 
+The ports read the same variable, the same way (`core/README.md`, "Two logging
+systems, one file"). This client keeps its own copy of the resolver because it
+imports nothing from `core` — one knob, two implementations, kept identical on
+purpose.
+
 ⚠ This is the verbosity knob and nothing else. A failure that is genuinely a
 failure keeps its own severity, even when it is handled with a fallback — a
 failed `editMessageText` (falls back to a fresh send) and a failed

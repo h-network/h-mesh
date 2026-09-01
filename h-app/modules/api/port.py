@@ -10,7 +10,7 @@ import redis
 from core.dispatch import delivery_lock
 from core.envelope import EnvelopeError, parse, parse_for_switch
 from core.keys import prefix
-from core.logging import log_record
+from core.logging import configure_logging, log_record
 from lib.ingress_snapshot import snapshot_ingress
 
 MAILBOX_MAXLEN = 1000
@@ -61,6 +61,9 @@ def deliver_api(*, r, pod: str, tenant: str, agent: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # First thing in the process, and only in the process: this is the entry
+    # point, so it is the one place allowed to set the root logger's level.
+    configure_logging()
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     args = sys.argv[1:] if argv is None else argv
     if not args:

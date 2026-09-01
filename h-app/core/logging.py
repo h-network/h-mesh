@@ -1,6 +1,21 @@
-"""Contract-shaped JSON line logging."""
+"""Contract-shaped JSON line logging, plus the stdlib logging threshold.
+
+⚠ **Two different systems live here, and they are not interchangeable.**
+`log_record`/`emit` write the custody contract: one JSON object per line, on
+stdout, mirrored durably, parsed by conservation checks. `configure_logging`
+sets the level for `logging.getLogger(...)` diagnostics — human prose, on
+stderr, read by whoever is looking at a daemon. A custody record must never be
+demoted to a `logger.debug`, and a diagnostic must never be dressed up as a
+JSON record. They share this file because it is where anyone looks for
+"logging", not because they are one mechanism.
+
+⚠ `import logging` below is the STDLIB module, not this one. Absolute imports
+mean a module named `core.logging` importing `logging` gets the standard
+library — no cycle, no self-import.
+"""
 
 import json
+import logging
 import os
 import sys
 from datetime import datetime, timezone
@@ -8,6 +23,60 @@ from datetime import datetime, timezone
 from .config import state_path
 
 _WRITER = os.environ.get("H_MESH_WRITER")
+
+# ── stdlib logging threshold (diagnostics, stderr) ───────────────────────────
+# ⚠ Kept deliberately identical to `clients/telegram/bot.py`'s own copy, down
+# to the variable name and the format string, so one `H_MESH_LOG_LEVEL` means
+# one thing everywhere. The duplication is the price of the telegram client
+# importing nothing from `core` — it talks to a tenant over HTTP and runs from
+# a bare checkout — so change both or neither.
+LOG_LEVEL_ENV_VAR = "H_MESH_LOG_LEVEL"
+# The five standard names, plus the two stdlib aliases, so a deploy that writes
+# the obvious WARN is not silently demoted to INFO for a spelling.
+LOG_LEVEL_NAMES = ("CRITICAL", "FATAL", "ERROR", "WARNING", "WARN", "INFO", "DEBUG")
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+
+def resolve_log_level(raw: str | None) -> int:
+    """The threshold `H_MESH_LOG_LEVEL` asks for, INFO when it says nothing usable.
+
+    Level NAMES only, case- and whitespace-insensitive; a numeric string is not
+    a name and falls back like any other unrecognised value.
+    """
+    name = (raw or "").strip().upper()
+    return getattr(logging, name) if name in LOG_LEVEL_NAMES else logging.INFO
+
+
+def configure_logging() -> int:
+    """`basicConfig` at `H_MESH_LOG_LEVEL`, returning the level applied.
+
+    ⚠ Call this from a process ENTRY POINT (a port's `main()`, a service's
+    startup) and never at import of a library module. `core.dispatch` and every
+    other module that logs is imported by processes this package does not own —
+    including the test suite — and a library that reconfigures the root logger
+    on import decides verbosity for all of them.
+
+    Without this, `logging`'s lastResort handler prints WARNING and above as a
+    bare message on stderr — no timestamp, no logger name — and drops
+    everything below it with no way to turn it up. That is the blind spot this
+    closes for the ports; `clients/telegram/bot.py` has the same knob.
+
+    Never raises: an unrecognised value falls back to INFO and says so, because
+    verbosity is not worth failing a delivery process at startup over.
+    """
+    raw = os.environ.get(LOG_LEVEL_ENV_VAR)
+    level = resolve_log_level(raw)
+    logging.basicConfig(level=level, format=LOG_FORMAT)
+    if (raw or "").strip() and (raw or "").strip().upper() not in LOG_LEVEL_NAMES:
+        # Loud on purpose, and emitted at the fallback level so it survives it:
+        # a mistyped DEGUB that quietly resolved to INFO would rebuild the exact
+        # blind spot this knob exists to remove — someone believing they are
+        # running at DEBUG while every debug line is still dropped on the floor.
+        logging.getLogger(__name__).warning(
+            "%s=%r is not a level name (%s); logging at INFO instead",
+            LOG_LEVEL_ENV_VAR, raw, ", ".join(LOG_LEVEL_NAMES),
+        )
+    return level
 
 _ENVELOPE_EVENTS = {
     "sent",

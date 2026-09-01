@@ -12,12 +12,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from core.channels import send  # noqa: E402
 from core.dispatch import register_type, dispatch_ingress  # noqa: E402
 from core.keys import prefix  # noqa: E402
+from core.logging import configure_logging  # noqa: E402
 from core.service import Switch  # noqa: E402
 from modules.tmux import deliver_tmux, list_windows, run_tmux  # noqa: E402
 from modules.tmux.reconciler import TmuxReconciler  # noqa: E402
 
 
 def main() -> None:
+    # The one caller in the tree that reaches core.dispatch's handler
+    # resolution, so it is the one place those logger.error lines can actually
+    # be produced today -- worth having them formatted and raisable here.
+    configure_logging()
     url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
     pod = os.environ.get("POD", "ci-tmux-smoke")
     tenant = os.environ.get("TENANT", "ci-tmux-smoke")
