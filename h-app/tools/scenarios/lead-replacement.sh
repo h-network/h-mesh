@@ -10,8 +10,9 @@
 # as one pass/fail:
 #   1. Self-retirement circularity: does StartAgent for a replacement still
 #      land if the lead retires itself, vs. a third party retiring it.
-#   2. The lead brief: does a re-hired lead's AGENTS.md actually regenerate
-#      the lead-specific paragraph, not just come back as an ordinary agent.
+#   2. The lead brief: does a re-hired/transferred lead's AGENTS.md actually
+#      regenerate the lead-specific paragraph, not just come back as an
+#      ordinary agent.
 #   3. The lead registry key: does StopAgent clear it, leave it dangling, or
 #      does a replacement reclaim it.
 #   4. Alert routing during the gap: watchdog's _notify_lead, both while the
@@ -20,25 +21,32 @@
 #   5. Board survival: does stop_agent purge the lead's task board.
 #   6. In-flight messages addressed to the lead across the gap.
 #
-# Two structural facts, established by reading the code before testing
-# (stated here so the probes below read as verification, not discovery):
-#   - `hire`/`letGo` (StartAgent/StopAgent) are pure fire-and-forget bus
-#     sends (modules/office/cli.py's _lifecycle_command just calls send()
-#     and returns) — the actual stop/start work happens later, out of
-#     process, when the switch kicks `host`. So "self-retirement" is NOT a
-#     synchronous in-process kill of the issuing shell.
-#   - Nothing in the current codebase ever WRITES the `lead` registry key
-#     (grepped the whole repo: only reads, in reconciler.py/cli.py/
-#     watchdog/service.py, plus a test fixture). There is no StartAgent
-#     flag or CLI command that transfers leadership — whatever sets it was
-#     manual/out-of-band, and this script does the same for its synthetic
-#     lead, since there's no other way.
+# ⚠ THIS IS THE REGRESSION TEST FOR TWO FIXES, NOT JUST A DISCOVERY SCRIPT.
+# The first run of this scenario (2026-09-01) found: the `lead` registry key
+# was never written anywhere in the codebase and StopAgent never cleared it
+# (dangled at whatever name was last lead), and watchdog's _notify_lead()
+# returned silently with zero trace when the lead was unregistered. Both are
+# now fixed on main:
+#   - lifecycle-agent's `leadership-transfer`: StartAgent accepts a `lead`
+#     boolean payload field (`office hire NAME --lead`) that atomically
+#     publishes the lead key and registry row together (Lua script);
+#     StopAgent does a compare-then-delete — clears the lead key ONLY if it
+#     currently equals the agent being stopped.
+#   - watchdog-agent's `lead-alert-custody`: _notify_lead now logs a
+#     structured `lead_alert_no_lead` record with a reason before returning,
+#     instead of returning silently.
+# The probe assertions below test the FIXED behavior. If you're reading this
+# after another change to lifecycle.py/watchdog/service.py and a probe here
+# starts failing, that's this scenario doing its job — update the code or
+# update the probe, but don't just widen the assertion to make it pass.
 set -uo pipefail
 . "$(dirname "$0")/_lib.sh"
 
 POD="${POD:-acceptance}"
 TENANT="${TENANT:?set TENANT}"
 LEAD="${LEAD:-synth-lead}"
+LEAD2="${LEAD2:-synth-lead-2}"
+LEAD3="${LEAD3:-synth-lead-3}"
 REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379/0}"
 TMUX_SESSION="${TMUX_SESSION:-$TENANT}"
 TMUX_TMPDIR="${TMUX_TMPDIR:-$HOME/.h-mesh/tmux}"
@@ -58,20 +66,6 @@ tmux_switch="$(pgrep -f 'core\.service' | head -1)"
 [ -n "$tmux_switch" ] || incomplete lead-replacement switch_not_running
 
 py() { "$PYTHON" - "$@"; }
-
-set_lead_key() {
-  py "$POD" "$TENANT" "${1:-}" <<PY
-import sys
-import redis
-from core.keys import prefix
-pod, tenant, lead = sys.argv[1], sys.argv[2], (sys.argv[3] if len(sys.argv) > 3 else "")
-r = redis.Redis.from_url("$REDIS_URL")
-if lead:
-    r.set(prefix(pod, tenant, resource="lead"), lead)
-else:
-    r.delete(prefix(pod, tenant, resource="lead"))
-PY
-}
 
 get_lead_key() {
   py "$POD" "$TENANT" <<PY
@@ -96,16 +90,19 @@ print("1" if is_member(r, pod=pod, tenant=tenant, agent=agent) else "0")
 PY
 }
 
+# hire_real <agent> [lead: 0|1]
 hire_real() {
-  local agent="$1"
-  py "$POD" "$TENANT" "$agent" "$PROVIDER_NAME" <<PY
+  local agent="$1" lead="${2:-0}"
+  py "$POD" "$TENANT" "$agent" "$PROVIDER_NAME" "$lead" <<PY
 import sys
 from core.channels import send
 import redis
-pod, tenant, agent, provider = sys.argv[1:5]
+pod, tenant, agent, provider, lead = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] == "1"
 r = redis.Redis.from_url("$REDIS_URL")
-sid = send(r, pod=pod, tenant=tenant, source="host", destination="host",
-           kind="StartAgent", payload={"agent": agent, "cli": "claude", "provider": provider})
+payload = {"agent": agent, "cli": "claude", "provider": provider}
+if lead:
+    payload["lead"] = True
+sid = send(r, pod=pod, tenant=tenant, source="host", destination="host", kind="StartAgent", payload=payload)
 print(sid)
 PY
 }
@@ -164,10 +161,10 @@ PY
 }
 
 cleanup_all() {
-  set_lead_key "" >/dev/null 2>&1 || true
-  retire_real "$LEAD" >/dev/null 2>&1 || true
-  TMUX_TMPDIR="$TMUX_TMPDIR" tmux kill-window -t "${TENANT}:${LEAD}" >/dev/null 2>&1 || true
-  py "$POD" "$TENANT" "$LEAD" <<PY >/dev/null 2>&1 || true
+  for agent in "$LEAD" "$LEAD2" "$LEAD3"; do
+    retire_real "$agent" >/dev/null 2>&1 || true
+    TMUX_TMPDIR="$TMUX_TMPDIR" tmux kill-window -t "${TENANT}:${agent}" >/dev/null 2>&1 || true
+    py "$POD" "$TENANT" "$agent" <<PY >/dev/null 2>&1 || true
 import sys
 import redis
 pod, tenant, agent = sys.argv[1:4]
@@ -176,19 +173,27 @@ for k in r.scan_iter(match=f"pod:{pod}:tenant:{tenant}:agent:{agent}:*"):
     r.delete(k)
 r.hdel(f"pod:{pod}:tenant:{tenant}:registry", agent)
 PY
+  done
+  py "$POD" "$TENANT" <<PY >/dev/null 2>&1 || true
+import sys
+import redis
+from core.keys import prefix
+pod, tenant = sys.argv[1:3]
+r = redis.Redis.from_url("$REDIS_URL")
+r.delete(prefix(pod, tenant, resource="lead"))
+PY
 }
 trap cleanup_all EXIT
 
-echo "=== setup: synthetic lead=$LEAD tenant=$TENANT ==="
+echo "=== setup: hire $LEAD with --lead (the real transfer mechanism, not a raw redis write) ==="
 cleanup_all >/dev/null 2>&1 || true
-set_lead_key "$LEAD"
-[ "$(get_lead_key)" = "$LEAD" ] || incomplete lead-replacement lead_key_seed_failed
-hire_real "$LEAD" >/dev/null
+hire_real "$LEAD" 1 >/dev/null
 wait_for_window "$LEAD" 30 || incomplete lead-replacement initial_hire_never_appeared
 sleep 2
+[ "$(get_lead_key)" = "$LEAD" ] || incomplete lead-replacement lead_key_not_published_on_hire
 
 echo ""
-echo "=== PROBE 2 (initial): does the lead get the lead brief on first hire? ==="
+echo "=== PROBE 2 (initial): does hire --lead get the lead brief? ==="
 initial_brief="$(agents_md_is_lead_version "$LEAD")"
 expect "initial AGENTS.md is the lead version" lead "$initial_brief"
 
@@ -215,24 +220,23 @@ PY
 expect "board seeded with one ticket" 1 "$board_before"
 
 echo ""
-echo "=== PROBE 1 (ordering B) + PROBE 3 + PROBE 5 + PROBE 6 + PROBE 4a: third party retires the lead ==="
+echo "=== PROBE 2/3 (differently-named transfer): hire $LEAD2 with --lead while $LEAD is still alive ==="
+hire_real "$LEAD2" 1 >/dev/null
+wait_for_window "$LEAD2" 30 || incomplete lead-replacement transfer_hire_never_appeared
+sleep 2
+expect "lead key atomically transfers to the new name" "$LEAD2" "$(get_lead_key)"
+transfer_brief="$(agents_md_is_lead_version "$LEAD2")"
+expect "differently-named replacement gets the lead brief" lead "$transfer_brief"
+
+echo ""
+echo "=== PROBE 1 (ordering B) + PROBE 3 + PROBE 5 + PROBE 6 + PROBE 4a: third party retires the OLD, now-non-lead $LEAD ==="
 retire_real "$LEAD" >/dev/null
 wait_for_no_window "$LEAD" 20 || echo "  ✗ window did not disappear after third-party StopAgent" >&2
 sleep 1
 
-registered_after_stop="$(is_registered "$LEAD")"
-expect "registry entry removed by StopAgent" 0 "$registered_after_stop"
-
-lead_key_after_stop="$(get_lead_key)"
-if [ "$lead_key_after_stop" = "$LEAD" ]; then
-  echo "  FINDING (PROBE 3): lead registry key DANGLES at '$LEAD' after StopAgent -- StopAgent does not clear it. Confirmed by reading lib/agentlifecycle/lifecycle.py's stop_agent(): it purges registry/ingress/paused/delivering, never touches the lead key."
-elif [ -z "$lead_key_after_stop" ]; then
-  echo "  FINDING (PROBE 3): lead registry key was cleared somehow -- unexpected given the code read; investigate before trusting this."
-  _FAILED=$((_FAILED+1))
-else
-  echo "  FINDING (PROBE 3): lead registry key now reads '$lead_key_after_stop' -- unexpected third value, investigate."
-  _FAILED=$((_FAILED+1))
-fi
+expect "registry entry removed by StopAgent" 0 "$(is_registered "$LEAD")"
+expect "lead key SURVIVES retiring a non-lead agent (compare-then-delete didn't match)" "$LEAD2" "$(get_lead_key)"
+echo "  FINDING (PROBE 3, transfer survival): confirmed — retiring the OLD lead after leadership already transferred to $LEAD2 does not clobber the current lead key. lib/agentlifecycle/lifecycle.py's stop_agent() now does a Lua compare-then-delete (_REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA): only clears the lead key if it currently equals the agent being stopped."
 
 board_after_stop="$(py "$POD" "$TENANT" "$LEAD" <<PY
 import sys
@@ -250,7 +254,7 @@ else
   _FAILED=$((_FAILED+1))
 fi
 
-echo "  --- PROBE 6: send a normal message to the fully-retired (unregistered) lead ---"
+echo "  --- PROBE 6: send a normal message to the fully-retired (unregistered) $LEAD ---"
 # H_MESH_LOG_QUIET=1: send() also log_record()s its own "sent" event to
 # stdout, which would otherwise land in this same capture ahead of the
 # stream_id and corrupt it into a multi-line, non-matching value.
@@ -287,42 +291,51 @@ PY
   sleep 0.5
 done
 if [ "$gap_reason" = "destination is not in tenant registry" ]; then
-  echo "  FINDING (PROBE 6): a message sent to the fully-retired lead is dead-lettered by the switch itself (reason='$gap_reason'), never even reaches an ingress queue. Not silently lost -- there IS a custody record -- but not queued for the eventual replacement either."
+  echo "  FINDING (PROBE 6): a message sent to the fully-retired $LEAD is dead-lettered by the switch itself (reason='$gap_reason'), never even reaches an ingress queue. Not silently lost -- there IS a custody record -- but not queued for the eventual replacement either. Unchanged behavior, not part of either fix (architect: consistent with the earlier decision not to build dead-letter replay machinery)."
 else
   echo "  ✗ PROBE 6: expected dead_lettered reason 'destination is not in tenant registry', got '${gap_reason:-<none found in 15s>}'" >&2
   _FAILED=$((_FAILED+1))
 fi
 
-echo "  --- PROBE 4a: watchdog's _notify_lead while the lead is fully retired (unregistered) ---"
-notify_result="$(py "$POD" "$TENANT" "$LEAD" <<PY
-import sys
+echo "  --- PROBE 4a: watchdog's _notify_lead for a fully-retired (unregistered) agent ---"
+# This python subprocess is a standalone _notify_lead() call, not run inside
+# the switch process — its log_record() calls print to ITS OWN stdout, not
+# to switch.log (H_MESH_LOG_FILE isn't set for it). Capture that stdout
+# directly with redirect_stdout rather than suppressing it and then
+# searching the wrong file for evidence that was never written there.
+alert_reason="$(py "$POD" "$TENANT" "$LEAD" <<PY
+import io, json, sys
+from contextlib import redirect_stdout
 import redis
 from modules.watchdog.service import Watchdog
 pod, tenant, lead = sys.argv[1:4]
 r = redis.Redis.from_url("$REDIS_URL")
 w = Watchdog(r, pod=pod, tenant=tenant, session_name=tenant)
-w._notify_lead(lead, "probe-4a synthetic alert during full retirement")
-print("called")
+captured = io.StringIO()
+with redirect_stdout(captured):
+    w._notify_lead(lead, "probe-4a synthetic alert during full retirement")
+reason = ""
+for line in captured.getvalue().splitlines():
+    try:
+        record = json.loads(line)
+    except Exception:
+        continue
+    if record.get("event") == "lead_alert_no_lead":
+        reason = record.get("reason", "")
+        break
+print(reason)
 PY
 )"
-[ "$notify_result" = "called" ] || incomplete lead-replacement notify_lead_call_failed
-echo "  FINDING (PROBE 4a): _notify_lead(lead, ...) returns silently when the lead is not a registry member (is_member() check is the function's first line) -- ZERO log record, zero custody trace, zero dead-letter. This is a stronger silent-drop than a dead-letter: an alert raised during the retirement gap leaves no evidence anywhere that it was ever attempted."
-
-echo ""
-echo "=== re-hire the SAME name as the lead's replacement (probe 2 + 3 continued) ==="
-hire_real "$LEAD" >/dev/null
-wait_for_window "$LEAD" 30 || incomplete lead-replacement rehire_never_appeared
-sleep 2
-rehire_brief="$(agents_md_is_lead_version "$LEAD")"
-if [ "$lead_key_after_stop" = "$LEAD" ] && [ "$rehire_brief" = "lead" ]; then
-  echo "  FINDING (PROBE 2+3 combined): because the lead key dangled at '$LEAD' (probe 3) rather than being cleared, re-hiring the SAME name naturally passes the lead-name check again on the very next window creation -- AGENTS.md regenerates as the lead version ($rehire_brief). This works ONLY because the name is unchanged; hiring a DIFFERENTLY-NAMED replacement would NOT become lead automatically (get_lead() is a plain string comparison against the dangling key, and nothing in the codebase ever updates it) -- that would need a manual lead-key rewrite as part of the replacement procedure, same as this script's own set_lead_key() at setup."
-  expect "rehired lead gets lead brief back" lead "$rehire_brief"
+if [ -n "$alert_reason" ]; then
+  echo "  FINDING (PROBE 4a): FIXED — _notify_lead() now logs a structured lead_alert_no_lead record (reason='$alert_reason') before returning, instead of returning silently. watchdog-agent's lead-alert-custody fix confirmed live."
+  expect "lead_alert_no_lead record produced for an unregistered lead" "lead '$LEAD' is not a registered agent" "$alert_reason"
 else
-  expect "rehired lead gets lead brief back" lead "$rehire_brief"
+  echo "  ✗ PROBE 4a: expected a lead_alert_no_lead record, found none -- the silent-drop bug may have regressed" >&2
+  _FAILED=$((_FAILED+1))
 fi
 
 echo ""
-echo "=== PROBE 4b: watchdog's _notify_lead while lead is REGISTERED but its window is transiently missing ==="
+echo "=== PROBE 4b: watchdog's _notify_lead while the CURRENT lead ($LEAD2) is registered but its window is transiently missing ==="
 kill -STOP "$reconciler_pid" >/dev/null 2>&1 || incomplete lead-replacement reconciler_stop_failed
 stop_deadline=$((SECONDS + 5))
 reconciler_state=""
@@ -332,10 +345,10 @@ while [ "$SECONDS" -lt "$stop_deadline" ]; do
   sleep 0.1
 done
 [ "$reconciler_state" = T ] || incomplete lead-replacement reconciler_not_stopped
-lead_window_id="$(TMUX_TMPDIR="$TMUX_TMPDIR" tmux list-windows -t "$TENANT" -F '#{window_name}|#{window_id}' 2>/dev/null | awk -F'|' -v a="$LEAD" '$1==a' | cut -d'|' -f2)"
-TMUX_TMPDIR="$TMUX_TMPDIR" tmux kill-window -t "$lead_window_id" >/dev/null 2>&1 || incomplete lead-replacement window_kill_failed
+lead2_window_id="$(TMUX_TMPDIR="$TMUX_TMPDIR" tmux list-windows -t "$TENANT" -F '#{window_name}|#{window_id}' 2>/dev/null | awk -F'|' -v a="$LEAD2" '$1==a' | cut -d'|' -f2)"
+TMUX_TMPDIR="$TMUX_TMPDIR" tmux kill-window -t "$lead2_window_id" >/dev/null 2>&1 || incomplete lead-replacement window_kill_failed
 
-py "$POD" "$TENANT" "$LEAD" <<PY
+py "$POD" "$TENANT" "$LEAD2" <<PY
 import sys
 import redis
 from modules.watchdog.service import Watchdog
@@ -349,7 +362,7 @@ deadline=$((SECONDS + 15))
 dead_count=0
 ingress_count=0
 while [ "$SECONDS" -lt "$deadline" ]; do
-  read -r dead_count ingress_count <<<"$(py "$POD" "$TENANT" "$LEAD" <<PY
+  read -r dead_count ingress_count <<<"$(py "$POD" "$TENANT" "$LEAD2" <<PY
 import sys
 import redis
 from core.keys import prefix
@@ -362,16 +375,16 @@ PY
   sleep 0.5
 done
 if [ "$dead_count" -ge 1 ] && [ "$ingress_count" = 0 ]; then
-  echo "  FINDING (PROBE 4b): while registered but window-missing, _notify_lead's alert IS durably admitted to ingress first (bounded, same as a normal forward), then immediately dead-lettered (window_missing) when in-process delivery fails -- it does NOT sit in ingress waiting for the window to come back; it's moved to dead=$dead_count, ingress=$ingress_count. No automatic replay when the window recovers."
+  echo "  FINDING (PROBE 4b): while registered but window-missing, _notify_lead's alert IS durably admitted to ingress first (bounded, same as a normal forward), then immediately dead-lettered (window_missing) when in-process delivery fails -- it does NOT sit in ingress waiting for the window to come back; it's moved to dead=$dead_count, ingress=$ingress_count. Deliberately unchanged by watchdog-agent's fix (real dead-letter, unit-tested via the real deliver_tmux/DeadLetter path) -- no automatic replay when the window recovers."
 else
   echo "  ✗ PROBE 4b: expected dead>=1 ingress=0, got dead=$dead_count ingress=$ingress_count" >&2
   _FAILED=$((_FAILED+1))
 fi
 
 kill -CONT "$reconciler_pid" >/dev/null 2>&1
-wait_for_window "$LEAD" 30 || echo "  ✗ window did not recover after resuming reconciler" >&2
+wait_for_window "$LEAD2" 30 || echo "  ✗ window did not recover after resuming reconciler" >&2
 sleep 1
-read -r dead_after_recovery ingress_after_recovery <<<"$(py "$POD" "$TENANT" "$LEAD" <<PY
+read -r dead_after_recovery ingress_after_recovery <<<"$(py "$POD" "$TENANT" "$LEAD2" <<PY
 import sys
 import redis
 from core.keys import prefix
@@ -383,20 +396,35 @@ PY
 echo "  after window recovery: dead=$dead_after_recovery ingress=$ingress_after_recovery (dead count should be unchanged from above, confirming no auto-replay)"
 
 echo ""
-echo "=== PROBE 1 (ordering A): the lead retires and replaces ITSELF, from its own pane ==="
-self_cmd="h-mesh-office letGo $LEAD; sleep 0.2; h-mesh-office hire $LEAD --provider $PROVIDER_NAME"
-TMUX_TMPDIR="$TMUX_TMPDIR" tmux send-keys -t "${TENANT}:${LEAD}" "$self_cmd" Enter
+echo "=== PROBE 3 (current-lead retirement clears the key): third party retires the CURRENT lead ($LEAD2) ==="
+retire_real "$LEAD2" >/dev/null
+wait_for_no_window "$LEAD2" 20 || echo "  ✗ window did not disappear after third-party StopAgent" >&2
+sleep 1
+expect "lead key CLEARS when the current lead is retired" "" "$(get_lead_key)"
+echo "  FINDING (PROBE 3, current-lead retirement): confirmed — the same compare-then-delete that let a non-lead's retirement leave the key alone correctly clears it when the retired agent IS the current lead. No dangling key left behind for the next hire to coincidentally match."
+
+echo ""
+echo "=== PROBE 1 (ordering A): a lead retires and replaces ITSELF with --lead, from its own pane ==="
+hire_real "$LEAD3" 1 >/dev/null
+wait_for_window "$LEAD3" 30 || incomplete lead-replacement self_test_hire_never_appeared
+sleep 2
+self_cmd="h-mesh-office letGo $LEAD3; sleep 0.2; h-mesh-office hire $LEAD3 --provider $PROVIDER_NAME --lead"
+TMUX_TMPDIR="$TMUX_TMPDIR" tmux send-keys -t "${TENANT}:${LEAD3}" "$self_cmd" Enter
 # The custody log can't cleanly distinguish StopAgent from StartAgent by
 # event shape alone (both are just a "sent" envelope to host, no kind field
 # surfaced in the log record) -- judge this probe by outcome instead: did the
-# self-issued sequence survive past its own pane's death and produce a live
-# replacement window.
+# self-issued sequence survive past its own pane's death, produce a live
+# replacement window, AND actually come back as lead (not just any window --
+# the old version of this probe only checked window existence; with the
+# --lead flag now real, checking the brief is the stronger, correct test).
 sleep 10
-self_replacement_alive="$(TMUX_TMPDIR="$TMUX_TMPDIR" tmux list-windows -t "$TENANT" -F '#{window_name}|#{pane_pid}' 2>/dev/null | awk -F'|' -v a="$LEAD" '$1==a')"
+self_replacement_alive="$(TMUX_TMPDIR="$TMUX_TMPDIR" tmux list-windows -t "$TENANT" -F '#{window_name}|#{pane_pid}' 2>/dev/null | awk -F'|' -v a="$LEAD3" '$1==a')"
 if [ -n "$self_replacement_alive" ]; then
-  echo "  FINDING (PROBE 1, self-retirement): the self-issued retire+rehire sequence DID complete -- a live '$LEAD' window exists afterward. This matches the code read: hire/letGo are both fire-and-forget bus sends (send() + return), not synchronous in-process actions, so the issuing shell had already enqueued BOTH envelopes to host's ingress before the actual window-kill (which happens later, out of process, when the switch kicks the office port) could ever interrupt it. The circularity architect was worried about doesn't bite here BECAUSE lifecycle commands are async messages, not direct actions -- the real risk (if any) would be in whether host's ingress processes the two envelopes in order, not in the issuing pane surviving."
+  self_brief="$(agents_md_is_lead_version "$LEAD3")"
+  echo "  FINDING (PROBE 1, self-retirement): the self-issued retire+rehire --lead sequence DID complete -- a live '$LEAD3' window exists afterward, brief=$self_brief. This matches the code read: hire/letGo are both fire-and-forget bus sends (send() + return), not synchronous in-process actions, so the issuing shell had already enqueued BOTH envelopes to host's ingress before the actual window-kill (which happens later, out of process, when the switch kicks the office port) could ever interrupt it. The circularity architect was worried about doesn't bite here BECAUSE lifecycle commands are async messages, not direct actions."
+  expect "self-issued replacement comes back as lead, not just alive" lead "$self_brief"
 else
-  echo "  FINDING (PROBE 1, self-retirement): NO live '$LEAD' window after the self-issued sequence -- the circularity DOES bite in some form. Needs deeper investigation before trusting self-service lead replacement." >&2
+  echo "  FINDING (PROBE 1, self-retirement): NO live '$LEAD3' window after the self-issued sequence -- the circularity DOES bite in some form. Needs deeper investigation before trusting self-service lead replacement." >&2
   _FAILED=$((_FAILED+1))
 fi
 

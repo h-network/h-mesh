@@ -206,51 +206,75 @@ workaround; rerun after the merge to get a clean-install result.
 ## lead-replacement.sh
 
 Not a port — no reference implementation exists for this one. Built fresh
-against
-architect's explicit brief: retire and re-hire the office's *lead*, not an
-ordinary agent, and report per-probe rather than one pass/fail. Runs
-entirely against a synthetic lead (`synth-lead` by default) on a throwaway
-tenant — never against the real office this agent runs in.
+against architect's explicit brief: retire and re-hire the office's *lead*,
+not an ordinary agent, and report per-probe rather than one pass/fail. Runs
+entirely against synthetic leads (`synth-lead`/`synth-lead-2`/
+`synth-lead-3` by default) on a throwaway tenant — never against the real
+office this agent runs in.
 
 ```
 TENANT=my-throwaway-tenant ./lead-replacement.sh
 ```
 
 Same real-hire requirements as `tmux-concurrent-hire.sh` (a provider-backed
-`claude`). Six probes, findings summarized (full reasoning and code
-citations are in the script's own output/comments):
+`claude`).
 
-1. **Self-retirement circularity.** Does the lead's own `letGo`+`hire`
-   sequence, issued from its own pane, survive past the pane's death?
-   **Yes** — `hire`/`letGo` are fire-and-forget bus sends
-   (`modules/office/cli.py`), not synchronous in-process actions, so both
-   envelopes are already durably enqueued before the actual (asynchronous)
-   window-kill could ever interrupt the issuing shell. Verified live: a
-   real self-issued retire+rehire produces a live replacement window.
-2. **The lead brief.** Does a re-hired lead's `AGENTS.md` regenerate the
-   lead-specific paragraph? **Yes, but only because the name is unchanged**
-   — `get_lead()` is a plain string comparison against the (dangling, see
-   probe 3) lead key, so a *differently-named* replacement would NOT
-   automatically become lead; nothing in the codebase updates the key.
-3. **The lead registry key.** Does `StopAgent` clear it? **No — confirmed
-   both by reading `stop_agent()` (purges registry/ingress/paused/
-   delivering, never the lead key) and live: it dangles at the retired
-   name.** This is exactly what makes probe 2's same-name rehire work at
-   all, and exactly what would silently misfire for a differently-named one.
-4. **Alert routing during the gap.** Two distinct cases, both confirmed live
-   by calling `Watchdog._notify_lead()` directly: while the lead is fully
-   retired (unregistered), the call returns silently at its first line
-   (`is_member()` check) — **zero log record, zero custody trace, zero
-   dead-letter**, a stronger silent-drop than a dead-letter. While
-   registered but the window is transiently missing, the alert *is*
-   durably admitted to ingress first, then immediately dead-lettered
+**This is now the regression test for two fixes, not just a discovery
+script.** The first run (2026-09-01) found two real bugs: the `lead`
+registry key was never written anywhere in the codebase and `StopAgent`
+never cleared it (dangled at whatever name was last lead), and watchdog's
+`_notify_lead()` returned silently with zero trace when the lead was
+unregistered. Both are fixed on main — lifecycle-agent's
+`leadership-transfer` (`StartAgent` now accepts a `lead: true` payload /
+`office hire NAME --lead`, atomically publishing the lead key and registry
+row together; `StopAgent` does a Lua compare-then-delete that only clears
+the lead key if it currently equals the agent being stopped) and
+watchdog-agent's `lead-alert-custody` (`_notify_lead()` now logs a
+structured `lead_alert_no_lead` record before returning). The probe
+assertions below test the *fixed* behavior; if a future change to
+`lifecycle.py`/`watchdog/service.py` makes one fail, that's the scenario
+doing its job.
+
+Six probes, current findings summarized (full reasoning and code citations
+are in the script's own output/comments):
+
+1. **Self-retirement circularity.** Does a lead's own `letGo`+`hire --lead`
+   sequence, issued from its own pane, survive past the pane's death and
+   come back as lead (not just alive)? **Yes** — `hire`/`letGo` are
+   fire-and-forget bus sends (`modules/office/cli.py`), not synchronous
+   in-process actions, so both envelopes are already durably enqueued
+   before the actual (asynchronous) window-kill could ever interrupt the
+   issuing shell. Verified live: a real self-issued retire+rehire produces
+   a live replacement window whose `AGENTS.md` is the lead version.
+2. **The lead brief.** Does a transferred lead's `AGENTS.md` regenerate the
+   lead-specific paragraph? **Yes, deliberately now** — verified for both a
+   same-name rehire (`hire NAME --lead`) and, more importantly, a
+   *differently-named* replacement hired with `--lead` while the old lead
+   is still alive: the new name's `AGENTS.md` is the lead version
+   immediately, no coincidence involved.
+3. **The lead registry key.** Does `StopAgent` clear it? **It's exactly
+   right now, in both directions** — verified live: retiring a
+   *non-current* lead (leadership already transferred elsewhere) leaves the
+   key alone; retiring the *current* lead clears it to empty. The Lua
+   compare-then-delete (`_REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA`) does exactly
+   what its name says.
+4. **Alert routing during the gap.** Two distinct cases. While the lead is
+   fully retired (unregistered): `_notify_lead()` now logs a structured
+   `lead_alert_no_lead` record with a reason before returning — verified
+   live, fix confirmed, no more silent drop. While registered but the
+   window is transiently missing (deliberately unchanged): the alert is
+   still durably admitted to ingress first, then immediately dead-lettered
    (`window_missing`) — not queued for later, no automatic replay when the
-   window recovers.
+   window recovers; this is a real dead-letter, unit-tested elsewhere via
+   the real (unmocked) `deliver_tmux`/`DeadLetter` path.
 5. **Board survival.** Does `stop_agent` purge the lead's task board?
    **No** — confirmed both by reading `stop_agent()` (never touches
    `tasks.*` keys) and live: a seeded ticket survives retirement intact.
+   Not a bug, never was.
 6. **In-flight messages across the gap.** A normal message sent to the
    fully-retired (unregistered) lead is dead-lettered by the switch itself
    (`"destination is not in tenant registry"`) — never reaches an ingress
    queue, and isn't queued for the eventual replacement either, but there
-   IS a custody record (unlike probe 4's silent case).
+   IS a custody record. Architect treated this as consistent with an
+   earlier decision not to build dead-letter replay machinery — accepted
+   behavior, not routed as a bug.
