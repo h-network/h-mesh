@@ -2,10 +2,16 @@
 
 import uvicorn
 
+from core.logging import configure_logging
 from modules.api.server import ApiSettings, create_app
 
 
 def main() -> None:
+    # Before uvicorn.run: its own dictConfig sets disable_existing_loggers
+    # False and never touches the root logger, so this threshold survives it.
+    # ⚠ It does not reach uvicorn's own loggers -- those take their level from
+    # uvicorn's `log_level` argument, not from root.
+    configure_logging()
     settings = ApiSettings.from_env()
     settings.validate()
     kwargs = {}

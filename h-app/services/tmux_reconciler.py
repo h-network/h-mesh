@@ -5,10 +5,12 @@ calls run_forever().
 
 import os
 
+from core.logging import configure_logging
 from modules.tmux.reconciler import TmuxReconciler
 
 
 def main() -> None:
+    configure_logging()
     pod = os.environ.get("POD", "default")
     tenant = os.environ.get("TENANT", "default")
     # The reconciler needs the credential, but the tmux server it creates must

@@ -11,7 +11,7 @@ import redis
 
 from .envelope import EnvelopeError, advance_hop, header_record_fields, parse_for_switch, stamp_source
 from .keys import prefix
-from .logging import emit, log_record
+from .logging import configure_logging, emit, log_record
 from .queues import admit_ingress
 from .registry import members, port_type
 from .retention import RetentionTrimmer
@@ -314,6 +314,7 @@ class Switch:
 
 
 def main() -> None:
+    configure_logging()
     # Delivery kicks are fire-and-forget: this process never calls wait() or
     # poll() on their children. Ignoring SIGCHLD makes the kernel auto-reap
     # exited port processes instead of leaving one zombie per delivery.
