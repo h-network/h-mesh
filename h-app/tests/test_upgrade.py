@@ -241,6 +241,16 @@ def test_upgrade_restarts_daemons_without_duplicating_and_preserves_the_tmux_ses
                     os.kill(pid, signal.SIGKILL)
                 except OSError:
                     pass
+        # ⚠ Also sweep any pidfile still under run_dir by name, not just the
+        # explicitly-tracked switch/reconciler pids above -- setup.sh/
+        # h-mesh upgrade start every daemon in DAEMON_MODULES (now including
+        # watchdog), and a hardcoded pid list here silently orphaned it on
+        # every run once that set grew. Measured: it did.
+        for pidfile in Path(run_dir).glob("*.pid"):
+            try:
+                os.kill(int(pidfile.read_text().strip()), signal.SIGKILL)
+            except (ValueError, OSError):
+                pass
         try:
             run_tmux("kill-server", socket=socket_path)
         except Exception:

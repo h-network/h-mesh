@@ -67,6 +67,23 @@ it in the shell you start from — the daemon environment is the tenant file wit
 the live environment layered on top, so either reaches the bot, and the live
 one wins.
 
+What gets logged, and where the line is drawn:
+
+| level | what |
+|---|---|
+| `INFO` | multi-step flow transitions (`flow hire: chat=… stage name -> profile, anchor 1 -> 4`), the hire/retire submission and its status code, an update ignored because it came from a chat that isn't `TELEGRAM_CHAT_ID`, and every handled Telegram failure (`editMessageText`, `setMessageReaction`) at `WARNING` |
+| `DEBUG` | one line per update received (id, kind, chat, message id, **character count**, whether it carries a photo/document/reply), which branch of `handle_text_message` took it, and one line per h-mesh API call — `api -> POST /agents/host/envelopes (118 bytes)` and `api <- POST /agents/host/envelopes 202` |
+
+⚠ **Shape, never content.** A message's text is logged as a character count
+and the branch that consumed it; a flow's answers are logged as the stage
+names they answered. Request logging is method, path, byte count and status
+code — never a body (it carries chat text) and never a header (it carries the
+bearer token). A callback's `data` *is* logged verbatim, because it is one of
+this bot's own short codes (`hi`, `at:agent`), not something a person typed.
+That is enough to answer "did the update arrive, which stage consumed it,
+did the POST happen, what did the door say" — which is what a flow that
+"just stops" needs, and all it needs.
+
 The ports read the same variable, the same way (`core/README.md`, "Two logging
 systems, one file"). This client keeps its own copy of the resolver because it
 imports nothing from `core` — one knob, two implementations, kept identical on
@@ -171,11 +188,15 @@ own (narrower) argparse surface, per office-sme:
   provider (`-` to skip either). Posts `StartAgent` with `port_type: "tmux"`,
   `cli: "claude"`. Unlike retire, hiring is not destructive — no identity or
   queues are ever removed — so it skips a type-the-name confirmation. Its
-  opening prompt is sent with `ForceReply` (compose box auto-opens, tagged
-  "Reply to:" this message) — the one flow prompt that can, since it's
-  always the first message of the flow (no picker precedes it, so nothing to
-  edit yet) and `editMessageText`, which every later step in this flow uses,
-  cannot attach a `ForceReply` at all. A successful hire's result carries a
+  opening prompt is **always a fresh send**, carrying `ForceReply` (compose
+  box auto-opens, tagged "Reply to:" this message) — the one flow prompt
+  that can, since `editMessageText`, which every later step in this flow
+  uses, cannot attach a `ForceReply` at all. ⚠ `handle_hire_start` therefore
+  *ignores* the `message_id` its caller passes: reached from the inline
+  button, that id is the tapped menu message, and editing it in place
+  silently dropped the `ForceReply` on the only path an operator actually
+  uses. The menu message is left where it is rather than overwritten. A
+  successful hire's result carries a
   **📋 Copy name** button for the agent name that was just created.
   ⚠ **No profile picker**: `office profiles` reads Redis directly and has no
   REST equivalent, so this client cannot list valid accounts ahead of time. A
@@ -223,21 +244,35 @@ Pause/Resume/Retire choice, Message-agent, Add Ticket's priority buttons) stay
 what inline keyboards are for; the sticky keyboard is for top-level nav that
 should always be one tap away without re-sending `/menu`.
 
-⚠ **Inline sub-flows edit one message in place rather than posting a new one
-per tap.** Add Ticket, Lifecycle (including its Pause/Resume/Retire screen and
-"◀ Back"), Message-agent, and Watch's agent picker all reuse the same
-message — `_send_or_edit_message`, keyed off `callback_query.message.message_id`
-— from the first picker tap through to the final result, so a chat doesn't
-fill up with one throwaway message per step. Two things that stay fresh sends
-regardless: Broadcast (its entry point is a sticky-keyboard tap, never an
-inline button, so there's never a message to edit into), and the very last
-step of Message-agent (its confirmation re-sends the sticky keyboard, and
-`editMessageText` can only ever carry an inline keyboard, never a
-`ReplyKeyboardMarkup` — the picker message still gets edited to acknowledge
-the tap, but the sticky-keyboard refresh is necessarily a second, new
-message). Hire only ever *starts* fresh too (its "➕ Hire" entry is a
-sticky-keyboard tap, same as Broadcast), but every stage after that initial
-send edits that first message rather than sending a new prompt each time.
+⚠ **A step answered by a BUTTON edits in place; a step answered by TYPING
+posts a new message.** That split is the whole rule, and the reason is that
+**an edit never notifies**: the moment the operator types, their own message
+is the newest thing in the chat, so a prompt edited into an older message
+lands above it silently. From the chat that is indistinguishable from the flow
+having died — which is exactly how the Hire flow presented before this was
+fixed: name asked, one follow-up seen, then apparently nothing.
+
+- **Button-answered screens edit** — Add Ticket's agent picker and its
+  priority buttons, Lifecycle (including Pause/Resume/Retire and "◀ Back"),
+  Message-agent's picker, Watch's picker: `_send_or_edit_message` keyed off
+  `callback_query.message.message_id`, so the screen the operator is looking
+  at is the screen that changes, and a chat doesn't fill up with a throwaway
+  message per tap.
+- **Typed-answer replies send fresh** — every reply produced by
+  `_advance_pending_flow` (`_send_typed_answer_reply`): Hire's three prompts
+  and its result, Add Ticket's description and priority prompts, Retire's
+  confirmation retry and its result, `/cancel`'s acknowledgement. The flow's
+  `message_id` still tracks its most recent message, so a later button tap
+  edits *that* one.
+- `/cancel` also clears the abandoned screen's inline keyboard
+  (`editMessageReplyMarkup`), so a cancelled flow can't be resumed by tapping
+  a button left behind on it.
+
+Two more that stay fresh sends for their own reasons: Broadcast (its entry
+point is a sticky-keyboard tap, never an inline button, so there's never a
+message to edit into) and the last step of Message-agent (its confirmation
+re-sends the sticky keyboard, and `editMessageText` can only carry an inline
+keyboard, never a `ReplyKeyboardMarkup`).
 The top-level sticky `ReplyKeyboardMarkup` menu itself is not part of any of
 this — Telegram has no API to edit a custom reply keyboard in place, so
 `/menu` and the sticky-keyboard taps that swap targets or toggle voice always

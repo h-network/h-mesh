@@ -24,8 +24,16 @@ same reason. `hire --provider NAME` likewise passes an explicit provider to
 the lifecycle payload, where the existing StartAgent validation applies.
 `hire` starts a fresh CLI session by default, including when an agent name has
 local session history; use `hire --resume` to restore that history explicitly.
+Use `hire NAME --lead` to hire a lead or transfer leadership to a tmux agent;
+the registry row and lead selection are published atomically, before tmuxhost
+creates the pane and its lead-specific `AGENTS.md`. Retiring the current lead
+clears the selection. Hire a replacement with `--lead` before retiring the old
+lead when the office should always have one; retiring a former lead cannot
+clear a leadership transfer that has already happened.
 
 The receiving port delegates to the settled `lib.agentlifecycle` API.
 `stop_agent` removes the retired instance's ingress queue and paused marker as
 well as its registry membership and delivery lock, so a later hire that reuses
-the name cannot inherit queued messages or paused state.
+the name cannot inherit queued messages or paused state. Registry removal also
+atomically clears the tenant lead key when (and only when) it still names the
+retired agent.

@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +26,12 @@ from core.keys import prefix
 from core.registry import is_member, members, port_type
 
 DEFAULT_ENVELOPE_MAX_BYTES = 1_048_576
+# Comfortably under both clients/telegram/bot.py's 90s idle-read timeout and
+# the shortest idle disconnect observed in the field (~5-7s on a real
+# install; see modules/api/README.md for what was and wasn't confirmed as
+# the cause). Module-level so a test can shrink it without waiting out a
+# real multi-second interval.
+SSE_KEEPALIVE_INTERVAL_S = 3.0
 ATTACHMENT_MAX_BYTES = 10_485_760
 ATTACHMENT_BASE64_MAX_BYTES = 4 * math.ceil(ATTACHMENT_MAX_BYTES / 3)
 ATTACHMENT_FILENAME_MAX_BYTES = 255
@@ -535,13 +542,13 @@ def _render_restdoc_html(app: FastAPI) -> str:
         </tr>
         <tr>
           <td><code>StartAgent</code></td>
-          <td><code>{{"agent": "...", "cli": "claude"}}</code></td>
-          <td>Enrols agent in registry, creates terminal window, and starts CLI (defaults to <code>claude</code>).</td>
+          <td><code>{{"agent": "...", "cli": "claude", "lead": true}}</code></td>
+          <td>Enrols agent in registry, creates a terminal window, and starts the CLI (defaults to <code>claude</code>). Optional <code>lead: true</code> atomically transfers leadership to this tmux agent as it is enrolled.</td>
         </tr>
         <tr>
           <td><code>StopAgent</code></td>
           <td><code>{{"agent": "..."}}</code></td>
-          <td>Reverses all three: terminates CLI process, kills terminal window, and removes from registry.</td>
+          <td>Reverses all three: terminates the CLI process, kills the terminal window, and removes it from the registry. Retiring the current lead also clears the lead selection, unless leadership was already transferred.</td>
         </tr>
       </tbody>
     </table>
@@ -662,6 +669,7 @@ def _stream_response(
 
     async def event_generator():
         nonlocal cursor
+        last_sent = time.monotonic()
         while True:
             if await request.is_disconnected():
                 break
@@ -681,7 +689,19 @@ def _stream_response(
                     cursor = cid
                     data_json = json.dumps(entry)
                     yield f"id: {cid}\nevent: {event_name}\ndata: {data_json}\n\n"
+                last_sent = time.monotonic()
             else:
+                now = time.monotonic()
+                if now - last_sent >= SSE_KEEPALIVE_INTERVAL_S:
+                    # A bare comment line: valid SSE, ignored by EventSource
+                    # and by clients/telegram/bot.py's parser (any line
+                    # starting with ':' is skipped), but it is a byte on the
+                    # wire -- which is the whole point. An idle stream that
+                    # never sends a byte looks identical, to anything
+                    # watching the connection from outside this generator,
+                    # to a stream nobody is reading anymore.
+                    yield ": keepalive\n\n"
+                    last_sent = now
                 await asyncio.sleep(0.1)
 
     return StreamingResponse(

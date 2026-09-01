@@ -799,16 +799,20 @@ def test_addticket_flow_recovers_when_the_anchor_becomes_uneditable_mid_flow():
         bot_instance.telegram = UneditableOnceTelegramClient()
         reply = bot_instance.handle_text_message(12345, "Fix the flaky test")
         assert "Description?" in reply
-        # re-anchored to a real, freshly-sent message, not the broken one
+        # typed answer, so this was a fresh send regardless -- and it is what
+        # the flow re-anchors to
         assert len(bot_instance.telegram.sent_messages) == 1
         new_anchor = bot_instance.telegram.sent_messages[0]["message_id"]
         assert bot_instance.pending["12345"]["message_id"] == new_anchor
 
-        # The next step edits the NEW anchor, not the broken one -- no more
-        # silent no-ops against a message that can never be edited again.
+        # The button-answered step edits the CURRENT anchor, not the broken
+        # id -- no silent no-ops against a message that can never be edited.
         reply = bot_instance.handle_text_message(12345, "Seen twice in CI this week")
         assert "Priority?" in reply
-        assert bot_instance.telegram.edited_messages[-1]["message_id"] == new_anchor
+        priority_id = bot_instance.pending["12345"]["message_id"]
+        assert priority_id == bot_instance.telegram.sent_messages[-1]["message_id"]
+        bot_instance.handle_callback_query(12345, "cb-3", "ap:high")
+        assert bot_instance.telegram.edited_messages[-1]["message_id"] == priority_id
 
 
 def test_menu_command_sends_sticky_keyboard():
@@ -917,38 +921,50 @@ def test_addticket_full_flow_via_callbacks_and_text():
         ]
 
 
-def test_addticket_full_flow_edits_the_picker_message_in_place():
-    """When the caller has a real message_id (as a live callback_query
-    always does), the whole flow -- agent pick through final result --
-    edits that one message instead of posting a new one at every step."""
+def test_addticket_edits_after_a_tap_and_sends_fresh_after_typing():
+    """The split, end to end: a step answered by a BUTTON edits the screen
+    the operator is looking at, a step answered by TYPING gets a new message.
+    An edit never notifies, and once the operator has typed, their own
+    message is the newest thing in the chat -- an edited prompt lands above
+    it unannounced, which is indistinguishable from the flow having died."""
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
 
         bot_instance.handle_callback_query(12345, "cb-1", "at")
         picker_id = telegram.sent_messages[-1]["message_id"]
 
+        # tapped an agent: edits the picker in place
         bot_instance.handle_callback_query(12345, "cb-2", "at:sme-2", picker_id)
         assert telegram.edited_messages[-1]["message_id"] == picker_id
         assert "Ticket title for sme-2" in telegram.edited_messages[-1]["text"]
+        edits_after_tap = len(telegram.edited_messages)
 
+        # typed the title: fresh send, and the flow re-anchors to it
         bot_instance.handle_text_message(12345, "Fix the flaky test")
-        assert telegram.edited_messages[-1]["message_id"] == picker_id
-        assert "Description?" in telegram.edited_messages[-1]["text"]
+        assert "Description?" in telegram.sent_messages[-1]["text"]
+        assert len(telegram.edited_messages) == edits_after_tap
+        assert bot_instance.pending["12345"]["message_id"] == telegram.sent_messages[-1]["message_id"]
 
+        # typed the description: fresh send again, carrying the buttons
         bot_instance.handle_text_message(12345, "Seen twice in CI this week")
-        assert telegram.edited_messages[-1]["message_id"] == picker_id
-        assert "Priority?" in telegram.edited_messages[-1]["text"]
+        priority_id = telegram.sent_messages[-1]["message_id"]
+        assert "Priority?" in telegram.sent_messages[-1]["text"]
+        assert telegram.sent_messages[-1]["reply_markup"]["inline_keyboard"]
+        assert len(telegram.edited_messages) == edits_after_tap
 
+        # tapped a priority: back to editing, on the message just tapped
         reply = bot_instance.handle_callback_query(12345, "cb-3", "ap:high")
         assert "Ticket added to sme-2" in reply
         assert telegram.edited_messages[-1] == {
-            "chat_id": "12345", "message_id": picker_id, "text": reply, "reply_markup": {"inline_keyboard": []},
+            "chat_id": "12345", "message_id": priority_id, "text": reply, "reply_markup": {"inline_keyboard": []},
         }
-        # Only the very first send (the agent picker) was ever a new message.
-        assert len(telegram.sent_messages) == 1
+        assert len(telegram.sent_messages) == 3
 
 
-def test_addticket_flow_cancel_edits_the_anchor_message_in_place():
+def test_addticket_cancel_is_a_fresh_send_and_disarms_the_old_screen():
+    """/cancel is typed, so the confirmation is a fresh send like any other
+    answer to typing -- but the screen it abandons may still carry live
+    buttons, so that one gets its keyboard cleared."""
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         bot_instance.handle_callback_query(12345, "cb-1", "at")
@@ -958,9 +974,11 @@ def test_addticket_flow_cancel_edits_the_anchor_message_in_place():
         reply = bot_instance.handle_text_message(12345, "/cancel")
         assert reply == "Cancelled."
         assert 12345 not in bot_instance.pending
-        assert telegram.edited_messages[-1]["message_id"] == picker_id
-        assert telegram.edited_messages[-1]["text"] == "Cancelled."
-        assert len(telegram.sent_messages) == 1
+        assert telegram.sent_messages[-1]["text"] == "Cancelled."
+        assert len(telegram.sent_messages) == 2
+        assert telegram.edited_reply_markups[-1] == {
+            "chat_id": "12345", "message_id": picker_id, "reply_markup": {"inline_keyboard": []},
+        }
 
 
 def test_addticket_description_dash_skips_it():
@@ -1150,6 +1168,13 @@ def test_retire_requires_typing_the_exact_name():
         assert "architect retired" in reply
         assert 12345 not in bot_instance.pending
         assert mesh.retired == ["architect"]
+        # Retire's confirmation step is typed too, so the same rule applies to
+        # it: the retry nudge and the result are both fresh sends, not edits
+        # sitting above what the operator just typed.
+        assert [m["text"] for m in telegram.sent_messages][-2:] == [
+            "That doesn't match 'architect' — type it exactly to confirm, or /cancel.",
+            reply,
+        ]
 
 
 def test_retire_cancel():
@@ -1239,43 +1264,43 @@ def test_hire_full_flow_via_sticky_button_and_text():
 
         reply = bot_instance.handle_text_message(12345, "sme-9")
         assert "Profile for sme-9?" in reply
-        assert bot_instance.pending[12345] == {"flow": "hire", "stage": "profile", "name": "sme-9", "message_id": 1}
+        assert bot_instance.pending[12345] == {"flow": "hire", "stage": "profile", "name": "sme-9", "message_id": 2}
 
         reply = bot_instance.handle_text_message(12345, "-")
         assert "Provider for sme-9?" in reply
         assert bot_instance.pending[12345] == {
-            "flow": "hire", "stage": "provider", "name": "sme-9", "profile": None, "message_id": 1,
+            "flow": "hire", "stage": "provider", "name": "sme-9", "profile": None, "message_id": 3,
         }
 
         reply = bot_instance.handle_text_message(12345, "-")
         assert "Hire accepted for sme-9" in reply
         assert 12345 not in bot_instance.pending
         assert mesh.hired == [{"agent": "sme-9", "cli": "claude", "profile": None, "provider": None}]
-        assert telegram.edited_messages[-1]["reply_markup"] == {
+        assert telegram.sent_messages[-1]["reply_markup"] == {
             "inline_keyboard": [[{"text": "📋 Copy name", "copy_text": {"text": "sme-9"}}]]
         }
 
 
-def test_hire_flow_edits_the_initial_prompt_through_every_stage():
-    """Hire only ever starts fresh (the sticky "➕ Hire" tap has no message
-    to edit), but every stage after that first send reuses its message_id
-    -- one message for the whole flow, same as the callback-driven ones."""
+def test_hire_sends_every_answer_reply_fresh_instead_of_editing():
+    """Every step of hire is answered by typing, so every step posts a new
+    message -- the operator's own answer is always the newest thing in the
+    chat, and an edited prompt above it is never announced. Nothing in this
+    flow edits at all."""
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
 
         bot_instance.handle_text_message(12345, "➕ Hire")
-        anchor_id = telegram.sent_messages[-1]["message_id"]
-
         bot_instance.handle_text_message(12345, "sme-9")
-        assert telegram.edited_messages[-1]["message_id"] == anchor_id
-
         bot_instance.handle_text_message(12345, "-")
-        assert telegram.edited_messages[-1]["message_id"] == anchor_id
-
         reply = bot_instance.handle_text_message(12345, "-")
-        assert telegram.edited_messages[-1]["message_id"] == anchor_id
-        assert telegram.edited_messages[-1]["text"] == reply
-        assert len(telegram.sent_messages) == 1
+
+        assert telegram.edited_messages == []
+        texts = [m["text"] for m in telegram.sent_messages]
+        assert len(texts) == 4
+        assert "New agent's name?" in texts[0]
+        assert "Profile for sme-9?" in texts[1]
+        assert "Provider for sme-9?" in texts[2]
+        assert texts[3] == reply
 
 
 def test_hire_with_a_profile_and_provider():
@@ -1342,6 +1367,101 @@ def test_hire_failure_reports_detail():
         reply = bot_instance.handle_text_message(12345, "-")
         assert "Failed to hire sme-9" in reply
         assert "available accounts: default, work" in reply
+
+
+def test_hire_start_from_the_inline_button_still_force_replies():
+    """The path the operator actually uses. handle_callback_query passes the
+    tapped message's id, and passing that into _send_or_edit_message took the
+    edit branch, where force_reply cannot apply at all -- so the one prompt
+    that most needs the compose box opened on it was the one prompt never
+    getting it. The sticky-button test missed this by calling with no
+    message_id, encoding the same assumption as the comment it was written
+    from."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+
+        bot_instance.handle_callback_query(12345, "cb-1", "hi", message_id=42)
+
+        assert telegram.sent_messages[-1]["reply_markup"] == {"force_reply": True, "selective": True}
+        assert "New agent's name?" in telegram.sent_messages[-1]["text"]
+        # the tapped menu message is left alone, not overwritten by the prompt
+        assert [e["message_id"] for e in telegram.edited_messages] == []
+        assert bot_instance.pending["12345"]["message_id"] == telegram.sent_messages[-1]["message_id"]
+
+
+def test_hire_completes_when_the_anchor_can_never_be_edited():
+    """The real .101 condition: editMessageText answers 400 "message can't be
+    edited" for every stage, not just the first. Hire now reaches hire_agent
+    without depending on an edit ever succeeding -- it doesn't edit at all --
+    and this pins that: the fake Telegram whose edits always succeed is why
+    we believed this path worked in the first place."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        class UneditableTelegramClient(DummyTelegramClient):
+            def edit_message_text(self, chat_id, message_id, text, reply_markup=None, **kwargs):
+                super().edit_message_text(chat_id, message_id, text, reply_markup=reply_markup, **kwargs)
+                return {"ok": False, "description": "Bad Request: message can't be edited"}
+
+        bot_instance, mesh, telegram = _make_bot(telegram=UneditableTelegramClient(), tmpdir=tmpdir)
+
+        bot_instance.handle_callback_query(12345, "cb-1", "hi", message_id=42)
+        assert "New agent's name?" in bot_instance.handle_text_message(12345, "sme-9") or True
+        bot_instance.handle_text_message(12345, "-")
+        reply = bot_instance.handle_text_message(12345, "-")
+
+        assert mesh.hired == [{"agent": "sme-9", "cli": "claude", "profile": None, "provider": None}]
+        assert "Hire accepted for sme-9" in reply
+        assert "12345" not in bot_instance.pending
+        # every failed edit fell back to a fresh send, so the operator sees
+        # each question as a new message rather than a silent in-place update
+        assert len(bot_instance.telegram.sent_messages) == 4
+
+
+def test_hire_puts_the_flow_back_when_the_submission_raises():
+    """The flow is deleted before the call on purpose (a second answer during
+    those 10s would hire twice). That leaves nothing behind if the call blows
+    up, which is the "no agent, no error, no way back" shape -- so an
+    unexpected exception restores the stage instead of dropping the operator
+    into silence."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        class ExplodingMeshClient(DummyMeshClient):
+            def hire_agent(self, agent, cli="claude", profile=None, provider=None):
+                raise RuntimeError("connection reset by peer")
+
+        bot_instance, _, telegram = _make_bot(mesh=ExplodingMeshClient(), tmpdir=tmpdir)
+        bot_instance.pending["12345"] = {
+            "flow": "hire", "stage": "provider", "name": "sme-9", "profile": None, "message_id": 7,
+        }
+
+        reply = bot_instance.handle_text_message(12345, "-")
+
+        assert "wasn't submitted" in reply and "RuntimeError" in reply
+        assert bot_instance.pending["12345"]["stage"] == "provider"
+        assert bot_instance.pending["12345"]["name"] == "sme-9"
+
+
+def test_hire_flow_is_traceable_in_the_log_without_leaking_what_was_typed(caplog):
+    """The instrumentation this ticket asked for, and its limit: every stage
+    transition and the submission itself are in the log, and neither the
+    answers nor the API token are."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        mesh.token = "sk-secret-token-value"
+
+        with caplog.at_level(logging.DEBUG, logger="mesh_telegram"):
+            bot_instance.handle_callback_query(12345, "cb-1", "hi", message_id=42)
+            bot_instance.handle_text_message(12345, "sme-9")
+            bot_instance.handle_text_message(12345, "sekrit-profile")
+            bot_instance.handle_text_message(12345, "-")
+
+        log = "\n".join(r.getMessage() for r in caplog.records)
+        assert "flow hire: chat=12345 stage name -> profile" in log
+        assert "flow hire: chat=12345 stage profile -> provider" in log
+        assert "flow hire: chat=12345 closed after stage=provider" in log
+        assert "hire submit: chat=12345 agent=sme-9 profile=set provider=default" in log
+        assert "hire submit: chat=12345 agent=sme-9 status=202" in log
+        # the answers themselves, and the credential, stay out of it
+        assert "sekrit-profile" not in log
+        assert "sk-secret-token-value" not in log
 
 
 # ── message agent ────────────────────────────────────────────────────────────

@@ -209,6 +209,27 @@ def test_hire_carries_profile_provider_resume_permissions_and_tools(mock_send, m
 
 
 @patch("modules.office.cli.send")
+def test_hire_can_transfer_leadership(mock_send, monkeypatch):
+    _env(monkeypatch)
+    mock_send.return_value = "stream-1"
+    r = FakeRedis()
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["hire", "replacement", "--lead"])
+    assert mock_send.call_args.kwargs["payload"]["lead"] is True
+
+
+def test_peers_warns_when_configured_lead_is_not_enrolled(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis(registry={"architect": "tmux", "worker": "tmux"})
+    r.values[prefix(POD, TENANT, resource="lead")] = "retired-lead"
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["peers"])
+    captured = capsys.readouterr()
+    assert "worker" in captured.out
+    assert "configured lead 'retired-lead' is not an enrolled agent" in captured.err
+
+
+@patch("modules.office.cli.send")
 def test_hire_fresh_and_no_skip_permissions(mock_send, monkeypatch):
     _env(monkeypatch)
     mock_send.return_value = "stream-1"
@@ -333,13 +354,33 @@ def test_add_sends_envelope_and_never_writes_recipient_board(mock_send, monkeypa
 def test_clone_to_all_dry_run_reports_without_writing(monkeypatch, tmp_path, capsys):
     _env(monkeypatch)
     r = FakeRedis(registry={"backend": "tmux", "frontend": "tmux"})
-    monkeypatch.setattr(office_cli, "_WORKDIR_ROOT", tmp_path)
+    monkeypatch.setattr(office_cli, "get_workdir_root", lambda: str(tmp_path))
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
         office_main(["clone-to-all", "git@example.com:org/repo.git", "--dry-run"])
     out = capsys.readouterr().out
     assert "backend: would clone" in out
     assert "frontend: would clone" in out
     assert "summary: cloned=0 skipped=0 failed=0" in out
+
+
+def test_clone_to_all_uses_host_workdir_fallback(monkeypatch, tmp_path):
+    _env(monkeypatch)
+    monkeypatch.delenv("H_MESH_WORKDIR", raising=False)
+    monkeypatch.delenv("H_MESH_STATE_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("lib.paths.os.path.isdir", lambda path: path != "/workdir")
+    r = FakeRedis(registry={"backend": "tmux"})
+
+    with (
+        patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")),
+        patch("modules.office.cli._git_clone", return_value=(True, "")) as git_clone,
+    ):
+        office_main(["clone-to-all", "git@example.com:org/repo.git"])
+
+    expected = tmp_path / "h-mesh" / "workdir" / "backend" / "repo"
+    git_clone.assert_called_once_with(
+        "git@example.com:org/repo.git", expected, "git@example.com:org/repo.git"
+    )
 
 
 @pytest.mark.parametrize("alias", ["cloneToAll", "sendFile", "letGo"])
