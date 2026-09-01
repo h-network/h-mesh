@@ -73,8 +73,11 @@ class FakeRedis:
     def get(self, key):
         return self.kv.get(key)
 
-    def set(self, key, value):
+    def set(self, key, value, nx=False, px=None):
+        if nx and key in self.kv:
+            return False
         self.kv[key] = value
+        return True
 
     def xadd(self, key, fields, maxlen=None, approximate=False):
         self.streams[key].append(fields)
@@ -83,6 +86,15 @@ class FakeRedis:
     def eval(self, script, key_count, *args):
         keys = args[:key_count]
         argv = args[key_count:]
+        if "core delivery lock release" in script:
+            key, token = keys[0], argv[0]
+            if self.kv.get(key) != token:
+                return 0
+            self.kv.pop(key, None)
+            return 1
+        if "core delivery lock renew" in script:
+            key, token = keys[0], argv[0]
+            return int(self.kv.get(key) == token)
         if "core unreplied increment" in script:
             key, client, since = keys[0], argv[0], argv[1]
             existing = self.hget(key, client)

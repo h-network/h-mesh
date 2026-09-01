@@ -5,12 +5,14 @@ only the process/callback the switch's kick invokes does.
 
 import importlib
 import logging
+import threading
 import time
+import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from typing import Any, Callable, Union
 
 from .keys import prefix
+from .logging import log_record
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,26 @@ _DEFAULT_REGISTRY: dict[str, HandlerSpec] = {}
 
 _REGISTRY: dict[str, HandlerSpec] = dict(_DEFAULT_REGISTRY)
 
+DELIVERY_LOCK_LEASE_MS = 10_000
+DELIVERY_LOCK_ACQUIRE_TIMEOUT = 60.0
+DELIVERY_LOCK_POLL_INTERVAL = 0.05
+
+_RENEW_DELIVERY_LOCK = """
+-- core delivery lock renew v1
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('PEXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+"""
+
+_RELEASE_DELIVERY_LOCK = """
+-- core delivery lock release v1
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
 _DRAIN_INGRESS = """
 -- core unroutable ingress drain v1
 local key = KEYS[1]
@@ -34,6 +56,11 @@ if #items > 0 then
 end
 return items
 """
+
+
+def delivery_lock_key(pod: str, tenant: str, agent: str) -> str:
+    """Canonical Redis key for one destination's delivery lease."""
+    return prefix(pod, tenant, agent=agent, resource="delivering")
 
 
 def register_type(port_type_name: str, handler: HandlerSpec) -> None:
@@ -143,18 +170,71 @@ def dispatch_ingress(r, *, pod: str, tenant: str, agent: str) -> None:
 
 
 @contextmanager
-def delivery_lock(r, *, pod: str, tenant: str, agent: str):
-    """Serialize delivery to one destination agent using Redis HSETNX busy tag."""
-    delivering_key = prefix(pod, tenant, resource="delivering")
-    while True:
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        if r.hsetnx(delivering_key, agent, now_iso):
-            break
-        time.sleep(0.05)
+def delivery_lock(
+    r,
+    *,
+    pod: str,
+    tenant: str,
+    agent: str,
+    lease_ms: int = DELIVERY_LOCK_LEASE_MS,
+    acquire_timeout: float = DELIVERY_LOCK_ACQUIRE_TIMEOUT,
+    poll_interval: float = DELIVERY_LOCK_POLL_INTERVAL,
+):
+    """Serialize delivery with an owned, renewable Redis lease.
+
+    A killed holder's key expires, while a live holder renews until it leaves
+    the context. Compare-and-delete prevents an expired holder from removing a
+    successor's lease if its ``finally`` block runs late.
+    """
+    if lease_ms <= 0 or acquire_timeout < 0 or poll_interval <= 0:
+        raise ValueError("delivery lock timings must be positive")
+    lock_key = delivery_lock_key(pod, tenant, agent)
+    token = uuid.uuid4().hex
+    deadline = time.monotonic() + acquire_timeout
+    while not r.set(lock_key, token, nx=True, px=lease_ms):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            reason = f"delivery lock acquisition timed out after {acquire_timeout:.3f}s"
+            log_record(
+                "dispatch", "delivery_lock_timeout", destination=agent, reason=reason,
+            )
+            raise TimeoutError(reason)
+        time.sleep(min(poll_interval, remaining))
+
+    stop_renewal = threading.Event()
+    lease_lost = threading.Event()
+
+    def renew() -> None:
+        interval = max(lease_ms / 3000.0, 0.001)
+        while not stop_renewal.wait(interval):
+            try:
+                if not r.eval(_RENEW_DELIVERY_LOCK, 1, lock_key, token, lease_ms):
+                    lease_lost.set()
+                    return
+            except Exception:
+                # A later renewal can still preserve ownership after a short
+                # Redis fault. The TTL remains the authority meanwhile.
+                continue
+
+    renewal = threading.Thread(
+        target=renew, name=f"delivery-lock-{agent}", daemon=True,
+    )
+    renewal.start()
     try:
         yield
     finally:
-        r.hdel(delivering_key, agent)
+        stop_renewal.set()
+        renewal.join(timeout=max(lease_ms / 1000.0, 0.1))
+        try:
+            r.eval(_RELEASE_DELIVERY_LOCK, 1, lock_key, token)
+        finally:
+            if lease_lost.is_set():
+                log_record(
+                    "dispatch",
+                    "delivery_lock_lost",
+                    destination=agent,
+                    reason="delivery lock lease was lost before handler completed",
+                )
 
 
 def run_delivery_kick(
@@ -162,8 +242,8 @@ def run_delivery_kick(
 ) -> None:
     """Serialize one delivery to a destination so a second kick can't race it.
 
-    Acquires a busy tag via HSETNX before calling dispatch_ingress(), and
-    always releases it, even if dispatch raises.
+    Acquires and renews a bounded Redis lease before calling
+    dispatch_ingress(), then releases only the lease it owns.
     """
     with delivery_lock(r, pod=pod, tenant=tenant, agent=agent):
         dispatch_ingress(r, pod=pod, tenant=tenant, agent=agent)

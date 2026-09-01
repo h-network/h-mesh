@@ -1,8 +1,10 @@
 import sys
 import threading
+import time
 import unittest
 from collections import defaultdict, deque
 from pathlib import Path
+from unittest.mock import patch
 
 
 H_APP = Path(__file__).resolve().parents[1]
@@ -10,6 +12,7 @@ if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
 from core.dispatch import (
+    delivery_lock,
     dispatch_ingress,
     get_handler,
     register_type,
@@ -30,18 +33,35 @@ class DispatchRedis:
         self.hashes = defaultdict(dict)
         self.lists = defaultdict(deque)
         self.values = {}
+        self.expiries = {}
         self.lock = threading.Lock()
-        self.hsetnx_contention = threading.Event()
+        self.setnx_contention = threading.Event()
         self.after_drain = None
         self.eval_calls = 0
 
     def get(self, key):
         with self.lock:
+            self._expire(key)
             return self.values.get(key)
 
-    def set(self, key, value):
+    def set(self, key, value, nx=False, px=None):
         with self.lock:
+            self._expire(key)
+            if nx and key in self.values:
+                self.setnx_contention.set()
+                return False
             self.values[key] = value
+            if px is not None:
+                self.expiries[key] = time.monotonic() + px / 1000
+            else:
+                self.expiries.pop(key, None)
+            return True
+
+    def _expire(self, key):
+        expiry = self.expiries.get(key)
+        if expiry is not None and time.monotonic() >= expiry:
+            self.values.pop(key, None)
+            self.expiries.pop(key, None)
 
     def hget(self, key, field):
         with self.lock:
@@ -73,6 +93,7 @@ class DispatchRedis:
             existed = key in self.lists or key in self.values or key in self.hashes
             self.lists.pop(key, None)
             self.values.pop(key, None)
+            self.expiries.pop(key, None)
             self.hashes.pop(key, None)
             return int(existed)
 
@@ -82,6 +103,23 @@ class DispatchRedis:
             return len(self.lists[key])
 
     def eval(self, script, key_count, *args):
+        if "core delivery lock renew" in script:
+            key, token, lease_ms = args
+            with self.lock:
+                self._expire(key)
+                if self.values.get(key) != token:
+                    return 0
+                self.expiries[key] = time.monotonic() + int(lease_ms) / 1000
+                return 1
+        if "core delivery lock release" in script:
+            key, token = args
+            with self.lock:
+                self._expire(key)
+                if self.values.get(key) != token:
+                    return 0
+                self.values.pop(key, None)
+                self.expiries.pop(key, None)
+                return 1
         self.assert_drain_script(script, key_count)
         key = args[0]
         with self.lock:
@@ -236,7 +274,7 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(entered_first.wait(timeout=1))
         second.start()
         try:
-            self.assertTrue(self.redis.hsetnx_contention.wait(timeout=1))
+            self.assertTrue(self.redis.setnx_contention.wait(timeout=1))
             self.assertEqual(calls, 1, "second dispatch entered while busy tag was held")
         finally:
             release_first.set()
@@ -248,8 +286,77 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(calls, 2)
         self.assertEqual(max_active, 1)
-        delivering = prefix(POD, TENANT, resource="delivering")
-        self.assertIsNone(self.redis.hget(delivering, AGENT))
+        delivering = prefix(POD, TENANT, agent=AGENT, resource="delivering")
+        self.assertIsNone(self.redis.get(delivering))
+
+    def test_delivery_lock_recovers_after_dead_holders_lease_expires(self):
+        key = prefix(POD, TENANT, agent=AGENT, resource="delivering")
+        self.redis.set(key, "dead-holder", nx=True, px=20)
+
+        with delivery_lock(
+            self.redis, pod=POD, tenant=TENANT, agent=AGENT,
+            lease_ms=100, acquire_timeout=0.5, poll_interval=0.005,
+        ):
+            self.assertNotEqual(self.redis.get(key), "dead-holder")
+
+        self.assertIsNone(self.redis.get(key))
+
+    def test_delivery_lock_release_does_not_delete_successors_lease(self):
+        key = prefix(POD, TENANT, agent=AGENT, resource="delivering")
+        with delivery_lock(
+            self.redis, pod=POD, tenant=TENANT, agent=AGENT,
+            lease_ms=1000, acquire_timeout=0.1, poll_interval=0.005,
+        ):
+            self.redis.set(key, "successor", px=1000)
+
+        self.assertEqual(self.redis.get(key), "successor")
+
+    def test_delivery_lock_renews_while_live_holder_is_running(self):
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+
+        def hold_first():
+            with delivery_lock(
+                self.redis, pod=POD, tenant=TENANT, agent=AGENT,
+                lease_ms=30, acquire_timeout=0.5, poll_interval=0.002,
+            ):
+                first_entered.set()
+                release_first.wait(timeout=1)
+
+        def enter_second():
+            with delivery_lock(
+                self.redis, pod=POD, tenant=TENANT, agent=AGENT,
+                lease_ms=30, acquire_timeout=0.5, poll_interval=0.002,
+            ):
+                second_entered.set()
+
+        first = threading.Thread(target=hold_first)
+        second = threading.Thread(target=enter_second)
+        first.start()
+        self.assertTrue(first_entered.wait(timeout=1))
+        second.start()
+        time.sleep(0.08)  # More than two unrenewed lease periods.
+        self.assertFalse(second_entered.is_set())
+        release_first.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+        self.assertTrue(second_entered.is_set())
+
+    def test_delivery_lock_acquire_is_bounded_and_diagnostic(self):
+        key = prefix(POD, TENANT, agent=AGENT, resource="delivering")
+        self.redis.set(key, "live-holder", nx=True, px=1000)
+
+        with patch("core.dispatch.log_record") as record:
+            with self.assertRaisesRegex(TimeoutError, "acquisition timed out"):
+                with delivery_lock(
+                    self.redis, pod=POD, tenant=TENANT, agent=AGENT,
+                    lease_ms=100, acquire_timeout=0.02, poll_interval=0.005,
+                ):
+                    pass
+
+        record.assert_called_once()
+        self.assertEqual(record.call_args.args[:2], ("dispatch", "delivery_lock_timeout"))
 
 
 def sample_lazy_handler(**kwargs):

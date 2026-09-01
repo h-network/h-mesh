@@ -306,8 +306,8 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         self.assertIn("[message from frank] invoked via python -m modules.tmux.port", stdout)
 
         # Delivering lock released
-        delivering_key = prefix(self.pod, self.tenant, resource="delivering")
-        self.assertIsNone(self.r.hget(delivering_key, "grace"))
+        delivering_key = prefix(self.pod, self.tenant, agent="grace", resource="delivering")
+        self.assertIsNone(self.r.get(delivering_key))
 
     def test_reconciler_empty_registry_settles_without_churn(self):
         reconciler = TmuxReconciler(
@@ -750,4 +750,3 @@ class RealTmuxIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

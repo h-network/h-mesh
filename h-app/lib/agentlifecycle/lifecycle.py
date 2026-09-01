@@ -12,6 +12,7 @@ from collections.abc import Callable
 from functools import wraps
 
 from core.keys import SEGMENT_REGEX, prefix
+from core.dispatch import delivery_lock_key
 from core.logging import log_record
 from core.policy import tags_key
 from core.registry import port_type
@@ -419,7 +420,7 @@ def stop_agent(
     )
     _write_desired(
         committed, "delivery lock cleared", "delivery lock clear",
-        lambda: r.hdel(prefix(pod, tenant, resource="delivering"), agent),
+        lambda: r.delete(delivery_lock_key(pod, tenant, agent)),
     )
     if agent_port_type != "api":
         try:
