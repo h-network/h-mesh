@@ -2,22 +2,23 @@
 # Proves observable at-most-once loss plus terminal recovery, NOT delivery:
 # a message sent while its window is absent is dead-lettered window_missing,
 # never opened, and reconciliation restores exactly one fresh pane. Ported
-# from h-flock's tmux-window-loss.sh — see conservation.sh's header for the
-# general bare-host environment shift.
+# from the reference implementation's tmux-window-loss.sh — see
+# conservation.sh's header for the general bare-host environment shift.
 #
-# h-flock's `flock.tmuxhost` daemon (the thing that (re)creates windows to
-# match desired state) maps onto h-mesh's `services.tmux_reconciler` — same
-# SIGSTOP/SIGCONT mechanic to open a deliberate recreate-gap. HTTP delivery
-# maps onto h-mesh's real REST API (`modules/api/server.py`'s
-# POST /agents/{agent}/envelopes), started here since setup.sh doesn't run
-# it by default (only the switch and reconciler are default daemons).
+# The reference implementation's window-management daemon (the thing that
+# (re)creates windows to match desired state) maps onto h-mesh's
+# `services.tmux_reconciler` — same SIGSTOP/SIGCONT mechanic to open a
+# deliberate recreate-gap. HTTP delivery maps onto h-mesh's real REST API
+# (`modules/api/server.py`'s POST /agents/{agent}/envelopes), started here
+# since setup.sh doesn't run it by default (only the switch and reconciler
+# are default daemons).
 #
-# One real difference, not just plumbing: h-flock required a non-empty
-# `launch` key as a precondition (its fixture agents always had a concrete
-# CLI). A bare `bash -il` window with no `launch` key at all is a normal,
-# valid h-mesh state (see conservation.sh's stations) — so this port only
-# requires port_type=tmux to be set, and reports launch (if any) without
-# gating on it.
+# One real difference, not just plumbing: the reference implementation
+# required a non-empty `launch` key as a precondition (its fixture agents
+# always had a concrete CLI). A bare `bash -il` window with no `launch` key
+# at all is a normal, valid h-mesh state (see conservation.sh's stations) —
+# so this port only requires port_type=tmux to be set, and reports launch
+# (if any) without gating on it.
 set -uo pipefail
 . "$(dirname "$0")/_lib.sh"
 

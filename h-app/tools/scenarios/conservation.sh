@@ -1,46 +1,48 @@
 #!/usr/bin/env bash
-# Conservation under injected switch and port death — ported from h-flock's
-# container/scenarios/conservation.sh to h-mesh's bare-host, Redis-backed bus.
+# Conservation under injected switch and port death — ported from the
+# reference implementation's container/scenarios/conservation.sh to h-mesh's
+# bare-host, Redis-backed bus.
 #
-# h-flock ran this inside a Docker container, shelling in via
-# dx() { docker exec -i "$CONTAINER" ...; } and reading custody from
+# The reference implementation ran this inside a Docker container, shelling
+# in via dx() { docker exec -i "$CONTAINER" ...; } and reading custody from
 # `docker logs`. h-mesh has no container: every command below runs directly
 # against the host this script is executed on (run it ON the acceptance VM,
 # or over `ssh host ...`; there is no exec wrapper to route through). Custody
 # comes from the switch daemon's own stdout, which setup.sh already redirects
 # to a durable per-tenant log file — that file is this script's `docker logs`.
 #
-# Message shape and bus vocabulary carried over almost unchanged: h-flock's
-# `flock.bus` (build/encode/parse, prefix, roster) maps onto h-mesh's
-# core.envelope + core.keys + core.registry; `flock.switch` maps onto
-# core.service.Switch; a `flock.port cons-N` delivery process maps onto a
-# one-shot `python -m modules.tmux.port <agent>` subprocess, spawned per kick
-# by the switch itself (core/service.py's transmission()) rather than a
-# long-lived per-agent loop — same externally observable shape (a transient
-# process per delivery, killable to inject port death) via a different
-# internal mechanism.
+# Message shape and bus vocabulary carried over almost unchanged: the
+# reference implementation's message-bus module (build/encode/parse, prefix,
+# roster) maps onto h-mesh's core.envelope + core.keys + core.registry; its
+# switch module maps onto core.service.Switch; its per-station delivery
+# process maps onto a one-shot `python -m modules.tmux.port <agent>`
+# subprocess, spawned per kick by the switch itself (core/service.py's
+# transmission()) rather than a long-lived per-agent loop — same externally
+# observable shape (a transient process per delivery, killable to inject
+# port death) via a different internal mechanism.
 #
-# One deliberate behavioural difference, not just plumbing: h-flock's
-# synthetic "cons-N" stations used port_type "api", a receive-only mailbox
-# with no window to manage. h-mesh has the same "api" port_type available
-# (modules/api/port.py drains ingress straight into a Redis mailbox stream,
-# no window needed) and it would be the cheaper, more direct port. This
-# script instead registers stations as port_type "tmux" and lets the
-# tenant's own tmux_reconciler (already running per setup.sh) create their
-# windows as plain `bash -il` panes — no `launch` key is set, so no CLI
-# starts. That's a choice, not a workaround: it exercises the real
+# One deliberate behavioural difference, not just plumbing: the reference
+# implementation's synthetic "cons-N" stations used port_type "api", a
+# receive-only mailbox with no window to manage. h-mesh has the same "api"
+# port_type available (modules/api/port.py drains ingress straight into a
+# Redis mailbox stream, no window needed) and it would be the cheaper, more
+# direct port. This script instead registers stations as port_type "tmux"
+# and lets the tenant's own tmux_reconciler (already running per setup.sh)
+# create their windows as plain `bash -il` panes — no `launch` key is set,
+# so no CLI starts. That's a choice, not a workaround: it exercises the real
 # production tmux window-creation and delivery path, which is a more direct
 # hit on doubt 1 ("window creation is trustworthy") than a synthetic mailbox
 # would be, at the cost of needing real tmux windows. Switch STATIONS'
 # registry port_type to "api" (and drop the wait_for_windows step) for a
 # lighter-weight, mailbox-only run instead.
 #
-# Scale is down from h-flock's STATIONS=100/ROUNDS=100 (10,000 messages) to
-# STATIONS=20/ROUNDS=50 (1,000 messages) by default for a first proof pass on
-# a single VM — override via env, same knobs as before. The injection
-# schedule (3 switch-kills interleaved with 5 port-kills, evenly spaced) is
-# generalised as fractions of the total message count so it scales with
-# STATIONS*ROUNDS instead of h-flock's hardcoded 1000..9400 line targets.
+# Scale is down from the reference implementation's STATIONS=100/ROUNDS=100
+# (10,000 messages) to STATIONS=20/ROUNDS=50 (1,000 messages) by default for
+# a first proof pass on a single VM — override via env, same knobs as
+# before. The injection schedule (3 switch-kills interleaved with 5
+# port-kills, evenly spaced) is generalised as fractions of the total
+# message count so it scales with STATIONS*ROUNDS instead of the original's
+# hardcoded 1000..9400 line targets.
 #
 # NOT ported in this pass: BUILD67 (memory-ceiling stress under a paused
 # destination) and BROADCAST69 (fan-out conservation) — both are opt-in modes

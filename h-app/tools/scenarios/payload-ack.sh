@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Send-and-verify-receipt — ported from h-flock's payload-ack.sh to h-mesh's
-# bare-host bus. See conservation.sh's header for the general environment
-# shift (no container, no dx() wrapper, custody read from the switch
-# daemon's own stdout log instead of `docker logs`).
+# Send-and-verify-receipt — ported from the reference implementation's
+# payload-ack.sh to h-mesh's bare-host bus. See conservation.sh's header for
+# the general environment shift (no container, no dx() wrapper, custody read
+# from the switch daemon's own stdout log instead of `docker logs`).
 #
-# One real simplification, not just plumbing: h-flock's switch resolves its
-# delivery process (`flock.port`) by PATH lookup at kick time, so the
-# original script had to shim the actual installed `flock.port` executable
-# with a no-op and restore it on exit, to stop the real port racing this
-# scenario's own bespoke consumer (payload-ack-port.py) for the same
-# ingress. h-mesh's switch (core/service.py's transmission()) instead
-# builds its kick target from the registry's port_type as a fixed module
-# path — `modules.<port_type>.port` — so this scenario registers its
-# stations under a port_type (`payload`) with no real module and installs
-# its own tiny no-op stub at that path for the run's duration, removed on
-# exit. Same shim-and-restore shape as h-flock, just targeting a module path
+# One real simplification, not just plumbing: the reference implementation's
+# switch resolves its delivery process by PATH lookup at kick time, so the
+# original script had to shim the actual installed executable with a no-op
+# and restore it on exit, to stop the real port racing this scenario's own
+# bespoke consumer (payload-ack-port.py) for the same ingress. h-mesh's
+# switch (core/service.py's transmission()) instead builds its kick target
+# from the registry's port_type as a fixed module path —
+# `modules.<port_type>.port` — so this scenario registers its stations under
+# a port_type (`payload`) with no real module and installs its own tiny
+# no-op stub at that path for the run's duration, removed on exit. Same
+# shim-and-restore shape as the original, just targeting a module path
 # instead of a PATH-resolved executable.
 #
 # ⚠ Do NOT just let the kick fail on a genuinely missing module instead of
@@ -28,7 +28,7 @@
 # all, so there's nothing to race.
 #
 # payload-ack-judge.py is copied unmodified: pure custody-log reasoning, no
-# flock-specific imports.
+# reference-implementation-specific imports.
 set -uo pipefail
 
 POD="${POD:-acceptance}"

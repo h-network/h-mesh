@@ -1,22 +1,23 @@
-# Stress/conservation scenarios (ported from h-flock)
+# Stress/conservation scenarios (ported from the reference implementation)
 
-Host-native ports of h-flock's `container/scenarios/` stress harness
-(`/workdir/architect/repo/container/scenarios/` on the architect's checkout —
-read-only reference, never modified). h-flock ran these inside a Docker
-container via a `dx() { docker exec ...; }` wrapper and read custody from
-`docker logs`. h-mesh has no container: everything here runs directly on the
-host (run it *on* the target VM, or over `ssh host ...`), and custody comes
-from the switch daemon's own stdout, which `setup.sh` already durably
-redirects to `$H_MESH_RUN_DIR/switch.log`.
+Host-native ports of the reference implementation's `container/scenarios/`
+stress harness (`/workdir/architect/repo/container/scenarios/` on the
+architect's checkout — read-only reference, never modified). The reference
+implementation ran these inside a Docker container via a
+`dx() { docker exec ...; }` wrapper and read custody from `docker logs`.
+h-mesh has no container: everything here runs directly on the host (run it
+*on* the target VM, or over `ssh host ...`), and custody comes from the
+switch daemon's own stdout, which `setup.sh` already durably redirects to
+`$H_MESH_RUN_DIR/switch.log`.
 
-The message-bus vocabulary carried over almost unchanged — h-flock's
-`flock.bus`/`flock.switch`/`flock.port` map onto h-mesh's `core.envelope` +
+The message-bus vocabulary carried over almost unchanged — the reference
+implementation's bus/switch/port modules map onto h-mesh's `core.envelope` +
 `core.keys` + `core.registry` + `core.service.Switch` + a per-kick
 `modules.<port_type>.port <agent>` subprocess — same Redis key shape
 (`pod:tenant:agent:{egress,ingress,dead,delivering}`), same envelope fields.
 `reconcile-unicast.py` and `analyse-run.py` are copied here **unmodified**:
-both are pure custody-log readers with no `flock`-specific imports, so they
-needed no porting at all.
+both are pure custody-log readers with no reference-implementation-specific
+imports, so they needed no porting at all.
 
 ## conservation.sh
 
@@ -37,21 +38,23 @@ are already running — e.g. via `setup.sh` — and a Python with h-mesh
 editable-installed (`PYTHON=/path/to/venv/python`, defaults to `python3`).
 
 Synthetic "cons-N" stations are registered as port_type **`tmux`**, not
-h-flock's mailbox-only `api` — a deliberate choice, not a fallback: it
+the reference implementation's mailbox-only `api` — a deliberate choice, not
+a fallback: it
 piggybacks on the tenant's real `tmux_reconciler` to create plain `bash -il`
 windows (no `launch` key, so no CLI starts) and so exercises the actual
 production window-creation and delivery path. Switch the registry's
 `port_type` to `"api"` in `seed_stations()` (and drop `wait_for_windows`) for
 a lighter, mailbox-only run instead.
 
-Scale defaults to `STATIONS=20 ROUNDS=50` (1,000 messages), down from
-h-flock's `STATIONS=100 ROUNDS=100` (10,000) — a first-pass size for a single
-VM; the injection schedule (3 switch-kills interleaved with 5 port-kills)
-scales with `STATIONS*ROUNDS` rather than hardcoded line counts, so raising
-either env var raises the traffic proportionally.
+Scale defaults to `STATIONS=20 ROUNDS=50` (1,000 messages), down from the
+reference implementation's `STATIONS=100 ROUNDS=100` (10,000) — a first-pass
+size for a single VM; the injection schedule (3 switch-kills interleaved
+with 5 port-kills) scales with `STATIONS*ROUNDS` rather than hardcoded line
+counts, so raising either env var raises the traffic proportionally.
 
-**Not ported in this pass:** h-flock's `BUILD67` (memory-ceiling stress under
-a paused destination) and `BROADCAST69` (fan-out conservation) modes — both
+**Not ported in this pass:** the reference implementation's `BUILD67`
+(memory-ceiling stress under a paused destination) and `BROADCAST69`
+(fan-out conservation) modes — both
 are opt-in in the original (`BUILD67=1` / `BROADCAST69=1`), not part of its
 default run, left for a follow-up once the default flow's value is confirmed.
 
@@ -80,7 +83,8 @@ TENANT=my-throwaway-tenant COUNT=4 ROUNDS=20 \
 ```
 
 Same daemon/Python requirements as `conservation.sh`. `payload-ack-judge.py`
-is copied unmodified (pure custody-log reasoning, no `flock` imports).
+is copied unmodified (pure custody-log reasoning, no reference-
+implementation imports).
 
 **A real finding surfaced and fixed here too:** the first run showed
 `verified=19` against `expected=20` — not a dropped write. Byte-level
@@ -97,8 +101,9 @@ processes' output glued together with no boundary — unparseable by both
 *independent* processes sharing one fd (the switch's kick children inherit
 its stdout/stderr — `core/service.py`'s `transmission()` — with nothing
 coordinating them against unstructured output). Not h-mesh-specific to this
-port: h-flock has the identical exposure (all processes share one container
-stdout via `docker logs`); this harness just made it deterministic by giving
+port: the reference implementation has the identical exposure (all
+processes share one container stdout via `docker logs`); this harness just
+made it deterministic by giving
 the switch a guaranteed-failing import on every single kick. Fixed *in this
 script* by installing a real, silent no-op at the module path instead of
 relying on the import failure (see the header comment) — reruns since are
@@ -126,17 +131,18 @@ already gates its exit code on its own parse-failure counters.
 Proves observable at-most-once loss plus terminal recovery, not delivery: a
 message sent while its window is absent is dead-lettered `window_missing`,
 never opened, and reconciliation restores exactly one fresh pane (new pane
-PID, old one gone). `services.tmux_reconciler` maps onto h-flock's
-`flock.tmuxhost` (same SIGSTOP/SIGCONT mechanic to open a recreate-gap).
-Starts the real `services.api` REST server since `setup.sh` doesn't run it
-by default.
+PID, old one gone). `services.tmux_reconciler` maps onto the reference
+implementation's own window-management daemon (same SIGSTOP/SIGCONT
+mechanic to open a recreate-gap). Starts the real `services.api` REST server
+since `setup.sh` doesn't run it by default.
 
 ```
 TENANT=my-throwaway-tenant ./tmux-window-loss.sh
 ```
 
-One real difference from h-flock's version: it required a non-empty
-`launch` key as a precondition (its fixture agents always had a concrete
+One real difference from the reference implementation's version: it
+required a non-empty `launch` key as a precondition (its fixture agents
+always had a concrete
 CLI). A bare `bash -il` window with no `launch` key at all is a normal,
 valid h-mesh state (see `conservation.sh`'s stations), so this port only
 requires `port_type=tmux`. Clean pass on first real run — a positive result,
@@ -169,7 +175,8 @@ TENANT=my-throwaway-tenant ./tmux-concurrent-hire.sh
 Uses **real** `claude` hires against the local vLLM endpoint (see
 `reference-vllm-endpoint` in project memory) via a provider name, per the
 ticket's own instruction to hire real agents rather than test a toy. Races
-claude against *itself* rather than h-flock's claude-vs-codex: `h-agent`'s
+claude against *itself* rather than the reference implementation's
+claude-vs-codex: `h-agent`'s
 own policy is that codex (and agy) refuse to start under a local provider
 at all, so racing them here would just be "claude always wins because codex
 always refuses" — not a real race. The property under test (does concurrent
@@ -198,7 +205,8 @@ workaround; rerun after the merge to get a clean-install result.
 
 ## lead-replacement.sh
 
-Not a port — no h-flock reference exists for this one. Built fresh against
+Not a port — no reference implementation exists for this one. Built fresh
+against
 architect's explicit brief: retire and re-hire the office's *lead*, not an
 ordinary agent, and report per-probe rather than one pass/fail. Runs
 entirely against a synthetic lead (`synth-lead` by default) on a throwaway

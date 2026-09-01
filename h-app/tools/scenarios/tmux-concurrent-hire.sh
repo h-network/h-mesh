@@ -2,20 +2,20 @@
 # Two StartAgent requests for the same never-before-seen agent name, fired
 # concurrently: exactly one window should exist afterward, running whichever
 # CLI actually won, with no leftover duplicate or split state. Ported from
-# h-flock's tmux-concurrent-hire.sh; see conservation.sh's header for the
-# general bare-host environment shift. HTTP delivery maps onto h-mesh's real
-# REST API, same as tmux-window-loss.sh.
+# the reference implementation's tmux-concurrent-hire.sh; see
+# conservation.sh's header for the general bare-host environment shift. HTTP
+# delivery maps onto h-mesh's real REST API, same as tmux-window-loss.sh.
 #
 # Real CLI, real race — per the ticket's own instruction to hire real agents
-# rather than testing a toy. h-flock's original races claude against codex;
-# this races claude against ITSELF (two concurrent StartAgent requests for
-# the same new agent name, same cli). Not a simplification of convenience:
+# rather than testing a toy. The original races claude against codex; this
+# races claude against ITSELF (two concurrent StartAgent requests for the
+# same new agent name, same cli). Not a simplification of convenience:
 # h-agent's own policy is that codex (and agy) REFUSE to start under a
 # local provider at all ("codex and agy refuse" rather than silently billing
 # a vendor), and this box has no real OpenAI credentials for a genuine
 # vendor-backed codex. Racing claude against codex here would really be
 # "claude always wins because codex always refuses" — not the concurrent
-# race h-flock's version tests. What's actually under test — do two
+# race the original tests. What's actually under test — do two
 # concurrent StartAgent calls for the same never-before-seen name produce
 # exactly one window, no duplicate/split registry state — is fully exercised
 # by two same-cli concurrent requests; which literal CLI symbol wins is not

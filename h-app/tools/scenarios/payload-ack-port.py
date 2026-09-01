@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Application adapter for the payload-ack scenario: verify payloads and
-acknowledge them. Ported from h-flock's payload-ack-port.py — same custody
-events, same checksum-verify-then-Ack shape, adapted to h-mesh's module
-names (core.envelope/core.keys/core.channels instead of flock.bus/.doors).
+acknowledge them. Ported from the reference implementation's
+payload-ack-port.py — same custody events, same checksum-verify-then-Ack
+shape, adapted to h-mesh's module names (core.envelope/core.keys/
+core.channels instead of the reference's bus/doors modules).
 """
 import argparse
 import hashlib

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Lead retirement/rehire — NOT a port of any h-flock script. h-flock has no
-# reference for this; the office/lead concept and the whole
-# lifecycle/watchdog machinery under test here are h-mesh-specific. Built
-# fresh at architect's direction, against a synthetic lead on a throwaway
-# tenant — never against the real office this agent runs in.
+# Lead retirement/rehire — NOT a port of any script from the reference
+# implementation, which has no equivalent for this; the office/lead concept
+# and the whole lifecycle/watchdog machinery under test here are
+# h-mesh-specific. Built fresh at architect's direction, against a synthetic
+# lead on a throwaway tenant — never against the real office this agent
+# runs in.
 #
 # Six probes, per architect's brief, each reported independently rather than
 # as one pass/fail:

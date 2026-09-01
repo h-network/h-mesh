@@ -2,10 +2,11 @@
 # Boundary is intentionally limited to credentials visible to tmux itself and
 # to the actual pane processes — this checks what a pane process could see if
 # it looked, not what a caller with host access could get some other way.
-# Ported from h-flock's tmux-boundary.sh; see conservation.sh's header for
-# the general bare-host environment shift. No docker exec here at all: pane
-# processes and this script run as the same host user, so /proc/<pid>/environ
-# is directly readable without an exec boundary to cross.
+# Ported from the reference implementation's tmux-boundary.sh; see
+# conservation.sh's header for the general bare-host environment shift. No
+# docker exec here at all: pane processes and this script run as the same
+# host user, so /proc/<pid>/environ is directly readable without an exec
+# boundary to cross.
 set -uo pipefail
 . "$(dirname "$0")/_lib.sh"
 
