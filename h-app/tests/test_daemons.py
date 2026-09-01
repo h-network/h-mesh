@@ -1,5 +1,6 @@
 import os
 import shutil
+import socket
 import sys
 import tempfile
 from pathlib import Path
@@ -8,8 +9,12 @@ import pytest
 import redis
 
 from services.daemons import (
+    ALL_DAEMON_MODULES,
+    DAEMON_MODULES,
+    OPTIONAL_DAEMON_MODULES,
     DaemonError,
     add_common_args,
+    enabled_daemon_modules,
     merged_daemon_env,
     pid_alive,
     resolve_config,
@@ -52,7 +57,7 @@ def _skip_unless_redis() -> None:
 
 
 def _kill_and_cleanup(run_dir: Path, tmpdir: str, env: dict) -> None:
-    for name in ("switch", "tmux_reconciler"):
+    for name in ALL_DAEMON_MODULES:
         pidfile = run_dir / f"{name}.pid"
         if pidfile.exists():
             try:
@@ -201,3 +206,62 @@ def test_merged_daemon_env_base_env_overrides_persisted(monkeypatch, tmp_path):
     env = merged_daemon_env("mytenant", base_env={"CLAUDE_OAUTH_TOKEN_DEFAULT": "new-token"})
 
     assert env["CLAUDE_OAUTH_TOKEN_DEFAULT"] == "new-token"
+
+
+def test_enabled_daemon_modules_is_just_the_base_set_without_telegram_config():
+    assert set(enabled_daemon_modules({})) == set(DAEMON_MODULES)
+
+
+def test_enabled_daemon_modules_adds_api_and_telegram_bot_when_both_present():
+    env = {"TELEGRAM_BOT_TOKEN": "x", "TELEGRAM_CHAT_ID": "y"}
+    modules = enabled_daemon_modules(env)
+    assert set(modules) == set(DAEMON_MODULES) | {"api", "telegram_bot"}
+    assert modules["api"] == OPTIONAL_DAEMON_MODULES["api"]
+    assert modules["telegram_bot"] == OPTIONAL_DAEMON_MODULES["telegram_bot"]
+
+
+def test_enabled_daemon_modules_requires_both_token_and_chat_id():
+    assert set(enabled_daemon_modules({"TELEGRAM_BOT_TOKEN": "x"})) == set(DAEMON_MODULES)
+    assert set(enabled_daemon_modules({"TELEGRAM_CHAT_ID": "y"})) == set(DAEMON_MODULES)
+
+
+def test_start_daemons_starts_an_optional_daemon_when_requested_in_daemon_modules():
+    # api is genuinely startable with no external network calls, given
+    # POD/TENANT/API_TOKEN/REDIS_URL -- proves the daemon_modules override
+    # actually starts a real, alive extra process end to end, and that the
+    # now-broadened stop_daemons() (checking ALL_DAEMON_MODULES) stops it
+    # too, not just the always-on pair.
+    _skip_unless_redis()
+    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_daemons_")
+    run_dir = Path(tmpdir) / "run"
+    pod = f"testpod-{os.urandom(4).hex()}"
+    tenant = f"testtenant-{os.urandom(4).hex()}"
+    python = Path(sys.executable)
+    env = _env(pod, tenant, tmpdir)
+    env["API_TOKEN"] = "test-token-for-api-daemon"
+    # ⚠ Explicit, not inherited -- this office's own ambient env sets
+    # API_BIND=0.0.0.0 (real infra config), which would make the api
+    # daemon demand TLS certs this test doesn't have and refuse to start.
+    # Same lesson as TMUX_TMPDIR: never trust an ambient value here.
+    env["API_BIND"] = "127.0.0.1"
+    # ⚠ Also explicit: this office's own real API server is genuinely
+    # listening on the default port 8080 right now (confirmed live) --
+    # binding there would either collide or, worse, look like it started
+    # against the wrong process. Pick an ephemeral port instead.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        env["API_PORT"] = str(probe.getsockname()[1])
+
+    daemon_modules = {**DAEMON_MODULES, "api": OPTIONAL_DAEMON_MODULES["api"]}
+    try:
+        pids = start_daemons(python=python, run_dir=run_dir, env=env, daemon_modules=daemon_modules)
+        assert set(pids) == {"switch", "tmux_reconciler", "api"}
+        for pid in pids.values():
+            assert pid_alive(pid)
+
+        stop_daemons(run_dir)
+        for pid in pids.values():
+            assert not pid_alive(pid)
+        assert not (run_dir / "api.pid").exists()
+    finally:
+        _kill_and_cleanup(run_dir, tmpdir, env)

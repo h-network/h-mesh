@@ -1,13 +1,15 @@
 """Start/stop lifecycle for h-mesh's own background daemons.
 
-The switch and tmux-reconciler are the daemons setup.sh starts and pidfiles
-today (see setup.sh's "5. Start required daemons" step). This module is the
-one place that knows which daemons exist, where their pidfiles live, how to
-resolve the config (pod/tenant/venv/tmux dir/env) they run with, and how to
-bring them up or down cleanly -- shared by `h-mesh upgrade` (services.upgrade),
-`h-mesh start` (this module's own main()), and `h-mesh stop`, so there is one
-daemon-lifecycle implementation and one config-resolution path, not one per
-caller.
+The switch and tmux-reconciler are always-on -- setup.sh starts and pidfiles
+them unconditionally (see its "5. Start required daemons" step). The REST
+API and Telegram bot are optional: they only start when the wizard's
+persisted config actually asks for them (see enabled_daemon_modules). This
+module is the one place that knows which daemons exist, where their
+pidfiles live, how to resolve the config (pod/tenant/venv/tmux dir/env) they
+run with, and how to bring them up or down cleanly -- shared by `h-mesh
+upgrade` (services.upgrade), `h-mesh start` (this module's own main()), and
+`h-mesh stop`, so there is one daemon-lifecycle implementation and one
+config-resolution path, not one per caller.
 """
 
 import argparse
@@ -30,6 +32,35 @@ DAEMON_MODULES = {
     "switch": "core.service",
     "tmux_reconciler": "services.tmux_reconciler",
 }
+
+# Started only when the wizard's collected config asks for them (see
+# enabled_daemon_modules below) -- unlike DAEMON_MODULES, not every install
+# wants these running.
+OPTIONAL_DAEMON_MODULES = {
+    "api": "services.api",
+    "telegram_bot": "services.telegram_bot",
+}
+
+# The full universe of daemons this install could ever have running, past or
+# present. stop_daemons() checks against this (not just DAEMON_MODULES) so a
+# daemon that was enabled in a previous run and isn't wanted anymore still
+# gets stopped, not orphaned.
+ALL_DAEMON_MODULES = {**DAEMON_MODULES, **OPTIONAL_DAEMON_MODULES}
+
+
+def enabled_daemon_modules(env: dict) -> dict[str, str]:
+    """The daemons this run should have running: the always-on set, plus the
+    optional ones whose required config is actually present in env.
+
+    The Telegram bot needs h-mesh's own REST API to talk to (see
+    clients.telegram.bot's README) -- there's no separate "enable the API"
+    question in the wizard, so a configured Telegram bot enables both.
+    """
+    modules = dict(DAEMON_MODULES)
+    if env.get("TELEGRAM_BOT_TOKEN") and env.get("TELEGRAM_CHAT_ID"):
+        modules["api"] = OPTIONAL_DAEMON_MODULES["api"]
+        modules["telegram_bot"] = OPTIONAL_DAEMON_MODULES["telegram_bot"]
+    return modules
 
 STOP_TIMEOUT_SECONDS = 10
 HEALTH_CHECK_SECONDS = 1
@@ -106,11 +137,15 @@ def _stop_one(name: str, pidfile: Path, *, log: Callable[[str], None]) -> None:
 def stop_daemons(run_dir: Path, *, log: Callable[[str], None] = print) -> None:
     """Stop every known daemon found via a live pidfile under run_dir.
 
+    Checks ALL_DAEMON_MODULES, not just the always-on set -- an optional
+    daemon (api, telegram_bot) enabled in a previous run but not this one
+    still gets stopped here, rather than left running unmanaged.
+
     Idempotent: a daemon that isn't running (no pidfile, or a stale one left
     behind by a crash) is left alone, not an error -- safe to call whether or
     not anything is actually up.
     """
-    for name in DAEMON_MODULES:
+    for name in ALL_DAEMON_MODULES:
         _stop_one(name, run_dir / f"{name}.pid", log=log)
 
 
@@ -131,9 +166,17 @@ def _start_one(name: str, module: str, python: Path, run_dir: Path, env: dict) -
 
 
 def start_daemons(
-    *, python: Path, run_dir: Path, env: dict, log: Callable[[str], None] = print
+    *,
+    python: Path,
+    run_dir: Path,
+    env: dict,
+    daemon_modules: dict[str, str] | None = None,
+    log: Callable[[str], None] = print,
 ) -> dict[str, int]:
-    """Start every known daemon, write pidfiles, and verify they're alive.
+    """Start every daemon in daemon_modules (default: DAEMON_MODULES, the
+    always-on set), write pidfiles, and verify they're alive. Pass
+    `enabled_daemon_modules(env)` to also start whichever optional daemons
+    that env's config asks for.
 
     Duplicate-safe: a daemon already alive (a live pidfile under run_dir) is
     left running as-is rather than started a second time -- callers that want
@@ -153,9 +196,11 @@ def start_daemons(
     Returns {name: pid}. Raises DaemonError, naming the daemon and its log
     path, if anything died within the health-check window.
     """
+    if daemon_modules is None:
+        daemon_modules = DAEMON_MODULES
     run_dir.mkdir(parents=True, exist_ok=True)
     pids: dict[str, int] = {}
-    for name, module in DAEMON_MODULES.items():
+    for name, module in daemon_modules.items():
         pidfile = run_dir / f"{name}.pid"
         existing_pid = _read_pid(pidfile)
         if existing_pid is not None and pid_alive(existing_pid):
@@ -298,7 +343,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     print(f"Starting daemons (logs written to {config.run_dir})...")
     try:
-        start_daemons(python=config.python, run_dir=config.run_dir, env=config.env)
+        start_daemons(
+            python=config.python, run_dir=config.run_dir, env=config.env,
+            daemon_modules=enabled_daemon_modules(config.env),
+        )
     except DaemonError as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

@@ -34,6 +34,7 @@ from services.daemons import (
     REPO_ROOT,
     DaemonError,
     add_common_args,
+    enabled_daemon_modules,
     resolve_config,
     start_daemons,
     stop_daemons,
@@ -116,7 +117,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     print(f"Starting daemons (logs written to {config.run_dir})...")
     try:
-        start_daemons(python=config.python, run_dir=config.run_dir, env=config.env)
+        start_daemons(
+            python=config.python, run_dir=config.run_dir, env=config.env,
+            daemon_modules=enabled_daemon_modules(config.env),
+        )
     except DaemonError as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

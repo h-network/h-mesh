@@ -294,6 +294,11 @@ LOCAL_MODEL="$(TENANT_ENV_GET PROVIDER_LOCAL_MODEL "")"
 LOCAL_KIND="$(TENANT_ENV_GET PROVIDER_LOCAL_KIND vllm)"
 EP_NAME="local"
 
+TELEGRAM_BOT_TOKEN="$(TENANT_ENV_GET TELEGRAM_BOT_TOKEN "")"
+TELEGRAM_CHAT_ID="$(TENANT_ENV_GET TELEGRAM_CHAT_ID "")"
+TELEGRAM_VOICE="$(TENANT_ENV_GET TELEGRAM_VOICE "")"
+API_TOKEN="$(TENANT_ENV_GET API_TOKEN "")"
+
 if [ "$INTERACTIVE" -eq 1 ]; then
     read -rp "How many agents? [${#AGENTS[@]}${AGENTS[0]:+ (${AGENTS[*]})}]: " N
     if [ -n "$N" ]; then
@@ -409,6 +414,43 @@ if [ "$INTERACTIVE" -eq 1 ]; then
         fi
     fi
 
+    read -rp "Run the Telegram bot? [y/N]: " WANT_TELEGRAM
+    if check_bool "$WANT_TELEGRAM" "n"; then
+        if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+            read -rsp "  Telegram Bot Token [keep existing]: " IN_TG_TOKEN; echo
+        else
+            read -rsp "  Telegram Bot Token (required, blank to skip): " IN_TG_TOKEN; echo
+        fi
+        TELEGRAM_BOT_TOKEN="${IN_TG_TOKEN:-$TELEGRAM_BOT_TOKEN}"
+
+        read -rp "  Telegram Chat ID (required)${TELEGRAM_CHAT_ID:+ [$TELEGRAM_CHAT_ID]}: " IN_TG_CHAT
+        TELEGRAM_CHAT_ID="${IN_TG_CHAT:-$TELEGRAM_CHAT_ID}"
+
+        if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            if [ "$TELEGRAM_VOICE" = "1" ]; then
+                read -rp "  Enable spoken voice replies? [Y/n]: " WANT_VOICE
+                if check_bool "$WANT_VOICE" "y"; then TELEGRAM_VOICE=1; else TELEGRAM_VOICE=0; fi
+            else
+                read -rp "  Enable spoken voice replies? [y/N]: " WANT_VOICE
+                if check_bool "$WANT_VOICE" "n"; then TELEGRAM_VOICE=1; else TELEGRAM_VOICE=0; fi
+            fi
+            # ⚠ The bot talks to h-mesh's own REST API (see
+            # clients/telegram/README.md) -- there's no separate "enable the
+            # API" question, a configured bot enables both. A bare-token
+            # API_TOKEN, generated once and persisted like every other
+            # secret here, not typed by anyone.
+            if [ -z "$API_TOKEN" ]; then
+                API_TOKEN="$("$PYTHON" -c 'import secrets; print(secrets.token_hex(16))')"
+            fi
+            echo "  (h-mesh's REST API will be started too -- the Telegram bot talks to it)"
+        else
+            echo "  ⚠ Both a Telegram Bot Token and Chat ID are required -- Telegram bot not enabled." >&2
+            TELEGRAM_BOT_TOKEN=""
+            TELEGRAM_CHAT_ID=""
+            TELEGRAM_VOICE=""
+        fi
+    fi
+
     # Persist everything the wizard just collected -- only exceptions travel
     # for CLI/account/provider, so the file stays small and readable.
     CLI_MAP=(); PROFILE_MAP=(); PROVIDER_MAP=()
@@ -437,6 +479,10 @@ if [ "$INTERACTIVE" -eq 1 ]; then
             echo "PROVIDER_${PR_UPPER}_TOKEN=local"
             echo "PROVIDER_${PR_UPPER}_KIND=${LOCAL_KIND}"
         fi
+        [ -n "$TELEGRAM_BOT_TOKEN" ] && echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}"
+        [ -n "$TELEGRAM_CHAT_ID" ] && echo "TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}"
+        [ "$TELEGRAM_VOICE" = "1" ] && echo "TELEGRAM_VOICE=1"
+        [ -n "$API_TOKEN" ] && echo "API_TOKEN=${API_TOKEN}"
     } | "$PYTHON" -m services.tenant_config set "$TENANT"
 
     # Re-read what was just persisted -- the hire step below uses the
@@ -452,6 +498,14 @@ if [ "$INTERACTIVE" -eq 1 ]; then
     for a in "${AGENTS[@]}"; do
         printf '  %-16s %-8s %-10s\n' "$a" "$(mget CLI "$a")" "$(mget PROF "$a")"
     done
+    echo
+    if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+        voice_note=""
+        [ "$TELEGRAM_VOICE" = "1" ] && voice_note=" (voice replies enabled)"
+        echo "  Telegram bot: enabled, chat id ${TELEGRAM_CHAT_ID}${voice_note}"
+    else
+        echo "  Telegram bot: not enabled"
+    fi
     echo
 fi
 
@@ -555,11 +609,14 @@ if [ "$NO_DAEMONS" -eq 0 ]; then
 import os, sys
 sys.path.insert(0, "h-app")
 from pathlib import Path
-from services.daemons import DaemonError, merged_daemon_env, start_daemons
+from services.daemons import DaemonError, enabled_daemon_modules, merged_daemon_env, start_daemons
 
 env = merged_daemon_env(os.environ["TENANT"])
 try:
-    start_daemons(python=Path(sys.executable), run_dir=Path(os.environ["H_MESH_SETUP_RUN_DIR"]), env=env)
+    start_daemons(
+        python=Path(sys.executable), run_dir=Path(os.environ["H_MESH_SETUP_RUN_DIR"]), env=env,
+        daemon_modules=enabled_daemon_modules(env),
+    )
 except DaemonError as exc:
     print(f"error: {exc}", file=sys.stderr)
     sys.exit(1)

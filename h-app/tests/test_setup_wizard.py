@@ -15,6 +15,7 @@ import redis
 from core.keys import prefix
 from core.registry import port_type
 from modules.tmux.ops import list_windows, run_tmux
+from services.daemons import enabled_daemon_modules
 from services.tenant_config import read_tenant_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -22,8 +23,8 @@ SETUP_SH = REPO_ROOT / "setup.sh"
 
 # One blank answer per prompt in the "accept every default" path: pod,
 # tenant, agent count, multiple-accounts?, default account's OAuth token,
-# default CLI, CLI/account exceptions, local provider?.
-DEFAULT_PATH_ANSWERS = ["", "", "", "", "", "", "", ""]
+# default CLI, CLI/account exceptions, local provider?, Telegram bot?.
+DEFAULT_PATH_ANSWERS = ["", "", "", "", "", "", "", "", ""]
 
 
 def _run_wizard(cwd: str, args: list[str], env: dict, answers: list[str], timeout: float = 60) -> tuple[str, int]:
@@ -245,6 +246,7 @@ def test_wizard_hires_a_per_agent_cli_exception_with_the_right_cli(wizard_env):
         "sme-2",  # any agents differing
         "codex",  # sme-2 -- CLI
         "",       # local model provider? -> n
+        "",       # Telegram bot? -> n
     ]
     output, code = _run_wizard(
         cwd=str(REPO_ROOT),
@@ -291,6 +293,7 @@ def test_wizard_provided_token_reaches_the_daemon_hiring_the_first_agent_in_the_
         "",              # default CLI
         "",              # any agents differing
         "",              # local model provider? -> n
+        "",              # Telegram bot? -> n
     ]
     output, code = _run_wizard(
         cwd=str(REPO_ROOT),
@@ -333,3 +336,68 @@ def test_wizard_prints_the_h_mesh_banner_before_the_first_prompt(wizard_env):
     assert "\x1b[0;37m" in output  # GREY
     assert "agentic office framework" in output
     assert "h-network" in output
+
+
+def test_wizard_persists_telegram_config_and_generates_an_api_token(wizard_env, monkeypatch):
+    # --no-daemons: the point of this test is what the wizard *persists*,
+    # not the daemon-start step -- with a fake bot token, actually starting
+    # services.telegram_bot would try to reach the real Telegram API.
+    ctx = wizard_env
+    answers = [
+        "",                     # pod
+        "",                     # tenant
+        "",                     # how many agents -> 1 (architect)
+        "",                     # use more than one account? -> n
+        "",                     # OAuth token for 'default'
+        "",                     # default CLI
+        "",                     # any agents differing
+        "",                     # local model provider? -> n
+        "y",                    # Run the Telegram bot? -> y
+        "fake-bot-token-123",   # Telegram Bot Token
+        "555444333",            # Telegram Chat ID
+        "",                     # voice replies -> n (default)
+    ]
+    output, code = _run_wizard(
+        cwd=str(REPO_ROOT),
+        args=["--venv", sys.prefix, "--skip-install", "--skip-deps", "--no-daemons"],
+        env=ctx["env"],
+        answers=answers,
+    )
+    assert code == 0, f"setup.sh exited {code}:\n{output}"
+    assert "Telegram bot: enabled, chat id 555444333" in output
+
+    monkeypatch.setenv("H_MESH_STATE_DIR", ctx["env"]["H_MESH_STATE_DIR"])
+    persisted = read_tenant_env(ctx["tenant"])
+    assert persisted.get("TELEGRAM_BOT_TOKEN") == "fake-bot-token-123"
+    assert persisted.get("TELEGRAM_CHAT_ID") == "555444333"
+    assert "TELEGRAM_VOICE" not in persisted
+    assert persisted.get("API_TOKEN"), "an API_TOKEN should have been generated"
+
+    modules = enabled_daemon_modules(persisted)
+    assert "api" in modules
+    assert "telegram_bot" in modules
+
+
+def test_wizard_requires_both_bot_token_and_chat_id(wizard_env, monkeypatch):
+    ctx = wizard_env
+    answers = [
+        "", "", "", "", "", "", "", "",  # defaults through local provider
+        "y",                    # Run the Telegram bot? -> y
+        "fake-bot-token-123",   # Telegram Bot Token
+        "",                     # Telegram Chat ID -- left blank
+    ]
+    output, code = _run_wizard(
+        cwd=str(REPO_ROOT),
+        args=["--venv", sys.prefix, "--skip-install", "--skip-deps", "--no-daemons"],
+        env=ctx["env"],
+        answers=answers,
+    )
+    assert code == 0, f"setup.sh exited {code}:\n{output}"
+    assert "Telegram Bot Token and Chat ID are required" in output
+    assert "Telegram bot: not enabled" in output
+
+    monkeypatch.setenv("H_MESH_STATE_DIR", ctx["env"]["H_MESH_STATE_DIR"])
+    persisted = read_tenant_env(ctx["tenant"])
+    assert "TELEGRAM_BOT_TOKEN" not in persisted
+    assert "TELEGRAM_CHAT_ID" not in persisted
+    assert "API_TOKEN" not in persisted
