@@ -1455,9 +1455,33 @@ def test_run_allows_compact_too():
         assert mesh.sent_commands[-1]["text"] == "/compact"
 
 
-def test_run_rejects_a_command_not_on_the_allowlist():
+def test_run_is_unrestricted_by_default():
+    """User decision, not an oversight: the default allowlist is empty, so
+    /run passes through whatever it's given. This bot is already locked to
+    one chat_id and the agent already runs with permissions skipped, so an
+    allowlist here would restrict the same operator from themselves, not
+    add a boundary against anyone else. Regression coverage for the exact
+    case that prompted this -- /run architect /context used to be refused."""
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        assert bot_instance.run_allowed_commands == frozenset()
+
+        reply = bot_instance.handle_text_message(12345, "/run architect /context")
+        assert reply == "✅ Ran on architect."
+        assert mesh.sent_commands[-1]["text"] == "/context"
+
+        reply = bot_instance.handle_text_message(12345, "/run architect /add-dir /some/path")
+        assert reply == "✅ Ran on architect."
+        assert mesh.sent_commands[-1]["text"] == "/add-dir /some/path"
+
+
+def test_run_rejects_a_command_not_on_an_explicitly_configured_allowlist():
+    """The knob still works for anyone who wants to restrict /run -- only
+    the default changed, not the mechanism."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(
+            tmpdir=tmpdir, run_allowed_commands=frozenset({"/clear", "/compact"}),
+        )
         reply = bot_instance.handle_text_message(12345, "/run architect /add-dir /some/path")
         assert "isn't an allowed /run command" in reply
         assert "/clear" in reply and "/compact" in reply
@@ -1465,21 +1489,18 @@ def test_run_rejects_a_command_not_on_the_allowlist():
         assert mesh.sent_envelopes == []
 
 
-def test_run_rejects_arbitrary_text_not_shaped_like_a_command():
+def test_run_allowlist_exact_match_only_when_configured():
+    """Exact match only -- /clear plus anything else is not /clear. Only
+    meaningful once an allowlist is actually configured; the unrestricted
+    default has nothing to match exactly against."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
-        reply = bot_instance.handle_text_message(12345, "/run architect rm -rf /")
-        assert "isn't an allowed /run command" in reply
-        assert mesh.sent_commands == []
-
-
-def test_run_rejects_an_allowed_command_name_with_trailing_arguments():
-    """Exact match only -- /clear plus anything else is not /clear."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, run_allowed_commands=frozenset({"/clear"}))
         reply = bot_instance.handle_text_message(12345, "/run architect /clear extra")
         assert "isn't an allowed /run command" in reply
         assert mesh.sent_commands == []
+
+        reply = bot_instance.handle_text_message(12345, "/run architect /clear")
+        assert reply == "✅ Ran on architect."
 
 
 def test_run_rejects_an_embedded_newline_even_inside_an_allowed_command():
