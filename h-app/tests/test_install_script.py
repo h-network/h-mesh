@@ -9,7 +9,38 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 INSTALL_SH = REPO_ROOT / "install.sh"
-CLONE_URL = f"file://{REPO_ROOT}/.git"
+
+
+def _clone_url(tmpdir: str) -> str:
+    """Build a self-contained source with the branch install.sh requests.
+
+    Actions checks out a detached, shallow commit, while install.sh correctly
+    asks git for a named release branch. The fixture owns that precondition;
+    the surrounding checkout depth and local branch names are irrelevant.
+    """
+    source = Path(tmpdir) / "source.git"
+    if not source.exists():
+        head = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "clone", "--bare", "--no-hardlinks", str(REPO_ROOT), str(source)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "--git-dir", str(source), "update-ref", "refs/heads/main", head],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "--git-dir", str(source), "symbolic-ref", "HEAD", "refs/heads/main"],
+            check=True,
+        )
+    return f"file://{source}"
 
 
 def _env(install_dir: str, home_dir: str, tmpdir: str) -> dict:
@@ -22,7 +53,7 @@ def _env(install_dir: str, home_dir: str, tmpdir: str) -> dict:
     # for the tests that look tmux-related at a glance.
     env = dict(os.environ)
     env["H_MESH_INSTALL_DIR"] = install_dir
-    env["H_MESH_CLONE_URL"] = CLONE_URL
+    env["H_MESH_CLONE_URL"] = _clone_url(tmpdir)
     env["HOME"] = home_dir
     env["TMUX_TMPDIR"] = tmpdir
     env["TMUX_SESSION"] = f"sess-{os.urandom(4).hex()}"
@@ -157,7 +188,12 @@ def test_install_sh_recovers_a_tty_for_setup_sh_when_piped_to_sh():
                 os.close(w)
                 os.dup2(r, 0)
                 os.close(r)
-                os.execvp("sh", ["sh"])
+                # Dependency installation is not this test's subject. On a
+                # clean runner, live network/package work consumed nearly the
+                # entire prompt deadline before setup.sh could exercise tty
+                # recovery at all. Pass the real installer's supported flag
+                # through the piped-sh argv and keep the tty assertion exact.
+                os.execvp("sh", ["sh", "-s", "--", "--skip-deps"])
             except Exception:
                 os._exit(127)
 
