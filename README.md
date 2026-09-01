@@ -163,6 +163,23 @@ python -m venv .venv
 Contributors running the test suite should install the test extra with
 `.venv/bin/python -m pip install -e '.[test]'`.
 
+After activating the project virtual environment, run the complete suite with
+the canonical runner. The runner resolves the repository root itself, so the
+command works from any working directory:
+
+```bash
+python -m tools.run_tests
+```
+
+The configured test path covers the entire `h-app` source tree, including
+tests colocated under `clients/web`. The runner asserts a minimum collection
+count before executing pytest, so under-collection fails loudly while normal
+test additions require no maintenance. If tests are intentionally removed,
+update `EXPECTED_MINIMUM_TEST_COUNT` in the runner.
+Passing an explicit path such as `pytest tests/` overrides configured discovery
+and intentionally runs only the selected subtree; do not use a narrowed path
+as evidence that the complete suite passes.
+
 Use an isolated environment when developing or validating an install. In
 particular, do not install h-mesh into an environment that provides another
 application's live commands; keeping prefixes separate prevents either

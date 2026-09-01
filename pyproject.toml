@@ -47,3 +47,6 @@ namespaces = true
 
 [tool.pytest.ini_options]
 pythonpath = ["h-app"]
+# Keep bare pytest authoritative as tests live both in h-app/tests and beside
+# the web client. Explicit path arguments still narrow collection by design.
+testpaths = ["h-app"]

@@ -74,7 +74,8 @@ jobs:
             exit 1
           fi
           grep -F "usage: python -m modules.tmux.port <agent>" tmux-port.stderr
-      - run: python3 -m unittest discover -s h-app/tests -v
+      - name: Run complete test suite
+        run: python -m tools.run_tests
       - name: Switch smoke test (real Redis)
         env:
           REDIS_URL: redis://127.0.0.1:6379/0
