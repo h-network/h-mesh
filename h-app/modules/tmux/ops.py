@@ -8,6 +8,7 @@ from typing import Set
 from core.config import state_path
 from core.logging import log_record
 from lib.paths import get_agent_workdir, get_workdir_root, resolve_venv_bin
+from services.claude_statusline import install_statusline
 
 
 # Seconds between the paste and the Enter. `paste-buffer -p` only emits the
@@ -556,7 +557,7 @@ def _seed_profile_dirs(profile: str | None) -> None:
 
 def write_agent_guide(
     cwd: str, agent_name: str, tenant: str = "default", lead: str | None = None,
-    profile: str | None = None,
+    profile: str | None = None, cli: str | None = None,
 ) -> None:
     try:
         os.makedirs(cwd, exist_ok=True)
@@ -584,6 +585,16 @@ def write_agent_guide(
         ensure_claude_project_trusted(cwd, profile=profile)
         ensure_codex_project_trusted(cwd, profile=profile)
         ensure_agy_project_trusted(cwd)
+
+        # ⚠ claude only. setup.sh/h-mesh upgrade cover the default account's
+        # ~/.claude up front, but a profiled account's ~/.claude-<profile>
+        # doesn't exist until an agent using that profile is hired -- this
+        # is that profile's only chance to get it. Idempotent, so calling it
+        # on every hire (not just the first) is cheap and correct.
+        if cli == "claude":
+            home_dir = os.environ.get("HOME", os.path.expanduser("~"))
+            config_dir = Path(home_dir) / (f".claude-{profile}" if profile else ".claude")
+            install_statusline(config_dir, log=lambda msg: None)
     except Exception as exc:
         # ⚠ Never raise into a delivery path — but never vanish either.
         # Silence here is how the profile-blind trust bug hid: seeding
@@ -603,6 +614,7 @@ def create_window(
     profile: str | None = None,
     tenant: str = "default",
     log_file: str | Path | None = None,
+    cli: str | None = None,
 ) -> tuple[int, str, str]:
     """⚠ This writes the guide for every caller, so it needs the lead.
 
@@ -619,7 +631,7 @@ def create_window(
         except OSError:
             pass
 
-        write_agent_guide(cwd, agent_name, lead=lead, profile=profile)
+        write_agent_guide(cwd, agent_name, lead=lead, profile=profile, cli=cli)
 
     # ⚠ Idempotent by name. tmux happily creates a second window with the same
     # name, and then refuses to resolve it: `tmux -t hq:<name>` answers

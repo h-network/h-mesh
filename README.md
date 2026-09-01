@@ -68,6 +68,11 @@ it uses. Either way it also:
 - installs h-mesh's default `~/.tmux.conf` (mouse mode, status bar, pane
   borders -- the same UX the container base image otherwise bakes in, for a
   bare host that has none; never overwrites an existing `~/.tmux.conf`)
+- installs a context-usage statusline (a progress bar showing how full the
+  model's context window is) for the default account's claude config;
+  profiled accounts get it too, at hire time, since that account's config
+  dir doesn't exist until then. codex/agy agents are untouched -- they have
+  their own statusline mechanisms, or none
 - seeds the registry's fixed lifecycle participants (`host` -> office,
   `api` -> api) for the given pod/tenant
 - starts the `h-mesh-switch` and `h-mesh-tmux-reconciler` daemons
@@ -110,9 +115,10 @@ h-mesh-upgrade --pod mypod --tenant mytenant
 
 Same pod/tenant/redis-url/session/tmux-tmpdir/tmux-socket/venv flags as
 setup.sh, plus `--skip-install` and `--skip-pull` (`h-mesh-upgrade --help`
-for the full list). It also re-persists the venv bin dir on `PATH` and
-re-installs the default `tmux.conf`, so running it repairs an install that
-predates either fix.
+for the full list). It also re-persists the venv bin dir on `PATH`,
+re-installs the default `tmux.conf`, and re-installs the default account's
+statusline, so running it repairs an install that predates any of those
+fixes.
 
 ⚠ **Known limit:** a hired agent's tmux pane inherits its environment once,
 at creation. Upgrading restarts h-mesh's own daemons and reinstalls the code

@@ -177,6 +177,12 @@ def test_wizard_accepting_every_default_hires_a_single_architect_agent(wizard_en
         time.sleep(0.2)
     assert "architect" in windows
 
+    # setup.sh installs the statusline for the default account up front,
+    # and write_agent_guide() re-installs it (idempotently) at hire time --
+    # either way, the real hired claude agent's config dir has it.
+    assert (Path(ctx["home_dir"]) / ".claude" / "scripts" / "statusline.py").exists()
+    assert (Path(ctx["home_dir"]) / ".claude" / "settings.json").exists()
+
 
 def test_wizard_rerun_is_idempotent_and_does_not_rehire(wizard_env, monkeypatch):
     ctx = wizard_env

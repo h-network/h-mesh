@@ -8,9 +8,10 @@ pidfiles setup.sh writes under $H_MESH_RUN_DIR), pulls and reinstalls, then
 starts fresh daemons with the current environment (services.daemons.start_daemons)
 -- so it does not double-start daemons against an already-running install,
 and a changed env var takes effect on the daemons it restarts. It also
-re-persists the venv bin dir on PATH (services.venv_path) and re-installs
-the default tmux.conf (services.tmux_conf), to repair an install that
-predates either fix.
+re-persists the venv bin dir on PATH (services.venv_path), re-installs the
+default tmux.conf (services.tmux_conf), and re-installs the claude
+statusline for the default account (services.claude_statusline), to repair
+an install that predates any of those fixes.
 
 ⚠ Known, deliberate limit: an agent's tmux pane inherits its environment at
 creation time only. This restarts h-mesh's own daemons and reinstalls the
@@ -22,10 +23,13 @@ var. Not attempted here.
 """
 
 import argparse
+import os
 import subprocess
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
+from services.claude_statusline import install_statusline
 from services.daemons import (
     REPO_ROOT,
     DaemonError,
@@ -97,6 +101,10 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     print("Installing default tmux.conf (unless one already exists)...")
     install_tmux_conf(log=print)
+    print()
+
+    print("Installing claude statusline (context-usage progress bar)...")
+    install_statusline(Path(os.environ.get("HOME", str(Path.home()))) / ".claude", log=print)
     print()
 
     print("Stopping existing daemons (if any)...")
