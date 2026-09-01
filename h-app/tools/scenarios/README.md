@@ -104,5 +104,93 @@ script* by installing a real, silent no-op at the module path instead of
 relying on the import failure (see the header comment) — reruns since are
 clean (`5/5` stages matching, `rc=0`, verified at `COUNT=2..4`,
 `ROUNDS=10..20`). The underlying fd-sharing exposure is real and general;
-reported to architect to decide whether it needs closing at the framing
-level (e.g. length-prefixed writes) rather than just avoided here.
+reported to architect and switch-agent, who isolated kicked-port
+stdout/stderr onto its own file (`ports.log`) with a validated pipe for real
+custody records — verified live: 30 forced import failures plus 1 valid
+delivery, `switch.log` malformed count 0, all 5 custody stages preserved for
+the valid stream, all 30 failures present in `ports.log` and absent from
+`switch.log`.
+
+`payload-ack-judge.py` was also hardened here: it now counts nonblank lines
+that fail `json.loads` and fails (`rc=7`) on that count alone, even when
+every stage total happens to balance — a torn/dropped line can lower one
+stage by exactly one without necessarily moving the harness's known-expected
+comparison off balance, so "stages match" was never actually proof nothing
+was lost. Verified: a synthetic torn line hand-appended to an otherwise
+clean, fully-balanced log flips the result from "clean" to `rc=7` under the
+patched version. `reconcile-unicast.py` did not need the same fix — it
+already gates its exit code on its own parse-failure counters.
+
+## tmux-window-loss.sh
+
+Proves observable at-most-once loss plus terminal recovery, not delivery: a
+message sent while its window is absent is dead-lettered `window_missing`,
+never opened, and reconciliation restores exactly one fresh pane (new pane
+PID, old one gone). `services.tmux_reconciler` maps onto h-flock's
+`flock.tmuxhost` (same SIGSTOP/SIGCONT mechanic to open a recreate-gap).
+Starts the real `services.api` REST server since `setup.sh` doesn't run it
+by default.
+
+```
+TENANT=my-throwaway-tenant ./tmux-window-loss.sh
+```
+
+One real difference from h-flock's version: it required a non-empty
+`launch` key as a precondition (its fixture agents always had a concrete
+CLI). A bare `bash -il` window with no `launch` key at all is a normal,
+valid h-mesh state (see `conservation.sh`'s stations), so this port only
+requires `port_type=tmux`. Clean pass on first real run — a positive result,
+h-mesh handles this correctly.
+
+## tmux-boundary.sh
+
+Checks that credentials (`API_TOKEN`, `REDIS_PASSWORD`, `REDISCLI_AUTH`,
+`REDIS_URL`) are invisible both to tmux's global environment and to real
+pane processes' `/proc/<pid>/environ`. No docker exec boundary to cross here
+— pane processes and this script run as the same host user, so `/proc`
+reads are direct.
+
+```
+TENANT=my-throwaway-tenant ./tmux-boundary.sh
+```
+
+Clean pass on first real run — another positive result.
+
+## tmux-concurrent-hire.sh
+
+Two `StartAgent` requests for the same never-before-seen agent name, fired
+concurrently: exactly one window should exist afterward, no duplicate or
+split registry state, and an identical unchanged rehire stays idempotent.
+
+```
+TENANT=my-throwaway-tenant ./tmux-concurrent-hire.sh
+```
+
+Uses **real** `claude` hires against the local vLLM endpoint (see
+`reference-vllm-endpoint` in project memory) via a provider name, per the
+ticket's own instruction to hire real agents rather than test a toy. Races
+claude against *itself* rather than h-flock's claude-vs-codex: `h-agent`'s
+own policy is that codex (and agy) refuse to start under a local provider
+at all, so racing them here would just be "claude always wins because codex
+always refuses" — not a real race. The property under test (does concurrent
+StartAgent for one new name produce exactly one window) is fully exercised
+by two same-cli concurrent requests.
+
+**Needs a workaround, not a clean environment:** a freshly `setup.sh`'d host
+cannot hire any real CLI at all. `modules/tmux/ops.py`'s `window_env()`
+constructs the hired pane's `PATH` explicitly and never includes wherever
+`h-agent` itself was installed — on `setup.sh`'s own documented default
+(`${PREFIX:-$HOME/.local}/bin`), every hire fails: window created, pane's
+`execvp("h-agent")` fails with ENOENT, window destroyed (`remain-on-exit` is
+off) within milliseconds, reconciler retries forever with capped backoff.
+Confirmed directly (pulled the real constructed `PATH` string, `env -i
+PATH="<that>" which h-agent` → not found) and three times live via real
+`StartAgent` envelopes. Reported to architect, routed to tmux-agent as
+`d137fc18` (unfixed as of this writing). This script fails fast with a
+clear reason if the workaround isn't applied — **prepend `h-agent`'s bin
+directory to the RECONCILER daemon's own `PATH` before starting it**, since
+`window_env()` reads `os.environ` at construction time. Once that's in
+place, real hires work end to end (verified: a real `claude` pane connected
+to `nemotron-lightning`, correct workdir, permissions bypassed, fully
+interactive). **Every result from this script reflects that workaround, not
+a clean install — don't read a pass here as proof the PATH bug is fixed.**
