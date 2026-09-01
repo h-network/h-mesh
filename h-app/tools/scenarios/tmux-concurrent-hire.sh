@@ -21,11 +21,13 @@
 # by two same-cli concurrent requests; which literal CLI symbol wins is not
 # the property being checked.
 #
-# Needs h-agent's own bin directory on the RECONCILER's PATH — on a host
-# that installed h-agent to its documented default location (setup.sh:
-# ${PREFIX:-$HOME/.local}/bin), it is NOT there by default; see project
-# memory for why (a live finding, reported separately, not fixed here).
-# This script fails fast with a clear reason if it isn't.
+# Real hires used to need h-agent's own bin directory manually prepended to
+# the RECONCILER's PATH — window_env() constructed the hired pane's PATH
+# from scratch and never included wherever h-agent was actually installed
+# (a live finding, reported separately). Fixed and merged same day
+# (tmux-agent/hired-pane-path-known-locations, 4238f35): window_env() now
+# derives the PATH from all known install locations regardless of the
+# daemon's own ambient PATH. No workaround needed as of that merge.
 set -uo pipefail
 . "$(dirname "$0")/_lib.sh"
 
@@ -48,11 +50,6 @@ export POD TENANT REDIS_URL TMUX_SESSION TMUX_TMPDIR PYTHONUNBUFFERED=1
 
 reconciler_pid="$(pgrep -f 'services\.tmux_reconciler' | head -1)"
 [ -n "$reconciler_pid" ] || incomplete tmux-concurrent-hire reconciler_not_running
-reconciler_path="$(tr '\0' '\n' <"/proc/$reconciler_pid/environ" 2>/dev/null | sed -n 's/^PATH=//p')"
-case ":$reconciler_path:" in
-  *:"$HOME/.local/bin":*) ;;
-  *) incomplete tmux-concurrent-hire "reconciler_path_missing_agent_bin (see project memory: window_env PATH gap)" ;;
-esac
 upper="$(printf '%s' "$PROVIDER_NAME" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
 tr '\0' '\n' <"/proc/$reconciler_pid/environ" 2>/dev/null | grep -q "^PROVIDER_${upper}_URL=" \
   || incomplete tmux-concurrent-hire "reconciler_missing_PROVIDER_${upper}_URL"
