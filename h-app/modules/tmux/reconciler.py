@@ -258,6 +258,7 @@ class TmuxReconciler:
                     self._spawned_agents.pop(agent, None)
             else:
                 self._spawned_agents.pop(agent, None)
+                self._known_windows.discard(agent)
                 if agent in roster_agents:
                     failures = self._failure_counts.get(agent, 0) + 1
                     self._failure_counts[agent] = failures
@@ -274,19 +275,21 @@ class TmuxReconciler:
 
         # Check agents that were known to be running previously, but are no longer in existing_windows
         for agent in list(self._known_windows):
-            if agent not in existing_windows and agent in roster_agents and agent not in self._spawned_agents:
-                failures = self._failure_counts.get(agent, 0) + 1
-                self._failure_counts[agent] = failures
-                backoff = min(60.0, self.poll_seconds * (2 ** (failures - 1)))
-                self._next_retry[agent] = now + backoff
-                log_record(
-                    "tmux_reconciler",
-                    "window_died",
-                    destination=agent,
-                    reason=f"window died or exited unexpectedly; retry in {backoff:.0f}s (failure #{failures})",
-                    count=failures,
-                    waited=backoff,
-                )
+            if agent not in existing_windows:
+                self._known_windows.discard(agent)
+                if agent in roster_agents and agent not in self._spawned_agents:
+                    failures = self._failure_counts.get(agent, 0) + 1
+                    self._failure_counts[agent] = failures
+                    backoff = min(60.0, self.poll_seconds * (2 ** (failures - 1)))
+                    self._next_retry[agent] = now + backoff
+                    log_record(
+                        "tmux_reconciler",
+                        "window_died",
+                        destination=agent,
+                        reason=f"window died or exited unexpectedly; retry in {backoff:.0f}s (failure #{failures})",
+                        count=failures,
+                        waited=backoff,
+                    )
 
     def reconcile_once(self, r: redis.Redis) -> None:
         all_members = members(r, pod=self.pod, tenant=self.tenant)
@@ -302,6 +305,10 @@ class TmuxReconciler:
                 self._failure_counts.pop(agent, None)
                 self._next_retry.pop(agent, None)
                 self._spawned_agents.pop(agent, None)
+
+        # Check initial state of existing windows and detect dead windows
+        existing_windows = self.get_windows()
+        self._check_dead_windows(existing_windows, roster_agents, now)
 
         lead = self.get_lead(r)
 

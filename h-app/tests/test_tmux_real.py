@@ -659,6 +659,41 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             self.assertEqual(died_events_p3[1]["count"], 2)
             self.assertEqual(died_events_p3[1]["waited"], 10.0)
 
+    def test_reconciler_running_window_death_not_double_counted(self):
+        reconciler = TmuxReconciler(
+            pod=self.pod,
+            tenant=self.tenant,
+            redis_url=self.redis_url,
+            poll_seconds=5.0,
+            session_name=self.session_name,
+            socket=self.socket,
+        )
+
+        self.r.hset(self.registry, mapping={"runner": "tmux"})
+
+        logged = []
+        with unittest.mock.patch("core.logging.mirror", side_effect=lambda line: logged.append(json.loads(line))):
+            # Pass 1: Spawns runner (healthy bash window)
+            reconciler.reconcile_once(self.r)
+            self.assertIn("runner", reconciler.get_windows())
+
+            # Mark runner as matured/healthy past poll_seconds
+            reconciler._spawned_agents["runner"] = time.monotonic() - 10.0
+            reconciler.reconcile_once(self.r)
+            self.assertIn("runner", reconciler._known_windows)
+            self.assertNotIn("runner", reconciler._spawned_agents)
+
+            # Kill window directly via tmux (simulating an agent process crash)
+            run_tmux("kill-window", "-t", f"{self.session_name}:runner", socket=self.socket)
+
+            # Pass 3: Detects running window death
+            reconciler.reconcile_once(self.r)
+
+            died_events = [r for r in logged if r.get("event") == "window_died" and r.get("destination") == "runner"]
+            self.assertEqual(len(died_events), 1)
+            self.assertEqual(died_events[0]["count"], 1)
+            self.assertEqual(reconciler._failure_counts.get("runner"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
