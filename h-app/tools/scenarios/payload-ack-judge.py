@@ -2,14 +2,26 @@
 import json, sys
 records=[]
 ignored=0
+unparseable=0
 scope = sys.argv[3] if len(sys.argv) > 3 else 'payload-'
 for line in open(sys.argv[1], errors='replace'):
+    if not line.strip():
+        continue
     try:
         r=json.loads(line)
-        if not (str(r.get('source','')).startswith(scope) or str(r.get('destination','')).startswith(scope)):
-            ignored += 1; continue
-        records.append(r)
-    except Exception: continue
+    except Exception:
+        # ⚠ Not a bare `continue`. A line that fails to parse is not proof of
+        # nothing — it can be a torn custody record (two writers sharing one
+        # fd, one line glued to another with no newline between them — seen
+        # live porting payload-ack.sh, see project memory). Silently skipping
+        # it makes a dropped/corrupted record invisible instead of a visible
+        # failure, which defeats the whole point of reconciling against a
+        # harness-known expected count. Count it and fail on it below.
+        unparseable += 1
+        continue
+    if not (str(r.get('source','')).startswith(scope) or str(r.get('destination','')).startswith(scope)):
+        ignored += 1; continue
+    records.append(r)
 generic={r.get('stream_id') for r in records if r.get('event')=='sent'}
 ack_ids={r.get('stream_id') for r in records if r.get('event')=='ack_sent'}
 sent=generic-ack_ids
@@ -27,6 +39,15 @@ if len(sys.argv)>2 and sys.argv[2]=='--ack-count':
 expected=int(sys.argv[2]) if len(sys.argv)>2 and sys.argv[2].isdigit() else 0
 print(f'ACK_OPENED_UNIQUE {len(ack_opened)}')
 print(f'PAYLOAD_SCOPE ignored_out_of_scope={ignored} sent={len(sent)} opened={len(opened)} verified={len(verified)} ack_sent={len(ack_sent)} ack_opened={len(ack_opened)}')
+print(f'MALFORMED_LINES count={unparseable}')
+# ⚠ Checked BEFORE the expected-count comparison, not after: a torn line can
+# lower a stage's count by exactly one without ever moving `short` off zero
+# (e.g. the torn record's own stream_id still shows up correctly in every
+# OTHER stage), so "stages_matching=5/5" is not proof nothing was lost — it's
+# proof nothing OBSERVABLE was lost. Fail on the unparseable count on its own
+# terms, regardless of whether the stage counts happen to balance.
+if unparseable:
+ print(f'PAYLOAD_RESULT rc=7 reason=unparseable_custody_lines count={unparseable}'); raise SystemExit(7)
 if expected:
  short=[f'{n}={len(s)}' for n,s in (('sent',sent),('opened',opened),('verified',verified),('ack_sent',ack_sent),('ack_opened',ack_opened)) if len(s)!=expected]
  print(f'PAYLOAD_EXPECTED submitted_by_harness={expected} stages_matching={5-len(short)}/5')
