@@ -1,3 +1,14 @@
+```
+██╗  ██╗      ███╗   ███╗███████╗███████╗██╗  ██╗
+██║  ██║      ████╗ ████║██╔════╝██╔════╝██║  ██║
+███████║█████╗██╔████╔██║█████╗  ███████╗███████║
+██╔══██║╚════╝██║╚██╔╝██║██╔══╝  ╚════██║██╔══██║
+██║  ██║      ██║ ╚═╝ ██║███████╗███████║██║  ██║
+╚═╝  ╚═╝      ╚═╝     ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝
+
+  H-MESH // agentic office framework // h-network
+```
+
 # h-mesh
 
 An agentic CLI framework where agents address each other directly, by name, and a single switch forwards every message to its destination. Work is tracked on a shared board per agent: pull a ticket, work it, mark it done.
