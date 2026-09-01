@@ -19,7 +19,7 @@ Everything else is a module that plugs into this.
 | `dispatch.py` | generic port_type -> handler registry and dispatch with renewable per-agent delivery leases, invoked only by whatever the switch's kick actually calls -- the switch itself never imports this |
 | `logging.py` | contract-shaped JSON event logging and durable stdout mirroring, plus `configure_logging()` — the stdlib logging threshold for entry points |
 | `retention.py` | count-based trimming for completed-task and dead-letter queues |
-| `windowlog.py` | agent-window log tailing, offset tracking, and bounded truncation |
+| `windowlog.py` | agent-window custody-log validation, tailing, offset tracking, and bounded truncation |
 | `service.py` | the `Switch` class — BLPOP/forward/kick loop, is what "the switch" is |
 
 The tenant participant hash is the wire-visible `registry` resource. Delivery

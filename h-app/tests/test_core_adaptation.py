@@ -205,6 +205,29 @@ class CoreAdaptationTests(unittest.TestCase):
                 tailer = WindowLogTailer(object(), pod="mesh", tenant="office")
                 self.assertEqual(tailer.path, Path(directory) / "window.log.jsonl")
 
+    def test_window_tailer_reports_malformed_custody_instead_of_republishing_it(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "window.log.jsonl"
+            path.write_text('not-json\n[]\n', encoding="utf-8")
+            redis_client = MagicMock()
+            redis_client.get.return_value = 0
+            tailer = WindowLogTailer(
+                redis_client, pod="mesh", tenant="office", path=path,
+            )
+            with (
+                patch("core.windowlog.publish") as publish_record,
+                patch("core.windowlog.log_record") as diagnostic,
+            ):
+                tailer.poll()
+
+            publish_record.assert_not_called()
+            self.assertEqual(diagnostic.call_count, 2)
+            self.assertTrue(all(
+                call.args[:2] == ("switch", "window_log_parse_error")
+                for call in diagnostic.call_args_list
+            ))
+            redis_client.set.assert_called_with(tailer.offset_key, path.stat().st_size)
+
 
 if __name__ == "__main__":
     unittest.main()

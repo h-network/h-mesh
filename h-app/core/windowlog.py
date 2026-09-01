@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .config import state_path
 from .keys import prefix
-from .logging import log_record, mirror
+from .logging import log_record, publish
 
 
 class WindowLogTailer:
@@ -54,22 +54,30 @@ class WindowLogTailer:
                         continue
                     try:
                         record = json.loads(line)
-                    except (TypeError, json.JSONDecodeError):
-                        record = None
-                    if isinstance(record, dict):
-                        # A current log_record already carries the process label.
-                        # Legacy/custom pane writers do not. Preserve an explicit
-                        # writer byte-for-byte in meaning; only fill the absence.
-                        if "writer" not in record:
-                            agent = (
-                                record.get("source")
-                                or record.get("agent")
-                                or record.get("destination")
-                                or "unknown"
-                            )
-                            record["writer"] = f"window:{agent}"
-                            line = json.dumps(record, separators=(",", ":"))
-                    print(line, flush=True)
+                        if not isinstance(record, dict):
+                            raise ValueError("window custody record is not a JSON object")
+                    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                        log_record(
+                            "switch",
+                            "window_log_parse_error",
+                            reason=f"invalid custody JSON at byte {committed}: {exc}",
+                            byte_count=len(raw),
+                        )
+                        committed = source.tell()
+                        continue
+                    # A current log_record already carries the process label.
+                    # Legacy/custom pane writers do not. Preserve an explicit
+                    # writer byte-for-byte in meaning; only fill the absence.
+                    if "writer" not in record:
+                        agent = (
+                            record.get("source")
+                            or record.get("agent")
+                            or record.get("destination")
+                            or "unknown"
+                        )
+                        record["writer"] = f"window:{agent}"
+                        line = json.dumps(record, separators=(",", ":"))
+                    publish(line)
                     # ⚠ THE ORIGIN RECORD OF EVERY AGENT SEND COMES THROUGH HERE.
                     # `office` runs in a pane and is QUIET, so its `sent` never
                     # touches stdout directly — it lands in the window file and
@@ -78,7 +86,6 @@ class WindowLogTailer:
                     # no `sent`, which reads exactly like an envelope the switch
                     # invented. Measured on a live tenant 2026-08-22: five of six
                     # stages in the file, `sent` count 0.
-                    mirror(line)
                     committed = source.tell()
             self.r.set(self.offset_key, committed)
             current_size = self.path.stat().st_size
