@@ -25,6 +25,10 @@ class AmbientTmuxError(RuntimeError):
     """Refused to drive a tmux server we were not explicitly pointed at."""
 
 
+class EmptyRosterError(RuntimeError):
+    """Refusing to reap non-empty session when roster is empty without explicit override."""
+
+
 class TmuxCommandError(RuntimeError):
     """A tmux command failed, distinct from a valid empty result."""
 
