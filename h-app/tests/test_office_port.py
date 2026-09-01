@@ -66,6 +66,23 @@ def test_resume_opener_injects_tmux_resume_and_kick(mock_resume, mock_tmux, mock
     popen.assert_called_once_with([sys.executable, "-m", "modules.tmux.port", "bob"])
 
 
+def test_nested_kick_preserves_switch_custody_pipe():
+    read_fd, write_fd = os.pipe()
+    try:
+        with (
+            patch.dict(os.environ, {"H_MESH_LOG_FILE": f"/proc/self/fd/{write_fd}"}),
+            patch("modules.office.port.subprocess.Popen") as popen,
+        ):
+            port._kick("bob")
+        popen.assert_called_once_with(
+            [sys.executable, "-m", "modules.tmux.port", "bob"],
+            pass_fds=(write_fd,),
+        )
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
 @patch("modules.office.port.receive")
 def test_tmux_callback_failure_is_not_silenced(mock_receive):
     r = MagicMock()

@@ -23,7 +23,21 @@ def _ensure_tmux(command: str, result: tuple[int, str, str]) -> None:
 
 def _kick(agent: str) -> None:
     """Start one independent tmux-port delivery attempt for a resumed agent."""
-    subprocess.Popen([sys.executable, "-m", "modules.tmux.port", agent])
+    kwargs = {}
+    custody_path = os.environ.get("H_MESH_LOG_FILE", "")
+    fd_prefix = "/proc/self/fd/"
+    if custody_path.startswith(fd_prefix):
+        try:
+            custody_fd = int(custody_path[len(fd_prefix):])
+            os.fstat(custody_fd)
+        except (OSError, ValueError):
+            pass
+        else:
+            # The office port itself was kicked by the switch. Keep its
+            # custody-only pipe alive through this nested tmux-port kick so
+            # the child can write to the H_MESH_LOG_FILE it inherited.
+            kwargs["pass_fds"] = (custody_fd,)
+    subprocess.Popen([sys.executable, "-m", "modules.tmux.port", agent], **kwargs)
 
 
 def deliver_office(
