@@ -605,6 +605,95 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             f"Expected PATH to start with {expected_venv_bin}, got: {path_val}",
         )
 
+    def test_reconciler_dying_window_detection_and_backoff(self):
+        reconciler = TmuxReconciler(
+            pod=self.pod,
+            tenant=self.tenant,
+            redis_url=self.redis_url,
+            poll_seconds=5.0,
+            session_name=self.session_name,
+            socket=self.socket,
+        )
+
+        # Register an agent that fails immediately upon execution (e.g. invalid command)
+        self.r.hset(self.registry, mapping={"crashy": "tmux"})
+        launch_key = prefix(self.pod, self.tenant, agent="crashy", resource="launch")
+        self.r.set(launch_key, "invalid_cli")
+
+        logged = []
+        with unittest.mock.patch("core.logging.mirror", side_effect=lambda line: logged.append(json.loads(line))), \
+             unittest.mock.patch("modules.tmux.ops.start_agent_command", return_value=["false"]):
+
+            # Pass 1: Spawns crashy, which dies immediately. Detected as dead on same or next check.
+            reconciler.reconcile_once(self.r)
+
+            created_events = [r for r in logged if r.get("event") == "window_created" and r.get("destination") == "crashy"]
+            died_events = [r for r in logged if r.get("event") == "window_died" and r.get("destination") == "crashy"]
+
+            self.assertEqual(len(created_events), 1)
+            self.assertEqual(len(died_events), 1)
+            self.assertEqual(died_events[0]["count"], 1)
+            self.assertEqual(died_events[0]["waited"], 5.0)
+
+            # Pass 2: Immediately run again (within the 5s backoff). Should NOT retry spawning.
+            reconciler.reconcile_once(self.r)
+
+            created_events_p2 = [r for r in logged if r.get("event") == "window_created" and r.get("destination") == "crashy"]
+            died_events_p2 = [r for r in logged if r.get("event") == "window_died" and r.get("destination") == "crashy"]
+
+            # No new creations or dead window logs emitted while in backoff
+            self.assertEqual(len(created_events_p2), 1)
+            self.assertEqual(len(died_events_p2), 1)
+
+            # Fast-forward time past the backoff interval (5s)
+            reconciler._next_retry["crashy"] = time.monotonic() - 1.0
+
+            # Pass 3: Backoff expired. Retries spawn, dies again -> count=2, waited=10s.
+            reconciler.reconcile_once(self.r)
+
+            created_events_p3 = [r for r in logged if r.get("event") == "window_created" and r.get("destination") == "crashy"]
+            died_events_p3 = [r for r in logged if r.get("event") == "window_died" and r.get("destination") == "crashy"]
+
+            self.assertEqual(len(created_events_p3), 2)
+            self.assertEqual(len(died_events_p3), 2)
+            self.assertEqual(died_events_p3[1]["count"], 2)
+            self.assertEqual(died_events_p3[1]["waited"], 10.0)
+
+    def test_reconciler_running_window_death_not_double_counted(self):
+        reconciler = TmuxReconciler(
+            pod=self.pod,
+            tenant=self.tenant,
+            redis_url=self.redis_url,
+            poll_seconds=5.0,
+            session_name=self.session_name,
+            socket=self.socket,
+        )
+
+        self.r.hset(self.registry, mapping={"runner": "tmux"})
+
+        logged = []
+        with unittest.mock.patch("core.logging.mirror", side_effect=lambda line: logged.append(json.loads(line))):
+            # Pass 1: Spawns runner (healthy bash window)
+            reconciler.reconcile_once(self.r)
+            self.assertIn("runner", reconciler.get_windows())
+
+            # Mark runner as matured/healthy past poll_seconds
+            reconciler._spawned_agents["runner"] = time.monotonic() - 10.0
+            reconciler.reconcile_once(self.r)
+            self.assertIn("runner", reconciler._known_windows)
+            self.assertNotIn("runner", reconciler._spawned_agents)
+
+            # Kill window directly via tmux (simulating an agent process crash)
+            run_tmux("kill-window", "-t", f"{self.session_name}:runner", socket=self.socket)
+
+            # Pass 3: Detects running window death
+            reconciler.reconcile_once(self.r)
+
+            died_events = [r for r in logged if r.get("event") == "window_died" and r.get("destination") == "runner"]
+            self.assertEqual(len(died_events), 1)
+            self.assertEqual(died_events[0]["count"], 1)
+            self.assertEqual(reconciler._failure_counts.get("runner"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

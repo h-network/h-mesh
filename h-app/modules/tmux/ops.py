@@ -642,7 +642,11 @@ def create_window(
     # `rehire` and made the agent unaddressable. Re-writing the guide above is
     # deliberate and harmless — it refreshes the lead sentence — but a second
     # window is not.
-    if agent_name in list_windows(session_name, socket=socket):
+    try:
+        current_windows = list_windows(session_name, socket=socket)
+    except Exception:
+        current_windows = set()
+    if agent_name in current_windows:
         return 0, "", ""
 
     if not command:
