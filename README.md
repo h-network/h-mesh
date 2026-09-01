@@ -69,7 +69,15 @@ already there.
 
 Piped, scripted, or passed `--non-interactive`, it never prompts -- flags,
 environment, and whatever's already been configured for that tenant are all
-it uses. Either way it also:
+it uses. Per-agent exceptions (`AGENT_CLIS`, `AGENT_PROFILES`,
+`AGENT_PROVIDERS`) are each set as a comma-separated list of `agent=value`
+pairs, e.g. `AGENT_CLIS=worker1=codex,worker2=agy` -- exactly one `=` per
+pair, agent name on the left. A malformed entry (wrong separator, a missing
+value) is a hard error, not a silently-ignored one: this matters most for
+`AGENT_PROVIDERS`, since an agent with no override that setup.sh recognizes
+runs against the real vendor API, not the local provider you configured for
+it -- a typo there is real spend, not just a wrong setting. Either way it
+also:
 
 - verifies/auto-installs system dependencies (`redis-server`, `python3-venv`,
   and `h-agent` itself via its own installer) -- skip with `--skip-deps`

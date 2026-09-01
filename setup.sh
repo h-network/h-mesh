@@ -15,6 +15,15 @@
 # CLAUDE_OAUTH_TOKEN_<PROFILE>, PROVIDER_LOCAL_*, TELEGRAM_*, API_TOKEN),
 # falling back to whatever's already persisted -- then persisted right back,
 # same as an interactive answer would be. See ENV_TENANT_GET below.
+#
+# AGENT_CLIS/AGENT_PROFILES/AGENT_PROVIDERS are each a comma-separated list
+# of agent=value pairs, e.g. AGENT_CLIS=worker1=codex,worker2=agy -- ONE '='
+# per pair, agent name on the left. A malformed entry (wrong separator, a
+# missing value) is refused with a hard error rather than silently treated
+# as absent -- see validate_pair_map below. This matters most for
+# AGENT_PROVIDERS: an agent with no provider override runs against the real
+# vendor API, so a typo'd separator there means real spend, not just a
+# wrong setting.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -57,6 +66,14 @@ roster, CLI/account choices, local model provider) the same way the
 reference project's setup.sh does. Piped or scripted (not a terminal), or
 with --non-interactive, it never prompts -- flags, environment, and any
 already-persisted tenant config are all it uses.
+
+Non-interactive env vars for per-agent exceptions (AGENT_CLIS,
+AGENT_PROFILES, AGENT_PROVIDERS) are each a comma-separated list of
+agent=value pairs -- e.g. AGENT_CLIS=worker1=codex,worker2=agy. A
+malformed entry (wrong separator, missing value) is refused with an
+error, not silently ignored -- this matters most for AGENT_PROVIDERS,
+where an agent with no recognized override runs against the real vendor
+API instead of the local provider you configured.
 EOF
     exit 0
 }
@@ -314,15 +331,53 @@ _mk() { printf 'M_%s_%s' "$1" "$(printf '%s' "$2" | tr -c 'A-Za-z0-9' '_')"; }
 mset() { eval "$(_mk "$1" "$2")=\$3"; }
 mget() { eval "printf '%s' \"\${$(_mk "$1" "$2"):-}\""; }
 
+# ⚠ A malformed entry (wrong separator, e.g. "worker1:local" instead of
+# "worker1=local") is NOT the same as an absent one, and must not be
+# silently treated as one. "${pair%%=*}"/"${pair#*=}" against a pair with
+# no "=" at all both evaluate to the whole malformed string -- so a typo'd
+# separator quietly created a bogus map key that never matched any real
+# agent, leaving the REAL agent name with no override at all. For
+# AGENT_PROVIDERS specifically, that meant hiring silently proceeded
+# against the real vendor API instead of the local provider the user
+# explicitly configured, with no on-screen indication anything was wrong --
+# caught live, by inspecting a pane, not by this script. Refuse rather than
+# ignore: falling back to a default IS the failure mode here, for all three
+# maps -- AGENT_CLIS/AGENT_PROFILES silently reverting to the wrong
+# CLI/account is exactly as much "configured one thing, silently got
+# another" as AGENT_PROVIDERS silently billing the wrong API, just with a
+# less expensive symptom.
+validate_pair_map() {
+    local csv="$1" var_name="$2" pair k v
+    [ -z "$csv" ] && return 0
+    for pair in ${csv//,/ }; do
+        case "$pair" in
+            *=*) : ;;
+            *)
+                echo "error: $var_name entry '$pair' is malformed (expected agent=value, e.g. worker1=local) -- refusing to continue rather than silently treat it as absent." >&2
+                return 1
+                ;;
+        esac
+        k="${pair%%=*}"; v="${pair#*=}"
+        if [ -z "$k" ] || [ -z "$v" ]; then
+            echo "error: $var_name entry '$pair' is malformed (expected agent=value, both non-empty) -- refusing to continue rather than silently treat it as absent." >&2
+            return 1
+        fi
+    done
+    return 0
+}
+
 # Seed the per-agent maps from persisted exceptions before any prompting, so
 # a re-run's defaults reflect prior answers even for agents not touched this
 # time.
 for a in "${AGENTS[@]}"; do mset CLI "$a" "$DEF_CLI"; mset PROF "$a" "$DEF_PROFILE"; done
 CLI_MAP_EXISTING="$(ENV_TENANT_GET AGENT_CLIS "")"
+validate_pair_map "$CLI_MAP_EXISTING" AGENT_CLIS || exit 1
 for pair in ${CLI_MAP_EXISTING//,/ }; do mset CLI "${pair%%=*}" "${pair#*=}"; done
 PROFILE_MAP_EXISTING="$(ENV_TENANT_GET AGENT_PROFILES "")"
+validate_pair_map "$PROFILE_MAP_EXISTING" AGENT_PROFILES || exit 1
 for pair in ${PROFILE_MAP_EXISTING//,/ }; do mset PROF "${pair%%=*}" "${pair#*=}"; done
 PROVIDER_MAP_EXISTING="$(ENV_TENANT_GET AGENT_PROVIDERS "")"
+validate_pair_map "$PROVIDER_MAP_EXISTING" AGENT_PROVIDERS || exit 1
 for pair in ${PROVIDER_MAP_EXISTING//,/ }; do mset EP "${pair%%=*}" "${pair#*=}"; done
 
 TOKEN_VAR() { printf 'CLAUDE_OAUTH_TOKEN_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
@@ -443,15 +498,32 @@ if [ "$INTERACTIVE" -eq 1 ]; then
         ask_token default
     fi
 
+    # ⚠ Update agents that were FOLLOWING the old default to the new one --
+    # not every agent unconditionally. An unconditional reset here silently
+    # reverted a per-agent CLI override on every re-run (e.g. observer=codex
+    # went back to claude just by accepting this prompt's own default,
+    # without ever touching the "any agents differing" exceptions below) --
+    # measured live. Every agent already has a non-empty CLI by this point
+    # (seeded to the *old* DEF_CLI above if newly added this run), so
+    # comparing against OLD_DEF_CLI correctly catches both a genuinely
+    # default-following agent and a brand-new one, while leaving an agent
+    # whose CLI already differs from the old default alone.
+    OLD_DEF_CLI="$DEF_CLI"
     read -rp "  Default CLI (claude/codex/agy) [$DEF_CLI]: " IN_CLI
     DEF_CLI="$(slug "${IN_CLI:-$DEF_CLI}")"
-    for a in "${AGENTS[@]}"; do mset CLI "$a" "$DEF_CLI"; done
+    for a in "${AGENTS[@]}"; do
+        [ "$(mget CLI "$a")" = "$OLD_DEF_CLI" ] && mset CLI "$a" "$DEF_CLI"
+    done
 
     if [ "${#PROFILES[@]}" -gt 1 ] || [ "${PROFILES[0]}" != "default" ]; then
         echo "  Accounts: ${PROFILES[*]}"
         read -rp "  Default account for every agent [${PROFILES[0]}]: " IN_DEF_PROFILE
+        # Same fix, same reasoning, as DEF_CLI just above.
+        OLD_DEF_PROFILE="$DEF_PROFILE"
         DEF_PROFILE="$(slug "${IN_DEF_PROFILE:-${PROFILES[0]}}")"
-        for a in "${AGENTS[@]}"; do mset PROF "$a" "$DEF_PROFILE"; done
+        for a in "${AGENTS[@]}"; do
+            [ "$(mget PROF "$a")" = "$OLD_DEF_PROFILE" ] && mset PROF "$a" "$DEF_PROFILE"
+        done
     fi
 
     echo "  Agents: ${AGENTS[*]}"

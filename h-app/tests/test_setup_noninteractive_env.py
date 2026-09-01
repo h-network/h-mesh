@@ -264,3 +264,93 @@ def test_non_interactive_env_line_omits_a_value_a_second_run_reuses_from_persist
     assert code2 == 0, output2
     assert "Persisting from live environment:" not in output2
     assert _read_persisted(ctx, monkeypatch).get("DEFAULT_CLI") == "codex"
+
+
+# ── Malformed AGENT_CLIS/AGENT_PROFILES/AGENT_PROVIDERS ─────────────────────
+# Real bug, reported live: a wrong separator (':' instead of '=') was
+# silently indistinguishable from an absent entry -- "${pair%%=*}"/
+# "${pair#*=}" against a pair with no '=' both evaluate to the whole
+# malformed string, so it set a bogus map key that never matched any real
+# agent, leaving the real agent with no override at all. For
+# AGENT_PROVIDERS specifically, that meant a hire proceeded silently against
+# the real vendor API instead of the local provider that was configured --
+# caught by inspecting a pane, not by this script. No prior test fed a
+# malformed override map at all.
+
+def test_non_interactive_malformed_agent_providers_refuses_rather_than_ignoring(noninteractive_env, monkeypatch):
+    ctx = noninteractive_env
+    output, code = _run_setup(ctx, {
+        "AGENTS": "worker1",
+        "AGENT_PROVIDERS": "worker1:local",  # wrong separator
+        "PROVIDER_LOCAL_URL": "http://10.0.0.5:8000",
+        "PROVIDER_LOCAL_MODEL": "some-model",
+    })
+    assert code != 0, f"stdout/stderr:\n{output}"
+    assert "AGENT_PROVIDERS" in output
+    assert "malformed" in output
+    persisted = _read_persisted(ctx, monkeypatch)
+    assert "AGENT_PROVIDERS" not in persisted
+
+
+def test_non_interactive_malformed_agent_clis_refuses_rather_than_ignoring(noninteractive_env, monkeypatch):
+    ctx = noninteractive_env
+    output, code = _run_setup(ctx, {
+        "AGENTS": "worker1",
+        "AGENT_CLIS": "worker1:codex",  # wrong separator
+    })
+    assert code != 0, f"stdout/stderr:\n{output}"
+    assert "AGENT_CLIS" in output
+    assert "malformed" in output
+
+
+def test_non_interactive_malformed_agent_profiles_refuses_rather_than_ignoring(noninteractive_env, monkeypatch):
+    ctx = noninteractive_env
+    output, code = _run_setup(ctx, {
+        "AGENTS": "worker1",
+        "ACCOUNTS": "default,backup",
+        "AGENT_PROFILES": "worker1:backup",  # wrong separator
+    })
+    assert code != 0, f"stdout/stderr:\n{output}"
+    assert "AGENT_PROFILES" in output
+    assert "malformed" in output
+
+
+def test_non_interactive_malformed_agent_providers_never_hires_the_agent_at_all(noninteractive_env, monkeypatch):
+    # The actual money question: does a malformed override still let a hire
+    # through (which would run the agent against the real vendor API)? Runs
+    # the real daemon+hire flow, not --no-daemons.
+    from core.registry import port_type
+
+    ctx = noninteractive_env
+    env = dict(ctx["env"])
+    env.update({
+        "AGENTS": "worker1",
+        "AGENT_PROVIDERS": "worker1:local",  # wrong separator
+        "PROVIDER_LOCAL_URL": "http://10.0.0.5:8000",
+        "PROVIDER_LOCAL_MODEL": "some-model",
+    })
+    # ⚠ Not --no-daemons, unlike every other test here -- the fix should
+    # abort before section 6 ever starts a daemon, but this cleanup is
+    # defensive in case that ever shifts: sweep run_dir for any pidfile a
+    # daemon left behind, rather than assuming none did. See
+    # hmesh-conventions memory on why a fixed name list isn't safe here.
+    run_dir = Path(ctx["home_dir"]) / ".h-mesh" / "run" / ctx["tenant"]
+    try:
+        res = subprocess.run(
+            [str(SETUP_SH), "--venv", sys.prefix, "--skip-install", "--skip-deps", "--non-interactive"],
+            env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+        output = res.stdout + res.stderr
+        assert res.returncode != 0, f"stdout/stderr:\n{output}"
+
+        r = redis.Redis.from_url(ctx["env"]["REDIS_URL"])
+        assert port_type(r, pod=ctx["pod"], tenant=ctx["tenant"], agent="worker1") is None, (
+            "a malformed AGENT_PROVIDERS entry must never let a hire through -- "
+            f"worker1 was registered anyway. stdout/stderr:\n{output}"
+        )
+    finally:
+        for pidfile in run_dir.glob("*.pid") if run_dir.is_dir() else []:
+            try:
+                os.kill(int(pidfile.read_text().strip()), 9)
+            except (ValueError, OSError):
+                pass
