@@ -396,6 +396,22 @@ def test_take_by_id_quarantines_malformed_entries_without_blocking_valid_match(m
     assert json.loads(r.lists[doing_key][0])["id"] == "valid-id"
 
 
+def test_take_quarantines_invalid_utf8_bytes(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis()
+    todo_key = prefix(POD, TENANT, "architect", "tasks.todo")
+    invalid_key = prefix(POD, TENANT, "architect", "tasks.invalid")
+    malformed = b"\xffnot-a-ticket"
+    r.lists[todo_key].append(malformed)
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit):
+            office_main(["take"])
+
+    assert "not a valid ticket" in capsys.readouterr().err
+    assert r.lists[todo_key] == []
+    assert r.lists[invalid_key] == [malformed]
+
+
 def test_concurrent_takes_leave_exactly_one_doing_ticket(monkeypatch):
     _env(monkeypatch)
     r = FakeRedis()

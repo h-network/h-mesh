@@ -35,7 +35,7 @@ def normalize_ticket(raw, *, state: str | None = None) -> dict:
     else:
         try:
             ticket = json.loads(_text(raw))
-        except (json.JSONDecodeError, TypeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
             raise BoardError("board entry is not a valid ticket") from exc
     if not isinstance(ticket, dict):
         raise BoardError("board entry is not a valid ticket")
