@@ -659,8 +659,20 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         with unittest.mock.patch("core.logging.mirror", side_effect=lambda line: logged.append(json.loads(line))), \
              unittest.mock.patch("modules.tmux.ops.start_agent_command", return_value=["false"]):
 
-            # Pass 1: Spawns crashy, which dies immediately. Detected as dead on same or next check.
-            reconciler.reconcile_once(self.r)
+            # Pass 1: Spawns crashy, which dies immediately. tmux removes an
+            # exited window asynchronously, so reconcile until the observable
+            # window_died behavior appears instead of assuming reaping happens
+            # inside the first call on every host.
+            deadline = time.monotonic() + 2.0
+            while True:
+                reconciler.reconcile_once(self.r)
+                died_events = [
+                    r for r in logged
+                    if r.get("event") == "window_died" and r.get("destination") == "crashy"
+                ]
+                if died_events or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
 
             created_events = [r for r in logged if r.get("event") == "window_created" and r.get("destination") == "crashy"]
             died_events = [r for r in logged if r.get("event") == "window_died" and r.get("destination") == "crashy"]
