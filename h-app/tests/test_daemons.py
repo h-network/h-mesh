@@ -1,13 +1,17 @@
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
 import redis
 
+from core.keys import prefix
+from core.registry import port_type
 from services.daemons import (
     ALL_DAEMON_MODULES,
     DAEMON_MODULES,
@@ -87,7 +91,7 @@ def test_start_daemons_then_stop_daemons_cleanly():
 
     try:
         pids = start_daemons(python=python, run_dir=run_dir, env=env)
-        assert set(pids) == {"switch", "tmux_reconciler"}
+        assert set(pids) == set(DAEMON_MODULES)
         for name, pid in pids.items():
             assert pid_alive(pid), f"{name} (pid {pid}) not alive right after start"
             assert (run_dir / f"{name}.pid").read_text().strip() == str(pid)
@@ -212,12 +216,17 @@ def test_enabled_daemon_modules_is_just_the_base_set_without_telegram_config():
     assert set(enabled_daemon_modules({})) == set(DAEMON_MODULES)
 
 
-def test_enabled_daemon_modules_adds_api_and_telegram_bot_when_both_present():
+def test_enabled_daemon_modules_adds_api_telegram_bot_and_session_when_both_present():
+    # session backs the Telegram bot's "watch" command -- rides the same
+    # TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID condition as api/telegram_bot,
+    # not a separate one, since it needs API_TOKEN and today that's only
+    # ever set once Telegram is configured.
     env = {"TELEGRAM_BOT_TOKEN": "x", "TELEGRAM_CHAT_ID": "y"}
     modules = enabled_daemon_modules(env)
-    assert set(modules) == set(DAEMON_MODULES) | {"api", "telegram_bot"}
+    assert set(modules) == set(DAEMON_MODULES) | {"api", "telegram_bot", "session"}
     assert modules["api"] == OPTIONAL_DAEMON_MODULES["api"]
     assert modules["telegram_bot"] == OPTIONAL_DAEMON_MODULES["telegram_bot"]
+    assert modules["session"] == OPTIONAL_DAEMON_MODULES["session"]
 
 
 def test_enabled_daemon_modules_requires_both_token_and_chat_id():
@@ -255,7 +264,7 @@ def test_start_daemons_starts_an_optional_daemon_when_requested_in_daemon_module
     daemon_modules = {**DAEMON_MODULES, "api": OPTIONAL_DAEMON_MODULES["api"]}
     try:
         pids = start_daemons(python=python, run_dir=run_dir, env=env, daemon_modules=daemon_modules)
-        assert set(pids) == {"switch", "tmux_reconciler", "api"}
+        assert set(pids) == set(DAEMON_MODULES) | {"api"}
         for pid in pids.values():
             assert pid_alive(pid)
 
@@ -265,3 +274,122 @@ def test_start_daemons_starts_an_optional_daemon_when_requested_in_daemon_module
         assert not (run_dir / "api.pid").exists()
     finally:
         _kill_and_cleanup(run_dir, tmpdir, env)
+
+
+def test_watchdog_starts_by_default_and_presence_leaves_unknown_after_a_real_hire():
+    # The actual bug: DAEMON_MODULES didn't include watchdog, so setup.sh/
+    # h-mesh start/h-mesh upgrade never started it, nothing ever sampled
+    # presence, and every agent read "unknown" forever with no ticket to
+    # explain why. Confirmed through the real path an operator would use to
+    # notice -- modules.office.cli's own "status" command -- not just that
+    # a watchdog pid happens to exist.
+    _skip_unless_redis()
+    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_watchdog_")
+    run_dir = Path(tmpdir) / "run"
+    pod = f"testpod-{os.urandom(4).hex()}"
+    tenant = f"testtenant-{os.urandom(4).hex()}"
+    python = Path(sys.executable)
+    env = _env(pod, tenant, tmpdir)
+
+    # h-agent is supplied by the runtime base image, not by this repo or CI
+    # -- stand in a fake one so the hired window has a long-lived shell,
+    # same pattern as test_setup_script.py/test_setup_wizard.py.
+    fake_bin = os.path.join(tmpdir, "bin")
+    os.makedirs(fake_bin, exist_ok=True)
+    fake_h_agent = os.path.join(fake_bin, "h-agent")
+    with open(fake_h_agent, "w") as f:
+        f.write("#!/usr/bin/env bash\nexec bash -il\n")
+    os.chmod(fake_h_agent, 0o755)
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+
+    r = redis.Redis.from_url(env["REDIS_URL"])
+    try:
+        pids = start_daemons(python=python, run_dir=run_dir, env=env)
+        assert "watchdog" in pids, "watchdog must be part of the default, always-on set"
+        assert pid_alive(pids["watchdog"])
+
+        registry_key = prefix(pod, tenant, resource="registry")
+        r.hset(registry_key, mapping={"host": "office"})
+
+        hire_env = dict(env)
+        hire_env["AGENT_NAME"] = "host"
+        hire_res = subprocess.run(
+            [str(python), "-m", "modules.office.cli", "hire", "worker1", "--cli", "claude"],
+            env=hire_env, capture_output=True, text=True, timeout=15,
+        )
+        assert hire_res.returncode == 0, f"hire failed: {hire_res.stderr}\n{hire_res.stdout}"
+
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if port_type(r, pod=pod, tenant=tenant, agent="worker1") == "tmux":
+                break
+            time.sleep(0.2)
+        assert port_type(r, pod=pod, tenant=tenant, agent="worker1") == "tmux", "worker1 never registered"
+
+        status_out = ""
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            status_res = subprocess.run(
+                [str(python), "-m", "modules.office.cli", "status", "worker1"],
+                env=hire_env, capture_output=True, text=True, timeout=10,
+            )
+            status_out = status_res.stdout
+            if "unknown" not in status_out:
+                break
+            time.sleep(0.5)
+        assert "unknown" not in status_out, (
+            f"presence stayed unknown after a real hire, status output: {status_out!r}\n"
+            f"watchdog.log:\n{(run_dir / 'watchdog.log').read_text()}"
+        )
+    finally:
+        _kill_and_cleanup(run_dir, tmpdir, env)
+
+
+def test_session_daemon_starts_when_telegram_is_configured_not_otherwise():
+    # session backs the Telegram bot's "watch" command and hard-requires
+    # API_TOKEN (modules.session.app.SessionSettings.from_env) -- confirms
+    # it actually starts, alive, once Telegram config makes it eligible via
+    # enabled_daemon_modules, and is absent when it doesn't.
+    _skip_unless_redis()
+    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_session_")
+    run_dir = Path(tmpdir) / "run"
+    pod = f"testpod-{os.urandom(4).hex()}"
+    tenant = f"testtenant-{os.urandom(4).hex()}"
+    python = Path(sys.executable)
+    env = _env(pod, tenant, tmpdir)
+    env["API_TOKEN"] = "test-token-for-session-daemon"
+    env["API_BIND"] = "127.0.0.1"
+    env["SESSION_BIND"] = "127.0.0.1"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        env["API_PORT"] = str(probe.getsockname()[1])
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        env["SESSION_PORT"] = str(probe.getsockname()[1])
+    env["TELEGRAM_BOT_TOKEN"] = "fake-bot-token"
+    env["TELEGRAM_CHAT_ID"] = "12345"
+
+    try:
+        # enabled_daemon_modules() is what setup.sh actually calls -- confirm
+        # its shape here -- but only start a subset for real (skip
+        # telegram_bot): a fake, non-functional TELEGRAM_BOT_TOKEN would make
+        # TelegramBot use the real TelegramClient, not DryRunTelegramClient,
+        # risking a real network call to Telegram's servers. This test is
+        # about session, not the bot.
+        daemon_modules = enabled_daemon_modules(env)
+        assert "session" in daemon_modules
+        start_modules = {**DAEMON_MODULES, "api": daemon_modules["api"], "session": daemon_modules["session"]}
+        pids = start_daemons(python=python, run_dir=run_dir, env=env, daemon_modules=start_modules)
+        assert "session" in pids
+        assert pid_alive(pids["session"]), (
+            f"session.log:\n{(run_dir / 'session.log').read_text()}"
+        )
+
+        stop_daemons(run_dir)
+        assert not pid_alive(pids["session"])
+    finally:
+        _kill_and_cleanup(run_dir, tmpdir, env)
+
+
+def test_session_daemon_absent_without_telegram_config():
+    assert "session" not in enabled_daemon_modules({})
