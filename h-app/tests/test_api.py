@@ -1,14 +1,18 @@
 import asyncio
 import json
+import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
 
+import redis
 
 H_APP = Path(__file__).resolve().parents[1]
 if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
+from core.channels import send
 from core.envelope import build, encode, parse
 from core.keys import prefix
 from modules.api.port import deliver_api
@@ -202,6 +206,69 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(self.redis.streams[inbox]), 1)
         self.assertEqual(json.loads(self.redis.streams[inbox][0][1]["envelope"])["payload"], {"text": "reply"})
         self.assertEqual(self.redis.lists[dead], ["not an envelope"])
+
+
+class RealApiPortSubprocessTests(unittest.TestCase):
+    """Runs `python -m modules.api.port` as a real subprocess, the way the
+    switch actually invokes it. A bare unittest of deliver_api() -- or a mock
+    asserting Popen was called with the right argv -- would both stay green
+    even with no main()/__main__ guard at all, since neither ever imports the
+    module as __main__ and lets it exit. This is the class of test that
+    catches that: it fails loudly (nonzero exit, or ingress left undrained)
+    if the module has nothing runnable behind `python -m`.
+    """
+
+    def setUp(self):
+        self.redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+        self.r = redis.Redis.from_url(self.redis_url)
+        self.r.ping()
+        self.pod = "real-api-test"
+        self.tenant = f"tenant-{os.urandom(4).hex()}"
+        self.registry = prefix(self.pod, self.tenant, resource="registry")
+        self.r.hset(self.registry, mapping={"harry": "tmux", "ivy": "api"})
+
+    def tearDown(self):
+        keys = self.r.keys(f"{self.pod}.{self.tenant}.*")
+        if keys:
+            self.r.delete(*keys)
+
+    def test_real_api_module_subprocess_invocation(self):
+        send(
+            self.r,
+            pod=self.pod,
+            tenant=self.tenant,
+            source="harry",
+            destination="ivy",
+            payload={"text": "invoked via python -m modules.api.port"},
+        )
+        raw = self.r.lpop(prefix(self.pod, self.tenant, "harry", "egress"))
+        self.r.rpush(prefix(self.pod, self.tenant, "ivy", "ingress"), raw)
+
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(H_APP)
+        env["POD"] = self.pod
+        env["TENANT"] = self.tenant
+        env["REDIS_URL"] = self.redis_url
+
+        res = subprocess.run(
+            [sys.executable, "-m", "modules.api.port", "ivy"],
+            cwd=str(H_APP),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 0, f"port main failed: {res.stderr}")
+
+        self.assertIsNone(self.r.lpop(prefix(self.pod, self.tenant, "ivy", "ingress")))
+
+        inbox_key = prefix(self.pod, self.tenant, "ivy", "inbox")
+        entries = self.r.xrange(inbox_key, min="-", max="+")
+        self.assertEqual(len(entries), 1)
+        delivered = json.loads(entries[0][1][b"envelope"])
+        self.assertEqual(delivered["payload"], {"text": "invoked via python -m modules.api.port"})
+
+        delivering_key = prefix(self.pod, self.tenant, resource="delivering")
+        self.assertIsNone(self.r.hget(delivering_key, "ivy"))
 
 
 if __name__ == "__main__":
