@@ -57,6 +57,8 @@ def normalize_ticket(raw, *, state: str | None = None) -> dict:
         "done_ts": ticket.get("done_ts"),
         "held_ts": ticket.get("held_ts"),
     }
+    if isinstance(ticket.get("hold_reason"), str) and ticket["hold_reason"]:
+        normalized["hold_reason"] = ticket["hold_reason"]
     if ticket.get("priority") is not None:
         normalized["priority"] = ticket["priority"]
     raw_related = ticket.get("related")
