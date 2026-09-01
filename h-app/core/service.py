@@ -1,9 +1,11 @@
 """Forward tenant egress queues without interpreting payloads."""
 
+import json
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 
@@ -11,7 +13,7 @@ import redis
 
 from .envelope import EnvelopeError, advance_hop, header_record_fields, parse_for_switch, stamp_source
 from .keys import prefix
-from .logging import configure_logging, emit, log_record
+from .logging import configure_logging, emit, log_record, publish
 from .queues import admit_ingress
 from .registry import members, port_type
 from .retention import RetentionTrimmer
@@ -34,6 +36,36 @@ def _log_observation(event: str, **fields) -> None:
         pass
 
 
+def _port_diagnostic_path() -> str:
+    run_dir = os.environ.get("H_MESH_RUN_DIR")
+    if not run_dir:
+        tenant = os.environ.get("TENANT", "default")
+        run_dir = str(os.path.expanduser(f"~/.h-mesh/run/{tenant}"))
+    os.makedirs(run_dir, exist_ok=True)
+    return os.path.join(run_dir, "ports.log")
+
+
+def _forward_port_custody(read_fd: int, *, agent: str) -> None:
+    """Validate a port's custody-only pipe before publishing each record."""
+    with os.fdopen(read_fd, "rb") as source:
+        for raw in source:
+            try:
+                line = raw.decode("utf-8").rstrip("\n")
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    raise ValueError("custody record is not a JSON object")
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                log_record(
+                    "switch",
+                    "port_custody_parse_error",
+                    destination=agent,
+                    reason=str(exc),
+                    byte_count=len(raw),
+                )
+                continue
+            publish(line)
+
+
 def transmission(agent: str, port_type_name: str | None, envelope: dict) -> None:
     """Start one module-owned port process; ingress carries the envelope.
 
@@ -47,9 +79,36 @@ def transmission(agent: str, port_type_name: str | None, envelope: dict) -> None
     """
     if port_type_name is None:
         raise ValueError("cannot transmit without a resolved port_type")
-    subprocess.Popen(
-        [sys.executable, "-m", f"modules.{port_type_name}.port", agent]
-    )
+    custody_read, custody_write = os.pipe()
+    child_env = dict(os.environ)
+    child_env.update({
+        # Port log_record() calls use this pipe instead of stdout. Arbitrary
+        # prints and tracebacks go to ports.log below and cannot corrupt the
+        # switch's structured stream.
+        "H_MESH_LOG_FILE": f"/proc/self/fd/{custody_write}",
+        "H_MESH_LOG_QUIET": "1",
+    })
+    child_env.pop("H_MESH_LOG_FILE_AGENT_ONLY", None)
+    try:
+        with open(_port_diagnostic_path(), "ab", buffering=0) as diagnostics:
+            subprocess.Popen(
+                [sys.executable, "-m", f"modules.{port_type_name}.port", agent],
+                stdout=diagnostics,
+                stderr=subprocess.STDOUT,
+                env=child_env,
+                pass_fds=(custody_write,),
+            )
+    except Exception:
+        os.close(custody_read)
+        raise
+    finally:
+        os.close(custody_write)
+    threading.Thread(
+        target=_forward_port_custody,
+        kwargs={"read_fd": custody_read, "agent": agent},
+        name=f"port-custody-{agent}",
+        daemon=True,
+    ).start()
 
 # ⚠ activity, presence and verification are NOT here. They observe agents; the
 # watchdog owns them. What is left runs on the forwarding thread because it is

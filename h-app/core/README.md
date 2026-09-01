@@ -29,6 +29,9 @@ no callback, forwarding still completes and core records `kick_deferred`.
 The production switch uses `transmission` to start
 `python -m modules.<port_type>.port <agent>`; `port_type` is currently assumed
 to equal its module directory name, and the child reads the frame from ingress.
+Kicked ports do not inherit the switch's structured stdout: their custody
+records return over a dedicated validated pipe, while arbitrary stdout/stderr
+and crash tracebacks go to `ports.log` beside the daemon logs.
 Broadcast kicks remain deferred until their membership-only path also resolves
 participant types.
 

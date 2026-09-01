@@ -1,5 +1,7 @@
+import io
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -16,7 +18,7 @@ if str(H_APP) not in sys.path:
 
 from core.config import state_dir, state_path
 from core.registry import is_member, members, port_type
-from core.service import Switch, main, transmission
+from core.service import Switch, _forward_port_custody, main, transmission
 from core.windowlog import WindowLogTailer
 
 
@@ -146,9 +148,13 @@ class CoreAdaptationTests(unittest.TestCase):
         envelope = {"stream_id": "secret", "payload": {"text": "not argv"}}
         with patch("core.service.subprocess.Popen") as popen:
             transmission("bob", "tmux", envelope)
-        popen.assert_called_once_with(
-            [sys.executable, "-m", "modules.tmux.port", "bob"]
-        )
+        popen.assert_called_once()
+        args, kwargs = popen.call_args
+        self.assertEqual(args[0], [sys.executable, "-m", "modules.tmux.port", "bob"])
+        self.assertEqual(kwargs["stderr"], subprocess.STDOUT)
+        self.assertEqual(kwargs["pass_fds"], (int(kwargs["env"]["H_MESH_LOG_FILE"].rsplit("/", 1)[1]),))
+        self.assertEqual(kwargs["env"]["H_MESH_LOG_QUIET"], "1")
+        self.assertTrue(kwargs["stdout"].closed)
         self.assertNotIn("secret", popen.call_args.args[0])
 
     def test_transmission_rejects_unresolved_port_type(self):
@@ -156,6 +162,19 @@ class CoreAdaptationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "resolved port_type"):
                 transmission("bob", None, {})
         popen.assert_not_called()
+
+    def test_port_custody_pipe_publishes_only_valid_json_objects(self):
+        raw = b'{"event":"opened","stream_id":"ok"}\nnot-json\n[]\n'
+        with (
+            patch("core.service.os.fdopen", return_value=io.BytesIO(raw)),
+            patch("core.service.publish") as publish,
+            patch("core.service.log_record") as record,
+        ):
+            _forward_port_custody(123, agent="bob")
+
+        publish.assert_called_once_with('{"event":"opened","stream_id":"ok"}')
+        self.assertEqual(record.call_count, 2)
+        self.assertTrue(all(call.args[:2] == ("switch", "port_custody_parse_error") for call in record.call_args_list))
 
     def test_main_installs_auto_reap_and_wires_production_transmission(self):
         events = []

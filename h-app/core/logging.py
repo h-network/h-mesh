@@ -122,6 +122,13 @@ def mirror(line: str) -> None:
         pass
 
 
+def publish(line: str) -> None:
+    """Write one complete structured line to stdout and its durable mirror."""
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+    mirror(line)
+
+
 def log_record(
     module: str,
     event: str,
@@ -202,19 +209,10 @@ def log_record(
         # Flush separately after the complete-record write: it emits no second
         # record bytes, and keeps timely observation when PYTHONUNBUFFERED is
         # absent instead of making Dockerfile configuration part of this API.
-        sys.stdout.write(line + "\n")
-        sys.stdout.flush()
-        # ⚠ A DURABLE MIRROR OF STDOUT, and deliberately nothing more. Container
-        # stdout is Docker's `json-file`, which is deleted with the container —
-        # so without this mirror, `docker compose down` destroys the only
-        # evidence a run ever happened.
-        # ⚠ Gated on the SAME condition as the stdout write, so the file is a
-        # byte-for-byte copy of what `docker logs` shows. A pane record is
-        # QUIET here and reaches the log once, when the switch re-emits the
-        # window file it tails. Mirroring it directly as well would
-        # write it TWICE, and a duplicate custody record is indistinguishable
-        # from a duplicate delivery to every conservation check we have.
-        mirror(line)
+        # ⚠ A DURABLE MIRROR OF STDOUT, and deliberately nothing more. The
+        # shared helper keeps direct records and validated port-pipe records on
+        # the same one-write publication path.
+        publish(line)
     try:
         agent_only = os.environ.get("H_MESH_LOG_FILE_AGENT_ONLY")
         if path and (not agent_only or os.environ.get("AGENT_NAME")):
