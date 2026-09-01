@@ -503,6 +503,68 @@ class WatchdogTests(unittest.TestCase):
         self.assertTrue(any(event.get("event") == "lead_alert_unknown" for event in events))
         self.assertFalse(any(event.get("event") == "lead_alert_sent" for event in events))
 
+    def test_notify_lead_logs_a_record_when_the_lead_is_not_a_registered_agent(self):
+        """A dangling `lead` key pointing at a retired agent must not vanish
+        silently -- there is currently no way to transfer leadership, so this
+        is a reachable state, not a hypothetical."""
+        r = FakeRedis()
+        _doing_agent(r)
+        _lead(r, name="retired-lead")  # never registered in this FakeRedis
+        self._set(service, "run_tmux", _quiet_windows())
+        self._set(service, "deliver_tmux", _no_kick())
+
+        out = _capture(lambda: _watchdog(r).poll(now=NOW))
+
+        self.assertNotIn(_key("retired-lead", "ingress"), r.lists)
+        events = [json.loads(line) for line in out.splitlines()]
+        no_lead = [e for e in events if e.get("event") == "lead_alert_no_lead"]
+        self.assertEqual(len(no_lead), 1)
+        self.assertEqual(no_lead[0]["destination"], "retired-lead")
+        self.assertIn("not a registered agent", no_lead[0]["reason"])
+        self.assertTrue(no_lead[0].get("stream_id"))
+        self.assertFalse(any(e.get("event") == "lead_alert_sent" for e in events))
+
+    def test_notify_lead_logs_a_record_when_the_lead_is_not_a_tmux_agent(self):
+        r = FakeRedis()
+        _doing_agent(r)
+        _lead(r, name="api")  # registered, but as the api client, not tmux
+        r.hashes[prefix(POD, TENANT, resource="registry")]["api"] = "api"
+        self._set(service, "run_tmux", _quiet_windows())
+        self._set(service, "deliver_tmux", _no_kick())
+
+        out = _capture(lambda: _watchdog(r).poll(now=NOW))
+
+        self.assertNotIn(_key("api", "ingress"), r.lists)
+        events = [json.loads(line) for line in out.splitlines()]
+        no_lead = [e for e in events if e.get("event") == "lead_alert_no_lead"]
+        self.assertEqual(len(no_lead), 1)
+        self.assertEqual(no_lead[0]["destination"], "api")
+        self.assertIn("port_type is not tmux", no_lead[0]["reason"])
+        self.assertFalse(any(e.get("event") == "lead_alert_sent" for e in events))
+
+    def test_lead_window_missing_dead_letters_with_a_real_record_not_replayed(self):
+        """A registered tmux lead whose window is merely missing right now
+        (recreate in progress) still gets a real custody record: admitted to
+        ingress, then dead-lettered by modules.tmux.port's own DeadLetter
+        handling when the pop finds no window. Deliberately not replayed
+        when the window returns -- see _notify_lead's docstring."""
+        r = FakeRedis()
+        _doing_agent(r)
+        _lead(r)
+        self._set(service, "run_tmux", _quiet_windows())
+        with patch("modules.tmux.port.list_windows", return_value=set()):
+            out = _capture(lambda: _watchdog(r).poll(now=NOW))
+
+        self.assertEqual(r.lists[_key("architect", "ingress")], [])
+        dead = r.lists[_key("architect", "dead")]
+        self.assertEqual(len(dead), 1)
+        events = [json.loads(line) for line in out.splitlines()]
+        dead_lettered = [e for e in events if e.get("event") == "dead_lettered"]
+        self.assertEqual(len(dead_lettered), 1)
+        self.assertEqual(dead_lettered[0]["reason"], "window_missing")
+        self.assertEqual(dead_lettered[0]["destination"], "architect")
+        self.assertTrue(any(e.get("event") == "lead_alert_sent" for e in events))
+
     # -- ack loop -------------------------------------------------------------
 
     def test_ack_loop_fires_when_both_directions_cross_the_threshold(self):
