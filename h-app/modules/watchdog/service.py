@@ -281,11 +281,34 @@ class Watchdog:
         A Redis/eval exception logs `lead_alert_unknown` instead, because the
         write may have committed before the error, mirroring `send_unknown`/
         `forward_unknown` elsewhere in core.
+
+        ⚠ The envelope is built (and logged, on the not-a-member path below)
+        BEFORE checking `lead` is a real tmux member, deliberately the same
+        order the switch itself uses — parse/build first, then judge the
+        destination — so an absent lead is never a silent no-op. A dangling
+        `lead` key pointing at a retired agent is a reachable state (there is
+        currently no way to transfer leadership at all), and this is the
+        watchdog's own purpose: raising what nobody else noticed. Silently
+        declining to raise its own delivery failure would be worse than
+        dead-lettering it — a dead-letter at least leaves a record. So a miss
+        here logs `lead_alert_no_lead` with a reason and the `stream_id` the
+        alert would have carried, exactly the way the switch's own
+        `dead_lettered`/"destination is not in tenant registry" record works
+        for the analogous case in an ordinary forward.
+
+        ⚠ If `lead` IS a member but its tmux window is merely missing right
+        now (recreate in progress), the alert still gets durably admitted to
+        ingress below, and the `deliver_tmux` call after that dead-letters it
+        with a `window_missing` record when the pop finds no window — a real
+        custody trail, already produced by `modules.tmux.port`'s normal
+        `DeadLetter` handling. This is deliberately NOT replayed when the
+        window comes back, the same choice already made for the analogous
+        stuck-delivery case in `verification.DeliveryVerifier` — verification
+        cannot distinguish "lost" from "will land once state catches up" any
+        better here than it can there, and the board/`unreplied` state that
+        triggered the alert is untouched, so it re-fires on its own next
+        threshold crossing regardless.
         """
-        if not is_member(self.r, pod=self.pod, tenant=self.tenant, agent=lead):
-            return
-        if port_type(self.r, pod=self.pod, tenant=self.tenant, agent=lead) != "tmux":
-            return
         try:
             require_allowed(self.r, pod=self.pod, tenant=self.tenant, source="watchdog", destination=lead)
             envelope = build(
@@ -294,6 +317,20 @@ class Watchdog:
             raw = encode(envelope)
         except EnvelopeError as exc:
             self._error("lead_alert", exc)
+            return
+        if not is_member(self.r, pod=self.pod, tenant=self.tenant, agent=lead):
+            log_record(
+                "watchdog", "lead_alert_no_lead",
+                stream_id=envelope["stream_id"], destination=lead,
+                reason=f"lead {lead!r} is not a registered agent",
+            )
+            return
+        if port_type(self.r, pod=self.pod, tenant=self.tenant, agent=lead) != "tmux":
+            log_record(
+                "watchdog", "lead_alert_no_lead",
+                stream_id=envelope["stream_id"], destination=lead,
+                reason=f"lead {lead!r} port_type is not tmux",
+            )
             return
         try:
             admitted, _, depth = admit_ingress(
