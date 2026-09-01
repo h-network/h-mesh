@@ -12,7 +12,7 @@ Everything else is a module that plugs into this.
 | `envelope.py` | wire frame: `build`/`parse`/`encode`, header splicing (`stamp_source`, `advance_hop`), address resolution |
 | `keys.py` | `prefix()` — the sole Redis key constructor, segment validation |
 | `config.py` | local state directory resolution (`H_MESH_STATE_DIR`, default `~/.h-mesh`) |
-| `channels.py` | `send()`/`receive()`, unreplied tracking, `DeadLetter` |
+| `channels.py` | `send()`/`receive()`, unreplied tracking, `DeadLetter`, and best-effort failure feedback to tmux senders |
 | `queues.py` | `admit_ingress()` — shared atomic ingress-admission Lua op |
 | `registry.py` | read-only registry access (`members`/`is_member`/`port_type`) |
 | `policy.py` | import/export tag ACL (`allows`/`require_allowed`) |
