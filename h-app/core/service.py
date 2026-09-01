@@ -373,6 +373,9 @@ class Switch:
 
 
 def main() -> None:
+    from services.daemon_identity import require_daemon_identity
+
+    require_daemon_identity()
     configure_logging()
     # Delivery kicks are fire-and-forget: this process never calls wait() or
     # poll() on their children. Ignoring SIGCHLD makes the kernel auto-reap

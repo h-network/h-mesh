@@ -54,6 +54,7 @@ from pathlib import Path
 from typing import Callable
 
 from services.tenant_config import read_tenant_env
+from services.daemon_identity import identity_arg
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -113,7 +114,8 @@ def enabled_daemon_modules(env: dict) -> dict[str, str]:
     return modules
 
 STOP_TIMEOUT_SECONDS = 10
-HEALTH_CHECK_SECONDS = 1
+HEALTH_CHECK_SECONDS = 3
+HEALTH_POLL_SECONDS = 0.1
 
 
 class DaemonError(RuntimeError):
@@ -250,21 +252,51 @@ def start_daemons(
         daemon_modules = DAEMON_MODULES
     run_dir.mkdir(parents=True, exist_ok=True)
     pids: dict[str, int] = {}
-    for name, module in daemon_modules.items():
-        pidfile = run_dir / f"{name}.pid"
-        existing_pid = _read_pid(pidfile)
-        if existing_pid is not None and pid_alive(existing_pid):
-            log(f"  • {name}: already running (pid: {existing_pid}), skipping")
-            pids[name] = existing_pid
-            continue
-        pid = _start_one(name, module, python, run_dir, env)
-        pids[name] = pid
-        log(f"  • {name} started (pid: {pid})")
+    started: dict[str, int] = {}
 
-    time.sleep(HEALTH_CHECK_SECONDS)
-    for name, pid in pids.items():
-        if not pid_alive(pid):
-            raise DaemonError(f"{name} failed to start. Check {run_dir / f'{name}.log'}")
+    def rollback() -> None:
+        if not started:
+            return
+        log("  • startup failed; stopping daemons started by this invocation")
+        for started_name in started:
+            try:
+                _stop_one(started_name, run_dir / f"{started_name}.pid", log=log)
+            except Exception as exc:
+                # Preserve the startup failure that triggered rollback, but
+                # keep attempting the rest: one bad cleanup must not orphan
+                # every later process this invocation created.
+                log(f"  • {started_name}: rollback failed: {exc}")
+
+    try:
+        for name, module in daemon_modules.items():
+            pidfile = run_dir / f"{name}.pid"
+            existing_pid = _read_pid(pidfile)
+            if existing_pid is not None and pid_alive(existing_pid):
+                log(f"  • {name}: already running (pid: {existing_pid}), skipping")
+                pids[name] = existing_pid
+                continue
+            pid = _start_one(name, module, python, run_dir, env)
+            pids[name] = pid
+            started[name] = pid
+            log(f"  • {name}: starting (pid: {pid})")
+
+        deadline = time.monotonic() + HEALTH_CHECK_SECONDS
+        while True:
+            for name, pid in started.items():
+                if not pid_alive(pid):
+                    raise DaemonError(
+                        f"{name} failed to start. Check {run_dir / f'{name}.log'}"
+                    )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(HEALTH_POLL_SECONDS, remaining))
+    except Exception:
+        rollback()
+        raise
+
+    for name, pid in started.items():
+        log(f"  • {name}: started (pid: {pid})")
     return pids
 
 
@@ -298,9 +330,9 @@ def _resolve_venv(venv_arg: str | None) -> Path:
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     """Add the pod/tenant/venv/tmux flags `resolve_config` expects, same defaults as setup.sh."""
-    parser.add_argument("--pod", default=os.environ.get("POD", "default"),
+    parser.add_argument("--pod", type=identity_arg, default=os.environ.get("POD", "default"),
                         help="Pod name (default: $POD or \"default\")")
-    parser.add_argument("--tenant", default=os.environ.get("TENANT", "default"),
+    parser.add_argument("--tenant", type=identity_arg, default=os.environ.get("TENANT", "default"),
                         help="Tenant name (default: $TENANT or \"default\")")
     parser.add_argument("--redis-url", default=os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"),
                         help="Redis connection URL")

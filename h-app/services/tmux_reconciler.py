@@ -7,12 +7,12 @@ import os
 
 from core.logging import configure_logging
 from modules.tmux.reconciler import TmuxReconciler
+from services.daemon_identity import require_daemon_identity
 
 
 def main() -> None:
+    pod, tenant = require_daemon_identity()
     configure_logging()
-    pod = os.environ.get("POD", "default")
-    tenant = os.environ.get("TENANT", "default")
     # The reconciler needs the credential, but the tmux server it creates must
     # not inherit it and pass it to every agent window. Consume it before the
     # first tmux command rather than merely reading it from the environment.

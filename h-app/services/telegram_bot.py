@@ -27,9 +27,11 @@ from clients.telegram.bot import (
     _sibling_path,
     DEFAULT_CURSOR_FILE,
 )
+from services.daemon_identity import require_daemon_identity
 
 
 def main() -> None:
+    require_daemon_identity()
     api_url = os.environ.get("H_MESH_API_URL", "http://127.0.0.1:8080")
     api_token = os.environ.get("H_MESH_API_TOKEN", os.environ.get("API_TOKEN", ""))
     session_url = os.environ.get("H_MESH_SESSION_URL", "")

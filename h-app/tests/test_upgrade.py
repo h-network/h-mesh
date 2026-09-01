@@ -13,6 +13,7 @@ import redis
 from core.keys import prefix
 from core.registry import port_type
 from modules.tmux.ops import list_windows, run_tmux
+from services import upgrade
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SETUP_SH = REPO_ROOT / "setup.sh"
@@ -25,6 +26,20 @@ def test_upgrade_help():
     assert res.returncode == 0
     assert "--skip-install" in res.stdout
     assert "--skip-pull" in res.stdout
+
+
+@pytest.mark.parametrize("field", ("pod", "tenant"))
+def test_upgrade_rejects_empty_identity_before_resolving_or_mutating(field, monkeypatch):
+    monkeypatch.setattr(
+        upgrade,
+        "resolve_config",
+        lambda _args: pytest.fail("empty identity reached config resolution"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        upgrade.main([f"--{field}", ""])
+
+    assert exc.value.code == 2
 
 
 def test_upgrade_restarts_daemons_without_duplicating_and_preserves_the_tmux_session():

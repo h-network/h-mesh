@@ -538,8 +538,49 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
 def _task_keys(pod: str, tenant: str, agent: str) -> dict[str, str]:
     return {
         state: prefix(pod, tenant, agent=agent, resource=f"tasks.{state}")
-        for state in ("todo", "doing", "hold", "done")
+        for state in ("todo", "doing", "hold", "done", "invalid")
     }
+
+
+_ATOMIC_TAKE = """
+-- office atomic take v1
+if redis.call('LLEN', KEYS[2]) > 0 then
+    return {0, 'busy'}
+end
+if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
+    return {0, 'changed'}
+end
+redis.call('RPUSH', KEYS[2], ARGV[2])
+return {1, 'ok'}
+"""
+
+_QUARANTINE_INVALID_TICKET = """
+-- office quarantine invalid ticket v1
+if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
+    return 0
+end
+redis.call('RPUSH', KEYS[2], ARGV[1])
+return 1
+"""
+
+
+def _quarantine_invalid(r, *, source_key: str, invalid_key: str, raw) -> None:
+    """Atomically preserve an unreadable entry off the actionable queues."""
+    if not r.eval(_QUARANTINE_INVALID_TICKET, 2, source_key, invalid_key, raw):
+        raise OfficeError("task changed while the command was running; try again")
+
+
+def _take_selected(r, *, source_key: str, doing_key: str, raw, ticket: dict) -> None:
+    result = r.eval(
+        _ATOMIC_TAKE, 2, source_key, doing_key, raw, serialize_ticket(ticket),
+    )
+    code = int(result[0])
+    reason = result[1].decode() if isinstance(result[1], bytes) else result[1]
+    if code:
+        return
+    if reason == "busy":
+        raise OfficeError("you already have one open task")
+    raise OfficeError("task changed while the command was running; try again")
 
 
 def _entries(r, keys: dict[str, str], states: Sequence[str]):
@@ -604,6 +645,8 @@ def _ticket_line(ticket: dict, *, state: str, now: datetime) -> str:
     age = _ticket_age(ticket, state=state, now=now)
     if age:
         line += f"  age:{age}"
+    if state == "hold" and ticket.get("hold_reason"):
+        line += f"  reason:{' '.join(ticket['hold_reason'].split())}"
     return line
 
 
@@ -620,6 +663,14 @@ def _list_one(r, *, pod: str, tenant: str, agent: str, heading: bool, now: datet
                 print(f"{indent}  {_ticket_line(ticket, state=state, now=now)}")
         else:
             print(f"{indent}  (empty)")
+    invalid = r.lrange(keys["invalid"], 0, -1)
+    print(f"{indent}invalid:")
+    if invalid:
+        for raw in invalid:
+            size = len(raw if isinstance(raw, bytes) else str(raw).encode("utf-8"))
+            print(f"{indent}  malformed ticket preserved ({size} bytes)")
+    else:
+        print(f"{indent}  (empty)")
 
 
 def _list_command(argv: list[str]) -> None:
@@ -646,23 +697,47 @@ def _take_command(argv: list[str]) -> None:
     args = parser.parse_args(argv)
     r, pod, tenant, source = _context()
     keys = _task_keys(pod, tenant, source)
+    # Fast-path the common refusal for a useful error even when todo is empty.
+    # _take_selected's Lua check remains the authoritative race-free guard.
     if r.llen(keys["doing"]):
         raise OfficeError("you already have one open task")
     if args.id is None:
-        raw = r.lpop(keys["todo"])
+        raw = r.lindex(keys["todo"], 0)
         if raw is None:
             raise OfficeError("your todo is empty")
         try:
             ticket = normalize_ticket(raw, state="todo")
         except BoardError as exc:
+            _quarantine_invalid(
+                r, source_key=keys["todo"], invalid_key=keys["invalid"], raw=raw,
+            )
             raise OfficeError(str(exc)) from exc
+        state = "todo"
     else:
-        state, raw, ticket = _select(r, keys, ("todo", "hold"), args.id)
-        _remove(r, keys[state], raw)
+        entries = []
+        for candidate_state in ("todo", "hold"):
+            for candidate_raw in r.lrange(keys[candidate_state], 0, -1):
+                try:
+                    candidate = normalize_ticket(candidate_raw, state=candidate_state)
+                except BoardError:
+                    _quarantine_invalid(
+                        r, source_key=keys[candidate_state],
+                        invalid_key=keys["invalid"], raw=candidate_raw,
+                    )
+                    continue
+                if candidate["id"].startswith(args.id):
+                    entries.append((candidate_state, candidate_raw, candidate))
+        if not entries:
+            raise OfficeError(f"no task matches id {args.id!r}")
+        if len(entries) != 1:
+            raise OfficeError(f"task id {args.id!r} is ambiguous")
+        state, raw, ticket = entries[0]
     ticket["status"] = "doing"
     ticket["started_ts"] = _now()
     ticket["done_ts"] = None
-    r.rpush(keys["doing"], serialize_ticket(ticket))
+    _take_selected(
+        r, source_key=keys[state], doing_key=keys["doing"], raw=raw, ticket=ticket,
+    )
     record_task_event("take", id=ticket["id"], title=ticket["title"], agent=source, actor=source)
     _log_task("task_taken", agent=source, ticket=ticket)
     print(serialize_ticket(ticket))
@@ -692,13 +767,17 @@ def _finish_command(action: str, argv: list[str]) -> None:
 def _hold_command(argv: list[str]) -> None:
     parser = _operation_parser("hold", "Put your open task on hold.")
     parser.add_argument("id", nargs="?", help="ticket id or unique prefix")
+    parser.add_argument("--reason", required=True, help="why the task cannot proceed")
     args = parser.parse_args(argv)
+    if not args.reason.strip():
+        raise OfficeError("hold reason cannot be empty")
     r, pod, tenant, source = _context()
     keys = _task_keys(pod, tenant, source)
     _, raw, ticket = _select(r, keys, ("doing",), args.id)
     _remove(r, keys["doing"], raw)
     ticket["status"] = "hold"
     ticket["held_ts"] = _now()
+    ticket["hold_reason"] = args.reason
     r.rpush(keys["hold"], serialize_ticket(ticket))
     record_task_event("hold", id=ticket["id"], title=ticket["title"], agent=source, actor=source)
     _log_task("task_held", agent=source, ticket=ticket)

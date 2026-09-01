@@ -857,6 +857,9 @@ def run_observers(watchdog, jobs, agents) -> list[str]:
 
 
 def main() -> None:
+    from services.daemon_identity import require_daemon_identity
+
+    require_daemon_identity()
     # ⚠ WATCHDOG_ENABLED silences ALERTING, not telemetry. Returning here would
     # also stop ActivityTailer, PresenceSampler and DeliveryVerifier — presence
     # would read `unknown` forever, the activity stream would stay empty, and

@@ -18,14 +18,19 @@ separate reconciler daemon as two different things.
 Nothing per-request (e.g. `agentlifecycle`) and nothing CLI-invoked (e.g.
 `office`) belongs here.
 
-A launcher does one thing besides starting its module: it calls
-`core.logging.configure_logging()` first, which sets the stdlib logging
-threshold from `H_MESH_LOG_LEVEL` (see `core/README.md`, "Two logging systems,
-one file"). A new launcher should do the same — the process that starts is the
-one entitled to pick the level, and without it stdlib logging drops everything
-below WARNING with no way to turn it up. `telegram_bot.py` is the one that
-does not, because `clients.telegram.bot` already configures itself at import
-from the same variable.
+A pod/tenant-scoped launcher first calls
+`services.daemon_identity.require_daemon_identity()`, before connections,
+threads, or other daemon work. This gives directly invoked daemons the same
+clear namespace rejection as `h-mesh start` and `h-mesh upgrade`, instead of
+depending on a later Redis-key construction to fail by accident.
+
+Launchers then call `core.logging.configure_logging()`, which sets the stdlib
+logging threshold from `H_MESH_LOG_LEVEL` (see `core/README.md`, "Two logging
+systems, one file"). A new launcher should do the same — the process that
+starts is the one entitled to pick the level, and without it stdlib logging
+drops everything below WARNING with no way to turn it up. `telegram_bot.py`
+is the one that does not, because `clients.telegram.bot` already configures
+itself at import from the same variable.
 
 | file | service |
 |---|---|
