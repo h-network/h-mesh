@@ -543,6 +543,68 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             env_default = window_env("worker")
             self.assertFalse(any(var.startswith("CLAUDE_CODE_OAUTH_TOKEN=") for var in env_default))
 
+    def test_window_env_path_injection(self):
+        from modules.tmux.ops import window_env
+        from lib.paths import resolve_venv_bin
+
+        # Default resolution prepends venv bin to ambient PATH
+        with unittest.mock.patch.dict(os.environ, {"PATH": "/usr/local/bin:/usr/bin", "VIRTUAL_ENV": "/custom/myvenv"}):
+            env = window_env("worker")
+            path_var = next(var for var in env if var.startswith("PATH="))
+            self.assertEqual(path_var, "PATH=/custom/myvenv/bin:/usr/local/bin:/usr/bin")
+
+        # Explicit venv_bin override
+        with unittest.mock.patch.dict(os.environ, {"PATH": "/usr/local/bin:/usr/bin"}):
+            env_explicit = window_env("worker", venv_bin="/explicit/bin")
+            self.assertIn("PATH=/explicit/bin:/usr/local/bin:/usr/bin", env_explicit)
+
+        # Deduplicates/moves to front if venv bin is already in PATH
+        with unittest.mock.patch.dict(os.environ, {"PATH": "/usr/local/bin:/explicit/bin:/usr/bin"}):
+            env_dedup = window_env("worker", venv_bin="/explicit/bin")
+            self.assertIn("PATH=/explicit/bin:/usr/local/bin:/usr/bin", env_dedup)
+
+    def test_hired_agent_pane_process_has_venv_bin_on_path_in_proc_environ(self):
+        from lib.paths import resolve_venv_bin
+
+        reconciler = TmuxReconciler(
+            pod=self.pod,
+            tenant=self.tenant,
+            redis_url=self.redis_url,
+            session_name=self.session_name,
+            socket=self.socket,
+        )
+
+        # Register agent
+        self.r.hset(self.registry, mapping={"testagent": "tmux"})
+        reconciler.reconcile_once(self.r)
+
+        # Get the PID of the pane process in real tmux
+        code, stdout, stderr = run_tmux(
+            "list-panes", "-t", f"{self.session_name}:testagent", "-F", "#{pane_pid}", socket=self.socket
+        )
+        self.assertEqual(code, 0, f"list-panes failed: {stderr}")
+        pane_pid = stdout.strip()
+        self.assertTrue(pane_pid.isdigit(), f"Expected integer PID, got {pane_pid}")
+
+        # Read the real /proc/{pid}/environ of the hired agent's pane process
+        environ_path = Path(f"/proc/{pane_pid}/environ")
+        self.assertTrue(environ_path.exists(), f"{environ_path} does not exist")
+
+        raw_environ = environ_path.read_bytes()
+        env_dict = dict(
+            item.decode("utf-8", errors="replace").split("=", 1)
+            for item in raw_environ.split(b"\x00")
+            if b"=" in item
+        )
+
+        self.assertIn("PATH", env_dict)
+        expected_venv_bin = resolve_venv_bin()
+        path_val = env_dict["PATH"]
+        self.assertTrue(
+            path_val == expected_venv_bin or path_val.startswith(f"{expected_venv_bin}:"),
+            f"Expected PATH to start with {expected_venv_bin}, got: {path_val}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
