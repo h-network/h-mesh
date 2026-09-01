@@ -151,26 +151,57 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
     if command -v h-agent >/dev/null 2>&1; then
         echo "  ✓ h-agent present"
     else
-        echo "  h-agent not found -- installing via its own installer..."
         H_AGENT_URL="${H_AGENT_INSTALL_URL:-https://raw.githubusercontent.com/h-network/h-agent/main/install.sh}"
-        if command -v curl >/dev/null 2>&1; then
-            curl -fsSL "$H_AGENT_URL" | bash
-        elif command -v wget >/dev/null 2>&1; then
-            wget -qO- "$H_AGENT_URL" | bash
-        else
+        if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
             echo "error: h-agent is missing, and installing it needs curl or wget" >&2
             exit 1
         fi
-        # ⚠ h-agent's installer only updates ~/.bashrc/~/.profile, for
-        # FUTURE shells -- it never touches this process's own PATH. Left
-        # alone, the daemons this same run starts later (which is what
-        # actually execs tmux window commands) would inherit the
-        # pre-install PATH and fail to find h-agent with "command not
-        # found" (tmux reports that as the pane exiting status 127) --
-        # measured live, on a host where h-agent had never been installed
-        # before. ${PREFIX:-$HOME/.local}/bin matches the installer's own
-        # default (see H_AGENT_URL's install.sh), and its override.
-        export PATH="${PREFIX:-$HOME/.local}/bin:$PATH"
+        # ⚠ Retried once: confirmed live that h-agent's own installer (which
+        # runs under set -euo pipefail) can abort after its CLI-install step
+        # and before placing h-agent itself, on a transient failure --
+        # re-running the identical installer by hand right after succeeded
+        # with no other change. One retry covers that cheaply; a second
+        # failure is treated as real.
+        h_agent_installed=0
+        for attempt in 1 2; do
+            echo "  h-agent not found -- installing via its own installer (attempt $attempt/2)..."
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsSL "$H_AGENT_URL" | bash
+            else
+                wget -qO- "$H_AGENT_URL" | bash
+            fi
+            h_agent_install_status=$?
+            # ⚠ h-agent's installer only updates ~/.bashrc/~/.profile, for
+            # FUTURE shells -- it never touches this process's own PATH. Left
+            # alone, the daemons this same run starts later (which is what
+            # actually execs tmux window commands) would inherit the
+            # pre-install PATH and fail to find h-agent with "command not
+            # found" (tmux reports that as the pane exiting status 127) --
+            # measured live, on a host where h-agent had never been installed
+            # before. ${PREFIX:-$HOME/.local}/bin matches the installer's own
+            # default (see H_AGENT_URL's install.sh), and its override.
+            export PATH="${PREFIX:-$HOME/.local}/bin:$PATH"
+            if command -v h-agent >/dev/null 2>&1; then
+                h_agent_installed=1
+                break
+            fi
+            echo "  h-agent installer exited $h_agent_install_status and h-agent is still not on PATH." >&2
+        done
+        # ⚠ The bug this replaced: curl|bash's exit status was never
+        # checked at all, and this script runs under pipefail but no -e --
+        # so even a checked nonzero status wouldn't have stopped it on its
+        # own. When h-agent's installer failed partway, setup.sh printed
+        # "successfully" and moved on with h-agent nowhere on the host;
+        # every window the reconciler later created died instantly with
+        # "command not found", and nothing here ever said why. Verify the
+        # actual binary, not just the installer's exit code -- an installer
+        # can exit 0 and still not place the binary where this expects it.
+        if [ "$h_agent_installed" -ne 1 ]; then
+            echo "error: h-agent installer failed twice (last exit $h_agent_install_status) -- h-agent is still not on PATH or at ${PREFIX:-$HOME/.local}/bin/h-agent." >&2
+            echo "  Install it manually (see $H_AGENT_URL) and re-run setup.sh." >&2
+            exit 1
+        fi
+        echo "  ✓ h-agent installed"
     fi
     echo
 fi
