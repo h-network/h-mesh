@@ -539,6 +539,19 @@ def test_dispatch_update_processes_a_callback_from_the_allowed_chat():
         assert len(telegram.sent_messages) == 1
 
 
+def test_dispatch_update_extracts_message_id_for_edit_in_place():
+    """The raw update's `callback_query.message.message_id` is what makes
+    edit-in-place possible at all -- `_dispatch_update` has to pull it out
+    and thread it through, not just chat id and data."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
+        bot_instance._dispatch_update({
+            "callback_query": {"id": "cb-1", "data": "lc:architect", "message": {"chat": {"id": 42}, "message_id": 77}},
+        })
+        assert telegram.sent_messages == []
+        assert telegram.edited_messages[-1]["message_id"] == 77
+
+
 def test_direct_handler_calls_bypass_the_allowlist():
     """CLI-driven one-shots (--prompt/--status/--menu) and dry-run mode call
     handlers directly, never through _dispatch_update -- they're operator
@@ -548,6 +561,45 @@ def test_direct_handler_calls_bypass_the_allowlist():
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
         bot_instance.handle_text_message(999, "/menu")
         assert len(telegram.sent_messages) == 1
+
+
+def test_send_or_edit_message_sends_fresh_without_a_message_id():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        returned_id = bot_instance._send_or_edit_message(12345, "hello", reply_markup={"inline_keyboard": []})
+        assert telegram.sent_messages == [
+            {"chat_id": 12345, "text": "hello", "message_id": 1, "reply_markup": {"inline_keyboard": []}}
+        ]
+        assert telegram.edited_messages == []
+        assert returned_id == 1
+
+
+def test_send_or_edit_message_edits_when_given_a_message_id():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        returned_id = bot_instance._send_or_edit_message(12345, "hello", message_id=7, clear_markup=True)
+        assert telegram.sent_messages == []
+        assert telegram.edited_messages == [
+            {"chat_id": 12345, "message_id": 7, "text": "hello", "reply_markup": {"inline_keyboard": []}}
+        ]
+        assert returned_id == 7
+
+
+def test_send_or_edit_message_swallows_message_not_modified():
+    """A double-tap racing two identical callbacks can produce two edits
+    with the same resulting text -- Telegram's "message is not modified"
+    for the second one is expected, not a bug to surface."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+
+        class NotModifiedTelegramClient(DummyTelegramClient):
+            def edit_message_text(self, chat_id, message_id, text, reply_markup=None, **kwargs):
+                super().edit_message_text(chat_id, message_id, text, reply_markup=reply_markup, **kwargs)
+                return {"ok": False, "description": "Bad Request: message is not modified"}
+
+        bot_instance.telegram = NotModifiedTelegramClient()
+        returned_id = bot_instance._send_or_edit_message(12345, "same text", message_id=7)
+        assert returned_id == 7  # no exception, no crash
 
 
 def test_menu_command_sends_sticky_keyboard():
@@ -656,6 +708,52 @@ def test_addticket_full_flow_via_callbacks_and_text():
         ]
 
 
+def test_addticket_full_flow_edits_the_picker_message_in_place():
+    """When the caller has a real message_id (as a live callback_query
+    always does), the whole flow -- agent pick through final result --
+    edits that one message instead of posting a new one at every step."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+
+        bot_instance.handle_callback_query(12345, "cb-1", "at")
+        picker_id = telegram.sent_messages[-1]["message_id"]
+
+        bot_instance.handle_callback_query(12345, "cb-2", "at:sme-2", picker_id)
+        assert telegram.edited_messages[-1]["message_id"] == picker_id
+        assert "Ticket title for sme-2" in telegram.edited_messages[-1]["text"]
+
+        bot_instance.handle_text_message(12345, "Fix the flaky test")
+        assert telegram.edited_messages[-1]["message_id"] == picker_id
+        assert "Description?" in telegram.edited_messages[-1]["text"]
+
+        bot_instance.handle_text_message(12345, "Seen twice in CI this week")
+        assert telegram.edited_messages[-1]["message_id"] == picker_id
+        assert "Priority?" in telegram.edited_messages[-1]["text"]
+
+        reply = bot_instance.handle_callback_query(12345, "cb-3", "ap:high")
+        assert "Ticket added to sme-2" in reply
+        assert telegram.edited_messages[-1] == {
+            "chat_id": "12345", "message_id": picker_id, "text": reply, "reply_markup": {"inline_keyboard": []},
+        }
+        # Only the very first send (the agent picker) was ever a new message.
+        assert len(telegram.sent_messages) == 1
+
+
+def test_addticket_flow_cancel_edits_the_anchor_message_in_place():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance.handle_callback_query(12345, "cb-1", "at")
+        picker_id = telegram.sent_messages[-1]["message_id"]
+        bot_instance.handle_callback_query(12345, "cb-2", "at:sme-2", picker_id)
+
+        reply = bot_instance.handle_text_message(12345, "/cancel")
+        assert reply == "Cancelled."
+        assert 12345 not in bot_instance.pending
+        assert telegram.edited_messages[-1]["message_id"] == picker_id
+        assert telegram.edited_messages[-1]["text"] == "Cancelled."
+        assert len(telegram.sent_messages) == 1
+
+
 def test_addticket_description_dash_skips_it():
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
@@ -742,13 +840,40 @@ def test_lifecycle_picker_includes_retire():
         assert any(b["callback_data"] == "lret:architect" for row in buttons for b in row)
 
 
+def test_lifecycle_flow_edits_the_same_message_including_back_and_forth():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+
+        bot_instance.handle_callback_query(12345, "cb-1", "lc")
+        picker_id = telegram.sent_messages[-1]["message_id"]
+
+        bot_instance.handle_callback_query(12345, "cb-2", "lc:architect", picker_id)
+        assert telegram.edited_messages[-1]["message_id"] == picker_id
+        assert "pause, resume, or retire" in telegram.edited_messages[-1]["text"]
+
+        # "◀ Back" on that screen (callback_data "lc") returns to the agent
+        # picker -- still an edit of the very same message, not a new one.
+        bot_instance.handle_callback_query(12345, "cb-3", "lc", picker_id)
+        assert telegram.edited_messages[-1]["message_id"] == picker_id
+        assert "Lifecycle — pick an agent" in telegram.edited_messages[-1]["text"]
+
+        bot_instance.handle_callback_query(12345, "cb-4", "lc:architect", picker_id)
+        reply = bot_instance.handle_callback_query(12345, "cb-5", "lp:architect", picker_id)
+        assert reply == "✅ architect paused."
+        assert telegram.edited_messages[-1] == {
+            "chat_id": 12345, "message_id": picker_id, "text": reply, "reply_markup": {"inline_keyboard": []},
+        }
+        # One send for the picker; every screen after it was an edit.
+        assert len(telegram.sent_messages) == 1
+
+
 def test_retire_requires_typing_the_exact_name():
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
 
         reply = bot_instance.handle_callback_query(12345, "cb-1", "lret:architect")
         assert "Type 'architect' exactly" in reply
-        assert bot_instance.pending[12345] == {"flow": "retire", "agent": "architect"}
+        assert bot_instance.pending[12345] == {"flow": "retire", "agent": "architect", "message_id": 1}
 
         reply = bot_instance.handle_text_message(12345, "architeckt")  # typo
         assert "doesn't match" in reply
@@ -833,20 +958,44 @@ def test_hire_full_flow_via_sticky_button_and_text():
 
         reply = bot_instance.handle_text_message(12345, "➕ Hire")
         assert "New agent's name?" in reply
-        assert bot_instance.pending[12345] == {"flow": "hire", "stage": "name"}
+        assert bot_instance.pending[12345] == {"flow": "hire", "stage": "name", "message_id": 1}
 
         reply = bot_instance.handle_text_message(12345, "sme-9")
         assert "Profile for sme-9?" in reply
-        assert bot_instance.pending[12345] == {"flow": "hire", "stage": "profile", "name": "sme-9"}
+        assert bot_instance.pending[12345] == {"flow": "hire", "stage": "profile", "name": "sme-9", "message_id": 1}
 
         reply = bot_instance.handle_text_message(12345, "-")
         assert "Provider for sme-9?" in reply
-        assert bot_instance.pending[12345] == {"flow": "hire", "stage": "provider", "name": "sme-9", "profile": None}
+        assert bot_instance.pending[12345] == {
+            "flow": "hire", "stage": "provider", "name": "sme-9", "profile": None, "message_id": 1,
+        }
 
         reply = bot_instance.handle_text_message(12345, "-")
         assert "Hire accepted for sme-9" in reply
         assert 12345 not in bot_instance.pending
         assert mesh.hired == [{"agent": "sme-9", "cli": "claude", "profile": None, "provider": None}]
+
+
+def test_hire_flow_edits_the_initial_prompt_through_every_stage():
+    """Hire only ever starts fresh (the sticky "➕ Hire" tap has no message
+    to edit), but every stage after that first send reuses its message_id
+    -- one message for the whole flow, same as the callback-driven ones."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+
+        bot_instance.handle_text_message(12345, "➕ Hire")
+        anchor_id = telegram.sent_messages[-1]["message_id"]
+
+        bot_instance.handle_text_message(12345, "sme-9")
+        assert telegram.edited_messages[-1]["message_id"] == anchor_id
+
+        bot_instance.handle_text_message(12345, "-")
+        assert telegram.edited_messages[-1]["message_id"] == anchor_id
+
+        reply = bot_instance.handle_text_message(12345, "-")
+        assert telegram.edited_messages[-1]["message_id"] == anchor_id
+        assert telegram.edited_messages[-1]["text"] == reply
+        assert len(telegram.sent_messages) == 1
 
 
 def test_hire_with_a_profile_and_provider():
@@ -986,6 +1135,26 @@ def test_message_agent_picker_and_prompt_routing():
 
         bot_instance.handle_text_message(12345, "how's it going?")
         assert telegram.sent_messages[-1]["text"] == "✅ Sent to sme-2."
+
+
+def test_message_agent_pick_edits_the_picker_but_still_sends_the_sticky_refresh():
+    """editMessageText can only carry an inline keyboard, never a
+    ReplyKeyboardMarkup, so the sticky-keyboard refresh this flow ends with
+    has to stay a fresh send -- but the picker itself should still be
+    edited in place rather than left behind with live, stale buttons."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+
+        bot_instance.handle_callback_query(12345, "cb-1", "ta")
+        picker_id = telegram.sent_messages[-1]["message_id"]
+
+        reply = bot_instance.handle_callback_query(12345, "cb-2", "ta:sme-2", picker_id)
+        assert "Now messaging sme-2" in reply
+        assert telegram.edited_messages[-1]["message_id"] == picker_id
+        assert telegram.edited_messages[-1]["reply_markup"] == {"inline_keyboard": []}
+        # ...and the sticky-keyboard refresh is still a separate, new message
+        assert "keyboard" in telegram.sent_messages[-1]["reply_markup"]
+        assert telegram.sent_messages[-1]["text"] == reply
 
 
 def test_message_agent_selection_is_per_chat():
@@ -2976,6 +3145,26 @@ def test_handle_watch_pick_rejects_an_unknown_agent():
         reply = bot_instance.handle_watch_pick(123, "nonexistent")
         assert "Unknown agent" in reply
         assert "123" not in bot_instance.pane_watches
+
+
+def test_handle_watch_pick_edits_the_picker_message_in_place(monkeypatch):
+    """The live pane tail itself is always a new message (PaneWatchRender,
+    a separate high-frequency channel) -- but the picker that led to it
+    should be edited into an ack, not left dangling with a live agent
+    button that no longer does anything useful."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=123, pane_watch_refresh_s=0.0)
+        monkeypatch.setattr(bot_instance, "_run_pane_watch", lambda *a, **kw: None)
+
+        bot_instance.handle_callback_query(123, "cb-1", "wa")
+        picker_id = telegram.sent_messages[-1]["message_id"]
+
+        bot_instance.handle_callback_query(123, "cb-2", "wp:architect", picker_id)
+        assert telegram.edited_messages[-1]["message_id"] == picker_id
+        assert "Watching architect" in telegram.edited_messages[-1]["text"]
+        assert telegram.edited_messages[-1]["reply_markup"] == {"inline_keyboard": []}
+        # No second new message for the ack -- only the picker was ever sent.
+        assert len(telegram.sent_messages) == 1
 
 
 def test_handle_watch_pick_replaces_an_existing_watch_in_the_same_chat(monkeypatch):
