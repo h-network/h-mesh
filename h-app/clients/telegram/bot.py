@@ -1686,8 +1686,25 @@ class TelegramBot:
         if message_id is not None:
             markup = {"inline_keyboard": []} if clear_markup else reply_markup
             resp = self.telegram.edit_message_text(chat_id, message_id, text, reply_markup=markup)
-            if isinstance(resp, dict) and not resp.get("ok", False) and "not modified" not in str(resp.get("description", "")):
-                logger.debug(f"editMessageText failed (chat={chat_id}, msg={message_id}): {resp.get('description')}")
+            ok = isinstance(resp, dict) and resp.get("ok", False)
+            if not ok:
+                description = str(resp.get("description", "")) if isinstance(resp, dict) else ""
+                if "not modified" in description:
+                    return message_id
+                # A real failure here — not "nothing changed" — used to be
+                # silently swallowed at DEBUG with no fallback: the anchor
+                # (retired VM's leftover message, one past Telegram's edit
+                # window, deleted by the user, whatever) stayed permanently
+                # broken and every tap on it produced literally nothing, no
+                # updated screen, no new message, no error shown. Failing
+                # closed like that is worse than a duplicate message, so
+                # fall back to a fresh send and re-anchor to it instead.
+                logger.warning(
+                    f"editMessageText failed (chat={chat_id}, msg={message_id}): {description or resp!r}; "
+                    "falling back to a fresh send instead of dropping the tap"
+                )
+                resp = self.telegram.send_message(chat_id, text, reply_markup=markup)
+                return resp.get("result", {}).get("message_id") if isinstance(resp, dict) else None
             return message_id
         markup = FORCE_REPLY if force_reply else ({"inline_keyboard": []} if clear_markup else reply_markup)
         resp = self.telegram.send_message(chat_id, text, reply_markup=markup)
@@ -2279,7 +2296,7 @@ class TelegramBot:
                 state["title"] = text.strip()
                 state["stage"] = "description"
                 reply = "Description? (send - to skip, /cancel to abort)"
-                self._send_or_edit_message(cid, reply, message_id=anchor_id)
+                state["message_id"] = self._send_or_edit_message(cid, reply, message_id=anchor_id)
                 return reply
             if state["stage"] == "description":
                 state["description"] = "" if text.strip() == "-" else text.strip()
@@ -2290,13 +2307,15 @@ class TelegramBot:
                     {"text": "🔴 High", "callback_data": "ap:high"},
                 ]]
                 reply = "Priority?"
-                self._send_or_edit_message(cid, reply, message_id=anchor_id, reply_markup={"inline_keyboard": buttons})
+                state["message_id"] = self._send_or_edit_message(
+                    cid, reply, message_id=anchor_id, reply_markup={"inline_keyboard": buttons}
+                )
                 return reply
             # stage == "priority": this step is answered by tapping a button
             # (handle_addticket_priority), not typed text — stray text here
             # just gets pointed back at the buttons rather than silently lost.
             reply = "Tap a priority button above, or /cancel."
-            self._send_or_edit_message(cid, reply, message_id=anchor_id)
+            state["message_id"] = self._send_or_edit_message(cid, reply, message_id=anchor_id)
             return reply
 
         if state["flow"] == "hire":
@@ -2304,7 +2323,7 @@ class TelegramBot:
                 name = text.strip()
                 if not _AGENT_NAME.match(name) or name in _RESERVED_AGENT_NAMES:
                     reply = "That name won't work — lowercase letters, digits and hyphens, not all digits, not a reserved word. Try again, or /cancel."
-                    self._send_or_edit_message(cid, reply, message_id=anchor_id)
+                    state["message_id"] = self._send_or_edit_message(cid, reply, message_id=anchor_id)
                     return reply  # stay in "name" stage; do not consume the pending flow
                 state["name"] = name
                 state["stage"] = "profile"
@@ -2313,14 +2332,14 @@ class TelegramBot:
                 # ahead of time (see MeshClient.hire_agent). A bad name still
                 # gets a clear error, listing the valid ones, from the api.
                 reply = f"Profile for {name}? (account/profile name, or - for the default; /cancel to abort)"
-                self._send_or_edit_message(cid, reply, message_id=anchor_id)
+                state["message_id"] = self._send_or_edit_message(cid, reply, message_id=anchor_id)
                 return reply
 
             if state["stage"] == "profile":
                 state["profile"] = None if text.strip() == "-" else text.strip()
                 state["stage"] = "provider"
                 reply = f"Provider for {state['name']}? (named local model endpoint, or - for the default; /cancel to abort)"
-                self._send_or_edit_message(cid, reply, message_id=anchor_id)
+                state["message_id"] = self._send_or_edit_message(cid, reply, message_id=anchor_id)
                 return reply
 
             # stage == "provider"
@@ -2347,7 +2366,7 @@ class TelegramBot:
             agent = state["agent"]
             if text.strip() != agent:
                 reply = f"That doesn't match '{agent}' — type it exactly to confirm, or /cancel."
-                self._send_or_edit_message(cid, reply, message_id=anchor_id)
+                state["message_id"] = self._send_or_edit_message(cid, reply, message_id=anchor_id)
                 return reply  # stay open for retry, same as the web console's disabled-until-match button
             del self.pending[cid]
             if self.telegram:
