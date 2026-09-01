@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shlex
 from collections import defaultdict, deque
@@ -76,17 +77,20 @@ class ControlModeClient:
         self._pending.clear()
         require_isolated_tmux(self.socket)
         command = ["tmux"]
-        if self.socket:
-            command.extend(["-S", self.socket])
+        explicit_socket = self.socket or os.environ.get("TMUX_SOCKET")
+        if explicit_socket:
+            command.extend(["-S", explicit_socket])
         command.extend(
             ["-C", "attach-session", "-f", "ignore-size", "-t", self.session_name]
         )
+        env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
         self.process = await asyncio.create_subprocess_exec(
             *command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=16 * 1024 * 1024,
+            env=env,
         )
         self._reader_task = asyncio.create_task(self._read_control_stream())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
