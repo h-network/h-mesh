@@ -1,4 +1,6 @@
-<img src="assets/banner.svg" alt="H-MESH // agentic office framework // h-network" width="600">
+<p align="center">
+  <img src="assets/banner.svg" alt="H-MESH // agentic office framework // h-network" width="600">
+</p>
 
 # h-mesh
 
