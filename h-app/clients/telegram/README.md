@@ -316,6 +316,34 @@ rather than sent to `--agent` as a prompt (and takes priority over a
 sticky-keyboard label, so typing a title that happens to match a button label
 is still treated as the title).
 
+⚠ **An edit is not a send.** Telegram delivers an `edited_message` update
+whenever the operator edits *any* of their messages from the last 48 hours,
+carrying the full edited text. This bot **declines those updates**: it logs one
+line and dispatches nothing. Editing a message is not an act of sending one,
+and treating it as one meant three things nobody had chosen — a typo fixed in
+an old message could answer the question a flow was currently asking (with
+text having nothing to do with it), could re-prompt the target agent with a
+near-duplicate turn, and could **re-run a `/run` command that had already
+executed once**. That behaviour arrived with the original port, with no
+comment, no test and nothing in this README, so it was inherited rather than
+decided; it is decided now.
+
+When a flow is open, the chat is told (`✏️ Editing a message doesn't send it
+… send it as a new message, or /cancel`), because that is the case where
+saying nothing leaves the operator waiting on an answer the bot has already
+discarded. With no flow open the edit is logged and otherwise ignored — there
+is nothing waiting on them and a lecture per edit would be noise. An edit from
+a chat that isn't `TELEGRAM_CHAT_ID` gets no note either; the chat check runs
+first, so an unauthorized sender still learns nothing.
+
+Two alternatives were considered and rejected. Treating an edit as a
+*correction* of the answer it replaces requires the stage to be reversible,
+and by the time an edit arrives a hire may already have been submitted.
+Filtering at the source with `getUpdates`'s `allowed_updates` would be tidier
+but drops update types silently and at a distance, so the next handler someone
+adds would fail by never being called — declining in `_dispatch_update` costs
+one visible log line per edit instead.
+
 Try it without a bot token: `python3 clients/telegram/bot.py --api-token "$H_MESH_API_TOKEN" --menu`.
 
 ---
