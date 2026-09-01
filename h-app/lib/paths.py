@@ -56,3 +56,62 @@ def resolve_venv_bin(venv_dir: str | Path | None = None) -> str:
         if repo_venv_bin.is_dir():
             return str(repo_venv_bin)
     return str(candidate)
+
+
+def build_pane_path(
+    venv_bin: str | Path | None = None,
+    ambient_path: str | None = None,
+) -> str:
+    """Construct a complete, deterministic PATH for agent panes from known-required locations.
+
+    Agent panes spawned by tmux run non-interactively without sourcing shell rc
+    files (~/.bashrc / ~/.profile). A daemon started from a minimal shell (e.g.
+    reboot, systemd, h-mesh start) has a stripped PATH that lacks user-level
+    install locations like ~/.local/bin where h-agent is installed.
+
+    Instead of blindly inheriting the daemon's ambient PATH, we assemble PATH
+    from known-required locations in priority order:
+    1. Virtualenv bin directory (where h-mesh-office, h-mesh, and repo tools live)
+    2. User binary directories ($PREFIX/bin, ~/.local/bin, ~/bin where h-agent and user tools live)
+    3. Any additional entries from the caller's ambient PATH
+    4. Standard system binary directories (/usr/local/bin, /usr/bin, /bin, etc.)
+    """
+    resolved_bin = resolve_venv_bin(venv_bin)
+    home_dir = os.environ.get("HOME", os.path.expanduser("~"))
+    prefix_dir = os.environ.get("PREFIX")
+
+    candidates: list[str] = []
+    if resolved_bin:
+        candidates.append(str(resolved_bin))
+
+    if prefix_dir:
+        candidates.append(os.path.join(prefix_dir, "bin"))
+
+    if home_dir:
+        candidates.append(os.path.join(home_dir, ".local", "bin"))
+        candidates.append(os.path.join(home_dir, "bin"))
+
+    raw_ambient = ambient_path if ambient_path is not None else os.environ.get("PATH", "")
+    if raw_ambient:
+        candidates.extend(raw_ambient.split(":"))
+
+    candidates.extend([
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/bin",
+        "/sbin",
+    ])
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for entry in candidates:
+        if not entry:
+            continue
+        norm = os.path.normpath(entry)
+        if norm not in seen:
+            seen.add(norm)
+            deduped.append(norm)
+
+    return ":".join(deduped)

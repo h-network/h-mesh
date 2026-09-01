@@ -563,21 +563,40 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         from modules.tmux.ops import window_env
         from lib.paths import resolve_venv_bin
 
-        # Default resolution prepends venv bin to ambient PATH
-        with unittest.mock.patch.dict(os.environ, {"PATH": "/usr/local/bin:/usr/bin", "VIRTUAL_ENV": "/custom/myvenv"}):
+        # Default resolution prepends venv bin, user bin dirs, and system paths
+        with unittest.mock.patch.dict(os.environ, {"HOME": "/home/worker", "PATH": "/usr/local/bin:/usr/bin", "VIRTUAL_ENV": "/custom/myvenv"}):
             env = window_env("worker")
             path_var = next(var for var in env if var.startswith("PATH="))
-            self.assertEqual(path_var, "PATH=/custom/myvenv/bin:/usr/local/bin:/usr/bin")
+            entries = path_var[len("PATH="):].split(":")
+            self.assertEqual(entries[0], "/custom/myvenv/bin")
+            self.assertIn("/home/worker/.local/bin", entries)
+            self.assertIn("/usr/local/bin", entries)
+            self.assertIn("/usr/bin", entries)
 
         # Explicit venv_bin override
-        with unittest.mock.patch.dict(os.environ, {"PATH": "/usr/local/bin:/usr/bin"}):
+        with unittest.mock.patch.dict(os.environ, {"HOME": "/home/worker", "PATH": "/usr/local/bin:/usr/bin"}):
             env_explicit = window_env("worker", venv_bin="/explicit/bin")
-            self.assertIn("PATH=/explicit/bin:/usr/local/bin:/usr/bin", env_explicit)
+            path_var = next(var for var in env_explicit if var.startswith("PATH="))
+            entries = path_var[len("PATH="):].split(":")
+            self.assertEqual(entries[0], "/explicit/bin")
+            self.assertIn("/home/worker/.local/bin", entries)
 
         # Deduplicates/moves to front if venv bin is already in PATH
-        with unittest.mock.patch.dict(os.environ, {"PATH": "/usr/local/bin:/explicit/bin:/usr/bin"}):
+        with unittest.mock.patch.dict(os.environ, {"HOME": "/home/worker", "PATH": "/usr/local/bin:/explicit/bin:/usr/bin"}):
             env_dedup = window_env("worker", venv_bin="/explicit/bin")
-            self.assertIn("PATH=/explicit/bin:/usr/local/bin:/usr/bin", env_dedup)
+            path_var = next(var for var in env_dedup if var.startswith("PATH="))
+            entries = path_var[len("PATH="):].split(":")
+            self.assertEqual(entries[0], "/explicit/bin")
+            self.assertEqual(len(entries), len(set(entries)))
+
+        # Clean/scrubbed environment (acceptance-agent repro case) guarantees ~/.local/bin and venv bin
+        with unittest.mock.patch.dict(os.environ, {"HOME": "/home/worker", "PATH": "/usr/bin:/bin"}, clear=True):
+            env_clean = window_env("worker", venv_bin="/opt/venv/bin")
+            path_var = next(var for var in env_clean if var.startswith("PATH="))
+            entries = path_var[len("PATH="):].split(":")
+            self.assertEqual(entries[0], "/opt/venv/bin")
+            self.assertIn("/home/worker/.local/bin", entries)
+            self.assertIn("/usr/bin", entries)
 
     def test_hired_agent_pane_process_has_venv_bin_on_path_in_proc_environ(self):
         from lib.paths import resolve_venv_bin

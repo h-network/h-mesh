@@ -9,7 +9,7 @@ H_APP = Path(__file__).resolve().parents[1]
 if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
-from lib.paths import get_agent_workdir, get_workdir_root
+from lib.paths import build_pane_path, get_agent_workdir, get_workdir_root
 
 
 class PathsTests(unittest.TestCase):
@@ -42,6 +42,53 @@ class PathsTests(unittest.TestCase):
 
     def test_get_agent_workdir_explicit_cwd(self):
         self.assertEqual(get_agent_workdir("eve", cwd="/custom/dir"), "/custom/dir")
+
+    def test_build_pane_path_includes_venv_and_user_and_system_locations(self):
+        with patch.dict(os.environ, {"HOME": "/home/tester", "PATH": "/usr/bin:/bin", "VIRTUAL_ENV": "/venv/root"}):
+            path_str = build_pane_path()
+            entries = path_str.split(":")
+            # venv bin is first
+            self.assertEqual(entries[0], "/venv/root/bin")
+            # ~/.local/bin and ~/bin are included
+            self.assertIn("/home/tester/.local/bin", entries)
+            self.assertIn("/home/tester/bin", entries)
+            # standard system directories are included
+            self.assertIn("/usr/local/bin", entries)
+            self.assertIn("/usr/bin", entries)
+            self.assertIn("/bin", entries)
+
+    def test_build_pane_path_with_stripped_ambient_env(self):
+        # Even with an empty ambient PATH (e.g. non-interactive launch / cron / systemd),
+        # ~/.local/bin and system paths are always guaranteed
+        with patch.dict(os.environ, {"HOME": "/home/tester"}, clear=True):
+            path_str = build_pane_path(venv_bin="/custom/bin", ambient_path="")
+            entries = path_str.split(":")
+            self.assertEqual(entries[0], "/custom/bin")
+            self.assertEqual(entries[1], "/home/tester/.local/bin")
+            self.assertEqual(entries[2], "/home/tester/bin")
+            self.assertIn("/usr/local/bin", entries)
+            self.assertIn("/usr/bin", entries)
+            self.assertIn("/bin", entries)
+
+    def test_build_pane_path_with_prefix_env(self):
+        with patch.dict(os.environ, {"HOME": "/home/tester", "PREFIX": "/opt/custom"}, clear=True):
+            path_str = build_pane_path(venv_bin="/custom/bin")
+            entries = path_str.split(":")
+            self.assertEqual(entries[0], "/custom/bin")
+            self.assertEqual(entries[1], "/opt/custom/bin")
+            self.assertEqual(entries[2], "/home/tester/.local/bin")
+
+    def test_build_pane_path_deduplication_and_order(self):
+        with patch.dict(os.environ, {"HOME": "/home/tester"}, clear=True):
+            ambient = "/usr/bin:/home/tester/.local/bin:/custom/bin:/bin"
+            path_str = build_pane_path(venv_bin="/custom/bin", ambient_path=ambient)
+            entries = path_str.split(":")
+            # No duplicates
+            self.assertEqual(len(entries), len(set(entries)))
+            # /custom/bin moved to front
+            self.assertEqual(entries[0], "/custom/bin")
+            # /home/tester/.local/bin present before ambient /usr/bin
+            self.assertEqual(entries[1], "/home/tester/.local/bin")
 
 
 if __name__ == "__main__":
