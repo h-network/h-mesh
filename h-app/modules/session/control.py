@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import shlex
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any
 
-from modules.tmux import require_isolated_tmux, resolve_tmux_socket
+from modules.tmux import require_isolated_tmux
 
 _CONTROL_ESCAPE = re.compile(rb"\\(\\|[0-7]{3})")
 
@@ -74,20 +75,22 @@ class ControlModeClient:
         self.broken_reason = None
         self._ready = asyncio.Event()
         self._pending.clear()
-        target_socket = resolve_tmux_socket(self.socket)
-        require_isolated_tmux(target_socket)
+        require_isolated_tmux(self.socket)
         command = ["tmux"]
-        if target_socket:
-            command.extend(["-S", target_socket])
+        explicit_socket = self.socket or os.environ.get("TMUX_SOCKET")
+        if explicit_socket:
+            command.extend(["-S", explicit_socket])
         command.extend(
             ["-C", "attach-session", "-f", "ignore-size", "-t", self.session_name]
         )
+        env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
         self.process = await asyncio.create_subprocess_exec(
             *command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=16 * 1024 * 1024,
+            env=env,
         )
         self._reader_task = asyncio.create_task(self._read_control_stream())
         self._stderr_task = asyncio.create_task(self._drain_stderr())

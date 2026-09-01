@@ -40,10 +40,9 @@ def test_require_isolated_tmux_raises_when_target_matches_ambient_socket(monkeyp
     assert "matches the ambient session socket ($TMUX)" in str(excinfo.value)
 
 
-def test_require_isolated_tmux_raises_when_tmux_matches_tmux_tmpdir_default(monkeypatch, tmp_path):
-    ambient_sock = str(tmp_path / "default")
+def test_require_isolated_tmux_raises_when_explicit_socket_matches_ambient_socket(monkeypatch, tmp_path):
+    ambient_sock = str(tmp_path / "ambient.sock")
     monkeypatch.setenv("TMUX", f"{ambient_sock},12345,0")
-    monkeypatch.setenv("TMUX_TMPDIR", str(tmp_path))
     with pytest.raises(AmbientTmuxError) as excinfo:
-        require_isolated_tmux()
+        require_isolated_tmux(socket=ambient_sock)
     assert "matches the ambient session socket ($TMUX)" in str(excinfo.value)
