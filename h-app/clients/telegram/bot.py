@@ -2962,6 +2962,56 @@ class TelegramBot:
             self.telegram.send_message(cid, reply_text)
         return reply_text
 
+    def _decline_edited_message(self, chat_id: str, update_id, edited: dict) -> None:
+        """An edit is not a send, and this bot acts on sends only.
+
+        ⚠ THE DECISION, on the record. Telegram delivers an `edited_message`
+        update whenever the operator edits ANY message of theirs from the last
+        48 hours, carrying the full edited text. Before this, that update was
+        handled as if it were a new message, which meant three things nobody
+        chose: editing a typo in an old message could answer a question the
+        flow was currently asking (with text having nothing to do with it),
+        could re-prompt the target agent with a near-duplicate turn, and —
+        worst — could re-run a `/run` command that had already executed once.
+        None of those are acts the operator performed; they pressed "edit" and
+        fixed a word. It arrived with the original port (6844f87) with no
+        comment, no test and no mention in the README, so it was never decided,
+        only inherited.
+
+        Rejected alternatives, so a later reader knows they were considered:
+        treating an edit as a correction of the answer it replaces needs the
+        stage to be reversible, and by the time an edit lands a hire may
+        already have been submitted; keeping the old behaviour and documenting
+        it makes the same physical act mean different things depending on
+        whether a flow happens to be open, which is precisely the invisible
+        state-dependence that made be9cbedd undiagnosable.
+
+        ⚠ Not filtered at `getUpdates` with `allowed_updates` instead, which
+        would be tidier and is deliberately not done: that drops update types
+        silently and at a distance, so the next handler someone adds would
+        fail by never being called. Declining here is one visible line in the
+        log for every edit.
+
+        The operator is told ONLY when a flow is open, because that is the
+        case where saying nothing leaves them waiting on an answer the bot has
+        already discarded. An edit with no flow open is logged and otherwise
+        left alone rather than answered with a lecture.
+        """
+        logger.info(
+            f"update {update_id}: edited_message from chat={chat_id} "
+            f"(msg={edited.get('message_id')}) not dispatched — an edit is not a send"
+        )
+        state = self.pending.get(chat_id)
+        if not state or not self.telegram:
+            return
+        stage = state.get("stage")
+        waiting = f"{state.get('flow')} is still waiting" + (f" for the {stage}" if stage else "")
+        self.telegram.send_message(
+            chat_id,
+            f"✏️ Editing a message doesn't send it, so that wasn't read as an answer — {waiting}. "
+            "Send it as a new message, or /cancel.",
+        )
+
     def _dispatch_update(self, update: dict) -> None:
         """⚠ Logs the SHAPE of an update, never its text: update id, kind,
         chat, message id, and how many characters arrived. A callback's `data`
@@ -2987,7 +3037,8 @@ class TelegramBot:
             self.handle_callback_query(chat_id, callback["id"], callback.get("data", ""), message_id)
             return
 
-        msg = update.get("message") or update.get("edited_message")
+        edited = update.get("edited_message")
+        msg = update.get("message") or edited
         if not msg:
             logger.debug(f"update {update_id}: no message or callback in it, nothing to dispatch")
             return
@@ -2995,6 +3046,7 @@ class TelegramBot:
         chat_id = str(msg["chat"]["id"])
         logger.debug(
             f"update {update_id}: message chat={chat_id} msg={msg.get('message_id')} "
+            f"edited={edited is not None} "
             f"text={len(msg.get('text', '').strip())} chars "
             f"photo={bool(msg.get('photo'))} document={bool(msg.get('document'))} "
             f"reply_to={bool(msg.get('reply_to_message'))}"
@@ -3002,6 +3054,11 @@ class TelegramBot:
         if not self._chat_allowed(chat_id):
             logger.info(f"update {update_id}: message from chat={chat_id} ignored (not the allowed chat)")
             return
+
+        if edited is not None:
+            self._decline_edited_message(chat_id, update_id, edited)
+            return
+
 
         photo_sizes = msg.get("photo")
         if photo_sizes:

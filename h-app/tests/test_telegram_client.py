@@ -649,6 +649,64 @@ def test_dispatch_update_processes_a_message_from_the_allowed_chat():
         assert len(telegram.sent_messages) == 1
 
 
+def test_an_edit_does_not_answer_an_open_flow_and_says_so(caplog):
+    """Telegram sends edited_message for ANY message the operator edits in the
+    last 48h. Consuming it as a flow answer means a stage can be taken by an
+    act the person never performed -- they fixed a typo, they did not send
+    anything. The flow stays exactly where it was, and they are told, because
+    silence here leaves them waiting on an answer already discarded."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
+        bot_instance.pending["42"] = {"flow": "hire", "stage": "provider", "name": "sme-9",
+                                      "profile": None, "message_id": 7}
+
+        with caplog.at_level(logging.INFO, logger="mesh_telegram"):
+            bot_instance._dispatch_update(
+                {"update_id": 9, "edited_message": {"chat": {"id": 42}, "message_id": 3, "text": "gpu-a"}}
+            )
+
+        assert mesh.hired == []
+        assert bot_instance.pending["42"] == {"flow": "hire", "stage": "provider", "name": "sme-9",
+                                              "profile": None, "message_id": 7}
+        assert "hire is still waiting for the provider" in telegram.sent_messages[-1]["text"]
+        assert "an edit is not a send" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_an_edit_with_no_open_flow_is_dropped_without_re_prompting_the_agent():
+    """The same rule where it matters most quietly: editing an old message
+    used to re-send it as a fresh prompt, and editing an old /run used to run
+    the command a second time. Neither is an act the operator performed. No
+    reply either -- with no flow open, nothing is waiting on them."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
+
+        bot_instance._dispatch_update(
+            {"update_id": 9, "edited_message": {"chat": {"id": 42}, "message_id": 3, "text": "hello architect"}}
+        )
+        bot_instance._dispatch_update(
+            {"update_id": 10, "edited_message": {"chat": {"id": 42}, "message_id": 4, "text": "/run sme-2 /clear"}}
+        )
+
+        assert mesh.sent_envelopes == []
+        assert mesh.sent_commands == []
+        assert telegram.sent_messages == []
+
+
+def test_an_edit_from_an_unauthorized_chat_gets_no_reply_either():
+    """The chat check comes first: an edit from a chat that isn't the
+    configured one must not draw the "that wasn't read as an answer" note,
+    which would tell an unauthorized sender a bot is listening."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
+        bot_instance.pending["999"] = {"flow": "hire", "stage": "name"}
+
+        bot_instance._dispatch_update(
+            {"update_id": 9, "edited_message": {"chat": {"id": 999}, "message_id": 3, "text": "sme-9"}}
+        )
+
+        assert telegram.sent_messages == []
+
+
 def test_dispatch_update_reacts_to_a_dispatched_prompt_using_its_own_message_id():
     """A plain prompt is a real update.message.message_id in production --
     _dispatch_update has to pull it out for the 👀 reaction to land on the

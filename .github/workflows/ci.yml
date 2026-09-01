@@ -1,11 +1,18 @@
-name: CI
+name: Authoritative CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
+  merge_group:
+
+permissions:
+  contents: read
 
 jobs:
-  test:
+  authoritative-full-suite:
+    name: Authoritative full suite
     runs-on: ubuntu-latest
     services:
       redis:
