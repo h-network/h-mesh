@@ -123,6 +123,10 @@ def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
                 pass
             assert res.returncode == 0, f"setup.sh failed: {res.stderr}\nstdout: {res.stdout}\nswitch.log: {sw_log}\ntmux_reconciler.log: {tr_log}"
 
+        # The H-MESH banner is wizard decoration for a human at a terminal --
+        # a non-interactive/scripted run like this one must not print it.
+        assert "H-MESH" not in res.stdout
+
         # 1. Verify fixed participants are seeded in Redis
         reg_key = prefix(pod, tenant, resource="registry")
         assert port_type(r, pod=pod, tenant=tenant, agent="host") == "office"

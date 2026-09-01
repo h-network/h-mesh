@@ -303,3 +303,27 @@ def test_wizard_provided_token_reaches_the_daemon_hiring_the_first_agent_in_the_
         entry.split("=", 1) for entry in environ_raw.decode(errors="replace").split("\0") if "=" in entry
     )
     assert env_pairs.get("CLAUDE_OAUTH_TOKEN_DEFAULT") == "test-token-abc"
+
+
+def test_wizard_prints_the_h_mesh_banner_before_the_first_prompt(wizard_env):
+    ctx = wizard_env
+    output, code = _run_wizard(
+        cwd=str(REPO_ROOT),
+        args=["--venv", sys.prefix, "--skip-install", "--skip-deps"],
+        env=ctx["env"],
+        answers=DEFAULT_PATH_ANSWERS,
+    )
+    assert code == 0, f"setup.sh exited {code}:\n{output}"
+
+    banner_pos = output.find("H-MESH")
+    prompt_pos = output.find("Pod name [")
+    assert banner_pos != -1, "banner never printed"
+    assert prompt_pos != -1, "wizard never prompted"
+    assert banner_pos < prompt_pos, "banner must print before the first prompt"
+
+    # Colors: yellow logo, cyan subtitle text, grey '//' separators.
+    assert "\x1b[0;33m" in output  # YELLOW
+    assert "\x1b[0;36m" in output  # CYAN
+    assert "\x1b[0;37m" in output  # GREY
+    assert "agentic office framework" in output
+    assert "h-network" in output

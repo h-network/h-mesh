@@ -190,6 +190,27 @@ check_bool() {
 # Skipped entirely outside a real terminal (or with --non-interactive):
 # flags/env and whatever's already persisted are all that mode uses.
 if [ "$INTERACTIVE" -eq 1 ]; then
+    # Literal ASCII art (figlet -f ansishadow.flf "H-MESH"), not generated
+    # at runtime -- a fresh host has neither figlet nor that font
+    # installed, and this is decoration for a human at a terminal, not
+    # worth adding a dependency for.
+    YELLOW="\033[0;33m"
+    CYAN="\033[0;36m"
+    GREY="\033[0;37m"
+    NC="\033[0m"
+    echo -e "${YELLOW}"
+    cat <<'BANNER'
+██╗  ██╗      ███╗   ███╗███████╗███████╗██╗  ██╗
+██║  ██║      ████╗ ████║██╔════╝██╔════╝██║  ██║
+███████║█████╗██╔████╔██║█████╗  ███████╗███████║
+██╔══██║╚════╝██║╚██╔╝██║██╔══╝  ╚════██║██╔══██║
+██║  ██║      ██║ ╚═╝ ██║███████╗███████║██║  ██║
+╚═╝  ╚═╝      ╚═╝     ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝
+BANNER
+    echo -e "${NC}"
+    echo -e "  ${CYAN}H-MESH${NC} ${GREY}//${NC} ${CYAN}agentic office framework${NC} ${GREY}//${NC} ${CYAN}h-network${NC}"
+    echo ""
+
     read -rp "Pod name [$POD]: " IN_POD; POD="$(slug "${IN_POD:-$POD}")"
     read -rp "Tenant name [$TENANT]: " IN_TENANT; TENANT="$(slug "${IN_TENANT:-$TENANT}")"
 fi
