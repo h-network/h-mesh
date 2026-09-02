@@ -164,7 +164,6 @@ def test_upgrade_restarts_daemons_without_duplicating_and_preserves_the_tmux_ses
             timeout=30,
         )
         assert upg_res.returncode == 0, f"upgrade failed: {upg_res.stderr}\nstdout: {upg_res.stdout}"
-
         with open(os.path.join(run_dir, "switch.pid")) as f:
             switch_pid = int(f.read().strip())
         with open(os.path.join(run_dir, "tmux_reconciler.pid")) as f:

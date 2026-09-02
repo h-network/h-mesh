@@ -186,7 +186,66 @@ class Watchdog:
         self._reported_blocks.intersection_update(current)
         self._reported_blocks.update(current)
 
+    def _last_activity_event(self, agent: str) -> dict | None:
+        """The most recent activity event's `kind` (and `tool`, if any).
+
+        ⚠ A best-effort signal for `_check_stalls`, not a verdict. An agent
+        whose last recorded action was `output` most plausibly finished a
+        turn and is waiting on a reply -- from the lead, from a client, from
+        anything -- rather than being wedged mid-task; `input`/`tool` reads
+        the opposite way. This does NOT distinguish "waiting on the lead"
+        specifically (that needs a real signal, e.g. peer-to-peer unreplied
+        tracking symmetric to `core.channels`' existing api-to-tmux one,
+        which does not exist yet) — it is only ever attached to the alert as
+        extra context for a human to weigh, never used to suppress it. See
+        `_check_stalls`'s docstring for why suppressing outright was rejected.
+        """
+        entries = self.r.xrevrange(
+            prefix(self.pod, self.tenant, agent, "activity"), max="+", min="-", count=1
+        )
+        for _, raw_fields in entries:
+            raw = _fields(raw_fields).get("event")
+            try:
+                event = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(event, dict) or event.get("kind") not in ("input", "output", "tool"):
+                continue
+            result = {"kind": event["kind"]}
+            if event["kind"] == "tool" and isinstance(event.get("tool"), str):
+                result["tool"] = event["tool"]
+            return result
+        return None
+
     def _check_stalls(self, agents: list[str], windows: dict[str, int], now: datetime) -> None:
+        """Report an old, non-working, silent-window ticket as `stalled`.
+
+        ⚠ This three-signal check cannot tell "genuinely stuck" from "idle
+        because it's waiting on a reply" -- an agent that asked the lead a
+        question and is legitimately waiting looks identical to a wedged one
+        by ticket-age + non-working presence + silent window alone. The
+        `blocked` mechanism (`verification.DeliveryVerifier`) answers a
+        narrower, different question (was a SPECIFIC paste TO this agent
+        confirmed), and `unreplied` only ever tracks api-client traffic, not
+        peer tmux-to-tmux waiting -- there is no existing signal for "this
+        agent is waiting on the lead specifically."
+
+        Deliberately NOT inventing that signal here, and deliberately NOT
+        suppressing the alert for this ambiguity either: an alert dismissed
+        as noise once was in fact correct (an agent had taken a ticket and
+        worked something else for 30 minutes) -- the goal is fewer FALSE
+        alerts, not fewer alerts, and guessing wrong in the direction of
+        silence is worse than an occasional alert a human discounts in two
+        seconds. So the record below carries `last_activity_kind` (and
+        `last_activity_tool`, for a tool call) as honest extra context — an
+        agent whose last recorded action was `output` most plausibly ended a
+        turn and could be waiting on someone, `input`/`tool` reads the
+        opposite way — for the LEAD to weigh, not for the watchdog to decide.
+        A real fix needs a real signal: peer-to-peer unreplied tracking in
+        `core.channels.send()`, symmetric to its existing api-to-tmux one.
+        That is out of this module's scope, the same way the ack-loop
+        family's `acks` writer is (see `_check_ack_loop`).
+        """
         now_s = now.timestamp()
         for agent in agents:
             ticket = self._ticket(agent)
@@ -242,6 +301,11 @@ class Watchdog:
             blocked = self._blocked(agent, now)
             if blocked is not None:
                 record["blocked"] = blocked
+            last_event = self._last_activity_event(agent)
+            if last_event is not None:
+                record["last_activity_kind"] = last_event["kind"]
+                if "tool" in last_event:
+                    record["last_activity_tool"] = last_event["tool"]
             self._alert(record)
             self.r.set(alerted_key, ticket_id, ex=self.cooldown_seconds)
 
@@ -410,12 +474,24 @@ class Watchdog:
             self.r.set(state_key, f"{ticket_id}:{multiple}")
 
     def _check_todo_duration(self, agents: list[str], now: datetime) -> None:
-        """Tell the lead directly when a ticket has sat unpicked in `todo`.
+        """Tell the lead directly when a ticket has sat unpicked in `todo`,
+        for an agent who is actually free to have picked it up.
 
         Same family as `_check_doing_duration`, same delivery and dedup shape,
         independent job and state. Presence-independent for the same reason:
         an agent can be perfectly healthy and simply not have looked at its
         board yet, which is exactly the case this exists to surface.
+
+        ⚠ Skips an agent outright while `tasks.doing` holds a ticket. One
+        agent works one ticket at a time — anything queued behind it in
+        `todo` cannot be started yet no matter how long it waits, so its age
+        says nothing about whether the agent is neglecting its board. This
+        was firing on tickets deliberately queued behind active work
+        (confirmed live, not a hypothetical), which is a false alert in
+        exactly the sense worth fixing: the age is real, the "neglect" it
+        implies is not, and the agent has no way to act on it yet regardless.
+        An agent with nothing in `doing` is genuinely free, and an old `todo`
+        entry for THAT agent still means what this check was built to catch.
 
         Unlike `doing` (one ticket, enforced), `todo` can hold several at
         once, so the per-ticket crossing count is a HASH keyed by ticket id
@@ -426,6 +502,8 @@ class Watchdog:
         if not lead:
             return
         for agent in agents:
+            if self._ticket(agent) is not None:
+                continue
             state_key = prefix(self.pod, self.tenant, agent, "todo.alerted")
             raw_tickets = self.r.lrange(prefix(self.pod, self.tenant, agent, "tasks.todo"), 0, -1)
             present_ids = set()
@@ -481,6 +559,22 @@ class Watchdog:
         a decision on a hold that has sat long enough to stop looking like a
         wait and start looking like abandonment — at which point the ticket
         probably belongs cancelled or deleted, not indefinitely held.
+
+        ⚠ `office hold` now requires `--reason`, and this reads that
+        `hold_reason` field (present, non-blank on anything held through the
+        current CLI; absent on older entries — handled gracefully either
+        way) into the alert text. Deliberately still fires on the same
+        schedule rather than being silenced or delayed by having a reason:
+        a stated reason explains why the wait STARTED, not that it is still
+        justified now, and a long-forgotten hold with a good original reason
+        is exactly the abandonment this check exists to surface — silencing
+        it would make the watchdog quieter by being blind, not by being
+        right, which is the one thing not to trade away here. What a reason
+        SHOULD change is whether the alert reads as a repeat: without it,
+        holding a ticket to stop one kind of nag just produced a different,
+        differently-worded one 60 minutes later ("just reworded" -- not
+        wrong to fire, but unhelpful about why). Carrying the reason makes
+        each crossing actually informative instead of a templated re-ask.
         """
         lead = self._lead()
         if not lead:
@@ -518,9 +612,15 @@ class Watchdog:
                     continue
 
                 minutes = hold_age // 60
+                reason = ticket.get("hold_reason")
+                # Collapse embedded whitespace/newlines the same way `office
+                # list` already does for this field -- an unnormalized
+                # multi-line reason would make one alert read like several.
+                reason_text = " ".join(reason.split()) if isinstance(reason, str) else ""
+                reason_suffix = f" (reason: {reason_text})" if reason_text else ""
                 text = (
                     f'[alert from watchdog] {agent} has had '
-                    f'"{ticket["title"]}" on hold for {minutes} min'
+                    f'"{ticket["title"]}" on hold for {minutes} min{reason_suffix}'
                 )
                 self._notify_lead(lead, text)
                 self.r.hset(state_key, ticket_id, str(multiple))
@@ -616,6 +716,13 @@ class Watchdog:
 
     def _check_ack_loop(self, agents: list[str], now: datetime) -> None:
         """Tell the lead directly when two peers are only exchanging closing acks.
+
+        ⚠ As of this writing, `core.channels.send()` does not yet write the
+        `acks` hash this reads — it is dormant, not broken: this method reads
+        exactly what a writer would produce, but nothing populates it yet.
+        Confirmed by reading `core.channels.send()` directly, not assumed.
+        Do not read this family firing (or not firing) as evidence either way
+        about ack-looping in a live tenant until that writer lands.
 
         Fifth in the family, and the first not driven by the board or a
         single agent's own state — it is `acks`, a HASH `core.channels.send()`

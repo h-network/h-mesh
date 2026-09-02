@@ -142,6 +142,7 @@ def log_record(
     task_id: str | None = None,
     waited: int | float | None = None,
     byte_count: int | None = None,
+    outcome: str | None = None,
 ) -> None:
     """One JSON object per line on stdout. Fields absent when not known.
 
@@ -179,6 +180,7 @@ def log_record(
         ("task_id", task_id),
         ("waited", waited),
         ("bytes", byte_count),
+        ("outcome", outcome),
     ):
         if value is not None:
             record[field] = value
@@ -254,6 +256,7 @@ def record_task_event(
     agent: str,
     actor: str,
     timestamp: str | None = None,
+    outcome: str | None = None,
 ) -> None:
     """Append one board-history event without ever breaking its command."""
     try:
@@ -270,6 +273,8 @@ def record_task_event(
             "timestamp": timestamp
             or datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         }
+        if outcome is not None:
+            record["outcome"] = outcome
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, separators=(",", ":")) + "\n")
     except Exception:

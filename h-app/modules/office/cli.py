@@ -563,9 +563,9 @@ def _task_keys(pod: str, tenant: str, agent: str) -> dict[str, str]:
     }
 
 
-_ATOMIC_TAKE = """
--- office atomic take v1
-if redis.call('LLEN', KEYS[2]) > 0 then
+_ATOMIC_TRANSITION = """
+-- office atomic task transition v1
+if ARGV[3] == '1' and redis.call('LLEN', KEYS[2]) > 0 then
     return {0, 'busy'}
 end
 if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
@@ -575,25 +575,46 @@ redis.call('RPUSH', KEYS[2], ARGV[2])
 return {1, 'ok'}
 """
 
-_QUARANTINE_INVALID_TICKET = """
--- office quarantine invalid ticket v1
-if redis.call('LREM', KEYS[1], 1, ARGV[1]) == 0 then
-    return 0
-end
-redis.call('RPUSH', KEYS[2], ARGV[1])
-return 1
-"""
-
-
 def _quarantine_invalid(r, *, source_key: str, invalid_key: str, raw) -> None:
     """Atomically preserve an unreadable entry off the actionable queues."""
-    if not r.eval(_QUARANTINE_INVALID_TICKET, 2, source_key, invalid_key, raw):
-        raise OfficeError("task changed while the command was running; try again")
+    _transition_selected(
+        r,
+        source_key=source_key,
+        destination_key=invalid_key,
+        raw=raw,
+        replacement=raw,
+    )
 
 
 def _take_selected(r, *, source_key: str, doing_key: str, raw, ticket: dict) -> None:
+    _transition_selected(
+        r,
+        source_key=source_key,
+        destination_key=doing_key,
+        raw=raw,
+        replacement=serialize_ticket(ticket),
+        require_destination_empty=True,
+    )
+
+
+def _transition_selected(
+    r,
+    *,
+    source_key: str,
+    destination_key: str,
+    raw,
+    replacement,
+    require_destination_empty: bool = False,
+) -> None:
+    """Atomically rewrite and move one entry, optionally requiring an empty destination."""
     result = r.eval(
-        _ATOMIC_TAKE, 2, source_key, doing_key, raw, serialize_ticket(ticket),
+        _ATOMIC_TRANSITION,
+        2,
+        source_key,
+        destination_key,
+        raw,
+        replacement,
+        "1" if require_destination_empty else "0",
     )
     code = int(result[0])
     reason = result[1].decode() if isinstance(result[1], bytes) else result[1]
@@ -635,7 +656,13 @@ def _remove(r, key: str, raw) -> None:
 
 
 def _log_task(event: str, *, agent: str, ticket: dict) -> None:
-    log_record("office", event, destination=agent, task_id=ticket["id"])
+    log_record(
+        "office",
+        event,
+        destination=agent,
+        task_id=ticket["id"],
+        outcome=ticket.get("outcome"),
+    )
 
 
 # One timestamp field per state, naming "age" consistently as "time in the
@@ -668,6 +695,8 @@ def _ticket_line(ticket: dict, *, state: str, now: datetime) -> str:
         line += f"  age:{age}"
     if state == "hold" and ticket.get("hold_reason"):
         line += f"  reason:{' '.join(ticket['hold_reason'].split())}"
+    if state == "done" and ticket.get("outcome"):
+        line += f"  outcome:{ticket['outcome']}"
     return line
 
 
@@ -765,23 +794,86 @@ def _take_command(argv: list[str]) -> None:
 
 
 def _done_command(argv: list[str]) -> None:
-    _finish_command("done", argv)
+    parser = _operation_parser("done", "Finish your open task and record its outcome.")
+    parser.add_argument("id", nargs="?", help="ticket id or unique prefix")
+    parser.add_argument(
+        "--outcome",
+        choices=("completed", "passed", "failed"),
+        help="completed work, or the verdict from review work",
+    )
+    args = parser.parse_args(argv)
+    if args.outcome is None:
+        if sys.stdin.isatty():
+            args.outcome = input("outcome required (completed, passed, or failed): ").strip()
+            if args.outcome not in ("completed", "passed", "failed"):
+                raise OfficeError("outcome must be completed, passed, or failed")
+        else:
+            raise OfficeError(
+                "done requires --outcome {completed,passed,failed}; "
+                "use completed for ordinary work"
+            )
+    _finish_command("done", args.id, outcome=args.outcome)
 
 
-def _finish_command(action: str, argv: list[str]) -> None:
-    parser = _operation_parser(action, f"{action.title()} your open task.")
+def _cancel_command(argv: list[str]) -> None:
+    parser = _operation_parser("cancel", "Cancel your open task.")
+    parser.add_argument("id", nargs="?", help="ticket id or unique prefix")
+    args = parser.parse_args(argv)
+    _finish_command("cancel", args.id)
+
+
+def _finish_command(action: str, task_id: str | None, *, outcome: str | None = None) -> None:
+    r, pod, tenant, source = _context()
+    keys = _task_keys(pod, tenant, source)
+    _, raw, ticket = _select(r, keys, ("doing",), task_id)
+    ticket["status"] = "done" if action == "done" else "cancelled"
+    ticket["done_ts"] = _now()
+    if outcome is not None:
+        ticket["outcome"] = outcome
+    _transition_selected(
+        r,
+        source_key=keys["doing"],
+        destination_key=keys["done"],
+        raw=raw,
+        replacement=serialize_ticket(ticket),
+    )
+    record_task_event(
+        action,
+        id=ticket["id"],
+        title=ticket["title"],
+        agent=source,
+        actor=source,
+        outcome=outcome,
+    )
+    log_event = "task_done" if action == "done" else "task_cancelled"
+    _log_task(log_event, agent=source, ticket=ticket)
+    print(serialize_ticket(ticket))
+
+
+def _return_command(argv: list[str]) -> None:
+    parser = _operation_parser("return", "Return your open task to todo.")
     parser.add_argument("id", nargs="?", help="ticket id or unique prefix")
     args = parser.parse_args(argv)
     r, pod, tenant, source = _context()
     keys = _task_keys(pod, tenant, source)
     _, raw, ticket = _select(r, keys, ("doing",), args.id)
-    _remove(r, keys["doing"], raw)
-    ticket["status"] = "done" if action == "done" else "cancelled"
-    ticket["done_ts"] = _now()
-    r.rpush(keys["done"], serialize_ticket(ticket))
-    record_task_event(action, id=ticket["id"], title=ticket["title"], agent=source, actor=source)
-    log_event = "task_done" if action == "done" else "task_cancelled"
-    _log_task(log_event, agent=source, ticket=ticket)
+    ticket["status"] = "todo"
+    ticket["started_ts"] = None
+    ticket["done_ts"] = None
+    ticket["held_ts"] = None
+    ticket.pop("hold_reason", None)
+    ticket.pop("outcome", None)
+    _transition_selected(
+        r,
+        source_key=keys["doing"],
+        destination_key=keys["todo"],
+        raw=raw,
+        replacement=serialize_ticket(ticket),
+    )
+    record_task_event(
+        "return", id=ticket["id"], title=ticket["title"], agent=source, actor=source
+    )
+    _log_task("task_returned", agent=source, ticket=ticket)
     print(serialize_ticket(ticket))
 
 
@@ -795,11 +887,16 @@ def _hold_command(argv: list[str]) -> None:
     r, pod, tenant, source = _context()
     keys = _task_keys(pod, tenant, source)
     _, raw, ticket = _select(r, keys, ("doing",), args.id)
-    _remove(r, keys["doing"], raw)
     ticket["status"] = "hold"
     ticket["held_ts"] = _now()
     ticket["hold_reason"] = args.reason
-    r.rpush(keys["hold"], serialize_ticket(ticket))
+    _transition_selected(
+        r,
+        source_key=keys["doing"],
+        destination_key=keys["hold"],
+        raw=raw,
+        replacement=serialize_ticket(ticket),
+    )
     record_task_event("hold", id=ticket["id"], title=ticket["title"], agent=source, actor=source)
     _log_task("task_held", agent=source, ticket=ticket)
     print(serialize_ticket(ticket))
@@ -1150,8 +1247,9 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("resume",), "resume an agent's CLI and inbox", lambda argv: _lifecycle_command("resume", argv)),
     (("list",), "show a task board", _list_command),
     (("take",), "take your next todo task", _take_command),
-    (("done",), "finish your open task", _done_command),
-    (("cancel",), "cancel your open task", lambda argv: _finish_command("cancel", argv)),
+    (("done",), "finish your open task and record its outcome", _done_command),
+    (("cancel",), "cancel your open task", _cancel_command),
+    (("return",), "return your open task to todo", _return_command),
     (("hold",), "put your open task on hold", _hold_command),
     (("delete",), "permanently remove a task", _delete_command),
     (("add",), "add a task to another agent's board", _add_command),
