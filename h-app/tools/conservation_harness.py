@@ -70,6 +70,11 @@ except ImportError:
     receive_undeliverable_key = None  # pre-retirement-conservation shape
 
 try:
+    from core.keys import retired_inbox_key
+except ImportError:
+    retired_inbox_key = None  # pre-inbox-conservation shape
+
+try:
     from lib.agentlifecycle.lifecycle import stop_agent
 except ImportError:
     stop_agent = None  # not present on this tree
@@ -246,6 +251,86 @@ def _stream_id_occurrences(raw_records: list, is_evidence_wrapper: bool) -> list
     return occurrences
 
 
+def _retired_inbox_occurrences(raw_records: list) -> tuple[list[tuple[str, dict]], list[str]]:
+    """Read, classify, and validate every record in the tenant retired-inbox
+    sink -- never left unread.
+
+    Reviewer's finding, twice: an earlier version reasoned that
+    retired-inbox records can never carry a `stream_id` (they're
+    `{agent, reason, entry_id, encoding, fields}`, not
+    `{agent, reason, encoding, envelope}`) and used that as grounds to
+    SKIP READING THE KEY ENTIRELY. That is not a parser rejecting an
+    unparseable shape -- it is a sink this scenario never looked at, so a
+    genuine envelope record duplicated (by a real bug, or reviewer's
+    injection) into retired-inbox was invisible: not miscounted, simply
+    never seen. "We do not read it" and "we read it and deliberately
+    treat this recognized shape as contributing no identity" are
+    different claims, and only the second is an enforced boundary.
+
+    Every record here is now read and classified into exactly one of
+    three outcomes:
+    - RECOGNIZED inbox-conservation shape (has `entry_id` AND `fields`,
+      no `envelope`): contributes no stream_id occurrence -- correct,
+      not assumed.
+    - ENVELOPE-BEARING (has `envelope`): decoded and its stream_id IS
+      returned as a real occurrence, exactly like undeliverable/
+      unresolved -- a genuine envelope duplicated into this sink, by any
+      cause, is now counted and can trigger DUPLICATED like anywhere
+      else.
+    - ANYTHING ELSE (fails to parse as JSON, or matches neither
+      recognized shape) is a SCHEMA ANOMALY -- returned separately and
+      always reported as a failure by the caller, never silently
+      skipped. A record this harness cannot classify is not evidence of
+      absence; the sink's own documented "no fifth destination for
+      envelopes" claim depends on nothing showing up here that isn't one
+      of the two shapes above.
+
+    Returns `(occurrences, anomalies)` -- `occurrences` matches
+    `_stream_id_occurrences`'s shape; `anomalies` is a list of
+    human-readable strings, one per record this function could not
+    positively classify as either recognized shape.
+    """
+    occurrences: list[tuple[str, dict]] = []
+    anomalies: list[str] = []
+    for raw in raw_records:
+        try:
+            record = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception as exc:
+            anomalies.append(f"retired_inbox record failed to parse as JSON: {raw!r} ({exc})")
+            continue
+        if not isinstance(record, dict):
+            anomalies.append(f"retired_inbox record is not a JSON object: {record!r}")
+            continue
+        has_envelope = "envelope" in record
+        has_inbox_shape = "entry_id" in record and "fields" in record
+        if has_envelope and has_inbox_shape:
+            anomalies.append(
+                f"retired_inbox record has BOTH an 'envelope' key and the "
+                f"recognized entry_id/fields shape -- ambiguous, not "
+                f"trusted either way: {record!r}"
+            )
+            continue
+        if has_envelope:
+            try:
+                header = parse_for_switch(_decode_evidence_envelope(record))
+            except Exception as exc:
+                anomalies.append(
+                    f"retired_inbox record has an 'envelope' key but failed "
+                    f"to parse as one: {record!r} ({exc})"
+                )
+                continue
+            occurrences.append((header["stream_id"], record))
+            continue
+        if has_inbox_shape:
+            continue  # recognized non-envelope inbox-conservation shape
+        anomalies.append(
+            f"retired_inbox record matches neither the recognized "
+            f"inbox-conservation shape (entry_id + fields) nor an envelope "
+            f"shape -- schema drift, not silently accepted: {record!r}"
+        )
+    return occurrences, anomalies
+
+
 def _setup(r, pod: str, tenant: str, agents: list[str]) -> None:
     registry = prefix(pod, tenant, resource="registry")
     r.hset(registry, mapping={agent: "tmux" for agent in agents})
@@ -257,12 +342,14 @@ def _cleanup(r, pod: str, tenant: str, agents: list[str]) -> None:
     keys = [
         prefix(pod, tenant, agent, resource)
         for agent in agents
-        for resource in ("egress", "ingress", "dead", "unreplied", "processing", "opening", "opened")
+        for resource in ("egress", "ingress", "dead", "unreplied", "processing", "opening", "opened", "inbox")
     ]
     if receive_unresolved_key is not None:
         keys.append(receive_unresolved_key(pod, tenant))
     if receive_undeliverable_key is not None:
         keys.append(receive_undeliverable_key(pod, tenant))
+    if retired_inbox_key is not None:
+        keys.append(retired_inbox_key(pod, tenant))
     r.delete(*keys)
 
 
@@ -796,6 +883,12 @@ def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -
 
     sender, target = "harness-sender-6", "harness-recipient-6"
     _setup(r, pod, tenant, [sender, target])
+    # Retirement's inbox-conservation branch is unconditional in the Lua,
+    # but real api-type inbox content is what actually exercises it, not
+    # a synthetic reason string -- overriding _setup's default "tmux" so
+    # stop_agent's real inbox-conservation branch runs against something
+    # real on every run of this scenario (see step 2b below).
+    r.hset(prefix(pod, tenant, resource="registry"), target, "api")
     try:
         # 1. One genuine, complete round trip FIRST, so `opened` is
         #    populated by the real send/step/receive/open mechanics before
@@ -842,6 +935,17 @@ def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -
         processing_stream_id = _seed(processing_key, "retirement-processing-target")
         opening_stream_id = _seed(opening_key, "retirement-opening-target")
 
+        # 2b. Real inbox content too -- a valid retired-inbox CONTROL case,
+        #     committed, not a script run once by hand and never landed.
+        #     Reviewer's finding: an earlier claim that this was checked
+        #     rested on exactly that -- run once on one box, reported, and
+        #     never in the diff. This exercises stop_agent's real
+        #     inbox-conservation branch on every run.
+        inbox_key = prefix(pod, tenant, target, "inbox")
+        if retired_inbox_key is not None:
+            r.xadd(inbox_key, {"payload": "retirement-inbox-control-1", "kind": "Message"})
+            r.xadd(inbox_key, {"payload": "retirement-inbox-control-2", "kind": "Message"})
+
         # Reviewer's finding against 67f42a1: a dict/set keyed by identity
         # silently collapses two occurrences of the same identity into
         # one, so a scenario built on that can only prove "at least one
@@ -861,15 +965,43 @@ def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -
         # after a normal retirement reported clean before this fix.
         dead_key = prefix(pod, tenant, target, "dead")
 
+        # ⚠ Reviewer's THIRD finding, against 1b47c71: reasoning that
+        # retired_inbox records can never carry a stream_id (a different
+        # top-level shape, {entry_id, fields} vs {envelope}) is not the
+        # same as READING the key. An earlier version used that reasoning
+        # to justify never scanning retired_inbox at all -- so a genuine
+        # envelope record duplicated into it (by a real bug, or reviewer's
+        # injection) was never seen, not correctly excluded. "We do not
+        # read it" and "we read it and deliberately treat this recognized
+        # shape as contributing no identity" are different claims,
+        # confirmed the hard way. `_retired_inbox_occurrences` reads and
+        # classifies every record explicitly, failing loudly (an anomaly,
+        # not a silent skip) on anything that isn't one of the two
+        # recognized shapes.
         def _occurrence_lists():
+            retired_inbox_occurrences, retired_inbox_anomalies = (
+                _retired_inbox_occurrences(r.lrange(retired_inbox_key(pod, tenant), 0, -1))
+                if retired_inbox_key is not None else ([], [])
+            )
             return (
                 _stream_id_occurrences(r.lrange(receive_undeliverable_key(pod, tenant), 0, -1), True),
                 _stream_id_occurrences(r.lrange(_unresolved_key(pod, tenant), 0, -1), True),
                 _stream_id_occurrences(r.lrange(_opened_key(pod, tenant, target), 0, -1), False),
                 _stream_id_occurrences(r.lrange(dead_key, 0, -1), False),
+                retired_inbox_occurrences,
+                retired_inbox_anomalies,
             )
 
-        before_undeliverable, before_unresolved, _before_opened, _before_dead = _occurrence_lists()
+        (
+            before_undeliverable, before_unresolved, _before_opened, _before_dead,
+            _before_retired_inbox, before_inbox_anomalies,
+        ) = _occurrence_lists()
+        if before_inbox_anomalies:
+            return [
+                f"HARNESS ERROR: retired_inbox already had unclassifiable "
+                f"record(s) BEFORE stop_agent ran, narrowing the claim: "
+                f"{before_inbox_anomalies!r}"
+            ]
         seeded_ids = {ingress_stream_id, processing_stream_id, opening_stream_id}
         for label, occurrences in (("undeliverable", before_undeliverable), ("unresolved", before_unresolved)):
             collision = [sid for sid, _ in occurrences if sid in seeded_ids]
@@ -889,12 +1021,34 @@ def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -
             )
 
         failures: list[str] = []
-        after_undeliverable, after_unresolved, after_opened, after_dead = _occurrence_lists()
+        (
+            after_undeliverable, after_unresolved, after_opened, after_dead,
+            after_retired_inbox, after_inbox_anomalies,
+        ) = _occurrence_lists()
+        if after_inbox_anomalies:
+            failures.append(
+                f"SCHEMA ANOMALY: retired_inbox has record(s) this harness "
+                f"cannot classify as either the recognized inbox-"
+                f"conservation shape or an envelope shape -- fails loudly "
+                f"rather than assuming absence: {after_inbox_anomalies!r}"
+            )
+        if retired_inbox_key is not None:
+            retired_inbox_raw = r.lrange(retired_inbox_key(pod, tenant), 0, -1)
+            if len(retired_inbox_raw) < 2:
+                failures.append(
+                    f"HARNESS ERROR: the two genuine inbox entries seeded in "
+                    f"step 2b were not conserved into retired_inbox by the "
+                    f"real stop_agent (found {len(retired_inbox_raw)} "
+                    "record(s)) -- the control case didn't exercise what it "
+                    "was meant to, narrowing the claim on the rest of this "
+                    "scenario"
+                )
         all_occurrences = (
             [(sid, "undeliverable", rec) for sid, rec in after_undeliverable]
             + [(sid, "unresolved", rec) for sid, rec in after_unresolved]
             + [(sid, "opened", rec) for sid, rec in after_opened]
             + [(sid, "dead", rec) for sid, rec in after_dead]
+            + [(sid, "retired_inbox", rec) for sid, rec in after_retired_inbox]
         )
 
         def _check_exactly_once(stream_id: str, label: str, expected_sink: str) -> None:
@@ -902,8 +1056,9 @@ def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -
             if not matches:
                 failures.append(
                     f"CUSTODY LOST: {label} identity {stream_id} appears in NONE "
-                    "of undeliverable/unresolved/opened/dead after stop_agent -- "
-                    "retirement must not turn admitted custody into absence."
+                    "of undeliverable/unresolved/opened/dead/retired_inbox "
+                    "after stop_agent -- retirement must not turn admitted "
+                    "custody into absence."
                 )
                 return
             if len(matches) > 1:
@@ -911,8 +1066,9 @@ def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -
                 failures.append(
                     f"DUPLICATED: {label} identity {stream_id} appears "
                     f"{len(matches)} times across undeliverable/unresolved/"
-                    f"opened/dead ({sinks!r}) -- retirement must move each "
-                    "identity to exactly one terminal location, not duplicate it."
+                    f"opened/dead/retired_inbox ({sinks!r}) -- retirement "
+                    "must move each identity to exactly one terminal "
+                    "location, not duplicate it."
                 )
                 return
             sink, record = matches[0]
@@ -954,6 +1110,9 @@ def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -
         #    wrote for it.
         evidence_before_undeliverable = r.lrange(receive_undeliverable_key(pod, tenant), 0, -1)
         evidence_before_unresolved = r.lrange(_unresolved_key(pod, tenant), 0, -1)
+        evidence_before_retired_inbox = (
+            r.lrange(retired_inbox_key(pod, tenant), 0, -1) if retired_inbox_key is not None else []
+        )
 
         _setup(r, pod, tenant, [target])  # re-hire under the same name
         successor_opened = []
@@ -1000,6 +1159,14 @@ def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -
                 "same-name rehire -- retirement evidence must survive a "
                 "successor's ordinary operation untouched."
             )
+        if retired_inbox_key is not None:
+            evidence_after_retired_inbox = r.lrange(retired_inbox_key(pod, tenant), 0, -1)
+            if evidence_after_retired_inbox != evidence_before_retired_inbox:
+                failures.append(
+                    "EVIDENCE MUTATED: tenant retired_inbox changed shape "
+                    "across a same-name rehire -- retirement evidence must "
+                    "survive a successor's ordinary operation untouched."
+                )
 
         return failures
     finally:

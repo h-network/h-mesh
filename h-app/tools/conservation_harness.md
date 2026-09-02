@@ -32,12 +32,13 @@ envelope's own `stream_id` -- never by count. Five scenarios:
    EXACTLY ONE terminal location, never zero, never more than one. Seeds one
    distinct identity in each of `ingress`, `processing`, and `opening`, plus
    one genuinely completed `opened` receipt, calls the real `stop_agent`,
-   then counts every occurrence of each seeded identity across the four
-   terminal custody sinks this file's own trace found (tenant
+   then counts every occurrence of each seeded identity across every
+   terminal custody sink this file actually reads and classifies (tenant
    `undeliverable`, tenant `unresolved`, the target's own `opened`, the
-   target's own `dead` -- see below for what makes that trace exhaustive
-   at this hash, and what would invalidate it) combined (see
-   `_stream_id_occurrences`,
+   target's own `dead`, and tenant `retired_inbox` -- see below for what
+   makes that list exhaustive at this hash, what would invalidate it, and
+   why "reads and classifies" replaced "reasons about and skips" for
+   `retired_inbox` specifically) combined (see `_stream_id_occurrences`,
    which keeps every parsed record rather than indexing by identity -- a
    dict/set collapses two occurrences into one and cannot prove
    "exactly once" at all, only "at least one"). Absence, more-than-one, and
@@ -92,14 +93,59 @@ appears anywhere in either script's call sites.
 That trace is exhaustive AT THIS HASH -- it is not something this instrument
 derives itself, and that is the limit to state plainly rather than imply
 past: **this scenario assumes there are only two scripts that ever move a
-raw envelope out of custody.** If a third one is added, or either script
-grows a new destination, this scan goes stale exactly the way it did three
-times already, and nothing here would catch that drift automatically.
-Deriving the sink list from the source itself (AST-reading both scripts'
-call sites, the way `_custody_shape()` already inspects `_open_received`'s
-signature and `_transfer_script()` resolves the Lua constant by identity)
-would close this permanently -- recorded as a real, separate follow-up, not
-started here.
+raw ENVELOPE (something carrying a `stream_id`, sourced from KEYS[3]/[4]/[5]
+processing/opening/ingress) out of custody.** If a third one is added, or
+either script grows a new destination for that kind of record, this scan
+goes stale exactly the way it did three times already, and nothing here
+would catch that drift automatically. Deriving the sink list from the
+source itself (AST-reading both scripts' call sites, the way
+`_custody_shape()` already inspects `_open_received`'s signature and
+`_transfer_script()` resolves the Lua constant by identity) would close
+this permanently -- recorded as a real, separate follow-up, not started
+here.
+
+⚠ THE INVALIDATING CONDITION ARRIVED IMMEDIATELY, AND THE FIRST RESPONSE TO
+IT WAS ITSELF THE FOURTH FALSE-CLEAN. `_REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA`
+gained a real fifth RPUSH destination the same day this section was
+written -- `retired_inbox_key`, conserving an api-type agent's `inbox`
+STREAM content on retirement. The first fix reasoned that retired_inbox
+records can never carry a `stream_id` (a different top-level shape,
+`{entry_id, fields}` vs `{envelope}`) and used that reasoning to justify
+**never reading the key at all**. Reviewer's finding: that is not a parser
+correctly rejecting an unparseable shape -- it is a sink this scenario
+never looked at. A genuine envelope record duplicated into `retired_inbox`
+(reviewer's reproduction: copy one real undeliverable record there after a
+normal retirement) was therefore invisible, not correctly excluded, and
+the scenario reported clean. "We do not read it" and "we read it and
+deliberately treat this recognized shape as contributing no identity" are
+different claims; only the second is an enforced boundary, and only the
+second is what's here now.
+
+`retired_inbox` IS now read on every run, via `_retired_inbox_occurrences`,
+and every record is classified into exactly one of three outcomes: the
+recognized non-envelope shape (`entry_id` + `fields`, no `envelope`)
+contributes no identity, correctly; an envelope-bearing record (has
+`envelope`) is decoded and its `stream_id` DOES count as a real occurrence,
+so a duplicate landing here -- by any cause, not just the one reproduced --
+triggers `DUPLICATED` like any other sink; anything else (fails to parse,
+or matches neither shape) is a SCHEMA ANOMALY, reported as a failure rather
+than silently skipped. A real, valid retired-inbox CONTROL case is part of
+the scenario's own setup now (two genuine `XADD` entries into the target's
+own `inbox`, with the target registered as an `api`-port agent), not a
+script run once by hand and left uncommitted -- the scenario asserts the
+real `stop_agent` actually conserved them (`>= 2` records found) before
+trusting anything else it measured, and asserts `retired_inbox`'s own
+evidence is byte-identical across the same-name-rehire check too, matching
+every other tenant evidence key.
+
+Falsified three ways by hand, each confirmed RED against the pre-fix hash
+and GREEN against this one: a genuine record duplicated into
+`retired_inbox` (reviewer's exact reproduction), and a record matching
+neither recognized shape at all. If a FUTURE destination ever carries a
+`stream_id` under a name this scan doesn't already read, that is still the
+condition that invalidates this trace -- but "arrives in a sink this file
+already reads" is a smaller, checked failure mode now, not a repeat of
+"never looked."
 
 ## What it does NOT reach
 
