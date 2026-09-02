@@ -1,9 +1,11 @@
 import asyncio
+import io
 import json
 import os
 import subprocess
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,17 +29,24 @@ class FakeRedis:
         self.hashes = {}
         self.lists = {}
         self.streams = {}
-        self.sets = {}
+        self.zsets = {}
 
-    def sadd(self, key, *values):
-        self.sets.setdefault(key, set()).update(values)
+    def hset(self, key, field, value):
+        self.hashes.setdefault(key, {})[field] = value
 
-    def srem(self, key, *values):
-        for value in values:
-            self.sets.get(key, set()).discard(value)
+    def zadd(self, key, mapping):
+        self.zsets.setdefault(key, {}).update(mapping)
 
-    def sismember(self, key, value):
-        return value in self.sets.get(key, set())
+    def zcard(self, key):
+        return len(self.zsets.get(key, {}))
+
+    def zrange(self, key, start, end):
+        members = [m for m, _ in sorted(self.zsets.get(key, {}).items(), key=lambda kv: kv[1])]
+        return members[start:] if end == -1 else members[start:end + 1]
+
+    def zrem(self, key, *members):
+        for member in members:
+            self.zsets.get(key, {}).pop(member, None)
 
     def hkeys(self, key):
         if key.endswith(":registry"):
@@ -55,8 +64,12 @@ class FakeRedis:
     def hgetall(self, key):
         return self.hashes.get(key, {})
 
-    def hdel(self, key, field):
-        return int(self.hashes.get(key, {}).pop(field, None) is not None)
+    def hdel(self, key, *fields):
+        count = 0
+        for field in fields:
+            if self.hashes.get(key, {}).pop(field, None) is not None:
+                count += 1
+        return count
 
     def get(self, key):
         return None
@@ -220,11 +233,23 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(json.loads(self.redis.streams[inbox][0][1]["envelope"])["payload"], {"text": "reply"})
         self.assertEqual(self.redis.lists[dead], ["not an envelope"])
 
-    def test_deliver_api_keeps_in_reply_to_when_delivered_to_the_replying_agent(self):
+    def _tamper_in_reply_to(self, envelope, value):
+        """Bypass build()/encode()'s strict validation to simulate an
+        already-parsed, permissive frame carrying whatever the wire said --
+        the shape deliver_api actually has to defend against."""
+        raw = encode(envelope)
+        header, body = raw[:256], raw[256:]
+        body_dict = json.loads(body)
+        body_dict["in_reply_to"] = value
+        return header + json.dumps(body_dict, separators=(",", ":"))
+
+    def test_deliver_api_keeps_in_reply_to_when_delivered_by_the_claimed_client(self):
         from lib.reply_correlation import record_delivered
 
         target = "a" * 32
-        record_delivered(self.redis, pod="test", tenant="office", agent="alice", stream_id=target)
+        # alice was really sent `target` by telegram, and is now replying
+        # to telegram -- the claimed source matches deliver_api's own agent.
+        record_delivered(self.redis, pod="test", tenant="office", agent="alice", stream_id=target, source="telegram")
         ingress = prefix("test", "office", "telegram", "ingress")
         envelope = build(
             "Message", "alice", "telegram", {"text": "reply"},
@@ -256,18 +281,58 @@ class ApiTests(unittest.TestCase):
         stored = json.loads(self.redis.streams[inbox][0][1]["envelope"])
         self.assertNotIn("in_reply_to", stored)
 
+    def test_deliver_api_drops_in_reply_to_delivered_by_a_different_client(self):
+        # The cross-client case: telegram really sent `target` to alice.
+        # alice now replies to webconsole (a different API client) naming
+        # it. was_delivered must check WHO delivered it, not just whether
+        # it was delivered to alice from anywhere -- otherwise webconsole
+        # would receive a confident correlation to a turn it never
+        # originated.
+        from lib.reply_correlation import record_delivered
+
+        target = "c" * 32
+        record_delivered(self.redis, pod="test", tenant="office", agent="alice", stream_id=target, source="telegram")
+        ingress = prefix("test", "office", "webconsole", "ingress")
+        envelope = build(
+            "Message", "alice", "webconsole", {"text": "reply"},
+            pod="test", tenant="office", in_reply_to=target,
+        )
+        self.redis.lists[ingress] = [encode(envelope)]
+
+        deliver_api(r=self.redis, pod="test", tenant="office", agent="webconsole")
+
+        inbox = prefix("test", "office", "webconsole", "inbox")
+        stored = json.loads(self.redis.streams[inbox][0][1]["envelope"])
+        self.assertNotIn("in_reply_to", stored)
+
     def test_deliver_api_drops_malformed_in_reply_to(self):
         ingress = prefix("test", "office", "telegram", "ingress")
         envelope = build("Message", "alice", "telegram", {"text": "reply"}, pod="test", tenant="office")
-        raw = encode(envelope)
-        # Tamper the wire body directly -- build()/encode() would refuse a
-        # malformed value outright (that's the strict outgoing side); this
-        # simulates what an already-parsed, permissive frame can carry.
-        header, body = raw[:256], raw[256:]
-        body_dict = json.loads(body)
-        body_dict["in_reply_to"] = "not-a-valid-id"
-        tampered = header + json.dumps(body_dict, separators=(",", ":"))
-        self.redis.lists[ingress] = [tampered]
+        self.redis.lists[ingress] = [self._tamper_in_reply_to(envelope, "not-a-valid-id")]
+
+        deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+
+        inbox = prefix("test", "office", "telegram", "inbox")
+        stored = json.loads(self.redis.streams[inbox][0][1]["envelope"])
+        self.assertNotIn("in_reply_to", stored)
+
+    def test_deliver_api_drops_present_null_in_reply_to(self):
+        # A key PRESENT with value null is not the same as absent -- must
+        # be caught and dropped, not passed through as a stored null.
+        ingress = prefix("test", "office", "telegram", "ingress")
+        envelope = build("Message", "alice", "telegram", {"text": "reply"}, pod="test", tenant="office")
+        self.redis.lists[ingress] = [self._tamper_in_reply_to(envelope, None)]
+
+        deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+
+        inbox = prefix("test", "office", "telegram", "inbox")
+        stored = json.loads(self.redis.streams[inbox][0][1]["envelope"])
+        self.assertNotIn("in_reply_to", stored)
+
+    def test_deliver_api_drops_present_empty_string_in_reply_to(self):
+        ingress = prefix("test", "office", "telegram", "ingress")
+        envelope = build("Message", "alice", "telegram", {"text": "reply"}, pod="test", tenant="office")
+        self.redis.lists[ingress] = [self._tamper_in_reply_to(envelope, "")]
 
         deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
 
@@ -285,6 +350,36 @@ class ApiTests(unittest.TestCase):
         inbox = prefix("test", "office", "telegram", "inbox")
         stored = json.loads(self.redis.streams[inbox][0][1]["envelope"])
         self.assertNotIn("in_reply_to", stored)
+
+    def test_deliver_api_drops_and_logs_distinct_reason_when_provenance_unavailable(self):
+        # A storage outage must not be recorded as "was never delivered" --
+        # that would be a false claim about what actually happened.
+        target = "d" * 32
+        ingress = prefix("test", "office", "telegram", "ingress")
+        envelope = build(
+            "Message", "alice", "telegram", {"text": "reply"},
+            pod="test", tenant="office", in_reply_to=target,
+        )
+        self.redis.lists[ingress] = [encode(envelope)]
+
+        def broken_hget(key, field):
+            raise ConnectionError("redis unavailable")
+
+        captured = io.StringIO()
+        with patch.object(self.redis, "hget", side_effect=broken_hget), \
+             redirect_stdout(captured):
+            deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+
+        inbox = prefix("test", "office", "telegram", "inbox")
+        stored = json.loads(self.redis.streams[inbox][0][1]["envelope"])
+        self.assertNotIn("in_reply_to", stored)
+        dropped_lines = [
+            line for line in captured.getvalue().splitlines()
+            if json.loads(line).get("event") == "reply_correlation_dropped"
+        ]
+        self.assertEqual(len(dropped_lines), 1)
+        self.assertIn("provenance unavailable", dropped_lines[0])
+        self.assertNotIn("was never delivered", dropped_lines[0])
 
     def test_idle_sse_stream_emits_keepalive_without_new_entries(self):
         """No existing test opened an SSE stream and left it idle -- every

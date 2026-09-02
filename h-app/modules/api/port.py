@@ -45,24 +45,50 @@ def _drop_untrustworthy_reply_correlation(r, *, pod: str, tenant: str, agent: st
     is the point: a client that reads no correlation behaves exactly as it
     did before this feature existed; a client that reads a wrong one would
     confidently mislabel a turn, which is worse than the bug this replaces.
-    Format and provenance are logged as distinct reasons -- they are
-    different failures, and only provenance means an agent claimed to
-    answer something that was never actually delivered to it.
+
+    Presence is checked before the value, deliberately: a wire frame with
+    `"in_reply_to": null` (or any other malformed-but-present value) is
+    PRESENT and untrustworthy, not absent -- `envelope.get(...) is None`
+    would conflate the two and let a literal null through to storage.
+    is_valid_reply_id already rejects None, "", and non-strings, so once
+    presence is checked correctly it collapses null/empty/wrong-type into
+    the same "malformed" branch as any other bad value.
+
+    Provenance is checked against `agent` (this deliver_api call's own
+    destination -- the API client whose mailbox this is), not just against
+    "was this id ever delivered to the replying agent, from anywhere".
+    Without that binding, an agent talked to by two different API clients
+    could claim in_reply_to for a message one of them sent while replying
+    to the *other*, and the wrong client would get a confident, wrong
+    correlation -- see lib/reply_correlation.py.
+
+    was_delivered can return None (could not verify, e.g. storage
+    unreachable) as well as False (verified absent/mismatched). Both drop
+    the field -- fail-safe either way -- but they are logged as distinct
+    reasons: reporting an infrastructure outage as "was never delivered"
+    would be a different, false claim about what happened.
     """
-    in_reply_to = envelope.get("in_reply_to")
-    if in_reply_to is None:
+    if "in_reply_to" not in envelope:
         return
+    in_reply_to = envelope["in_reply_to"]
     if not is_valid_reply_id(in_reply_to):
         envelope.pop("in_reply_to", None)
         _record("reply_correlation_dropped", envelope, agent, reason="malformed in_reply_to")
         return
-    source = envelope.get("l2", {}).get("source")
-    if not source or not was_delivered(r, pod=pod, tenant=tenant, agent=source, stream_id=in_reply_to):
+    reply_source = envelope.get("l2", {}).get("source")
+    if not reply_source:
         envelope.pop("in_reply_to", None)
-        _record(
-            "reply_correlation_dropped", envelope, agent,
-            reason=f"in_reply_to {in_reply_to!r} was never delivered to {source!r}",
-        )
+        _record("reply_correlation_dropped", envelope, agent, reason="in_reply_to present but reply has no l2 source")
+        return
+    verdict = was_delivered(r, pod=pod, tenant=tenant, agent=reply_source, stream_id=in_reply_to, source=agent)
+    if verdict is True:
+        return
+    envelope.pop("in_reply_to", None)
+    if verdict is None:
+        reason = f"in_reply_to {in_reply_to!r} provenance unavailable (storage unreachable)"
+    else:
+        reason = f"in_reply_to {in_reply_to!r} was never delivered to {reply_source!r} from {agent!r}"
+    _record("reply_correlation_dropped", envelope, agent, reason=reason)
 
 
 def deliver_api(*, r, pod: str, tenant: str, agent: str) -> None:

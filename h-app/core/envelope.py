@@ -181,7 +181,14 @@ def encode(frame: dict) -> str:
     hops = _counter(frame.get("hops", 0), "hops")
     _validate_body(frame)
     body = {field: frame[field] for field in ("kind", "ts", "l3", "payload")}
-    if "in_reply_to" in frame and frame["in_reply_to"] is not None:
+    if "in_reply_to" in frame:
+        # Any PRESENT value, including None, goes through the same strict
+        # check -- _identifier() already rejects non-strings, so a
+        # hand-built frame carrying an explicit `in_reply_to: None` is
+        # rejected as a caller bug rather than silently treated as absent.
+        # build() itself never produces that shape (it only sets the key
+        # when its own in_reply_to argument is not None), so this only
+        # ever fires for a frame nobody validated on the way in.
         body["in_reply_to"] = _identifier(frame["in_reply_to"], "in_reply_to")
     return (
         VERSION

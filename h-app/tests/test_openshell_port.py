@@ -89,12 +89,23 @@ class OpenShellPortTests(unittest.TestCase):
         from lib.reply_correlation import was_delivered
 
         stream_id = self.queue()
-        self.assertFalse(was_delivered(self.redis, pod=POD, tenant=TENANT, agent="bob", stream_id=stream_id))
+        self.assertFalse(
+            was_delivered(self.redis, pod=POD, tenant=TENANT, agent="bob", stream_id=stream_id, source="alice")
+        )
         deliver_openshell(self.redis, pod=POD, tenant=TENANT, agent="bob", client=self.client)
-        # deliver_api validates in_reply_to against real provenance
-        # regardless of how it was produced -- this confirms an openshell
-        # reply's automatic in_reply_to would actually pass that check.
-        self.assertTrue(was_delivered(self.redis, pod=POD, tenant=TENANT, agent="bob", stream_id=stream_id))
+        # deliver_api validates in_reply_to against real provenance --
+        # recipient AND originating source -- regardless of how it was
+        # produced. This confirms an openshell reply's automatic
+        # in_reply_to would actually pass that check when the destination
+        # matches who really sent it (alice).
+        self.assertTrue(
+            was_delivered(self.redis, pod=POD, tenant=TENANT, agent="bob", stream_id=stream_id, source="alice")
+        )
+        # And that it does NOT validate toward a different claimed source --
+        # the cross-client case.
+        self.assertFalse(
+            was_delivered(self.redis, pod=POD, tenant=TENANT, agent="bob", stream_id=stream_id, source="mallory")
+        )
 
     def test_command_has_no_message_prefix(self):
         self.queue("Command", {"text": "git status"})

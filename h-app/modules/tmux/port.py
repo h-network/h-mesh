@@ -123,8 +123,11 @@ def message_opener(
     msg = "".join(blocks)
     corr_id = envelope.get("correlation_id")
     mark_delivery_pending(r, pod, tenant, agent, stream_id, correlation_id=corr_id)
-    record_delivered(r, pod=pod, tenant=tenant, agent=agent, stream_id=stream_id)
     submit_text(session_name, agent, msg, stream_id=stream_id, socket=socket)
+    # Recorded only after submit_text returns successfully: if it raises,
+    # the message never reached the pane, and a stream_id "delivered" here
+    # but never actually seen must not later validate a reply's in_reply_to.
+    record_delivered(r, pod=pod, tenant=tenant, agent=agent, stream_id=stream_id, source=source)
 
 
 def messages_opener(

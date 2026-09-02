@@ -127,7 +127,8 @@ def _reply(
     # exception.
     stream_id = envelope.get("stream_id")
     if stream_id:
-        record_delivered(r, pod=pod, tenant=tenant, agent=agent, stream_id=stream_id)
+        origin = envelope.get("l2", {}).get("source")
+        record_delivered(r, pod=pod, tenant=tenant, agent=agent, stream_id=stream_id, source=origin)
     text = result.stdout if result.exit_code == 0 else result.stdout + result.stderr
     if not text.strip():
         return

@@ -35,7 +35,7 @@ class FakeRedis:
         self.hashes = defaultdict(dict)
         self.kv = {}
         self.streams = defaultdict(list)
-        self.sets = defaultdict(set)
+        self.zsets = defaultdict(dict)
 
     def rpush(self, key, *values):
         self.lists[key].extend(values)
@@ -47,16 +47,20 @@ class FakeRedis:
     def llen(self, key):
         return len(self.lists[key])
 
-    def sadd(self, key, *values):
-        self.sets.setdefault(key, set()).update(values)
-        return len(values)
+    def zadd(self, key, mapping):
+        self.zsets[key].update(mapping)
+        return len(mapping)
 
-    def srem(self, key, *values):
-        for value in values:
-            self.sets.get(key, set()).discard(value)
+    def zcard(self, key):
+        return len(self.zsets[key])
 
-    def sismember(self, key, value):
-        return value in self.sets.get(key, set())
+    def zrange(self, key, start, end):
+        members = [m for m, _ in sorted(self.zsets[key].items(), key=lambda kv: kv[1])]
+        return members[start:] if end == -1 else members[start:end + 1]
+
+    def zrem(self, key, *members):
+        for member in members:
+            self.zsets[key].pop(member, None)
 
     def blpop(self, keys, timeout=0):
         if isinstance(keys, str):
@@ -82,8 +86,12 @@ class FakeRedis:
     def hget(self, key, field):
         return self.hashes[key].get(field)
 
-    def hdel(self, key, field):
-        return int(self.hashes[key].pop(field, None) is not None)
+    def hdel(self, key, *fields):
+        count = 0
+        for field in fields:
+            if self.hashes[key].pop(field, None) is not None:
+                count += 1
+        return count
 
     def get(self, key):
         return self.kv.get(key)
@@ -157,6 +165,33 @@ class TmuxPortTests(unittest.TestCase):
         mock_submit.assert_called_once_with(
             "testtenant", "bob", "[message from alice] hello bob\n",
             stream_id=stream_id, socket=None,
+        )
+
+    @patch("modules.tmux.port.submit_text")
+    @patch("modules.tmux.port.list_windows", return_value={"alice", "bob"})
+    def test_a_failed_paste_never_counts_as_delivered(self, mock_list, mock_submit):
+        # record_delivered runs after submit_text, not before: if the paste
+        # itself fails, neither the message nor any reply hint reached the
+        # pane, so a later --reply-to naming this id must not validate.
+        from lib.reply_correlation import was_delivered
+
+        self.register(alice="tmux", bob="tmux")
+        stream_id = send(
+            self.redis, pod=POD, tenant=TENANT, source="alice",
+            destination="bob", payload={"text": "hello bob"},
+        )
+        raw = self.redis.lpop(prefix(POD, TENANT, "alice", "egress"))
+        self.redis.rpush(prefix(POD, TENANT, "bob", "ingress"), raw)
+        mock_submit.side_effect = RuntimeError("tmux paste failed")
+
+        # receive() converts an opener exception into a dead-letter rather
+        # than propagating it -- confirm that happened, then check the
+        # thing this test is actually about.
+        deliver_tmux(self.redis, pod=POD, tenant=TENANT, agent="bob", session_name="testtenant")
+        self.assertEqual(len(self.redis.lists[prefix(POD, TENANT, "bob", "dead")]), 1)
+
+        self.assertFalse(
+            was_delivered(self.redis, pod=POD, tenant=TENANT, agent="bob", stream_id=stream_id, source="alice")
         )
 
     @patch("modules.tmux.port.submit_text")

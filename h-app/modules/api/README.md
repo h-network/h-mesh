@@ -93,12 +93,16 @@ transitional:
 - **malformed or unverifiable, dropped before storage** -- a claimed
   `in_reply_to` that isn't a well-formed 32-character lowercase hex id, or
   is well-formed but was never actually delivered to the agent claiming to
-  answer it, is stripped by `modules/api/port.py`'s `deliver_api` before the
-  envelope is ever written to a mailbox. This state is never visible on the
-  wire -- from a client's perspective it is indistinguishable from
-  uncorrelated. It exists so a confidently wrong pointer can never reach a
-  client; see `lib/reply_correlation.py` for the validation itself, and its
-  own module docstring for why this key is deliberately not the same one
+  answer it *by this specific API client* (provenance is bound to
+  `(replying agent, originating client, stream_id)`, not just `(agent,
+  stream_id)` -- an id Telegram delivered to an agent must not validate
+  when that agent replies to a different API client naming the same id),
+  is stripped by `modules/api/port.py`'s `deliver_api` before the envelope
+  is ever written to a mailbox. This state is never visible on the wire --
+  from a client's perspective it is indistinguishable from uncorrelated.
+  It exists so a confidently wrong pointer can never reach a client; see
+  `lib/reply_correlation.py` for the validation itself, and its own
+  module docstring for why this key is deliberately not the same one
   `modules/tmux/port.py`'s `mark_delivery_pending` writes for watchdog.
 
 Design note, in the words of the client this shipped for: **correlated when
