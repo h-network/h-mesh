@@ -34,20 +34,6 @@ class FakeRedis:
     def hset(self, key, field, value):
         self.hashes.setdefault(key, {})[field] = value
 
-    def zadd(self, key, mapping):
-        self.zsets.setdefault(key, {}).update(mapping)
-
-    def zcard(self, key):
-        return len(self.zsets.get(key, {}))
-
-    def zrange(self, key, start, end):
-        members = [m for m, _ in sorted(self.zsets.get(key, {}).items(), key=lambda kv: kv[1])]
-        return members[start:] if end == -1 else members[start:end + 1]
-
-    def zrem(self, key, *members):
-        for member in members:
-            self.zsets.get(key, {}).pop(member, None)
-
     def hkeys(self, key):
         if key.endswith(":registry"):
             return [name.encode() for name in self.registry]
@@ -100,9 +86,25 @@ class FakeRedis:
     def xrange(self, key, min="-", max="+", count=None):
         return self.streams.get(key, [])[:count]
 
-    def eval(self, script, numkeys, key, *args):
+    def eval(self, script, numkeys, *args):
+        keys = args[:numkeys]
+        argv = args[numkeys:]
         if "LRANGE" in script and "DEL" in script:
-            return self.lists.pop(key, [])
+            return self.lists.pop(keys[0], [])
+        if "reply_correlation record_delivered" in script:
+            hash_key, order_key = keys
+            stream_id, source, score, maxlen = argv
+            maxlen = int(maxlen)
+            self.hashes.setdefault(hash_key, {})[stream_id] = source
+            self.zsets.setdefault(order_key, {})[stream_id] = float(score)
+            count = len(self.zsets[order_key])
+            if count > maxlen:
+                ordered = sorted(self.zsets[order_key].items(), key=lambda kv: kv[1])
+                stale = [member for member, _ in ordered[: count - maxlen]]
+                for member in stale:
+                    self.zsets[order_key].pop(member, None)
+                    self.hashes[hash_key].pop(member, None)
+            return 1
         return 1
 
     def pipeline(self, transaction=False):

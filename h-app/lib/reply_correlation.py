@@ -26,6 +26,39 @@ from core.logging import log_record
 DELIVERED_MAXLEN = 200
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
+# Four Redis writes (HSET, ZADD, and conditionally ZREM+HDEL) done as
+# separate commands were found to leave a real gap: an injected failure
+# between HSET and ZADD left provenance present in the hash with no
+# corresponding entry in the eviction index, so it could never be evicted
+# and would validate forever -- the confident-lie direction this whole
+# feature exists to prevent, not merely a bookkeeping inconsistency. Same
+# problem on the ZREM/HDEL trim boundary. One EVAL is the fix: Redis
+# executes a script's redis.call()s with no other command interleaved and
+# no partial application from a mid-script network failure, because there
+# is no network round trip between them -- they are not separate calls
+# from here at all, only one.
+_RECORD_DELIVERED = """
+-- reply_correlation record_delivered v1
+local hash_key = KEYS[1]
+local order_key = KEYS[2]
+local stream_id = ARGV[1]
+local source = ARGV[2]
+local score = ARGV[3]
+local maxlen = tonumber(ARGV[4])
+
+redis.call('HSET', hash_key, stream_id, source)
+redis.call('ZADD', order_key, score, stream_id)
+local count = redis.call('ZCARD', order_key)
+if count > maxlen then
+    local stale = redis.call('ZRANGE', order_key, 0, count - maxlen - 1)
+    if #stale > 0 then
+        redis.call('ZREM', order_key, unpack(stale))
+        redis.call('HDEL', hash_key, unpack(stale))
+    end
+end
+return 1
+"""
+
 
 def is_valid_reply_id(value: object) -> bool:
     """Format check only: a well-formed 32-hex-char stream_id."""
@@ -38,36 +71,35 @@ def record_delivered(r, *, pod: str, tenant: str, agent: str, stream_id: str, so
 
     A hash (stream_id -> source) answers "was this delivered, and by whom"
     in one read. A sorted set (stream_id -> recency) exists only to decide
-    eviction order. Both HSET and ZADD are idempotent per member, so
-    redelivery of the same stream_id -- normal in this system, ingress
-    snapshots can replay -- refreshes its recency instead of creating a
-    duplicate entry that a plain set+list design mishandles on trim (a
-    second copy in an order list, trimmed independently of the set entry it
-    was supposed to correspond to, could evict a still-current id).
+    eviction order. The write, the eviction check, and the trim all happen
+    inside one Lua script (_RECORD_DELIVERED) via a single EVAL, not as
+    separate HSET/ZADD/ZREM/HDEL round trips -- an earlier version used
+    separate commands and left a real gap: an injected failure between the
+    HSET and the ZADD left provenance present in the hash with nothing in
+    the eviction index, so it could never age out and would validate
+    forever. A single script has no network round trip between its
+    internal steps for a failure to land between.
 
-    Partial-failure reasoning: if this fails between the HSET/ZADD and the
-    eviction step, the window is left slightly larger than
-    DELIVERED_MAXLEN -- never wrong, never missing an entry that should be
-    there, just temporarily over budget. It self-corrects on the next
-    successful call. If the write itself fails, that is logged (not
-    swallowed silently, so correlation does not just quietly stop working)
-    and nothing is recorded -- fails toward "cannot correlate", the same
-    direction a genuine lookup miss does.
+    What this call site cannot fully know: if `r.eval(...)` itself raises,
+    that could mean the script never reached Redis (nothing written), OR
+    that Redis executed it completely but the client lost the response
+    (the network dropped after the write, before the acknowledgement) --
+    those are genuinely different facts and this code cannot always tell
+    them apart. Either way there is no possibility of a HALF-applied
+    script -- the write and its eviction index either both happened or
+    (from this process's point of view) did not observably happen -- so
+    the outcome is always safe (fails toward "cannot correlate" or
+    correlates correctly), never the wrong-in-kind failure a torn
+    multi-command write produced. The failure itself is logged (not
+    swallowed silently), because correlation quietly stopping is still
+    worth knowing about even when it stopped safely.
     """
     if not is_valid_reply_id(stream_id):
         return
     try:
         hash_key = prefix(pod, tenant, agent=agent, resource="delivered")
         order_key = prefix(pod, tenant, agent=agent, resource="delivered.order")
-        r.hset(hash_key, stream_id, source)
-        r.zadd(order_key, {stream_id: time.time()})
-        count = r.zcard(order_key)
-        if count > DELIVERED_MAXLEN:
-            stale = r.zrange(order_key, 0, count - DELIVERED_MAXLEN - 1)
-            if stale:
-                stale = [item.decode() if isinstance(item, bytes) else item for item in stale]
-                r.zrem(order_key, *stale)
-                r.hdel(hash_key, *stale)
+        r.eval(_RECORD_DELIVERED, 2, hash_key, order_key, stream_id, source, time.time(), DELIVERED_MAXLEN)
     except Exception as exc:
         try:
             log_record(

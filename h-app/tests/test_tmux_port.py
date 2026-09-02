@@ -47,21 +47,6 @@ class FakeRedis:
     def llen(self, key):
         return len(self.lists[key])
 
-    def zadd(self, key, mapping):
-        self.zsets[key].update(mapping)
-        return len(mapping)
-
-    def zcard(self, key):
-        return len(self.zsets[key])
-
-    def zrange(self, key, start, end):
-        members = [m for m, _ in sorted(self.zsets[key].items(), key=lambda kv: kv[1])]
-        return members[start:] if end == -1 else members[start:end + 1]
-
-    def zrem(self, key, *members):
-        for member in members:
-            self.zsets[key].pop(member, None)
-
     def blpop(self, keys, timeout=0):
         if isinstance(keys, str):
             keys = [keys]
@@ -133,6 +118,20 @@ class FakeRedis:
                 value = {"count": 1, "since": since}
             self.hset(key, client, json.dumps(value, separators=(",", ":")))
             return value["count"]
+        if "reply_correlation record_delivered" in script:
+            hash_key, order_key = keys
+            stream_id, source, score, maxlen = argv
+            maxlen = int(maxlen)
+            self.hashes[hash_key][stream_id] = source
+            self.zsets[order_key][stream_id] = float(score)
+            count = len(self.zsets[order_key])
+            if count > maxlen:
+                ordered = sorted(self.zsets[order_key].items(), key=lambda kv: kv[1])
+                stale = [member for member, _ in ordered[: count - maxlen]]
+                for member in stale:
+                    self.zsets[order_key].pop(member, None)
+                    self.hashes[hash_key].pop(member, None)
+            return 1
         raise AssertionError(f"unexpected Lua script: {script}")
 
 
