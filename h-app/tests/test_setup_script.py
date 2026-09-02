@@ -179,17 +179,27 @@ def test_setup_does_not_report_equal_exit_status_when_attempts_actually_differ()
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_setup_never_overclaims_when_matching_exit_codes_have_different_causes():
+def test_setup_reports_only_the_observed_status_and_uncertainty_when_exit_codes_match():
     # Reviewer's exact counterexample: h-agent's real installer exits 1 for
     # MULTIPLE distinct causes (claude/codex/agy each have their own
     # verification-failed path), so two attempts returning the same code
     # does not mean they failed for the same reason, that either was
     # deterministic, or that a third attempt or an upstream/host change is
-    # what's needed. Two DIFFERENT simulated failures here both exit 1 --
-    # the report must state the observation (both exited 1) and the limit
-    # (cannot tell whether the causes matched), and must never claim
-    # "identical", "deterministic", "non-transient", or promise that
-    # retrying can't help.
+    # what's needed. Two DIFFERENT simulated failures here both exit 1.
+    #
+    # ⚠ A denylist of forbidden words ("identical", "deterministic", ...)
+    # is not proof of anything -- reviewer FAILED an earlier version of this
+    # test for exactly that: a future message could add "there is no point
+    # retrying" or "another attempt is futile" and every denylisted spelling
+    # check would still pass while the same overclaim returned, with the
+    # test's own name falsely certifying it can't. Assert the EXACT text of
+    # the one line setup.sh itself emits for this case instead of trying to
+    # enumerate every dishonest paraphrase -- any future wording change that
+    # adds a conclusion this line doesn't already make will change the
+    # string and fail here, whatever words it uses. The simulated
+    # installer's OWN stderr (a fake dependency's output, not setup.sh's
+    # own words) is deliberately left unconstrained -- that content belongs
+    # to the dependency, not to what's under test.
     tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_setup_h_agent_")
     try:
         h_agent_url, counter_path = _fake_h_agent_installer(
@@ -204,15 +214,28 @@ def test_setup_never_overclaims_when_matching_exit_codes_have_different_causes()
         )
         assert res.returncode != 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
         assert "h-agent installer failed twice (last exit 1)" in res.stderr, res.stderr
-        assert "Both attempts exited with status 1" in res.stderr, res.stderr
-        assert "cannot tell from the exit status alone whether both attempts failed for the same reason" in res.stderr, res.stderr
 
-        combined = res.stdout + res.stderr
-        for overclaim in ("identical", "identically", "deterministic", "non-transient", "will not help", "cannot help"):
-            assert overclaim not in combined.lower(), (
-                f"report overclaimed {overclaim!r} from two exit codes that happen to "
-                f"match but had different real causes:\n{combined}"
-            )
+        observation_lines = [
+            line for line in res.stderr.splitlines()
+            if line.strip().startswith("Both attempts exited with status")
+        ]
+        assert len(observation_lines) == 1, (
+            f"expected exactly one setup-owned observation line, got "
+            f"{observation_lines!r}\nfull stderr:\n{res.stderr}"
+        )
+        expected = (
+            "  Both attempts exited with status 1. setup.sh cannot tell "
+            "from the exit status alone whether both attempts failed for "
+            "the same reason -- check the installer output above before "
+            "deciding whether to retry or to change something on this "
+            "host or upstream."
+        )
+        assert observation_lines[0] == expected, (
+            f"setup.sh's own diagnostic line drifted from the approved "
+            f"observation-and-uncertainty wording:\n"
+            f"  actual:   {observation_lines[0]!r}\n"
+            f"  expected: {expected!r}"
+        )
         assert open(counter_path).read().strip() == "2", "expected exactly 2 attempts"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
