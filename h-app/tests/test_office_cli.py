@@ -15,7 +15,7 @@ if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
 from core.envelope import build, encode
-from core.keys import prefix, receive_undeliverable_key, receive_unresolved_key
+from core.keys import prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key
 from modules.office import cli as office_cli
 from modules.office.cli import main as office_main
 
@@ -228,6 +228,69 @@ def test_undeliverable_malformed_record_is_reported_without_consuming(monkeypatc
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == "unparseable undeliverable custody record\n"
+    assert r.lrange(key, 0, -1) == [record]
+
+
+def test_retired_inbox_shows_hex_decoded_fields_without_consuming(monkeypatch, capsys):
+    r = FakeRedis()
+    _env(monkeypatch)
+    record = json.dumps({
+        "agent": "worker-1",
+        "reason": "destination retired with unread inbox content",
+        "entry_id": "1700000000000-0",
+        "encoding": "hex",
+        "fields": [["envelope".encode().hex(), '{"text":"hi"}'.encode().hex()]],
+    })
+    key = retired_inbox_key(POD, TENANT)
+    r.rpush(key, record)
+    with patch("modules.office.cli.redis.Redis.from_url", return_value=r):
+        office_main(["retired-inbox", "--agent", "worker-1"])
+    shown = json.loads(capsys.readouterr().out)
+    assert shown == {
+        "agent": "worker-1",
+        "entry_id": "1700000000000-0",
+        "reason": "destination retired with unread inbox content",
+        "fields": {"envelope": '{"text":"hi"}'},
+    }
+    assert r.lrange(key, 0, -1) == [record]
+
+
+def test_retired_inbox_shows_non_utf8_fields_as_hex_instead_of_raising(monkeypatch, capsys):
+    r = FakeRedis()
+    _env(monkeypatch)
+    hostile = b"\xff\x00not-valid-utf8"
+    record = json.dumps({
+        "agent": "worker-1",
+        "reason": "destination retired with unread inbox content",
+        "entry_id": "1700000000000-0",
+        "encoding": "hex",
+        "fields": [["envelope".encode().hex(), hostile.hex()]],
+    })
+    key = retired_inbox_key(POD, TENANT)
+    r.rpush(key, record)
+    with patch("modules.office.cli.redis.Redis.from_url", return_value=r):
+        office_main(["retired-inbox"])
+    shown = json.loads(capsys.readouterr().out)
+    # Field and value decode as a matched pair, not independently -- a
+    # decodable field name next to an undecodable value would be a
+    # confusing partial display, so an undecodable value falls the whole
+    # pair back to hex even though "envelope" alone would decode fine.
+    assert shown["fields"] == {"envelope".encode().hex(): hostile.hex()}
+
+
+def test_retired_inbox_malformed_record_is_reported_without_consuming(monkeypatch, capsys):
+    r = FakeRedis()
+    _env(monkeypatch)
+    record = json.dumps({"agent": "worker-1", "encoding": "hex", "fields": "not-a-list"})
+    key = retired_inbox_key(POD, TENANT)
+    r.rpush(key, record)
+
+    with patch("modules.office.cli.redis.Redis.from_url", return_value=r):
+        office_main(["retired-inbox"])
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "unparseable retired-inbox custody record\n"
     assert r.lrange(key, 0, -1) == [record]
 
 

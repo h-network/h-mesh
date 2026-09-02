@@ -168,9 +168,12 @@ def record_delivered(r, *, pod: str, tenant: str, agent: str, stream_id: str, so
     correlation reached through name reuse rather than the cross-client
     path this feature already defended. If no incarnation is currently
     established for `agent`, this returns without writing anything: a
-    record nothing could ever match is not worth writing, and lifecycle's
-    own SETNX-at-hire/DEL-at-stop keeps that window bounded to legacy
-    agents and the brief span between a stop and the next hire.
+    record nothing could ever match is not worth writing. lifecycle's
+    publish scripts mint one atomically with registry membership on a new
+    hire or a self-heal (see was_delivered's docstring for exactly when
+    that fires, and the honest statement that it is NOT bounded for an
+    agent that is never re-enrolled or stopped), and delete it at
+    retirement.
 
     Best-effort, same policy as modules/tmux/port.py's mark_delivery_pending
     and modules/api/port.py's _record: a bookkeeping write failure here
@@ -216,17 +219,24 @@ def was_delivered(r, *, pod: str, tenant: str, agent: str, stream_id: str, sourc
     -- the deliberate, explicit choice for every agent alive before this
     binding shipped: its first was_delivered check returns False even for
     a delivery that just happened, until an incarnation id is established.
-    lifecycle's publish scripts self-heal this on the very next StartAgent
-    for that name -- an idempotent re-enrol of an already-registered name
-    with no incarnation yet mints one (never rebinding an already-present
-    id, which is what keeps an ordinary restart safe) -- so in practice
-    this is bounded by whenever that agent process next restarts, not by
-    a full stop+rehire. Worst case (an agent that never restarts before
-    someone replies to it) is still bounded to at most
-    DELIVERED_TTL_SECONDS of "reply correlation does not confirm, the
-    field gets dropped" after an upgrade -- failing toward absent, the
-    same posture this feature has held through every prior generation,
-    never toward a wrong confirmation.
+    Because no incarnation means record_delivered writes no TTL claim at
+    all (not merely one was_delivered later distrusts), DELIVERED_TTL_SECONDS
+    does NOT bound this window -- an earlier draft of this docstring
+    claimed it did, which was wrong, corrected here rather than left to be
+    found by someone reading it as true. lifecycle's publish scripts
+    self-heal this on the very next StartAgent for that name -- an
+    idempotent re-enrol of an already-registered name with no incarnation
+    yet mints one (never rebinding an already-present id, which is what
+    keeps an ordinary restart safe) -- so the window closes at that
+    agent's next restart-triggered re-enrol OR an explicit stop+rehire,
+    whichever comes first. ⚠ FOR AN AGENT THAT IS NEVER RE-ENROLLED AND
+    NEVER STOPPED, NOTHING BOUNDS IT: no event ever calls a publish script
+    for that name again, so no incarnation is ever established, and
+    was_delivered returns False for it indefinitely. That is the honest
+    answer, not a second bound standing in for the one that turned out to
+    be false -- failing toward absent, the same posture this feature has
+    held through every prior generation, never toward a wrong confirmation,
+    but "fails safe" and "bounded" are not the same claim.
 
     The INITIAL incarnation read (which key to even look at) is a plain
     GET, outside any script -- there is no way to know which key to check

@@ -185,7 +185,17 @@ end
 for _, record in ipairs(retired_inbox) do
     redis.call('RPUSH', KEYS[21], record)
 end
-redis.call('DEL', KEYS[20])
+-- Only ever DEL the inbox key on the same condition that reads and
+-- conserves it. modules/api is the sole writer of an "inbox" resource
+-- today, so a non-api agent should never have one -- but "should never"
+-- is not a storage guarantee, and an unconditional DEL here would
+-- silently destroy whatever a non-api inbox key held with zero evidence,
+-- for a port type this script has no defined conservation semantics for
+-- at all. Preserved in place, not conserved: the safer default when the
+-- content's shape and meaning are both unknown.
+if this_port_type == 'api' then
+    redis.call('DEL', KEYS[20])
+end
 redis.call('DEL', KEYS[3])
 redis.call('DEL', KEYS[4])
 redis.call('DEL', KEYS[5])

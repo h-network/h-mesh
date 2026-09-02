@@ -231,14 +231,16 @@ def test_stop_conserves_api_inbox_content_with_hex_fields_plain_entry_id(real_re
     """Ticket 97ad745c's second exposure: a same-named successor's own
     client could otherwise read a retired predecessor's already-delivered
     mailbox content. switch-agent's exact shape: field NAMES and VALUES
-    hex-encoded as an ordered array of pairs (not a JSON object, so
-    duplicate fields and order survive exactly), the stream entry id kept
-    as plain text (Redis-generated ASCII, a real storage invariant unlike
-    the fields), and every valid Redis stream entry conserved regardless
-    of whether it looks like something the current writer would produce --
-    including hostile non-UTF8 bytes in a field value, which this test
-    plants directly to prove hex-encoding actually protects the boundary
-    rather than merely matching today's json.dumps-shaped writes."""
+    hex-encoded as an ORDERED ARRAY of pairs, not a JSON object, so
+    duplicate fields and field order survive exactly rather than being
+    reconstructed -- proven here by planting a genuine duplicate field
+    name via raw XADD (redis-py's own dict-based xadd/xrange cannot even
+    represent this, so this test bypasses both and reads the RESP reply
+    fields flatly, matching what the Lua side actually sees). The stream
+    entry id is kept as plain text (Redis-generated ASCII, a real storage
+    invariant unlike the fields), and a hostile non-UTF8 byte value is
+    planted directly to prove hex-encoding protects the boundary rather
+    than merely matching today's json.dumps-shaped writes."""
     tenant = f"stop-inbox-{uuid4().hex[:12]}"
     agent = "worker"
     registry_key = prefix(POD, tenant, resource="registry")
@@ -246,7 +248,14 @@ def test_stop_conserves_api_inbox_content_with_hex_fields_plain_entry_id(real_re
     evidence_key = retired_inbox_key(POD, tenant)
     hostile_value = b"\xff\x00not-valid-utf8"
     real_redis.hset(registry_key, agent, "api")
-    entry_id = real_redis.xadd(inbox_key, {"envelope": hostile_value, "custom": "plain"})
+    # A genuine duplicate field name ("dup" twice) in a specific order --
+    # constructed via the raw command, since redis-py's dict-based xadd
+    # cannot represent it at all.
+    expected_pairs = [
+        (b"dup", b"first"), (b"other", hostile_value), (b"dup", b"second"),
+    ]
+    xadd_args = [item for pair in expected_pairs for item in pair]
+    entry_id = real_redis.execute_command("XADD", inbox_key, "*", *xadd_args)
     try:
         stop_agent(
             real_redis, pod=POD, tenant=tenant,
@@ -261,9 +270,10 @@ def test_stop_conserves_api_inbox_content_with_hex_fields_plain_entry_id(real_re
         assert record["encoding"] == "hex"
         expected_entry_id = entry_id.decode() if isinstance(entry_id, bytes) else entry_id
         assert record["entry_id"] == expected_entry_id
-        fields = {bytes.fromhex(f).decode(): bytes.fromhex(v) for f, v in record["fields"]}
-        assert fields["envelope"] == hostile_value
-        assert fields["custom"] == b"plain"
+        observed_pairs = [
+            (bytes.fromhex(f), bytes.fromhex(v)) for f, v in record["fields"]
+        ]
+        assert observed_pairs == expected_pairs
         assert real_redis.exists(inbox_key) == 0
         assert real_redis.hget(registry_key, agent) is None
     finally:
@@ -281,16 +291,20 @@ def test_stop_conserves_more_than_a_thousand_inbox_entries_by_exact_identity(rea
     directly (bypassing the writer's own maxlen) and confirms every single
     one survives conservation by exact identity, not just a plausible
     count."""
+    # A LIST, not a set: the documented property is exact-once, ORDERED
+    # conservation, and a set comparison cannot fail on duplication or
+    # reordering -- it would pass even if a record were dropped and
+    # another duplicated, as long as the surviving id set matched.
     tenant = f"stop-inbox-bulk-{uuid4().hex[:12]}"
     agent = "worker"
     registry_key = prefix(POD, tenant, resource="registry")
     inbox_key = prefix(POD, tenant, agent=agent, resource="inbox")
     evidence_key = retired_inbox_key(POD, tenant)
     real_redis.hset(registry_key, agent, "api")
-    expected_ids = set()
+    expected_ids = []
     for index in range(1200):
         entry_id = real_redis.xadd(inbox_key, {"n": str(index)})
-        expected_ids.add(entry_id.decode() if isinstance(entry_id, bytes) else entry_id)
+        expected_ids.append(entry_id.decode() if isinstance(entry_id, bytes) else entry_id)
     try:
         stop_agent(
             real_redis, pod=POD, tenant=tenant,
@@ -299,8 +313,52 @@ def test_stop_conserves_more_than_a_thousand_inbox_entries_by_exact_identity(rea
         )
 
         records = [json.loads(raw) for raw in real_redis.lrange(evidence_key, 0, -1)]
-        assert {record["entry_id"] for record in records} == expected_ids
+        assert [record["entry_id"] for record in records] == expected_ids
+        assert all(record["agent"] == agent for record in records)
+        assert all(
+            record["reason"] == "destination retired with unread inbox content"
+            for record in records
+        )
         assert real_redis.exists(inbox_key) == 0
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
+def test_stop_preserves_a_non_api_agents_inbox_key_instead_of_silently_deleting_it(real_redis):
+    """switch-agent's exact finding against the first version of this
+    script: the inbox DEL was OUTSIDE the `this_port_type == 'api'`
+    conditional that gates reading and conserving it, so stopping a
+    NON-api name with an inbox stream (something no writer produces
+    today, but not something this script may assume never exists --
+    modules/api is the sole writer of an "inbox" resource, not a
+    guarantee no other one ever will be) deleted every entry while
+    writing zero retired-inbox evidence. That is worse than the original
+    exposure: the original left content for a successor to inherit, this
+    one destroyed it outright, from inside the branch whose entire
+    purpose is conservation. Seeds a tmux-type membership with an inbox
+    stream, stops it, and confirms the content is neither leaked into
+    the retired-inbox evidence stream (this script has no defined
+    conservation semantics for a non-api port type) NOR silently gone --
+    it must still be readable at its original key."""
+    tenant = f"stop-non-api-inbox-{uuid4().hex[:12]}"
+    agent = "worker"
+    registry_key = prefix(POD, tenant, resource="registry")
+    inbox_key = prefix(POD, tenant, agent=agent, resource="inbox")
+    evidence_key = retired_inbox_key(POD, tenant)
+    real_redis.hset(registry_key, agent, "tmux")
+    entry_id = real_redis.xadd(inbox_key, {"unexpected": "content"})
+    try:
+        stop_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent}},
+            kill_window=lambda _agent: None,
+        )
+
+        preserved = real_redis.xrange(inbox_key, "-", "+")
+        assert [entry_id_ for entry_id_, _ in preserved] == [entry_id]
+        assert real_redis.lrange(evidence_key, 0, -1) == []
     finally:
         keys = real_redis.keys(prefix(POD, tenant) + ":*")
         if keys:

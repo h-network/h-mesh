@@ -28,7 +28,7 @@ import redis
 
 from core.channels import send
 from core.envelope import EnvelopeError, parse
-from core.keys import prefix, receive_undeliverable_key, receive_unresolved_key
+from core.keys import prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key
 from core.logging import log_record, record_task_event
 from core.registry import is_member, members, port_type
 from lib.attachment_schema import ATTACHMENT_MAX_BYTES, MIME_TYPE_REGEX
@@ -1063,6 +1063,53 @@ def _undeliverable_command(argv: list[str]) -> None:
             print("unparseable undeliverable custody record", file=sys.stderr)
 
 
+def _retired_inbox_command(argv: list[str]) -> None:
+    """Read api-type agents' inbox content conserved at retirement.
+
+    Same shape as unresolved/undeliverable: read-only, no replay/delete/
+    expiry verb -- a durable sink nobody can inspect is hiding, not
+    conserving, so this exists in the same commit as the write path
+    that fills it. Records here are not envelopes (deliver_api's inbox
+    entries aren't wire frames), so this decodes each hex field/value
+    pair directly rather than going through core.envelope.parse(); a
+    field or value that isn't valid UTF-8 once decoded from hex is shown
+    as its hex form instead of raising, since the conservation script's
+    whole point is to survive exactly that content. The printed `fields`
+    collapses to a dict for readability -- a duplicate field name would
+    show only its last value here -- but the underlying stored record
+    itself keeps the full ordered pair list; this view simplifies display,
+    it does not lose the durable data.
+    """
+    parser = _operation_parser(
+        "retired-inbox",
+        "Read api agents' inbox content still unread when their destination retired.",
+    )
+    parser.add_argument("-a", "--agent", metavar="AGENT")
+    args = parser.parse_args(argv)
+    r, pod, tenant, _ = _context()
+    for stored in r.lrange(retired_inbox_key(pod, tenant), 0, -1):
+        try:
+            record = json.loads(_text(stored))
+            agent = record["agent"]
+            if args.agent and agent != args.agent:
+                continue
+            fields = {}
+            for field_hex, value_hex in record["fields"]:
+                field_raw, value_raw = bytes.fromhex(field_hex), bytes.fromhex(value_hex)
+                try:
+                    fields[field_raw.decode()] = value_raw.decode()
+                except UnicodeDecodeError:
+                    fields[field_raw.hex()] = value_raw.hex()
+            print(json.dumps({
+                "agent": agent,
+                "entry_id": record["entry_id"],
+                "reason": record.get("reason", "destination retired with unread inbox content"),
+                "fields": fields,
+            }, separators=(",", ":")))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            print("unparseable retired-inbox custody record", file=sys.stderr)
+
+
 def _take_command(argv: list[str]) -> None:
     parser = _operation_parser("take", "Move a todo or held task into doing.")
     parser.add_argument("id", nargs="?", help="ticket id or unique prefix")
@@ -1642,6 +1689,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("list",), "show a task board", _list_command),
     (("unresolved",), "show unresolved delivery outcomes", _unresolved_command),
     (("undeliverable",), "show messages not opened before retirement", _undeliverable_command),
+    (("retired-inbox",), "show api agents' inbox content conserved at retirement", _retired_inbox_command),
     (("take",), "take your next todo task", _take_command),
     (("done",), "finish your open task and record its outcome", _done_command),
     (("cancel",), "cancel your open task", _cancel_command),
