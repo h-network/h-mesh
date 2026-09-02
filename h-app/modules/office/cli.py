@@ -1190,7 +1190,7 @@ def _retitle_command(argv: list[str]) -> None:
 
 
 def _hold_command(argv: list[str]) -> None:
-    parser = _operation_parser("hold", "Put your open task on hold.")
+    parser = _operation_parser("hold", "Put your active or queued task on hold.")
     parser.add_argument("id", nargs="?", help="ticket id or unique prefix")
     parser.add_argument("--reason", required=True, help="why the task cannot proceed")
     args = parser.parse_args(argv)
@@ -1198,13 +1198,19 @@ def _hold_command(argv: list[str]) -> None:
         raise OfficeError("hold reason cannot be empty")
     r, pod, tenant, source = _context()
     keys = _task_keys(pod, tenant, source)
-    _, raw, ticket = _select(r, keys, ("doing",), args.id)
+    # Preserve the established no-ID shorthand for the active ticket. Queued
+    # parking is explicit: when an ID is supplied, it may select either the
+    # active ticket or queued work without first moving that work into doing.
+    # Holds therefore do not consume the one-doing slot; they remain separately
+    # visible, with their reason, in tasks.hold.
+    states = ("doing",) if args.id is None else ("doing", "todo")
+    state, raw, ticket = _select(r, keys, states, args.id)
     ticket["status"] = "hold"
     ticket["held_ts"] = _now()
     ticket["hold_reason"] = args.reason
     _transition_selected(
         r,
-        source_key=keys["doing"],
+        source_key=keys[state],
         destination_key=keys["hold"],
         raw=raw,
         replacement=serialize_ticket(ticket),
@@ -1580,7 +1586,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("return",), "return your open task to todo", _return_command),
     (("show",), "read one ticket without changing it", _show_command),
     (("retitle",), "correct the title of your open task", _retitle_command),
-    (("hold",), "put your open task on hold", _hold_command),
+    (("hold",), "put an active or queued task on hold", _hold_command),
     (("delete",), "permanently remove a task", _delete_command),
     (("add",), "add a task to another agent's board", _add_command),
     (("clone-to-all",), "clone a repository into agent workspaces", _clone_to_all_command),

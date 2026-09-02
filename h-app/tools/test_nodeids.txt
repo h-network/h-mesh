@@ -291,6 +291,7 @@ h-app/tests/test_office_cli.py::test_show_can_read_another_enrolled_agents_ticke
 h-app/tests/test_office_cli.py::test_done_writes_outcome_to_both_audit_channels
 h-app/tests/test_office_cli.py::test_hold_then_list_shows_priority_and_age
 h-app/tests/test_office_cli.py::test_hold_requires_and_lists_reason
+h-app/tests/test_office_cli.py::test_hold_parks_queued_ticket_without_displacing_active_work
 h-app/tests/test_office_cli.py::test_list_accepts_legacy_hold_and_done_without_new_fields
 h-app/tests/test_office_cli.py::test_malformed_board_entry_raises_office_error_not_board_error
 h-app/tests/test_office_cli.py::test_take_by_id_quarantines_malformed_entries_without_blocking_valid_match
