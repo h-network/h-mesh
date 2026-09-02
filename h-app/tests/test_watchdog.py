@@ -1,10 +1,14 @@
+import ast
 import contextlib
+import inspect
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
+import textwrap
 import unittest
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -241,29 +245,61 @@ def _watchdog_records(out, destination="architect"):
 
 
 # The canonical, closed evidence-level contract (core.logging.log_record's
-# `evidence` field -- see modules/watchdog/service.py's _notify_lead for the
-# writer side). A CLOSED allowlist, not a denylist of overclaiming words: a
-# reviewer's finding was that scanning specific fields (or even specific
-# words, wherever found) for "sent"/"delivered" still lets a genuinely novel
-# claim-shaped vocabulary slip through unnoticed ("paste landed", "message
-# confirmed", anything nobody has enumerated yet). An allowlist has the
-# opposite failure mode: anything NOT explicitly recognized is rejected,
-# including vocabulary nobody has written yet, which is what a real contract
-# needs.
+# `evidence` field -- see modules/watchdog/service.py's _log_lead_alert for
+# the writer side). A CLOSED allowlist, not a denylist of overclaiming
+# words: scanning specific fields (or even every field, for specific words)
+# still lets a genuinely novel claim-shaped vocabulary slip through
+# unnoticed ("paste landed", anything nobody has enumerated yet). An
+# allowlist has the opposite failure mode: anything NOT explicitly
+# recognized is rejected, including vocabulary nobody has written yet.
 _ADMISSION_ONLY_EVIDENCE = frozenset({"admitted", "rejected", "unknown", "no_lead"})
+
+# ⚠ `evidence` alone is not sufficient. Reviewer constructed a record with a
+# truthful evidence="admitted" tag that ALSO carried outcome="delivered" and
+# reason="alert sent" -- a correct tag next to a contradicting claim still
+# misleads a human or any other consumer of the record, and the field-only
+# check accepted it. _log_lead_alert (service.py) now makes `outcome`/
+# `title`/`old_title` structurally impossible for this code path -- it does
+# not expose them as parameters at all, so nothing calling through it can
+# set them regardless of future changes. `reason` remains free text (it
+# legitimately interpolates runtime values that can't be reduced to a fixed
+# template), so it is the one field this scan still covers as defense in
+# depth: the primary contract is the closed `evidence` set above, this is a
+# backstop specifically for the field that couldn't be eliminated.
+_OVERCLAIM_WORD = re.compile(r"\b(sent|delivered)\b", re.IGNORECASE)
+_NEGATION_BEFORE = re.compile(r"\b(?:not|never|no)\s+(?:\w+\s+){0,2}$", re.IGNORECASE)
+
+
+def _reason_contradicts_evidence(record):
+    reason = record.get("reason")
+    if not isinstance(reason, str):
+        return False
+    for match in _OVERCLAIM_WORD.finditer(reason):
+        preceding = reason[max(0, match.start() - 24):match.start()]
+        if _NEGATION_BEFORE.search(preceding):
+            continue
+        return True
+    return False
 
 
 def _assert_admission_only_evidence(testcase, records):
     """Assert every record's `evidence` tag is one of the admission-only
-    values -- never `delivered`/`sent`/`created`, and never silently absent.
-    A record with no `evidence` field at all is a contract violation too,
-    not a free pass: the contract requires the tag be PRESENT, not merely
-    that its content happens not to overclaim."""
+    values -- never `delivered`/`sent`/`created`, and never silently absent
+    -- AND that `reason` (the one field _log_lead_alert cannot structurally
+    close off) does not independently contradict it. Could a system that
+    still produces the harmful output pass this check? A record with a
+    correct `evidence` tag and a contradicting `reason` must fail here, not
+    just one with a wrong `evidence` value -- that is the exact gap reviewer
+    found in the version of this helper before it checked `reason` too."""
     testcase.assertTrue(records, "an alert attempt must leave a record, not silence")
     for record in records:
         testcase.assertIn(
             record.get("evidence"), _ADMISSION_ONLY_EVIDENCE,
             f"record {record!r} does not carry a closed, admission-only evidence tag",
+        )
+        testcase.assertFalse(
+            _reason_contradicts_evidence(record),
+            f"record {record!r} carries a correct evidence tag but its reason text overclaims",
         )
 
 
@@ -287,20 +323,32 @@ class AdmissionEvidenceContractTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             _assert_admission_only_evidence(self, [{"evidence": "sent"}])
 
-    def test_rejects_a_sent_claim_hiding_in_an_unenumerated_field(self):
-        """The exact shape of reviewer's counterexample: a claim expressed
-        through a field name the helper never has to know about, because
-        it checks the canonical `evidence` tag, not a list of field names.
-        This record overclaims via `evidence` regardless of what else it
-        also happens to say in `outcome`/`reason`."""
+    def test_rejects_reviewers_exact_contradictory_record(self):
+        """Reviewer's literal counterexample, verbatim, with the evidence
+        tag left CORRECT: evidence="admitted" alongside outcome="delivered"
+        and reason="alert sent". A first version of this fixture changed
+        `evidence` itself to "sent" and asserted rejection -- that tested
+        the allowlist mechanism (an illegal value in the field the helper
+        reads is caught), not the actual harm reviewer demonstrated: a
+        record whose CANONICAL TAG IS TRUTHFUL can still contain a false
+        delivery claim elsewhere. This is the fixture that must fail if
+        `_assert_admission_only_evidence` only checks `evidence`."""
         record = {
             "event": "lead_alert_admitted",
+            "evidence": "admitted",
             "outcome": "delivered",
             "reason": "alert sent",
-            "evidence": "sent",
         }
         with self.assertRaises(AssertionError):
             _assert_admission_only_evidence(self, [record])
+
+    def test_accepts_a_correct_evidence_tag_with_ordinary_reason_text(self):
+        """The contradiction check must not be so broad it rejects ordinary,
+        non-overclaiming reason text alongside a correct tag."""
+        _assert_admission_only_evidence(self, [{
+            "evidence": "no_lead",
+            "reason": "lead 'retired-lead' is not a registered agent",
+        }])
 
     def test_rejects_a_missing_evidence_tag(self):
         """A record with no `evidence` field at all is a contract
@@ -334,6 +382,64 @@ class AdmissionEvidenceContractTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             _assert_admission_only_evidence(
                 self, [{"evidence": "admitted"}, {"evidence": "delivered"}]
+            )
+
+
+class LeadAlertLoggingStructureTests(unittest.TestCase):
+    """Structural pins on _log_lead_alert itself and on _notify_lead's
+    source, answering reviewer's "ninth call site" question: what
+    necessarily catches a future lead-alert log call that forgets its
+    evidence tag, independent of whether any test scenario happens to
+    exercise that specific code path?
+
+    Two guarantees, neither depending on runtime scenario coverage:
+    1. `_log_lead_alert` cannot be called without `evidence` (no default) --
+       a missing tag is a TypeError, not a silently-logged record.
+    2. `_log_lead_alert` does not expose `outcome`/`title`/`old_title` as
+       parameters, so the exact contradiction reviewer constructed cannot
+       be built by anything calling through it, regardless of intent.
+    3. A static AST walk of _notify_lead's own source confirms every
+       log-emitting call in it is a call to `_log_lead_alert` -- so a
+       "ninth call site" that logs through `log_record` directly (bypassing
+       the wrapper's guarantees entirely) is caught by inspection, at test
+       time, before it ships -- not only if some scenario reaches it.
+    """
+
+    def test_log_lead_alert_requires_evidence(self):
+        watchdog = service.Watchdog(object(), pod="p", tenant="t", session_name="t")
+        with self.assertRaises(TypeError):
+            watchdog._log_lead_alert("some_event", "lead", "stream-1")
+
+    def test_log_lead_alert_does_not_expose_outcome_title_or_old_title(self):
+        watchdog = service.Watchdog(object(), pod="p", tenant="t", session_name="t")
+        for forbidden_kwarg in ("outcome", "title", "old_title"):
+            with self.assertRaises(TypeError):
+                watchdog._log_lead_alert(
+                    "some_event", "lead", "stream-1",
+                    evidence="admitted", **{forbidden_kwarg: "delivered"},
+                )
+
+    def test_every_log_emitting_call_in_notify_lead_goes_through_the_wrapper(self):
+        source = textwrap.dedent(inspect.getsource(service.Watchdog._notify_lead))
+        tree = ast.parse(source)
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("log_record", "_log_lead_alert")
+        ] + [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id in ("log_record", "_log_lead_alert")
+        ]
+        self.assertTrue(calls, "expected at least one lead-alert log call in _notify_lead")
+        for call in calls:
+            name = call.func.attr if isinstance(call.func, ast.Attribute) else call.func.id
+            self.assertEqual(
+                name, "_log_lead_alert",
+                f"_notify_lead calls {name}(...) directly at line {call.lineno} "
+                "(source-relative) instead of going through _log_lead_alert -- "
+                "this bypasses the evidence-required and outcome/title/old_title "
+                "-excluded guarantees entirely",
             )
 
 

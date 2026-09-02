@@ -312,6 +312,42 @@ class Watchdog:
     def _lead(self) -> str | None:
         return _text(self.r.get(prefix(self.pod, self.tenant, resource="lead")))
 
+    # ⚠ The ONLY way _notify_lead may log anything about a lead-alert
+    # attempt. A canonical `evidence` tag next to free-form `reason`/
+    # `outcome` fields was not enough by itself: a caller could set a
+    # truthful `evidence="admitted"` while independently writing
+    # `outcome="delivered"` or "sent" into `reason` -- a correct tag next
+    # to a contradicting claim, which still misleads a human or any other
+    # consumer reading the record. Confirmed live: reviewer constructed
+    # exactly that record and the field-level check accepted it.
+    #
+    # This wrapper makes that structurally impossible for `outcome`
+    # specifically, not just discouraged: it does not expose `outcome`,
+    # `title`, or `old_title` as parameters at all, so nothing calling
+    # through here can set them, regardless of what future evidence values
+    # or event names get added. `reason` stays free text -- it genuinely
+    # needs to interpolate runtime values (an agent name, a ticket title,
+    # an exception, a queue depth) that cannot be reduced to a fixed
+    # template -- so it is not eliminated as an attack surface, only
+    # narrowed to the one field defense-in-depth already covers via
+    # `_assert_admission_only_evidence` in the test suite.
+    #
+    # `evidence` has no default: a call site that omits it fails LOUDLY at
+    # the call, a TypeError raised the first time that path executes,
+    # rather than silently logging an untagged record. Combined with
+    # tests.test_watchdog's AST-based structural check (every log_record-
+    # shaped call inside _notify_lead's own source is confirmed to pass
+    # evidence=), a future "ninth call site" that forgets it is caught at
+    # test time, before it ever reaches this required-argument runtime
+    # failure in the field at all.
+    def _log_lead_alert(
+        self, event: str, lead: str, stream_id: str, *, evidence: str, reason: str | None = None
+    ) -> None:
+        log_record(
+            "watchdog", event,
+            stream_id=stream_id, destination=lead, reason=reason, evidence=evidence,
+        )
+
     def _notify_lead(self, lead: str, text: str) -> None:
         """Paste one message directly into the lead's pane.
 
@@ -383,19 +419,17 @@ class Watchdog:
             self._error("lead_alert", exc)
             return
         if not is_member(self.r, pod=self.pod, tenant=self.tenant, agent=lead):
-            log_record(
-                "watchdog", "lead_alert_no_lead",
-                stream_id=envelope["stream_id"], destination=lead,
-                reason=f"lead {lead!r} is not a registered agent",
+            self._log_lead_alert(
+                "lead_alert_no_lead", lead, envelope["stream_id"],
                 evidence="no_lead",
+                reason=f"lead {lead!r} is not a registered agent",
             )
             return
         if port_type(self.r, pod=self.pod, tenant=self.tenant, agent=lead) != "tmux":
-            log_record(
-                "watchdog", "lead_alert_no_lead",
-                stream_id=envelope["stream_id"], destination=lead,
-                reason=f"lead {lead!r} port_type is not tmux",
+            self._log_lead_alert(
+                "lead_alert_no_lead", lead, envelope["stream_id"],
                 evidence="no_lead",
+                reason=f"lead {lead!r} port_type is not tmux",
             )
             return
         try:
@@ -408,19 +442,17 @@ class Watchdog:
                 limit=self.ingress_max,
             )
         except Exception as exc:
-            log_record(
-                "watchdog", "lead_alert_unknown",
-                stream_id=envelope["stream_id"], destination=lead,
-                reason=f"admission outcome UNKNOWN after {exc}",
+            self._log_lead_alert(
+                "lead_alert_unknown", lead, envelope["stream_id"],
                 evidence="unknown",
+                reason=f"admission outcome UNKNOWN after {exc}",
             )
             return
         if not admitted:
-            log_record(
-                "watchdog", "lead_alert_capacity",
-                stream_id=envelope["stream_id"], destination=lead,
-                reason=f"lead ingress full: depth {depth} has reached INGRESS_MAX {self.ingress_max}",
+            self._log_lead_alert(
+                "lead_alert_capacity", lead, envelope["stream_id"],
                 evidence="rejected",
+                reason=f"lead ingress full: depth {depth} has reached INGRESS_MAX {self.ingress_max}",
             )
             return
         # ⚠ ADMITTED, not sent/delivered: this only proves the envelope was
@@ -444,9 +476,8 @@ class Watchdog:
         # logged by channels.receive() itself under module="tmux", each
         # backed by an actual distinguishing fact instead of an absence of
         # exception.
-        log_record(
-            "watchdog", "lead_alert_admitted",
-            stream_id=envelope["stream_id"], destination=lead,
+        self._log_lead_alert(
+            "lead_alert_admitted", lead, envelope["stream_id"],
             evidence="admitted",
         )
         try:

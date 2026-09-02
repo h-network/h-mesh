@@ -61,6 +61,25 @@ deliberately rather than by accident (2026-09-02):
   discipline correctly before it had a name: "not confirmed... cannot
   distinguish loss from a landed paste."
 
+  The claim is enforced structurally, not by trusting a naming convention.
+  `core.logging.log_record` gained a new optional `evidence` field -- a
+  canonical, machine-checkable claim-level tag, separate from the free-text
+  `reason` a human reads -- and `_log_lead_alert` is the *only* way
+  `_notify_lead` may log anything: it requires `evidence` (no default, so
+  an omitted tag is a loud `TypeError` at the call, not a silently untagged
+  record) and does not expose `outcome`/`title`/`old_title` as parameters
+  at all, so a caller cannot independently contradict a correct `evidence`
+  tag through those fields the way an early version of this fix's own test
+  helper missed (a record with `evidence="admitted"` alongside
+  `outcome="delivered"` still overclaims, even though the canonical tag is
+  truthful). `reason` stays free text -- it legitimately interpolates
+  runtime values a fixed template can't capture -- so the test suite keeps
+  a narrow, scoped check on that one remaining field as defense in depth.
+  A static AST check over `_notify_lead`'s own source (not a runtime
+  scenario) confirms every log call in it goes through `_log_lead_alert`,
+  so a future call site that bypasses the wrapper entirely is caught at
+  test time regardless of whether any test scenario happens to exercise it.
+
 - **`blocked` self-heals.** `DeliveryVerifier` used to only ever CLEAR
   `blocked` in response to a NEW delivery marker verifying -- an agent
   nobody messaged again after one unverified paste stayed `blocked` in
