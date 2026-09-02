@@ -2480,6 +2480,7 @@ class TelegramBot:
 
         code, presence_data = self.mesh.get_presence(agent)
         state = presence_data.get("presence", {}).get("state") if code == 200 else "unknown"
+        delivery_unverified = bool(presence_data.get("delivery_unverified")) if code == 200 else False
         if state == "blocked":
             reply = f"{agent} is not accepting messages right now"
             self.telegram.send_message(cid, reply)
@@ -2528,6 +2529,8 @@ class TelegramBot:
             return reply
 
         reply = f"✅ {label.capitalize()} sent to {agent}."
+        if delivery_unverified:
+            reply += " A prior delivery remains unverified; this send is fresh evidence."
         self.telegram.send_message(cid, reply)
         return reply
 
@@ -3294,6 +3297,7 @@ class TelegramBot:
             self.telegram.send_chat_action(cid)
         code, presence_data = self.mesh.get_presence(agent)
         state = presence_data.get("presence", {}).get("state") if code == 200 else "unknown"
+        delivery_unverified = bool(presence_data.get("delivery_unverified")) if code == 200 else False
 
         if state == "blocked":
             reply_text = f"{agent} is not accepting messages right now"
@@ -3370,7 +3374,9 @@ class TelegramBot:
                 )
 
         reply_text = f"✅ Ran on {agent}." if raw else f"✅ Sent to {agent}."
-        if not reacted and self.telegram:
+        if delivery_unverified:
+            reply_text += " A prior delivery remains unverified; this send is fresh evidence."
+        if (not reacted or delivery_unverified) and self.telegram:
             self.telegram.send_message(cid, reply_text)
         return reply_text
 

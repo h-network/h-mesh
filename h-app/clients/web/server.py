@@ -1203,7 +1203,8 @@ class OfficeHandler(SimpleHTTPRequestHandler):
             self._json(200, {
                 "agent": "sme-3", "port_type": "tmux",
                 "depths": {"ingress": 2, "egress": 0, "dead": 0},
-                "presence": {"state": "blocked", "since": "2026-08-10T02:15:00Z", "last_activity": "2026-08-10T02:20:00Z"},
+                "presence": {"state": "idle", "since": "2026-08-10T02:15:00Z", "last_activity": "2026-08-10T02:20:00Z"},
+                "delivery_unverified": {"since": "2026-08-10T02:16:00Z", "stream_id": "a" * 32},
             })
         elif clean_subpath == "/agents/lab":
             self._json(200, {

@@ -32,6 +32,7 @@ class DummyMeshClient:
         self.token = token
         self.ssl_context = None
         self.presence_state = "idle"
+        self.delivery_unverified = None
         self.messages_queue = []
         self.activity_queue = []
         # agent -> port_type; defaults cover the common tmux roster used by tests
@@ -67,12 +68,14 @@ class DummyMeshClient:
         return 202, {"stream_id": "s3", "correlation_id": "c3"}
 
     def get_presence(self, agent):
-        return 200, {
+        result = {
             "agent": agent,
             "port_type": self.roster.get(agent, "tmux"),
             "depths": {"ingress": 0, "egress": 0, "dead": 0},
             "presence": {"state": self.presence_state, "since": "2026-08-09T15:00:00Z"},
         }
+        result["delivery_unverified"] = self.delivery_unverified
+        return 200, result
 
     def get_board(self, agent):
         board = self.boards.get(agent, {"todo": [], "doing": [], "hold": [], "done": []})
@@ -2124,6 +2127,20 @@ def test_handle_photo_message_respects_blocked_presence():
         assert reply == "architect is not accepting messages right now"
         assert mesh.sent_attachments == []
         assert telegram.requests == []
+
+
+def test_handle_photo_message_attempts_send_and_warns_when_prior_delivery_is_unverified():
+    """The warning must remain visible without becoming the gate it replaced."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mesh = DummyMeshClient()
+        mesh.delivery_unverified = {"since": "2026-09-02T06:00:00Z", "stream_id": "a" * 32}
+        bot_instance, mesh, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
+
+        reply = bot_instance.handle_photo_message(12345, [{"file_id": "full"}], "")
+
+        assert len(mesh.sent_attachments) == 1
+        assert reply.startswith("✅ Photo sent to architect.")
+        assert "prior delivery remains unverified" in reply
 
 
 def test_handle_photo_message_rejects_an_oversized_reported_file_size():

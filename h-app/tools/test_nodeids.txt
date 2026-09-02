@@ -92,6 +92,7 @@ h-app/tests/test_agentlifecycle.py::test_hostile_payload_shape_is_proven_rejecti
 h-app/tests/test_agentlifecycle.py::test_logging_failure_does_not_replace_unknown_write_outcome
 h-app/tests/test_agentlifecycle.py::test_logging_failure_does_not_replace_partial_actual_failure
 h-app/tests/test_agentlifecycle.py::test_logging_failure_does_not_replace_success
+h-app/tests/test_api.py::ApiTests::test_absent_presence_stays_unknown_with_unverified_delivery
 h-app/tests/test_api.py::ApiTests::test_api_port_writes_mailbox_and_dead_letters_corrupt_input
 h-app/tests/test_api.py::ApiTests::test_auth_and_health
 h-app/tests/test_api.py::ApiTests::test_deliver_api_does_not_dead_letter_an_envelope_after_a_failed_inbox_write
@@ -114,6 +115,7 @@ h-app/tests/test_api.py::ApiTests::test_overlapping_prompts_answered_out_of_orde
 h-app/tests/test_api.py::ApiTests::test_post_envelope_does_not_report_a_write_failure_as_a_rejection
 h-app/tests/test_api.py::ApiTests::test_qualified_destination_routes_through_core_channel
 h-app/tests/test_api.py::ApiTests::test_real_tmux_delivery_then_deliver_api_rejects_peer_originated_correlation
+h-app/tests/test_api.py::ApiTests::test_unverified_delivery_does_not_override_active_presence
 h-app/tests/test_api.py::RealApiPortSubprocessTests::test_real_api_module_subprocess_invocation
 h-app/tests/test_attachment_schema.py::AttachmentSchemaTests::test_base64_validation
 h-app/tests/test_attachment_schema.py::AttachmentSchemaTests::test_caption_length_validation
@@ -631,6 +633,7 @@ h-app/tests/test_telegram_client.py::test_dispatch_update_routes_a_photo_instead
 h-app/tests/test_telegram_client.py::test_handle_photo_message_sends_an_attachment_envelope_to_the_persistent_target
 h-app/tests/test_telegram_client.py::test_handle_photo_message_maps_caption_to_the_envelope_caption_field
 h-app/tests/test_telegram_client.py::test_handle_photo_message_falls_back_to_a_generated_filename_when_telegrams_is_invalid
+h-app/tests/test_telegram_client.py::test_handle_photo_message_attempts_send_and_warns_when_prior_delivery_is_unverified
 h-app/tests/test_telegram_client.py::test_handle_photo_message_mention_routes_without_changing_the_persistent_target
 h-app/tests/test_telegram_client.py::test_handle_photo_message_mention_to_unknown_agent_is_refused
 h-app/tests/test_telegram_client.py::test_handle_photo_message_respects_blocked_presence

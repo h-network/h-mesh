@@ -94,6 +94,7 @@ export class MessagesPanel {
 
   setPresence(detail = {}) {
     const presence = detail.presence?.state || "unknown";
+    const deliveryWarning = detail.delivery_unverified ? " A prior delivery remains unverified; this new send will provide fresh evidence." : "";
     const banner = document.getElementById("conversation-presence");
     const input = document.getElementById("message");
     const send = document.getElementById("send");
@@ -105,8 +106,8 @@ export class MessagesPanel {
       pending: "Starting · wait for the agent window before sending.",
     };
     banner.className = `conversation-presence state-${presence}`;
-    banner.textContent = messages[presence] || messages.unknown;
-    const disabled = presence === "blocked" || presence === "pending";
+    banner.textContent = (messages[presence] || messages.unknown) + deliveryWarning;
+    const disabled = presence === "pending";
     input.disabled = disabled;
     send.disabled = disabled;
     input.placeholder = disabled ? `${this.selected} is not accepting messages` : `Message ${this.selected}…`;

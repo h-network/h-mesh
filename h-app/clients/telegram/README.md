@@ -9,7 +9,11 @@ A Telegram bot client that talks to an **h-mesh** tenant over HTTP, allowing a u
 - **Participant Enrolment:** On startup, the bot enrols as a participant named `telegram` on the bus (`StartAgent` with `port_type: "api"`), retrying with backoff for up to 60s — `container/entrypoint.sh` starts the api door and this bundled client within the same instant, no readiness wait, so a single early attempt can lose that race (measured live).
 - **Fire-and-forget prompts, delivery-side pushes replies:** A plain text message posts the envelope (`POST /agents/{agent}/envelopes`, always `202` immediately) and returns right away — no wait loop. `ReplyPusher`, a background thread, independently polls this bot's own mailbox (`GET /agents/telegram/messages`) and pushes each new reply into the chat as it arrives, on its own schedule. This matches how delivery actually works: nothing in the switch/port/api chain waits on anything, so nothing here should either.
   ⚠ **This replaced an earlier design that blocked inline** — `handle_user_prompt` used to poll-and-wait for a reply, unbounded, inside the same loop that read Telegram's `getUpdates`. One chat's unanswered prompt froze the *entire* bot, for every chat, until that one exchange resolved (measured live on the acceptance VM: the poller sat on one cursor for minutes while every message sent afterward went unread). Removed entirely rather than patched.
-- **`blocked` Visibility:** If `architect` is `blocked`, the bot immediately reports `"architect is not accepting messages right now"` instead of posting.
+- **Delivery uncertainty is not an admission gate:** `GET /agents/{agent}`
+  reports activity-derived presence separately from `delivery_unverified`. A
+  retained unverified-delivery marker does not make Telegram refuse a prompt
+  or attachment; the new send is attempted and its own result supplies fresh
+  evidence.
 - **Cursor Persistence:** `ReplyPusher` persists its mailbox cursor to disk (`~/.h-mesh/telegram.cursor.json` by default — see `--cursor-file` below) as it delivers each reply, and — like `AlertPusher` — seeds a fresh cursor store from the mailbox's current tail rather than replaying history on first run.
 - **Discoverable commands:** `/menu`, `/status`, `/watch`, `/unwatch`, `/run`, and `/voice` are registered with Telegram itself via `setMyCommands` at enrol time, so they show up in the client's own `/` command picker instead of requiring the user to know and type them blind.
 - **Text-to-Speech (TTS) Voice Replies:** Spoken voice replies via Microsoft Edge's neural TTS voices (`edge-tts` package, PyPI) using Telegram's `sendVoice` endpoint. Declared dependency in `pyproject.toml`. Spoken voice replies are opt-in per tenant (`TELEGRAM_VOICE=1`, prompted during `setup.sh`) and opt-in per chat via `/voice` or the sticky menu toggle (voice-enabled chats receive both the full text reply and the spoken voice audio).
@@ -632,9 +636,9 @@ at all).
   downloaded byte count — smaller than Telegram's own ceiling, so a photo
   between the two downloads fine and must still be refused here rather than
   left to the api's own `422`.
-- **`blocked` presence is checked before any download work happens** — same
-  as a text prompt, so a blocked agent doesn't cause a photo to be fetched
-  for nothing.
+- **Presence is checked before download work happens**, but a separate
+  `delivery_unverified` marker is a warning, not proof that the agent cannot
+  accept the attachment, so it does not suppress the attempt.
 - A **Telegram album** (several photos sent together) arrives as *separate*
   updates sharing a `media_group_id`, not one message with several photos —
   handled without any special casing, one `Attachment` envelope per photo.
