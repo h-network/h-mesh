@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core.keys import prefix
-from core.logging import mirror
+from core.logging import log_record, mirror
 from core.registry import members
 
 
@@ -254,6 +254,31 @@ if request_id ~= "" and seen_key ~= "" then
     if is_seen == 1 then
         return 0
     end
+end
+
+-- ⚠ EVAL is isolated but NOT transactional: a runtime error partway
+-- through does not undo redis.call() side effects already applied by
+-- THIS script. Without this preflight, a WRONGTYPE on either SADD below
+-- (after XADD has already run) would leave the usage record emitted with
+-- its own dedup marker never set -- exactly the state the next retry's
+-- SISMEMBER check depends on being right. So every key this script may
+-- write is checked BEFORE the first mutation: the script does nothing at
+-- all, or it does everything, never partially.
+local function wrong_type(key, expected)
+    if key == "" then
+        return false
+    end
+    local actual = redis.call("TYPE", key)["ok"]
+    return actual ~= "none" and actual ~= expected
+end
+if wrong_type(stream_key, "stream") then
+    return redis.error_reply("wrong type for stream_key")
+end
+if wrong_type(seen_key, "set") then
+    return redis.error_reply("wrong type for seen_key")
+end
+if wrong_type(attributed_key, "set") then
+    return redis.error_reply("wrong type for attributed_key")
 end
 
 redis.call("XADD", stream_key, "MAXLEN", "~", maxlen, "*", "usage", raw_usage)
@@ -538,7 +563,20 @@ class ActivityTailer:
                         self._seen_requests[agent].add(request_id)
                     return
                 emitted = bool(res)
-            except Exception:
+            except Exception as exc:
+                # ⚠ Was a silent `except: return` -- a preflight rejection
+                # (or any other eval failure) vanished with no trace, so a
+                # systemic problem (e.g. something elsewhere writing the
+                # wrong type to one of these keys) could silently stop all
+                # usage tracking for an agent, forever, with nothing to find
+                # it by. Decided this must be observable rather than quiet:
+                # usage/cost data is exactly the kind of thing that should
+                # not go missing without a record saying so.
+                log_record(
+                    "watchdog", "usage_emit_failed",
+                    destination=agent,
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
                 return
         elif hasattr(self.r, "xadd"):
             if request_id and hasattr(self.r, "sismember"):
