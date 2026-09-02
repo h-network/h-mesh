@@ -152,7 +152,7 @@ def pid_alive(pid: int) -> bool:
 
 @dataclass(frozen=True)
 class PidRead:
-    """Result of one atomic attempt to read a pidfile.
+    """Result of one single read attempt on a pidfile.
 
     ``pid`` is None for two different facts a caller may need to tell
     apart: no pidfile was found (never existed, or another process
@@ -170,7 +170,7 @@ class PidRead:
 
 
 def _read_pid(pidfile: Path) -> PidRead:
-    """One atomic read, not check-then-read.
+    """A single read attempt, not check-then-read.
 
     A prior version called ``pidfile.exists()`` before ``read_text()`` --
     a real TOCTOU: a concurrent reaper (another process finishing the
@@ -182,6 +182,8 @@ def _read_pid(pidfile: Path) -> PidRead:
     already has to handle "file absent" on its own (it always could,
     race or not), so the separate exists() guard added a TOCTOU window
     without buying any actual guarantee -- deleted rather than repaired.
+    This removes the pathname check/use window; it is not a general
+    atomic snapshot against concurrent content writes.
     """
     try:
         text = pidfile.read_text()
@@ -323,7 +325,7 @@ def _stop_one(
     if pid_read.pid is None:
         # Decided from pid_read.corrupt, not a second pidfile.exists() call
         # -- re-checking existence here would reopen the exact TOCTOU
-        # window _read_pid's own atomic read exists to close.
+        # window _read_pid's single read attempt exists to close.
         if pid_read.corrupt:
             log(f"  • {name}: pidfile {pidfile} did not contain a pid, removing")
             _remove_pidfiles(pidfile)

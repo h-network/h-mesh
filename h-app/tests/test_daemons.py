@@ -126,9 +126,17 @@ def test_stop_daemons_survives_a_pidfile_vanishing_mid_read(tmp_path, monkeypatc
     traceback is actually closed. Patches read_text() rather than exists()
     so this stays a real regression test regardless of which internal
     check the fix ends up using to notice the file is gone.
+
+    A second, corrupt pidfile (tmux_reconciler.pid, the next name
+    stop_daemons() visits after switch) pins the secondary consequence
+    reviewer asked to strengthen: not just "no crash", but that the
+    teardown actually continued past the raced entry rather than
+    silently stopping there.
     """
     pidfile = tmp_path / "switch.pid"
     pidfile.write_text("999999999\n")
+    later_entry = tmp_path / "tmux_reconciler.pid"
+    later_entry.write_text("not-a-pid\n")
 
     real_read_text = Path.read_text
     vanished = []
@@ -141,10 +149,16 @@ def test_stop_daemons_survives_a_pidfile_vanishing_mid_read(tmp_path, monkeypatc
 
     monkeypatch.setattr(Path, "read_text", vanish_then_read)
 
-    stop_daemons(tmp_path)  # must not raise FileNotFoundError
+    logs: list[str] = []
+    stop_daemons(tmp_path, log=logs.append)  # must not raise FileNotFoundError
 
     assert vanished, "the race was never actually constructed -- test proves nothing"
     assert not pidfile.exists()
+    assert not later_entry.exists(), (
+        "teardown aborted at the raced entry instead of continuing to "
+        "later roster entries"
+    )
+    assert any("tmux_reconciler" in line and "did not contain a pid" in line for line in logs), logs
 
 
 def test_stop_daemons_distinguishes_a_corrupt_pidfile_from_an_absent_one(tmp_path):
