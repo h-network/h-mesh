@@ -356,6 +356,53 @@ class ApiTests(unittest.TestCase):
         stored = json.loads(self.redis.streams[inbox][0][1]["envelope"])
         self.assertNotIn("in_reply_to", stored)
 
+    def test_overlapping_prompts_answered_out_of_order_correlate_independently(self):
+        # The scenario that actually motivated this feature: two prompts
+        # delivered to the same agent before either is answered, answered
+        # in reverse order. The harm this checks for is not "does
+        # correlation exist" but "can one concurrently-delivered id's
+        # provenance contaminate another's" -- the confident-lie failure
+        # this whole feature exists to prevent, specifically under the
+        # concurrency that motivated it, not just sequentially.
+        from modules.tmux.port import message_opener
+
+        target_a = send(
+            self.redis, pod="test", tenant="office", source="telegram",
+            destination="bob", payload={"text": "question A"},
+        )
+        raw_a = self.redis.lpop(prefix("test", "office", "telegram", "egress"))
+        target_b = send(
+            self.redis, pod="test", tenant="office", source="telegram",
+            destination="bob", payload={"text": "question B"},
+        )
+        raw_b = self.redis.lpop(prefix("test", "office", "telegram", "egress"))
+
+        with patch("modules.tmux.port.list_windows", return_value={"bob"}), \
+             patch("modules.tmux.port.submit_text"):
+            # Both delivered before either is answered.
+            message_opener(self.redis, "test", "office", "bob", parse(raw_a), "sess", socket=None)
+            message_opener(self.redis, "test", "office", "bob", parse(raw_b), "sess", socket=None)
+
+        # Answered in reverse order: B first, then A.
+        ingress = prefix("test", "office", "telegram", "ingress")
+        reply_b = build("Message", "bob", "telegram", {"text": "answer B"}, pod="test", tenant="office", in_reply_to=target_b)
+        self.redis.lists[ingress] = [encode(reply_b)]
+        deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+
+        reply_a = build("Message", "bob", "telegram", {"text": "answer A"}, pod="test", tenant="office", in_reply_to=target_a)
+        self.redis.lists[ingress] = [encode(reply_a)]
+        deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+
+        inbox = prefix("test", "office", "telegram", "inbox")
+        by_text = {
+            json.loads(fields["envelope"])["payload"]["text"]: json.loads(fields["envelope"]).get("in_reply_to")
+            for _, fields in self.redis.streams[inbox]
+        }
+        self.assertEqual(by_text["answer B"], target_b)
+        self.assertEqual(by_text["answer A"], target_a)
+        self.assertNotEqual(by_text["answer B"], target_a)
+        self.assertNotEqual(by_text["answer A"], target_b)
+
     def test_deliver_api_drops_malformed_in_reply_to(self):
         ingress = prefix("test", "office", "telegram", "ingress")
         envelope = build("Message", "alice", "telegram", {"text": "reply"}, pod="test", tenant="office")
