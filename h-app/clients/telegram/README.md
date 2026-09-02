@@ -71,6 +71,26 @@ afterwards. A handler added after that point which reads `update["poll"]` — th
 ordinary way a new Telegram type gets picked up — is a `NameError` on the first
 update dispatched.
 
+⚠ **ONE DECISION, USED EVERYWHERE — and this is where the first structural
+attempt was unsound.** Routing iterated `ALLOWED_UPDATE_TYPES` while a separate
+`_update_chat_id` re-parsed the raw update with its own priority (callback
+first). They disagreed, so an update carrying BOTH a `message` from an
+unauthorised chat and a `callback_query` from the allowed one had the message's
+TEXT routed under the callback's chat id: unauthorised content admitted and
+sent on. `_routed_type` selects, `_chat_id_of` derives the identity from what
+was selected, `submit_update` authorises off the same selection, and the second
+parser is deleted rather than left for the next person to reach for.
+
+⚠ **An update carrying more than one routable type is REFUSED, not resolved.**
+Telegram sends one per update, so two is malformed — and choosing a winner
+leaves the pairing possible wherever the priorities disagree.
+
+⚠ **What made this new: a value grew a second meaning when it was reused.**
+`ALLOWED_UPDATE_TYPES` was written to say what to REQUEST FROM TELEGRAM, and
+iterating it for routing made its ORDER load-bearing without anyone deciding it
+should be. Same family as a bound living in the renderer and a budget belonging
+to no identity — the thing being relied on was not the thing being maintained.
+
 ⚠ **The claim at its real strength: a handler cannot acquire a new top-level
 update type without a visible edit AT that boundary.** Not "cannot drift". Code
 inserted above the unbinding, or deleting that line, still reaches the raw

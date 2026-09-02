@@ -654,6 +654,77 @@ def test_every_allowed_type_is_routed_and_nothing_else_is():
         )
 
 
+def test_a_second_types_chat_cannot_authorise_another_types_payload():
+    """⚠ AUTHORIZATION HARM, introduced by my own refactor and caught in review.
+    Routing iterated `ALLOWED_UPDATE_TYPES` (message first) while a separate
+    `_update_chat_id` re-parsed the raw update preferring callback_query. The
+    two disagreed, so one type's PAYLOAD was paired with another type's
+    IDENTITY.
+
+    Reviewer's reproduction: a `message` from unauthorised chat 99999 carrying
+    text, plus a `callback_query` whose message belongs to allowed chat 12345.
+    Routing selected the message, the identity came out as 12345, and the bot
+    ADMITTED AND SENT the unauthorised text — confirmed in the envelopes.
+
+    ⚠ On main the orders happened to agree (callback checked first in both), so
+    this could not arise. My refactor made `ALLOWED_UPDATE_TYPES` — a list
+    written to say what to REQUEST FROM TELEGRAM — load-bearing for routing
+    order, a second meaning nobody had stated. The fix is one decision:
+    `_routed_type` selects, `_chat_id_of` derives the identity from what was
+    selected, and the second parser is deleted rather than left for the next
+    person to reach for.
+
+    A multi-type update is now REFUSED rather than resolved, because picking a
+    winner leaves the pairing possible wherever priorities disagree."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance.allowed_chat_id = "12345"
+
+        hostile = {
+            "update_id": 1,
+            "message": {"chat": {"id": 99999}, "text": "REMOTE MESSAGE"},
+            "callback_query": {"id": "cb", "data": "hi",
+                               "message": {"message_id": 5, "chat": {"id": 12345}}},
+        }
+        # ⚠ Dispatched DIRECTLY, and that matters: routed through
+        # submit_update the admission happens on a worker thread, so asserting
+        # the envelopes immediately can pass while the harm is still in flight.
+        # The first version of this test did exactly that — it failed on the
+        # worker-allocation assertion and its envelope assertion passed against
+        # the broken code, which is a test that reports the wrong reason.
+        bot_instance._dispatch_update(dict(hostile))
+
+        admitted = [e for e in mesh.sent_envelopes if "REMOTE MESSAGE" in json.dumps(e)]
+        assert admitted == [], (
+            "an unauthorised chat's message was admitted using another type's chat id"
+        )
+
+        # and the gate upstream must not allocate for it either
+        bot_instance.submit_update(dict(hostile))
+        assert bot_instance._chat_workers == {}, (
+            "the hostile update allocated a worker for the allowed chat"
+        )
+        assert telegram.sent_messages == []
+
+
+def test_the_routed_type_and_the_chat_identity_come_from_one_decision():
+    """The property behind the harm above, asserted directly: whatever
+    `_routed_type` selects is what `_chat_id_of` reads, so there is no second
+    parser to disagree with. There is no `_update_chat_id` any more — a second
+    way to answer the same question is what made the disagreement possible."""
+    assert not hasattr(bot.TelegramBot, "_update_chat_id"), (
+        "the second chat-id parser is back; two answers to one question is the defect"
+    )
+
+    callback = {"id": "cb", "message": {"chat": {"id": 5}}}
+    assert bot._chat_id_of("callback_query", callback) == "5"
+    assert bot._chat_id_of("message", {"chat": {"id": 7}}) == "7"
+    assert bot._chat_id_of("edited_message", {"chat": {"id": 9}}) == "9"
+    # a missing id is None, never the string "None" — that would become a chat
+    assert bot._chat_id_of("message", {}) is None
+    assert bot._chat_id_of(None, None) is None
+
+
 def test_an_update_of_an_unrequested_type_is_dropped_and_said_so(caplog):
     """The dispatcher's half of the same property: an update carrying only a
     type this bot does not request is dropped with a log line rather than

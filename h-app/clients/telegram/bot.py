@@ -876,11 +876,49 @@ def _routed_type(update: dict) -> "tuple[str | None, dict | None]":
     because nothing else looks for one, and the dispatcher unbinds the raw
     update immediately after calling this.
     """
-    for kind in ALLOWED_UPDATE_TYPES:
-        payload = update.get(kind)
-        if payload is not None:
-            return kind, payload
+    present = [kind for kind in ALLOWED_UPDATE_TYPES if update.get(kind) is not None]
+    if len(present) > 1:
+        # ⚠ REFUSED, NOT RESOLVED. Telegram sends one type per update, so a
+        # shape carrying two is malformed — and reviewer showed what "resolve
+        # it" costs: a `message` from an unauthorised chat paired with a
+        # `callback_query` from the allowed one had its TEXT routed and the
+        # OTHER type's chat used as the identity, so unauthorised content was
+        # admitted and sent on. Picking a winner leaves that pairing possible
+        # in whatever direction the priorities disagree; refusing removes it.
+        logger.warning(
+            f"update carries {len(present)} routable types at once, which Telegram does "
+            "not send; refusing it rather than choosing one"
+        )
+        return None, None
+    if present:
+        return present[0], update[present[0]]
     return None, None
+
+
+def _chat_id_of(kind: str | None, payload: dict | None) -> str | None:
+    """The chat of the SELECTED payload — never a second look at the update.
+
+    ⚠ THIS IS THE HALF THAT MADE THE FIRST STRUCTURAL ATTEMPT UNSOUND. Routing
+    chose a type from `ALLOWED_UPDATE_TYPES` while a separate helper re-parsed
+    the raw update with its own priority, so the two could disagree: one type's
+    payload paired with another type's authorisation identity. Deriving the id
+    from the payload that was actually selected makes disagreement
+    unexpressible rather than unlikely.
+
+    ⚠ Returns None rather than the string "None" when the id is missing: a
+    malformed update must not become a chat named None with a thread of its
+    own.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if kind == "callback_query":
+        holder = payload.get("message")
+        holder = holder if isinstance(holder, dict) else {}
+    else:
+        holder = payload
+    chat = holder.get("chat")
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    return None if chat_id is None else str(chat_id)
 
 
 class TelegramClient:
@@ -3489,22 +3527,6 @@ class TelegramBot:
             "Send it as a new message, or /cancel.",
         )
 
-    @staticmethod
-    def _update_chat_id(update: dict) -> str | None:
-        """The chat an update belongs to, for routing only — `_dispatch_update`
-        does its own extraction and its own authorisation check.
-
-        ⚠ Returns None rather than the string "None" when the id is missing:
-        a malformed update must not become a chat named None with a thread of
-        its own."""
-        callback = update.get("callback_query")
-        if callback:
-            chat_id = callback.get("message", {}).get("chat", {}).get("id")
-        else:
-            msg = update.get("message") or update.get("edited_message")
-            chat_id = msg.get("chat", {}).get("id") if msg else None
-        return None if chat_id is None else str(chat_id)
-
     def chat_worker(self, chat_id: int | str) -> ChatWorker:
         """That chat's serial worker, created under the same guard as its
         transaction — "fetch one or make one" is the check-then-mutate this
@@ -3528,8 +3550,15 @@ class TelegramBot:
         after every one of those updates had been correctly rejected. The
         rejection has to happen before anything is allocated, not after.
         `_dispatch_update` still re-checks — this is a gate, not a
-        replacement for the authorisation it does."""
-        cid = self._update_chat_id(update)
+        replacement for the authorisation it does.
+
+        ⚠ AND IT AUTHORISES OFF THE SAME SINGLE DECISION the dispatcher uses.
+        A second parser here was how an unauthorised `message` could be paired
+        with an allowed `callback_query`'s chat id: two parsers with different
+        priorities, one identity, the wrong one. Routing once and deriving the
+        id from what was routed is what makes that unexpressible."""
+        kind, payload = _routed_type(update)
+        cid = _chat_id_of(kind, payload)
         if cid is None or not self._chat_allowed(cid):
             # Handled inline: logging and dropping costs nothing and needs no
             # thread of its own, and an unauthorised chat must never get one.
@@ -3544,7 +3573,7 @@ class TelegramBot:
         ("hi", "at:agent"), not something a person typed."""
         update_id = update.get("update_id")
         kind, payload = _routed_type(update)
-        chat_id = self._update_chat_id(update)
+        chat_id = _chat_id_of(kind, payload)
         # ⚠ EVERYTHING THE RAW UPDATE IS ALLOWED TO PROVIDE HAS BEEN TAKEN, so
         # it is unbound here on purpose. A handler added below that reads
         # `update["poll"]` — the way a new Telegram type would ordinarily be
