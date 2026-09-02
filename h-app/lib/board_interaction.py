@@ -152,16 +152,27 @@ def add_ticket(r, *, pod: str, tenant: str, agent: str, envelope: dict) -> None:
         )
         raise RuntimeError("board_write_unknown")
 
-    log_record(
-        "board_interaction", "board_write_confirmed", correlation_id=corr_id,
-        destination=agent, count=depth, task_id=ticket_obj.get("id", ""),
-    )
+    # The positive RPUSH result proves creation. Contain each observation at
+    # this boundary, independently: neither observer may downgrade known
+    # success to unresolved custody, and one failing must not suppress the
+    # other attempt. This is deliberately local rather than a global
+    # log_record policy -- only this caller knows its effect is committed.
+    try:
+        log_record(
+            "board_interaction", "board_write_confirmed", correlation_id=corr_id,
+            destination=agent, count=depth, task_id=ticket_obj.get("id", ""),
+        )
+    except Exception:
+        pass
 
-    record_task_event(
-        "add",
-        id=ticket_obj.get("id", ""),
-        title=ticket_obj.get("title", ""),
-        agent=agent,
-        actor=source,
-        timestamp=ticket_obj.get("created_ts"),
-    )
+    try:
+        record_task_event(
+            "add",
+            id=ticket_obj.get("id", ""),
+            title=ticket_obj.get("title", ""),
+            agent=agent,
+            actor=source,
+            timestamp=ticket_obj.get("created_ts"),
+        )
+    except Exception:
+        pass

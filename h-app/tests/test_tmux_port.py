@@ -326,6 +326,48 @@ class TmuxPortTests(unittest.TestCase):
             [stream_id],
         )
 
+    def _assert_add_ticket_observer_failure_keeps_confirmed_custody(self, observer):
+        self.register(alice="tmux", bob="tmux")
+        stream_id = send(
+            self.redis,
+            pod=POD,
+            tenant=TENANT,
+            source="alice",
+            destination="bob",
+            payload={"id": "t1", "title": "confirmed board write"},
+            kind="AddTicket",
+        )
+        raw = self.redis.lpop(prefix(POD, TENANT, "alice", "egress"))
+        self.redis.rpush(prefix(POD, TENANT, "bob", "ingress"), raw)
+
+        with patch(observer, side_effect=OSError("observer unavailable")):
+            deliver_tmux(
+                self.redis,
+                pod=POD,
+                tenant=TENANT,
+                agent="bob",
+                session_name=TENANT,
+            )
+
+        todo = self.redis.lists[prefix(POD, TENANT, agent="bob", resource="tasks.todo")]
+        self.assertEqual([json.loads(value)["id"] for value in todo], ["t1"])
+        self.assertEqual(list(self.redis.lists[prefix(POD, TENANT, "bob", "dead")]), [])
+        self.assertEqual(list(self.redis.lists[prefix(POD, TENANT, resource="unresolved")]), [])
+        opened = self.redis.lists[prefix(POD, TENANT, "bob", "opened")]
+        self.assertEqual([parse(value)["stream_id"] for value in opened], [stream_id])
+
+    def test_add_ticket_success_log_failure_keeps_confirmed_custody(self):
+        """A broken success logger must not downgrade created work to unknown."""
+        self._assert_add_ticket_observer_failure_keeps_confirmed_custody(
+            "lib.board_interaction.log_record"
+        )
+
+    def test_add_ticket_task_event_failure_keeps_confirmed_custody(self):
+        """A broken audit writer must not downgrade created work to unknown."""
+        self._assert_add_ticket_observer_failure_keeps_confirmed_custody(
+            "lib.board_interaction.record_task_event"
+        )
+
     @patch("modules.tmux.port.submit_text")
     @patch("modules.tmux.port.list_windows", return_value={"bob"})
     def test_deliver_tmux_attachment(self, mock_list, mock_submit):
