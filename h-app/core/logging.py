@@ -86,7 +86,7 @@ _ENVELOPE_EVENTS = {
     "forward_unknown",
     "source_stamped",
     "kick_started",
-    "kick_deferred",
+    "kick_skipped",
     "kick_unknown",
     "dead_lettered",
     "received",

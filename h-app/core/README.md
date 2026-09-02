@@ -14,7 +14,7 @@ Everything else is a module that plugs into this.
 | `config.py` | local state directory resolution (`H_MESH_STATE_DIR`, default `~/.h-mesh`) |
 | `channels.py` | `send()`/`receive()`, unreplied tracking, `DeadLetter`, and best-effort failure feedback to tmux senders |
 | `queues.py` | `admit_ingress()` — shared atomic ingress-admission Lua op |
-| `registry.py` | read-only registry access (`members`/`is_member`/`port_type`) |
+| `registry.py` | read-only registry access (`members`/`member_types`/`is_member`/`port_type`) |
 | `policy.py` | import/export tag ACL (`allows`/`require_allowed`) |
 | `dispatch.py` | generic port_type -> handler registry and dispatch with renewable per-agent delivery leases, invoked only by whatever the switch's kick actually calls -- the switch itself never imports this |
 | `logging.py` | contract-shaped JSON event logging and durable stdout mirroring, plus `configure_logging()` — the stdlib logging threshold for entry points |
@@ -25,15 +25,25 @@ Everything else is a module that plugs into this.
 The tenant participant hash is the wire-visible `registry` resource. Delivery
 itself remains outside core: pass a `kick(agent, port_type, envelope)` callback to
 `Switch` when an edge module should be notified after ingress admission. With
-no callback, forwarding still completes and core records `kick_deferred`.
+no callback, forwarding still completes and core records terminal `kick_skipped`.
 The production switch uses `transmission` to start
 `python -m modules.<port_type>.port <agent>`; `port_type` is currently assumed
 to equal its module directory name, and the child reads the frame from ingress.
 Kicked ports do not inherit the switch's structured stdout: their custody
 records return over a dedicated validated pipe, while arbitrary stdout/stderr
 and crash tracebacks go to `ports.log` beside the daemon logs.
-Broadcast kicks remain deferred until their membership-only path also resolves
-participant types.
+Broadcast fan-out reads one registry snapshot containing both participant names
+and port types, admits every recipient atomically, then starts each recipient's
+delivery port. Each resolvable recipient therefore records `kick_started` or
+`kick_unknown`. A recipient with no usable type, or a switch with no callback,
+records terminal `kick_skipped`; it is not a promise of later retry. Resolvable
+members still start delivery when another member is unresolvable, making a
+partial outcome explicit instead of discarding the whole broadcast.
+After fan-out, the switch also sends the initiating participant one consolidated
+fact-only notice naming skipped recipients: it says no delivery attempt was
+started, not that later receipt is impossible. This makes the partial outcome
+visible at the initiating office/API surface without contradicting an existing
+port that may independently drain an already-admitted queue.
 
 Core logging uses the `H_MESH_WRITER`, `H_MESH_CUSTODY_FILE`,
 `H_MESH_LOG_FILE`, `H_MESH_LOG_QUIET`, and
