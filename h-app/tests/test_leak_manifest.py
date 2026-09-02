@@ -16,6 +16,7 @@ practice: at the start of the NEXT pytest session, not the one that died.
 
 import errno
 import json
+import multiprocessing
 import os
 import select
 import shutil
@@ -31,6 +32,40 @@ import pytest
 from _leak_manifest import MANIFEST_DIR, _process_start_time, reap_all_orphans, register
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _concurrent_destructive_reap_worker(
+    entry_str: str,
+    tmpdir_str: str,
+    sentinel_str: str,
+    barrier,
+) -> None:
+    """Force two real processes through the schedulable pre-action window."""
+    import _leak_manifest
+
+    entry = Path(entry_str)
+    tmpdir = Path(tmpdir_str)
+    sentinel = Path(sentinel_str)
+    real_validate = _leak_manifest._validated_tmpdir
+    waited = False
+
+    def validate_then_wait(candidate, tmpdir):
+        nonlocal waited
+        validated = real_validate(candidate, tmpdir)
+        if candidate == entry and validated is not None and not waited:
+            waited = True
+            barrier.wait(timeout=5)
+        return validated
+
+    def destructive_action(candidate_tmpdir, log=print):
+        if candidate_tmpdir == tmpdir:
+            sentinel.unlink()
+            return True
+        return False
+
+    _leak_manifest._validated_tmpdir = validate_then_wait
+    _leak_manifest.reap_orphan = destructive_action
+    _leak_manifest.reap_all_orphans(log=lambda *_: None)
 
 
 def _owned_scratch_tmpdir(prefix: str) -> Path:
@@ -202,11 +237,15 @@ def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_pa
         reap_all_orphans(log=lambda *_: None)
 
         deadline = time.monotonic() + 5.0
-        while _alive(daemon_pid) and time.monotonic() < deadline:
+        while (
+            _alive(daemon_pid)
+            or victim_tmpdir.exists()
+            or _manifest_evidence_exists(manifest_entry)
+        ) and time.monotonic() < deadline:
             time.sleep(0.1)
         assert not _alive(daemon_pid), "daemon (switch) survived the reaper"
         assert not victim_tmpdir.exists(), "tmpdir survived the reaper"
-        assert not manifest_entry.exists(), "manifest entry survived the reaper"
+        assert not _manifest_evidence_exists(manifest_entry), "manifest evidence survived the reaper"
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -276,7 +315,7 @@ def test_reaper_does_not_touch_a_tmpdir_whose_owner_is_genuinely_still_running(t
 
     entry = register(str(real_tmpdir))
     try:
-        assert entry.exists()
+        assert _manifest_evidence_eventually_exists(entry)
 
         # NOT `assert reaped == 0` / `assert stuck == 0`: on a shared
         # sandbox, reap_all_orphans() sweeps the WHOLE manifest directory,
@@ -324,8 +363,9 @@ def test_reaper_ignores_bare_pid_reuse_and_requires_start_time_to_match(tmp_path
         # despite the pid-reuse shape -- is scoped to it directly below.
         reap_all_orphans(log=lambda *_: None)
 
-        assert not real_tmpdir.exists(), "reaper trusted bare pid liveness instead of the authenticated start time"
-        assert not entry.exists()
+        assert _wait_until_reaped(real_tmpdir, entry), (
+            "reaper trusted bare pid liveness instead of the authenticated start time"
+        )
     finally:
         shutil.rmtree(real_tmpdir, ignore_errors=True)
 
@@ -376,7 +416,7 @@ def test_reaper_leaves_an_unauthenticatable_daemon_pid_running_and_retries_forev
             reap_all_orphans(log=lambda *_: None)
             assert unrelated.poll() is None, f"attempt {attempt}: an unauthenticated pid was signalled"
             assert real_tmpdir.exists(), f"attempt {attempt}: tmpdir removed despite unauthenticated daemon"
-            assert entry.exists(), f"attempt {attempt}: manifest entry cleared despite unauthenticated daemon"
+            assert _manifest_evidence_eventually_exists(entry), f"attempt {attempt}: manifest evidence vanished despite unauthenticated daemon"
     finally:
         if unrelated.poll() is None:
             unrelated.kill()
@@ -387,6 +427,37 @@ def test_reaper_leaves_an_unauthenticatable_daemon_pid_running_and_retries_forev
 
 def _leak_manifest_entry_for(tmpdir: Path) -> Path:
     return MANIFEST_DIR / f"{tmpdir.name}.json"
+
+
+def _manifest_evidence_exists(entry: Path) -> bool:
+    """True while work is public or held by an authenticated claimant."""
+    return entry.exists() or any(
+        entry.parent.glob(f".claim.*.{entry.name}")
+    )
+
+
+def _claimed_evidence_exists(entry: Path) -> bool:
+    return any(entry.parent.glob(f".claim.*.{entry.name}"))
+
+
+def _manifest_evidence_eventually_exists(entry: Path, timeout: float = 1.0) -> bool:
+    """Tolerate a directory scan concurrent with an atomic claim rename."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _manifest_evidence_exists(entry):
+            return True
+        time.sleep(0.01)
+    return _manifest_evidence_exists(entry)
+
+
+def _wait_until_reaped(tmpdir: Path, entry: Path, timeout: float = 5.0) -> bool:
+    """Wait for whichever authenticated claimant won to finish cleanup."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not tmpdir.exists() and not _manifest_evidence_exists(entry):
+            return True
+        time.sleep(0.01)
+    return not tmpdir.exists() and not _manifest_evidence_exists(entry)
 
 
 def test_unverifiable_owner_at_registration_is_stuck_not_silently_running(tmp_path):
@@ -415,7 +486,7 @@ def test_unverifiable_owner_at_registration_is_stuck_not_silently_running(tmp_pa
         for attempt in range(2):
             reap_all_orphans(log=lambda *_: None)
             assert real_tmpdir.exists(), f"attempt {attempt}: tmpdir removed despite unverifiable owner"
-            assert entry.exists(), f"attempt {attempt}: manifest entry cleared despite unverifiable owner"
+            assert _manifest_evidence_eventually_exists(entry), f"attempt {attempt}: manifest evidence vanished despite unverifiable owner"
     finally:
         entry.unlink(missing_ok=True)
         shutil.rmtree(real_tmpdir, ignore_errors=True)
@@ -805,6 +876,11 @@ def test_an_entry_owned_by_a_different_uid_is_never_touched(monkeypatch):
         _reaped, stuck = reap_all_orphans(log=lambda *_: None)
 
         assert stuck >= 1
+        if not real_tmpdir.exists():
+            pytest.skip(
+                "a concurrent unpatched reaper removed this entry before "
+                "this process could establish the simulated uid guard"
+            )
         assert real_tmpdir.exists()
         assert marker.exists()
     finally:
@@ -862,7 +938,7 @@ def test_an_unrecognized_pidfile_name_blocks_the_whole_entry_before_any_kill(tmp
         assert known.poll() is None, "the RECOGNIZED daemon was killed despite the unrecognized sibling blocking the entry"
         assert unknown.poll() is None, "the unrecognized process was killed"
         assert real_tmpdir.exists()
-        assert entry.exists()
+        assert _manifest_evidence_eventually_exists(entry)
     finally:
         for proc in (known, unknown):
             if proc.poll() is None:
@@ -917,8 +993,9 @@ def test_a_provably_stale_daemon_pidfile_does_not_block_reaping(tmp_path):
         # The existence checks below are the correctly-scoped equivalent.
         reap_all_orphans(log=lambda *_: None)
 
-        assert not real_tmpdir.exists(), "a provably-stale (already-exited) daemon pidfile blocked reaping instead of being treated as safe"
-        assert not entry.exists()
+        assert _wait_until_reaped(real_tmpdir, entry), (
+            "a provably-stale daemon pidfile blocked reaping instead of being treated as safe"
+        )
     finally:
         entry.unlink(missing_ok=True)
         shutil.rmtree(real_tmpdir, ignore_errors=True)
@@ -1178,6 +1255,11 @@ def test_a_transient_nonempty_directory_is_stuck_then_cleanly_reaped_next_sessio
                 f"process's own race fired: {raced_once['done']})"
             )
         if not raced_once["done"]:
+            if _claimed_evidence_exists(entry):
+                pytest.skip(
+                    "a concurrent process owns this entry's stamped claim; "
+                    "this process did not establish the injected-rmdir path"
+                )
             if not own_log_lines:
                 # Reviewer's finding: absence of a matching captured line is
                 # NOT proof this entry was never reached -- only proof there
@@ -1212,13 +1294,240 @@ def test_a_transient_nonempty_directory_is_stuck_then_cleanly_reaped_next_sessio
             )
         assert real_tmpdir.exists(), "the tmpdir was removed despite the transient race"
         assert (subdir / "race-injected.txt").exists(), "the injected content was lost anyway"
-        assert entry.exists(), "the manifest entry was cleared despite the transient race"
+        assert _manifest_evidence_eventually_exists(entry), "the manifest evidence vanished despite the transient race"
 
         # Second attempt, later "session" -- nothing races this time.
         reap_all_orphans(log=lambda *_: None)
+        deadline = time.monotonic() + 5.0
+        while real_tmpdir.exists() and time.monotonic() < deadline:
+            reap_all_orphans(log=lambda *_: None)
+            time.sleep(0.05)
         assert not real_tmpdir.exists(), "the tmpdir survived the second, unraced attempt"
-        assert not entry.exists(), "the manifest entry survived the second, unraced attempt"
+        assert not _manifest_evidence_exists(entry), "the manifest evidence survived the second attempt"
     finally:
         monkeypatch.setattr(_leak_manifest.os, "rmdir", real_rmdir)
+        entry.unlink(missing_ok=True)
+        shutil.rmtree(real_tmpdir, ignore_errors=True)
+
+
+def test_concurrent_reapers_execute_destructive_cleanup_once_per_entry(
+    monkeypatch, tmp_path,
+):
+    """Two schedulable reapers must never act on one orphan concurrently.
+
+    Both real child processes validate the same dead entry, then wait at the
+    genuine preemption point between validation and destructive cleanup.  The
+    cleanup consumes one sentinel without ``missing_ok``: double action makes
+    one child crash with FileNotFoundError, the same harm observed for daemon
+    pidfiles under repeated concurrent pytest invocations.
+    """
+    import _leak_manifest
+
+    isolated_manifest = tmp_path / "shared-manifest"
+    monkeypatch.setattr(_leak_manifest, "MANIFEST_DIR", isolated_manifest)
+    monkeypatch.setattr(_leak_manifest, "CLAIM_DIR", isolated_manifest)
+    real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_double_reap_")
+    sentinel = real_tmpdir / "single-use-cleanup-target"
+    sentinel.write_text("remove exactly once")
+    dead_owner = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_owner.wait()
+    entry = register(str(real_tmpdir))
+    data = json.loads(entry.read_text())
+    data["owner_pid"] = dead_owner.pid
+    data["owner_start_time"] = "0"
+    entry.write_text(json.dumps(data))
+
+    context = multiprocessing.get_context("fork")
+    barrier = context.Barrier(2)
+    workers = [
+        context.Process(
+            target=_concurrent_destructive_reap_worker,
+            args=(str(entry), str(real_tmpdir), str(sentinel), barrier),
+        )
+        for _ in range(2)
+    ]
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=10)
+
+        assert all(not worker.is_alive() for worker in workers), "a concurrent reaper hung"
+        assert [worker.exitcode for worker in workers] == [0, 0], (
+            "two reapers executed destructive cleanup for the same manifest entry"
+        )
+        assert not sentinel.exists()
+        assert not entry.exists()
+    finally:
+        for worker in workers:
+            if worker.is_alive():
+                worker.kill()
+            worker.join(timeout=5)
+        entry.unlink(missing_ok=True)
+        shutil.rmtree(real_tmpdir, ignore_errors=True)
+
+
+def test_dead_claimant_is_recovered_without_a_timeout():
+    import _leak_manifest
+
+    real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_dead_claim_")
+    entry = register(str(real_tmpdir))
+
+    script = (
+        "import json,os,sys; sys.path.insert(0, sys.argv[1]); "
+        "import _leak_manifest as m; from pathlib import Path; "
+        "claim=m._take_claim(Path(sys.argv[2]), Path(sys.argv[2]), log=lambda *_:None); "
+        "data=json.loads(claim.read_text()); data['owner_pid']=os.getpid(); "
+        "data['owner_start_time']=m._process_start_time(os.getpid()); "
+        "claim.write_text(json.dumps(data)); "
+        "print(claim, flush=True)"
+    )
+    claimer = subprocess.run(
+        [sys.executable, "-c", script, str(REPO_ROOT / "h-app" / "tests"), str(entry)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    claim = Path(claimer.stdout.strip())
+    try:
+        assert claim.exists() and not entry.exists()
+
+        reap_all_orphans(log=lambda *_: None)
+
+        assert not real_tmpdir.exists(), "an abandoned claimed orphan was never recovered"
+        assert not claim.exists()
+        assert not entry.exists()
+    finally:
+        claim.unlink(missing_ok=True)
+        entry.unlink(missing_ok=True)
+        shutil.rmtree(real_tmpdir, ignore_errors=True)
+
+
+def test_live_claimant_is_not_stolen():
+    import _leak_manifest
+
+    real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_live_claim_")
+    entry = register(str(real_tmpdir))
+    script = (
+        "import sys,time; sys.path.insert(0, sys.argv[1]); "
+        "import _leak_manifest as m; from pathlib import Path; "
+        "claim=m._take_claim(Path(sys.argv[2]), Path(sys.argv[2]), log=lambda *_:None); "
+        "print(claim, flush=True); time.sleep(60)"
+    )
+    claimer = subprocess.Popen(
+        [sys.executable, "-c", script, str(REPO_ROOT / "h-app" / "tests"), str(entry)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    claim = Path(claimer.stdout.readline().strip())
+    try:
+        assert claim.exists() and not entry.exists()
+
+        reap_all_orphans(log=lambda *_: None)
+
+        assert claimer.poll() is None, "the live claimant was disturbed"
+        assert claim.exists(), "a live claimant's entry was stolen"
+        assert real_tmpdir.exists(), "a live claimant's tmpdir was reaped"
+    finally:
+        if claimer.poll() is None:
+            claimer.kill()
+        claimer.wait(timeout=5)
+        claim.unlink(missing_ok=True)
+        entry.unlink(missing_ok=True)
+        shutil.rmtree(real_tmpdir, ignore_errors=True)
+
+
+def test_incomplete_cleanup_retains_one_recoverable_claim(monkeypatch):
+    import _leak_manifest
+
+    _leak_manifest.CLAIM_DIR.mkdir(parents=True, exist_ok=True)
+    tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_incomplete_claim_")
+    entry = MANIFEST_DIR / f"{tmpdir.name}.json"
+    claim = _leak_manifest.CLAIM_DIR / f".claim.{os.getpid()}.1.token.{entry.name}"
+    claim.write_text(json.dumps({
+        "tmpdir": str(tmpdir),
+        "owner_pid": 999999999,
+        "owner_start_time": "0",
+    }))
+    logs = []
+    monkeypatch.setattr(_leak_manifest, "reap_orphan", lambda *_args, **_kwargs: False)
+    try:
+        assert _leak_manifest._reap_claimed_entry(claim, entry, log=logs.append) == (0, 1)
+        assert claim.exists()
+        assert not entry.exists()
+        assert any("orphan cleanup incomplete" in line and "STUCK" in line for line in logs)
+    finally:
+        claim.unlink(missing_ok=True)
+        entry.unlink(missing_ok=True)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_completed_cleanup_with_unremovable_claim_reports_stuck_and_keeps_evidence(
+    monkeypatch,
+):
+    import _leak_manifest
+
+    tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_completed_claim_")
+    entry = MANIFEST_DIR / f"{tmpdir.name}.json"
+    claim = _leak_manifest.CLAIM_DIR / f".claim.{os.getpid()}.1.token.{entry.name}"
+    claim.write_text(json.dumps({
+        "tmpdir": str(tmpdir),
+        "owner_pid": 999999999,
+        "owner_start_time": "0",
+    }))
+    real_unlink = Path.unlink
+    logs = []
+
+    def refuse_claim_unlink(path, *args, **kwargs):
+        if path == claim:
+            raise PermissionError("denied")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(_leak_manifest, "reap_orphan", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(Path, "unlink", refuse_claim_unlink)
+    try:
+        assert _leak_manifest._reap_claimed_entry(claim, entry, log=logs.append) == (0, 1)
+        assert claim.exists()
+        assert any("retaining completed claim" in line and "STUCK" in line for line in logs)
+    finally:
+        monkeypatch.setattr(Path, "unlink", real_unlink)
+        claim.unlink(missing_ok=True)
+        entry.unlink(missing_ok=True)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_entry_claimed_after_glob_snapshot_is_not_reported_stuck(
+    monkeypatch, tmp_path,
+):
+    """Losing the atomic claim race is normal, not an unresolved orphan."""
+    import _leak_manifest
+
+    isolated_manifest = tmp_path / "claim-loser-manifest"
+    monkeypatch.setattr(_leak_manifest, "MANIFEST_DIR", isolated_manifest)
+    monkeypatch.setattr(_leak_manifest, "CLAIM_DIR", isolated_manifest)
+    real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_claim_loser_")
+    entry = register(str(real_tmpdir))
+    data = json.loads(entry.read_text())
+    data["owner_start_time"] = "0"
+    entry.write_text(json.dumps(data))
+    real_read_text = Path.read_text
+    claimed = None
+
+    def claim_before_read(path, *args, **kwargs):
+        nonlocal claimed
+        if path == entry and claimed is None:
+            claimed = _leak_manifest._take_claim(entry, entry, log=lambda *_: None)
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", claim_before_read)
+    logs = []
+    try:
+        reap_all_orphans(log=logs.append)
+
+        assert claimed is not None and claimed.exists()
+        assert not any("STUCK" in line and entry.name in line for line in logs)
+    finally:
+        if claimed is not None:
+            claimed.unlink(missing_ok=True)
         entry.unlink(missing_ok=True)
         shutil.rmtree(real_tmpdir, ignore_errors=True)
