@@ -157,6 +157,54 @@ class EnvelopeTests(unittest.TestCase):
                 with self.assertRaisesRegex(EnvelopeError, message):
                     parse(raw)
 
+    def test_build_without_in_reply_to_leaves_it_absent_not_null(self):
+        frame = self.frame()
+        self.assertNotIn("in_reply_to", frame)
+        raw = encode(frame)
+        parsed = parse(raw)
+        self.assertNotIn("in_reply_to", parsed)
+
+    def test_build_with_in_reply_to_round_trips_the_exact_value(self):
+        target = "b" * 32
+        frame = build(
+            "Message", "alice", "bob", {"text": "hello"},
+            pod=POD, tenant=TENANT, in_reply_to=target,
+        )
+        self.assertEqual(frame["in_reply_to"], target)
+        parsed = parse(encode(frame))
+        self.assertEqual(parsed["in_reply_to"], target)
+
+    def test_encode_rejects_malformed_in_reply_to(self):
+        with self.assertRaisesRegex(EnvelopeError, "in_reply_to must be"):
+            encode(self.frame(in_reply_to="not-a-valid-id"))
+
+    def test_parse_tolerates_malformed_in_reply_to_on_the_wire(self):
+        # parse() must never dead-letter an otherwise-valid envelope over a
+        # bad optional field -- that judgment belongs to the receiving
+        # module (deliver_api), not the wire layer. A hand-built body with a
+        # garbage in_reply_to must still parse, carrying the value through
+        # unvalidated for the caller to judge.
+        frame = self.frame()
+        raw = encode(frame)
+        header, body = raw[:HEADER_WIDTH], raw[HEADER_WIDTH:]
+        import json
+        body_dict = json.loads(body)
+        body_dict["in_reply_to"] = "not-a-valid-id"
+        tampered = header + json.dumps(body_dict, separators=(",", ":"))
+        parsed = parse(tampered)
+        self.assertEqual(parsed["in_reply_to"], "not-a-valid-id")
+
+    def test_old_frame_produced_before_the_field_existed_still_round_trips(self):
+        # Simulates a frame from before in_reply_to existed: no key at all,
+        # not even in the raw wire bytes, not just absent from build()'s
+        # kwargs.
+        frame = self.frame()
+        raw = encode(frame)
+        self.assertNotIn('"in_reply_to"', raw[HEADER_WIDTH:])
+        parsed = parse(raw)
+        self.assertNotIn("in_reply_to", parsed)
+        self.assertEqual(parsed["payload"], {"text": "hello", "nested": {"ok": True}})
+
     def test_encode_rejects_invalid_counters_and_body(self):
         cases = (
             ({"ttl": -1}, "ttl must be"),

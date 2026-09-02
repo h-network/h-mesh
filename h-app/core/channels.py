@@ -172,6 +172,7 @@ def send(
     kind: str = "Message",
     correlation_id: str | None = None,
     module: str = "channels",
+    in_reply_to: str | None = None,
 ) -> str:
     try:
         _, local_source = resolve_source(pod=pod, tenant=tenant, source=source)
@@ -187,7 +188,8 @@ def send(
                 destination=local_destination,
             )
         envelope = build(
-            kind, source, destination, payload, correlation_id, pod=pod, tenant=tenant
+            kind, source, destination, payload, correlation_id,
+            pod=pod, tenant=tenant, in_reply_to=in_reply_to,
         )
     except EnvelopeError as exc:
         log_record(

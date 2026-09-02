@@ -15,6 +15,7 @@ from core.registry import port_type
 from lib.attachment_schema import validate_attachment_payload
 from lib.board_interaction import add_ticket
 from lib.paths import get_workdir_root
+from lib.reply_correlation import record_delivered
 from .ops import list_windows, submit_text
 
 # The CLIs that write a session file the switch can tail. An agent running
@@ -103,7 +104,11 @@ def message_opener(
     source = envelope.get("l2", {}).get("source", "unknown")
     payload = envelope.get("payload", {})
     text = payload.get("text", "") if isinstance(payload, dict) else str(payload)
-    blocks = [f"[message from {source}] {text}\n"]
+    stream_id = envelope.get("stream_id", "")
+    # Exposed so a reply can opt into `office send --reply-to` -- see
+    # lib/reply_correlation.py. Nothing downstream requires it; a reply that
+    # never names it stays valid, same as before this existed.
+    blocks = [f"[message {stream_id} from {source}] {text}\n"]
     try:
         pt = port_type(r, pod=pod, tenant=tenant, agent=source)
     except Exception:
@@ -112,9 +117,9 @@ def message_opener(
         blocks.append(f"[reply to {source}]\n")
 
     msg = "".join(blocks)
-    stream_id = envelope.get("stream_id", "")
     corr_id = envelope.get("correlation_id")
     mark_delivery_pending(r, pod, tenant, agent, stream_id, correlation_id=corr_id)
+    record_delivered(r, pod=pod, tenant=tenant, agent=agent, stream_id=stream_id)
     submit_text(session_name, agent, msg, stream_id=stream_id, socket=socket)
 
 
