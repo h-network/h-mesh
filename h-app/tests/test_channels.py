@@ -11,8 +11,8 @@ if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
 from core.channels import DeadLetter, receive, send
-from core.envelope import parse
-from core.keys import prefix
+from core.envelope import build, encode, parse
+from core.keys import delivery_lock_key, prefix
 from core.service import Switch
 
 
@@ -390,6 +390,36 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(kicks, [("host", "office", stream_id)])
         self.assertEqual(log.call_args.args, ("kick_restarted",))
         self.assertIn("non-empty ingress", log.call_args.kwargs["reason"])
+
+    def test_backlog_reconciliation_waits_for_live_delivery_lease(self):
+        self.register(host="office")
+        raw = encode(build(
+            "StartAgent", "host", "host", {"agent": "worker"},
+            pod=POD, tenant=TENANT,
+        ))
+        self.redis.rpush(prefix(POD, TENANT, "host", "ingress"), raw)
+        self.redis.values[delivery_lock_key(POD, TENANT, "host")] = "live-holder"
+        kicks = []
+
+        Switch(
+            self.redis, pod=POD, tenant=TENANT,
+            kick=lambda *args: kicks.append(args),
+        )._reconcile_ingress()
+
+        self.assertEqual(kicks, [])
+
+    def test_backlog_reconciliation_leaves_paused_agent_queued(self):
+        self.register(host="office")
+        self.redis.rpush(prefix(POD, TENANT, "host", "ingress"), "queued")
+        self.redis.values[prefix(POD, TENANT, "host", "paused")] = "1"
+        kicks = []
+
+        Switch(
+            self.redis, pod=POD, tenant=TENANT,
+            kick=lambda *args: kicks.append(args),
+        )._reconcile_ingress()
+
+        self.assertEqual(kicks, [])
 
 
 if __name__ == "__main__":

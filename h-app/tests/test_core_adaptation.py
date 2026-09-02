@@ -121,6 +121,7 @@ class CoreAdaptationTests(unittest.TestCase):
 
     def test_switch_run_retries_after_redis_connection_error(self):
         switch = Switch(object(), pod="mesh", tenant="office", poll_seconds=5)
+        switch._reconcile_ingress = MagicMock()
         switch.step = MagicMock(
             side_effect=[redis.exceptions.ConnectionError("redis restarting"), KeyboardInterrupt]
         )
@@ -133,6 +134,7 @@ class CoreAdaptationTests(unittest.TestCase):
             switch.run()
 
         self.assertEqual(switch.step.call_count, 2)
+        switch._reconcile_ingress.assert_called_once_with()
         sleep.assert_called_once_with(2.0)
         emit.assert_called_once_with(
             "error", {},

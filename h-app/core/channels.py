@@ -231,25 +231,17 @@ def send(
     return envelope["stream_id"]
 
 
-def receive(
+def _open_received(
     r,
     *,
     pod: str,
     tenant: str,
     agent: str,
     openers: dict[str, Callable[[dict], None]],
-    timeout: int,
-    blocking: bool = True,
-    module: str = "port",
+    raw,
+    module: str,
 ) -> None:
-    ingress_key = prefix(pod, tenant, agent, "ingress")
-    if blocking:
-        item = r.blpop(ingress_key, timeout=timeout)
-        raw = None if item is None else item[1]
-    else:
-        raw = r.lpop(ingress_key)
-    if raw is None:
-        return
+    """Parse and open one raw envelope already removed from ingress."""
     try:
         envelope = parse(raw)
     except EnvelopeError as exc:
@@ -294,3 +286,42 @@ def receive(
         )
         return
     _emit_for_recipient(module, "opened", envelope, agent)
+
+
+def receive(
+    r,
+    *,
+    pod: str,
+    tenant: str,
+    agent: str,
+    openers: dict[str, Callable[[dict], None]],
+    timeout: int,
+    blocking: bool = True,
+    module: str = "port",
+) -> None:
+    """Wait for ingress when requested, then drain it one envelope at a time.
+
+    A switch kick means work is available, not that exactly one queue entry is
+    paired with this process. Draining prevents an older entry left by a missed
+    or crashed kick from consuming the only attempt for the request behind it.
+    Each envelope is removed immediately before it is opened, so a process
+    failure cannot discard an unprocessed batch.
+    """
+    ingress_key = prefix(pod, tenant, agent, "ingress")
+    if blocking:
+        item = r.blpop(ingress_key, timeout=timeout)
+        raw = None if item is None else item[1]
+    else:
+        raw = r.lpop(ingress_key)
+
+    while raw is not None:
+        _open_received(
+            r,
+            pod=pod,
+            tenant=tenant,
+            agent=agent,
+            openers=openers,
+            raw=raw,
+            module=module,
+        )
+        raw = r.lpop(ingress_key)

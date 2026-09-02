@@ -20,7 +20,7 @@ from .envelope import (
     parse_for_switch,
     stamp_source,
 )
-from .keys import prefix
+from .keys import delivery_lock_key, prefix
 from .logging import configure_logging, emit, log_record, publish
 from .queues import admit_ingress
 from .registry import member_types, members, port_type
@@ -192,7 +192,15 @@ class Switch:
             limit=self.ingress_max,
         )
 
-    def _kick(self, agent: str, port_type_name: str | None, envelope: dict) -> bool:
+    def _kick(
+        self,
+        agent: str,
+        port_type_name: str | None,
+        envelope: dict,
+        *,
+        started_event: str = "kick_started",
+        started_reason: str | None = None,
+    ) -> bool:
         if port_type_name is None:
             _log_observation(
                 "kick_skipped",
@@ -227,14 +235,43 @@ class Switch:
             return True
         # A callback return proves only that the switch started a delivery
         # attempt; it does not claim that the edge reached or popped ingress.
-        _log_observation(
-            "kick_started",
+        fields = dict(
             stream_id=envelope.get("stream_id"),
             correlation_id=envelope.get("correlation_id"),
             source=envelope.get("l2", {}).get("source"),
             destination=agent,
         )
+        if started_reason is not None:
+            fields["reason"] = started_reason
+        _log_observation(started_event, **fields)
         return True
+
+    def _reconcile_ingress(self) -> None:
+        """Restart abandoned ingress once its prior delivery lease is gone."""
+        for agent, port_type_name in sorted(
+            member_types(self.r, pod=self.pod, tenant=self.tenant).items()
+        ):
+            if self.r.get(prefix(self.pod, self.tenant, agent, "paused")) is not None:
+                continue
+            ingress_key = prefix(self.pod, self.tenant, agent, "ingress")
+            if self.r.llen(ingress_key) < 1:
+                continue
+            if self.r.get(delivery_lock_key(self.pod, self.tenant, agent)) is not None:
+                continue
+            raw = self.r.lindex(ingress_key, 0)
+            if raw is None:
+                continue
+            try:
+                envelope = parse_for_switch(raw)
+            except EnvelopeError:
+                envelope = {}
+            self._kick(
+                agent,
+                port_type_name or None,
+                envelope,
+                started_event="kick_restarted",
+                started_reason="non-empty ingress found without a delivery lease",
+            )
 
     def _notify_broadcast_sender(
         self, *, sender: str, sender_type: str | None,
@@ -394,6 +431,13 @@ class Switch:
             now = time.monotonic()
             if now >= next_maintenance:
                 agents = None
+                try:
+                    self._reconcile_ingress()
+                except Exception as exc:
+                    _emit_observation(
+                        "error", {},
+                        reason=f"ingress recovery pass failed: {type(exc).__name__}: {exc}",
+                    )
                 if retention_trimmer is not None:
                     try:
                         agents = self._agents()
