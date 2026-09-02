@@ -105,8 +105,15 @@ redis.call('HDEL', KEYS[1], ARGV[1])
 if current_lead == ARGV[1] then
     redis.call('DEL', KEYS[2])
 end
-if #undeliverable > 0 then redis.call('RPUSH', KEYS[17], unpack(undeliverable)) end
-if #unresolved > 0 then redis.call('RPUSH', KEYS[18], unpack(unresolved)) end
+-- Keep every mutation's command arity constant. Expanding either unbounded
+-- table with unpack() can itself fail after HDEL (Lua stack/argument limit),
+-- and EVAL would preserve that partial membership removal.
+for _, record in ipairs(undeliverable) do
+    redis.call('RPUSH', KEYS[17], record)
+end
+for _, record in ipairs(unresolved) do
+    redis.call('RPUSH', KEYS[18], record)
+end
 redis.call('DEL', KEYS[3])
 redis.call('DEL', KEYS[4])
 redis.call('DEL', KEYS[5])

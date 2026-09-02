@@ -225,6 +225,68 @@ def test_undeliverable_record_preserves_non_utf8_raw_exactly(real_redis):
             real_redis.delete(*keys)
 
 
+@pytest.mark.parametrize(
+    ("source_resource", "destination_key", "reason"),
+    [
+        (
+            "ingress",
+            receive_undeliverable_key,
+            "destination retired before opening",
+        ),
+        (
+            "opening",
+            receive_unresolved_key,
+            "opener outcome unknown when destination retired",
+        ),
+    ],
+    ids=["undeliverable", "unresolved"],
+)
+def test_stop_large_backlog_conserves_every_identity_in_correct_sink(
+    real_redis, source_resource, destination_key, reason,
+):
+    tenant = f"stop-large-{uuid4().hex[:12]}"
+    agent = "worker"
+    registry_key = prefix(POD, tenant, resource="registry")
+    source_key = prefix(POD, tenant, agent=agent, resource=source_resource)
+    sink_key = destination_key(POD, tenant)
+    frames = [
+        build(
+            "Message", "sender", agent, {"sequence": sequence},
+            pod=POD, tenant=tenant,
+        )
+        for sequence in range(10_000)
+    ]
+    expected_ids = [frame["stream_id"] for frame in frames]
+    real_redis.hset(registry_key, agent, "tmux")
+    real_redis.rpush(source_key, *(encode(frame) for frame in frames))
+    try:
+        stop_agent(
+            real_redis,
+            pod=POD,
+            tenant=tenant,
+            envelope={"payload": {"agent": agent}},
+            kill_window=lambda _agent: None,
+        )
+
+        records = [json.loads(raw) for raw in real_redis.lrange(sink_key, 0, -1)]
+        observed_ids = [
+            parse(bytes.fromhex(record["envelope"]))["stream_id"]
+            for record in records
+        ]
+        # This is the conservation harm, not an assertion that a particular
+        # Lua mechanism completed: every admitted identity is terminal exactly
+        # once before membership may disappear.
+        assert observed_ids == expected_ids
+        assert [record["agent"] for record in records] == [agent] * len(frames)
+        assert [record["reason"] for record in records] == [reason] * len(frames)
+        assert real_redis.lrange(source_key, 0, -1) == []
+        assert real_redis.hget(registry_key, agent) is None
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
 @patch("lib.agentlifecycle.lifecycle.log_record")
 @patch("lib.agentlifecycle.lifecycle.port_type", return_value="tmux")
 def test_stop_agent_purges_instance_delivery_state_before_killing_window(
