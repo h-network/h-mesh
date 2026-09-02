@@ -79,7 +79,11 @@ def legacy_name_violations(root: Path) -> tuple[int, list[str]]:
                     )
                     if raw_value not in invalid
                 ):
-                    folded = folded.replace(allowed_literal, "")
+                    folded = re.sub(
+                        rf"(?<![a-z0-9_]){re.escape(allowed_literal)}(?![a-z0-9_])",
+                        "",
+                        folded,
+                    )
             matches = [name for name in LEGACY_BANNED_NAMES if name in folded]
             if matches:
                 violations.append(f"{relative}:{line_number}: {', '.join(matches)}")
@@ -133,6 +137,24 @@ def test_legacy_name_allowance_cannot_hide_an_unlisted_reference(tmp_path: Path)
     ), (
         "an explicit allowance must remove only the literal it names; "
         f"observed {violations}"
+    )
+
+
+def test_legacy_name_allowance_does_not_apply_inside_longer_identifier(tmp_path: Path):
+    source = tmp_path / "module.py"
+    allowed_name = "F" + "LOCK"
+    longer_violation = allowed_name + "_NEW_REFERENCE"
+    source.write_text(
+        f'{allowed_name} = "{longer_violation}"  '
+        f"{LEGACY_ALLOW_MARKER} {allowed_name}\n"
+    )
+
+    _, violations = legacy_name_violations(tmp_path)
+
+    banned_match = "f" + "lock"
+    assert violations == [f"module.py:1: {banned_match}, {banned_match}_"], (
+        "an allowance for one identifier must not erase the same substring "
+        f"inside an unlisted longer identifier; observed {violations}"
     )
 
 
