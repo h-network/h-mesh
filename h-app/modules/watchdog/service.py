@@ -613,9 +613,11 @@ class Watchdog:
 
                 minutes = hold_age // 60
                 reason = ticket.get("hold_reason")
-                reason_suffix = (
-                    f" (reason: {reason})" if isinstance(reason, str) and reason.strip() else ""
-                )
+                # Collapse embedded whitespace/newlines the same way `office
+                # list` already does for this field -- an unnormalized
+                # multi-line reason would make one alert read like several.
+                reason_text = " ".join(reason.split()) if isinstance(reason, str) else ""
+                reason_suffix = f" (reason: {reason_text})" if reason_text else ""
                 text = (
                     f'[alert from watchdog] {agent} has had '
                     f'"{ticket["title"]}" on hold for {minutes} min{reason_suffix}'
