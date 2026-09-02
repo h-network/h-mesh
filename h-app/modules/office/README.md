@@ -34,8 +34,11 @@ preflight rule. Hire a replacement with `--lead` before retiring the old lead
 when the office should always have one; retiring a former lead cannot clear a
 leadership transfer that has already happened.
 
-Board transitions keep the one-doing-ticket invariant atomically, including
-concurrent `office take` calls. A malformed todo/held entry is moved without
+Board transitions run in one isolated Lua script and preflight both Redis key
+types before mutation; `take` also checks destination emptiness before its
+first write. This keeps the one-doing-ticket invariant under concurrent
+`office take` calls and prevents WRONGTYPE from leaving a removed-only ticket.
+A malformed todo/held entry is moved without
 rewriting into the visible `invalid` list instead of being discarded or
 permanently blocking later tickets. `office hold --reason TEXT [ID]` requires
 and stores the blocking reason; `office list` shows it on held tickets. Use
@@ -73,3 +76,15 @@ the name cannot inherit queued messages or paused state. Registry removal also
 atomically clears the tenant lead key when (and only when) it still names the
 retired agent; all type checks occur before the first removal, so a runtime
 error cannot leave only half of that combined transition applied.
+
+`office send -a AGENT --reply-to STREAM_ID TEXT` opts a reply into exact
+correlation: `STREAM_ID` is the id shown in the `[reply to X: office send -a
+X --reply-to <id> "..."]` hint line a tmux agent gets when the message it's
+answering came from an api-type source (see `modules/tmux/README.md`).
+`--reply-to` is format-checked locally for fast feedback (rejects anything
+that isn't a 32-character lowercase hex id before sending at all), but that
+is a courtesy, not the trust boundary -- the recipient's door
+(`modules/api/port.py`'s `deliver_api`) independently validates the claim
+against real delivery provenance and silently drops it if it doesn't hold,
+same as if `--reply-to` had never been passed. See `lib/reply_correlation.py`
+and `modules/api/README.md` for the full mechanism.
