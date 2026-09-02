@@ -344,6 +344,84 @@ but drops update types silently and at a distance, so the next handler someone
 adds would fail by never being called — declining in `_dispatch_update` costs
 one visible log line per edit instead.
 
+⚠ **Two mechanisms, and they do different jobs.** A per-chat worker gives
+*ordering*; a per-chat transaction gives *mutual exclusion*. Neither implies
+the other, and the branch that shipped only the second was wrong about it.
+
+**Ordering — `ChatWorker`, one thread and one queue per chat.** `getUpdates`
+returns updates in order; `run_polling` hands each to `submit_update`, which
+routes it to that chat's worker. Updates for one chat are therefore handled in
+arrival order, while different chats stay fully concurrent — the reason
+updates were taken off the polling loop in the first place (a chat waiting on
+a slow call must not stall the poller) still holds. A lock alone does *not*
+give this: lock acquisition is not FIFO, so with only a lock the answers
+`sme-9` then `-` could be applied `-` first, rejected against `stage=name`,
+leaving the flow a step behind with nothing crashed and a log that reads
+normally. A handler that raises is logged and the worker continues; before
+this, each update owned a bare thread and an exception killed it in silence.
+
+**Mutual exclusion — `TelegramBot.chat_txn(chat_id)`.** Still needed, because
+the worker is not the only thread touching a chat's state: `ReplyPusher`,
+`AlertPusher`, activity watchers and `/watch`'s own thread all do. Every
+read-then-write holds it: a whole pending-flow step, `handle_addticket_priority`'s
+claim, `/watch`'s replace (read incumbent, signal, install) and
+`_stop_pane_watch`, `handle_voice_toggle`'s read-and-flip, the activity-render
+swap and `finalize_activity`'s compare-and-pop, and every flow install. It is
+a plain non-reentrant lock: nesting raises `ChatTransactionError` naming the
+chat rather than deadlocking, which is why `handle_watch_pick` replaces inline
+instead of calling `_stop_pane_watch`.
+
+**What the guard does and does not catch.** Per-chat maps are `ChatDict`, a
+`MutableMapping` over a private dict — so `update`, `clear`, `popitem`, `pop`,
+`setdefault` and `|=` all route through one guarded choke point, where a
+`dict` subclass had four holes. Stored values are handed out frozen
+(`FrozenChatState`), so `state = pending.get(cid); state["stage"] = ...` is
+refused at the write instead of quietly changing what another thread is
+reading; a step advances by writing a successor back. ⚠ It does **not** catch a
+STALE READ: reading outside a transaction and writing back inside one is
+accepted, and is still wrong. Nothing in a container can see how old the value
+in your hand is — that is what holding the transaction across the whole
+read-then-write is for. Reads themselves stay unguarded: a lone read is always
+safe.
+
+**What a chat's own updates wait for**, with real numbers: a flow step is one
+mesh call (10s timeout) plus typically one or two Telegram calls (30s each;
+60s for a file download, 90s for TTS and the session stream), so tens of
+seconds worst case for that one chat. The step holds throughout rather than
+claiming and releasing, deliberately: the next answer must not be accepted
+before the prompt it answers is visible. Claim-and-release would be safe only
+with an explicit in-progress state that queues or rejects input arriving
+mid-step. The transaction is released on exceptions.
+
+⚠ **A limit with a fix in flight — a reply cannot yet say which turn it
+answers.** `ReplyPusher` finalizes a chat+agent's activity render with no
+render handle, because the api door mints a fresh `correlation_id` per
+envelope and an agent's reply is its own envelope: nothing on the wire links
+it to the prompt. With two overlapping prompts to one agent, the first reply
+ends whichever render is installed, which may belong to the second,
+still-running turn. The display stops early; no state is corrupted.
+
+Raised with api-agent, who first declined — nothing populates an
+`in_reply_to` without the agent cooperating, and the no-cooperation fallback
+(FIFO oldest-delivered-first) assumes replies return in order, which is
+exactly false here. **That decline has since been overtaken:** architect put
+an opt-in exact-correlation option to them, they specified it, and it is being
+built across the tmux port, `office send` and the openshell port — additive
+and opt-in.
+
+⚠ The fallback below is not going away when it lands. Correlation depends on
+the replying agent passing the id back, so uncorrelated replies keep arriving,
+and the by-key behaviour is what serves them;
+`test_an_overlapping_reply_finalizes_the_wrong_turns_render` becomes the
+fallback's test rather than something to delete.
+
+It is also an ORDERING dependency, not only a missing correlation:
+ReplyPusher's thread and the polling worker are excluded from each other by
+the transaction, not ordered. Dropping the reply-triggered finalize would
+remove the dependency, at the cost of every turn's display lingering until the
+watcher notices — up to its 300s timeout — which was ruled against as a
+certain cost traded for a rare one.
+
 Try it without a bot token: `python3 clients/telegram/bot.py --api-token "$H_MESH_API_TOKEN" --menu`.
 
 ---

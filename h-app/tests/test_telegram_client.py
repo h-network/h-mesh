@@ -421,22 +421,22 @@ def test_dispatching_flows_all_show_typing_before_their_network_call():
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
 
-        bot_instance.pending["12345"] = {"flow": "addticket", "agent": "architect", "stage": "priority", "title": "t"}
+        with bot_instance.chat_txn("12345"): bot_instance.pending["12345"] = {"flow": "addticket", "agent": "architect", "stage": "priority", "title": "t"}
         bot_instance.handle_addticket_priority(12345, "high")
         assert telegram.chat_actions[-1] == {"chat_id": "12345", "action": "typing"}
 
         bot_instance.handle_lifecycle_control(12345, "PauseAgent", "architect")
         assert telegram.chat_actions[-1] == {"chat_id": 12345, "action": "typing"}
 
-        bot_instance.pending["12345"] = {"flow": "hire", "stage": "provider", "name": "newagent", "profile": None}
+        with bot_instance.chat_txn("12345"): bot_instance.pending["12345"] = {"flow": "hire", "stage": "provider", "name": "newagent", "profile": None}
         bot_instance.handle_pending_text(12345, "-")
         assert telegram.chat_actions[-1] == {"chat_id": "12345", "action": "typing"}
 
-        bot_instance.pending["12345"] = {"flow": "retire", "agent": "architect"}
+        with bot_instance.chat_txn("12345"): bot_instance.pending["12345"] = {"flow": "retire", "agent": "architect"}
         bot_instance.handle_pending_text(12345, "architect")
         assert telegram.chat_actions[-1] == {"chat_id": "12345", "action": "typing"}
 
-        bot_instance.pending["12345"] = {"flow": "broadcast"}
+        with bot_instance.chat_txn("12345"): bot_instance.pending["12345"] = {"flow": "broadcast"}
         bot_instance.handle_pending_text(12345, "standup in five")
         assert telegram.chat_actions[-1] == {"chat_id": "12345", "action": "typing"}
 
@@ -657,7 +657,7 @@ def test_an_edit_does_not_answer_an_open_flow_and_says_so(caplog):
     silence here leaves them waiting on an answer already discarded."""
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
-        bot_instance.pending["42"] = {"flow": "hire", "stage": "provider", "name": "sme-9",
+        with bot_instance.chat_txn("42"): bot_instance.pending["42"] = {"flow": "hire", "stage": "provider", "name": "sme-9",
                                       "profile": None, "message_id": 7}
 
         with caplog.at_level(logging.INFO, logger="mesh_telegram"):
@@ -698,7 +698,7 @@ def test_an_edit_from_an_unauthorized_chat_gets_no_reply_either():
     which would tell an unauthorized sender a bot is listening."""
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=42)
-        bot_instance.pending["999"] = {"flow": "hire", "stage": "name"}
+        with bot_instance.chat_txn("999"): bot_instance.pending["999"] = {"flow": "hire", "stage": "name"}
 
         bot_instance._dispatch_update(
             {"update_id": 9, "edited_message": {"chat": {"id": 999}, "message_id": 3, "text": "sme-9"}}
@@ -1042,7 +1042,7 @@ def test_addticket_cancel_is_a_fresh_send_and_disarms_the_old_screen():
 def test_addticket_description_dash_skips_it():
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
-        bot_instance.pending[12345] = {"flow": "addticket", "agent": "architect", "stage": "title"}
+        with bot_instance.chat_txn(12345): bot_instance.pending[12345] = {"flow": "addticket", "agent": "architect", "stage": "title"}
         bot_instance.handle_text_message(12345, "Quick fix")
         bot_instance.handle_text_message(12345, "-")
         bot_instance.handle_callback_query(12345, "cb-1", "ap:normal")
@@ -1054,7 +1054,7 @@ def test_addticket_description_dash_skips_it():
 def test_addticket_priority_stray_text_reprompts_without_losing_the_flow():
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
-        bot_instance.pending[12345] = {"flow": "addticket", "agent": "architect", "stage": "priority",
+        with bot_instance.chat_txn(12345): bot_instance.pending[12345] = {"flow": "addticket", "agent": "architect", "stage": "priority",
                                         "title": "Quick fix", "description": ""}
         reply = bot_instance.handle_text_message(12345, "high please")
         assert "Tap a priority button" in reply
@@ -1065,7 +1065,7 @@ def test_addticket_priority_stray_text_reprompts_without_losing_the_flow():
 def test_addticket_flow_cancel():
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
-        bot_instance.pending[12345] = {"flow": "addticket", "agent": "architect", "stage": "title"}
+        with bot_instance.chat_txn(12345): bot_instance.pending[12345] = {"flow": "addticket", "agent": "architect", "stage": "title"}
         reply = bot_instance.handle_text_message(12345, "/cancel")
         assert reply == "Cancelled."
         assert 12345 not in bot_instance.pending
@@ -1077,7 +1077,7 @@ def test_pending_flow_takes_priority_over_ordinary_prompt():
     (which would send it to target_agent instead of consuming it as an answer)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
-        bot_instance.pending[12345] = {"flow": "addticket", "agent": "architect", "stage": "title"}
+        with bot_instance.chat_txn(12345): bot_instance.pending[12345] = {"flow": "addticket", "agent": "architect", "stage": "title"}
         bot_instance.handle_text_message(12345, "not a prompt for architect")
         # send_message (chat) was only used for the flow prompt, never routed as
         # a Message envelope — DummyMeshClient has no record of prompt sends,
@@ -1238,7 +1238,7 @@ def test_retire_requires_typing_the_exact_name():
 def test_retire_cancel():
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
-        bot_instance.pending[12345] = {"flow": "retire", "agent": "architect"}
+        with bot_instance.chat_txn(12345): bot_instance.pending[12345] = {"flow": "retire", "agent": "architect"}
         reply = bot_instance.handle_text_message(12345, "/cancel")
         assert reply == "Cancelled."
         assert 12345 not in bot_instance.pending
@@ -1253,7 +1253,7 @@ def test_retire_failure_reports_detail():
 
         mesh = FailingMeshClient()
         bot_instance, _, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
-        bot_instance.pending[12345] = {"flow": "retire", "agent": "architect"}
+        with bot_instance.chat_txn(12345): bot_instance.pending[12345] = {"flow": "retire", "agent": "architect"}
         reply = bot_instance.handle_text_message(12345, "architect")
         assert "Failed to retire architect" in reply
         assert "unknown agent" in reply
@@ -1278,7 +1278,7 @@ def test_broadcast_full_flow():
 def test_broadcast_cancel():
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
-        bot_instance.pending[12345] = {"flow": "broadcast"}
+        with bot_instance.chat_txn(12345): bot_instance.pending[12345] = {"flow": "broadcast"}
         reply = bot_instance.handle_text_message(12345, "/cancel")
         assert reply == "Cancelled."
         assert 12345 not in bot_instance.pending
@@ -1293,7 +1293,7 @@ def test_broadcast_failure_reports_detail():
 
         mesh = FailingMeshClient()
         bot_instance, _, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
-        bot_instance.pending[12345] = {"flow": "broadcast"}
+        with bot_instance.chat_txn(12345): bot_instance.pending[12345] = {"flow": "broadcast"}
         reply = bot_instance.handle_text_message(12345, "hi all")
         assert "Broadcast failed" in reply
         assert "policy denied" in reply
@@ -1364,7 +1364,7 @@ def test_hire_sends_every_answer_reply_fresh_instead_of_editing():
 def test_hire_with_a_profile_and_provider():
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
-        bot_instance.pending[12345] = {"flow": "hire", "stage": "name"}
+        with bot_instance.chat_txn(12345): bot_instance.pending[12345] = {"flow": "hire", "stage": "name"}
 
         bot_instance.handle_text_message(12345, "sme-9")
         bot_instance.handle_text_message(12345, "work")
@@ -1377,7 +1377,7 @@ def test_hire_with_a_profile_and_provider():
 def test_hire_rejects_invalid_name_without_consuming_the_flow():
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
-        bot_instance.pending[12345] = {"flow": "hire", "stage": "name"}
+        with bot_instance.chat_txn(12345): bot_instance.pending[12345] = {"flow": "hire", "stage": "name"}
 
         reply = bot_instance.handle_text_message(12345, "123")  # all-digits, refused
         assert "won't work" in reply
@@ -1406,11 +1406,136 @@ def test_hire_cancel_at_any_stage():
             {"flow": "hire", "stage": "profile", "name": "sme-9"},
             {"flow": "hire", "stage": "provider", "name": "sme-9", "profile": None},
         ):
-            bot_instance.pending[12345] = state
+            with bot_instance.chat_txn(12345): bot_instance.pending[12345] = state
             reply = bot_instance.handle_text_message(12345, "/cancel")
             assert reply == "Cancelled."
             assert 12345 not in bot_instance.pending
         assert mesh.hired == []
+
+
+def test_two_answers_racing_one_flow_neither_double_submit_nor_crash():
+    """A real race between two real threads, not a mock asserting a lock was
+    taken.
+
+    ⚠ The window this closes is genuinely narrow: between _advance_pending_flow
+    reading the flow state and the submission branch deleting it, with no I/O
+    in between, so a plain barrier never hits it -- I checked, and a version of
+    this test written that way passed with the lock removed, which would have
+    been a test of nothing. The window is widened here by making the state
+    READ slow (the shim below blocks the first thread inside its second get),
+    which is timing simulation, not a change in what is asserted: two threads
+    answer the same stage, and afterwards exactly one hire must have been sent
+    and neither thread may have died.
+
+    Without the per-chat lock the loser's `del self.pending[cid]` raises
+    KeyError against an entry the winner already removed -- in production that
+    is a dispatch thread dying silently, with nothing in the chat."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        entered_window = threading.Event()
+        release_window = threading.Event()
+
+        class SlowReadPending(bot.ChatDict):
+            """Blocks the first thread to reach its SECOND read -- the read
+            inside _advance_pending_flow, which is where the window opens."""
+
+            reads = 0
+            gate = threading.Lock()
+
+            def get(self, key, default=None):
+                value = super().get(key, default)
+                with SlowReadPending.gate:
+                    SlowReadPending.reads += 1
+                    mine = SlowReadPending.reads
+                if mine == 2 and value:
+                    entered_window.set()
+                    release_window.wait(timeout=2)
+                return value
+
+        class SlowMeshClient(DummyMeshClient):
+            def hire_agent(self, agent, cli="claude", profile=None, provider=None):
+                time.sleep(0.1)
+                return super().hire_agent(agent, cli=cli, profile=profile, provider=provider)
+
+        bot_instance, mesh, telegram = _make_bot(mesh=SlowMeshClient(), tmpdir=tmpdir)
+        bot_instance.pending = SlowReadPending()
+        with bot_instance.chat_txn("12345"): bot_instance.pending["12345"] = {
+            "flow": "hire", "stage": "provider", "name": "sme-9", "profile": None, "message_id": 1,
+        }
+
+        errors = []
+
+        def answer():
+            try:
+                bot_instance.handle_text_message(12345, "-")
+            except BaseException as exc:  # a dispatch thread dying is the bug
+                errors.append(exc)
+
+        first = threading.Thread(target=answer)
+        first.start()
+        assert entered_window.wait(timeout=5), "first thread never reached the window"
+        second = threading.Thread(target=answer)
+        second.start()
+        time.sleep(0.2)  # let the second thread get as far as it can
+        release_window.set()
+        for t in (first, second):
+            t.join(timeout=10)
+
+        assert [t.is_alive() for t in (first, second)] == [False, False]
+        assert errors == []
+        assert mesh.hired == [{"agent": "sme-9", "cli": "claude", "profile": None, "provider": None}]
+        assert "12345" not in bot_instance.pending
+
+
+def test_a_chat_transaction_is_one_object_no_matter_which_thread_asks_first():
+    """The lock map is itself check-then-mutate: two threads on a chat's first
+    two updates must not each build a lock and each hold a different one."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        ready = threading.Barrier(8)
+        seen = []
+
+        def grab():
+            ready.wait(timeout=5)
+            seen.append(bot_instance.chat_txn(4242))
+
+        threads = [threading.Thread(target=grab) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert len(seen) == 8
+        assert len({id(lock) for lock in seen}) == 1
+
+def test_racing_flows_in_different_chats_do_not_wait_on_each_other():
+    """Per chat, not global: a chat stuck in a 10s hire must not stall every
+    other chat's traffic. Chat B completes while chat A is still blocked."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        release_a = threading.Event()
+
+        class BlockingMeshClient(DummyMeshClient):
+            def hire_agent(self, agent, cli="claude", profile=None, provider=None):
+                if agent == "slow-agent":
+                    release_a.wait(timeout=5)
+                return super().hire_agent(agent, cli=cli, profile=profile, provider=provider)
+
+        bot_instance, mesh, telegram = _make_bot(mesh=BlockingMeshClient(), tmpdir=tmpdir)
+        with bot_instance.chat_txn("111"): bot_instance.pending["111"] = {
+            "flow": "hire", "stage": "provider", "name": "slow-agent", "profile": None, "message_id": 1,
+        }
+        with bot_instance.chat_txn("222"): bot_instance.pending["222"] = {
+            "flow": "hire", "stage": "provider", "name": "quick-agent", "profile": None, "message_id": 2,
+        }
+
+        blocked = threading.Thread(target=lambda: bot_instance.handle_text_message(111, "-"))
+        blocked.start()
+        try:
+            bot_instance.handle_text_message(222, "-")  # would hang if the lock were global
+            assert [h["agent"] for h in mesh.hired] == ["quick-agent"]
+        finally:
+            release_a.set()
+            blocked.join(timeout=5)
+        assert [h["agent"] for h in mesh.hired] == ["quick-agent", "slow-agent"]
 
 
 def test_hire_failure_reports_detail():
@@ -1421,7 +1546,7 @@ def test_hire_failure_reports_detail():
 
         mesh = FailingMeshClient()
         bot_instance, _, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
-        bot_instance.pending[12345] = {"flow": "hire", "stage": "provider", "name": "sme-9", "profile": "bogus"}
+        with bot_instance.chat_txn(12345): bot_instance.pending[12345] = {"flow": "hire", "stage": "provider", "name": "sme-9", "profile": "bogus"}
         reply = bot_instance.handle_text_message(12345, "-")
         assert "Failed to hire sme-9" in reply
         assert "available accounts: default, work" in reply
@@ -1486,7 +1611,7 @@ def test_hire_puts_the_flow_back_when_the_submission_raises():
                 raise RuntimeError("connection reset by peer")
 
         bot_instance, _, telegram = _make_bot(mesh=ExplodingMeshClient(), tmpdir=tmpdir)
-        bot_instance.pending["12345"] = {
+        with bot_instance.chat_txn("12345"): bot_instance.pending["12345"] = {
             "flow": "hire", "stage": "provider", "name": "sme-9", "profile": None, "message_id": 7,
         }
 
@@ -2134,7 +2259,7 @@ def test_status_command_respects_per_chat_target():
         mesh = DummyMeshClient()
         mesh.boards["sme-2"] = {"todo": [], "doing": [{"title": "Fix the flaky test"}], "hold": [], "done": []}
         bot_instance, _, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
-        bot_instance.chat_target_agent[12345] = "sme-2"
+        with bot_instance.chat_txn(12345): bot_instance.chat_target_agent[12345] = "sme-2"
 
         text = bot_instance.handle_status_command(12345)
         assert "Agent Status: sme-2" in text
@@ -3748,3 +3873,505 @@ def test_naming_sweep_classes_and_env_vars(monkeypatch):
 
 
 
+
+
+# ── per-chat transactions: the reviewer's four channels ──────────────────────
+
+def _race(target, n=2, gap=0.0):
+    """Run `target` in n threads, collecting anything that escapes one. A
+    dispatch thread dying is the production symptom, so it has to be visible
+    to the test rather than printed and forgotten."""
+    errors = []
+
+    def run():
+        try:
+            target()
+        except BaseException as exc:  # noqa: BLE001 - the point is to catch everything
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(n)]
+    for t in threads:
+        t.start()
+        if gap:
+            time.sleep(gap)
+    for t in threads:
+        t.join(timeout=10)
+    assert [t.is_alive() for t in threads] == [False] * n
+    return errors
+
+
+def _slow_read_dict(bot_instance, *, block_on=1, initial=None):
+    """A ChatDict that stalls one reader inside the window under test.
+
+    ⚠ Timing simulation, deliberately, and the same technique as the
+    pending-flow race test: these windows contain no I/O, so plain concurrency
+    never lands inside them -- a version of each of these tests written with
+    only threads and a barrier passed with the fix REMOVED, i.e. tested
+    nothing. What is asserted stays behavioural: the final state, and that no
+    thread died.
+    """
+
+    class SlowRead(bot.ChatDict):
+        reads = 0
+        gate = threading.Lock()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            with SlowRead.gate:
+                SlowRead.reads += 1
+                mine = SlowRead.reads
+            if mine == block_on:
+                SlowRead.entered.set()
+                SlowRead.release.wait(timeout=2)
+            return value
+
+    d = SlowRead(guard=bot_instance._holds_chat_txn)
+    if initial:
+        with bot_instance.chat_txn(next(iter(initial))):
+            for k, v in initial.items():
+                d[k] = v
+    return d
+
+
+def test_two_priority_taps_add_one_ticket_and_kill_no_thread():
+    """Reviewer's finding 1. Two callbacks read the same priority state; one
+    added the ticket and the other died with KeyError('12345') -- the same
+    silent dispatch-thread death this branch exists to close."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        entered = threading.Event()
+        release = threading.Event()
+
+        class SlowAddMesh(DummyMeshClient):
+            def add_ticket(self, agent, title, description="", priority="normal"):
+                entered.set()
+                release.wait(timeout=2)
+                return super().add_ticket(agent, title, description, priority)
+
+        bot_instance, mesh, telegram = _make_bot(mesh=SlowAddMesh(), tmpdir=tmpdir)
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending[12345] = {
+                "flow": "addticket", "agent": "sme-2", "stage": "priority",
+                "title": "t", "description": "d", "message_id": 1,
+            }
+
+        errors = _race(lambda: bot_instance.handle_addticket_priority(12345, "high"), gap=0.05)
+        release.set()
+
+        assert errors == []
+        assert len(mesh.added_tickets) == 1
+        assert "12345" not in bot_instance.pending
+
+
+def test_two_watch_picks_leave_exactly_one_stoppable_watch():
+    """Reviewer's finding 2. Stopping outside the transaction let two picks
+    each see no current watch and each start a watcher: both live, one
+    untracked, its stop_event never set and unreachable through the bot. The
+    first reader is stalled inside the window (see _slow_read_dict) so the two
+    picks genuinely overlap."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        slow = _slow_read_dict(bot_instance)
+        bot_instance.pane_watches = slow
+        started = []
+
+        def fake_run(cid, agent, render, stop_event):
+            started.append(stop_event)
+            stop_event.wait(timeout=5)
+
+        bot_instance._run_pane_watch = fake_run
+        errors = []
+
+        def pick():
+            try:
+                bot_instance.handle_watch_pick(12345, "sme-2")
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        first = threading.Thread(target=pick)
+        first.start()
+        assert slow.entered.wait(timeout=5)
+        second = threading.Thread(target=pick)
+        second.start()
+        time.sleep(0.2)
+        slow.release.set()
+        for th in (first, second):
+            th.join(timeout=5)
+
+        tracked = bot_instance.pane_watches.get("12345")
+        assert errors == []
+        assert tracked is not None
+        assert len(started) == 2
+        # every watcher started is either the tracked one or already told to
+        # stop -- none is left running with no way to reach it
+        assert all(ev is tracked["stop_event"] or ev.is_set() for ev in started)
+        tracked["stop_event"].set()
+
+
+def test_a_failing_prompt_does_not_finalize_a_later_prompts_render():
+    """Reviewer's finding 3. A installs render A and blocks in its send; B
+    swaps in render B and succeeds; A's send then fails and used to clean up
+    'the render for this chat and agent', which by then was B's -- leaving B
+    live, completed, and untracked."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, no_activity_push=False)
+        key = "12345:architect"
+
+        with bot_instance.chat_txn(12345):
+            render_a = ActivityRender("12345", "architect")
+            render_b = ActivityRender("12345", "architect")
+            bot_instance.activity_renders[key] = render_b
+
+        # A owns render_a, which is no longer the installed one
+        bot_instance.finalize_activity(12345, "architect", render=render_a)
+
+        assert bot_instance.activity_renders.get(key) is render_b
+        assert render_b.completed is False
+        # the callback path (no render handle) still finalizes what is installed
+        bot_instance.finalize_activity(12345, "architect")
+        assert bot_instance.activity_renders.get(key) is None
+        assert render_b.completed is True
+
+
+def test_two_voice_toggles_end_where_two_sequential_toggles_would():
+    """Reviewer's finding 4. Two synchronized toggles both replied 'enabled'
+    and left it enabled; done one after the other they end disabled. The
+    read-then-write window has no I/O in it, so the first reader is stalled
+    inside it (see _slow_read_dict) to make the interleaving deterministic."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, voice_feature_enabled=True)
+        slow = _slow_read_dict(bot_instance)
+        bot_instance.chat_voice_enabled = slow
+
+        errors = []
+
+        def toggle():
+            try:
+                bot_instance.handle_voice_toggle(12345)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        first = threading.Thread(target=toggle)
+        first.start()
+        assert slow.entered.wait(timeout=5)
+        second = threading.Thread(target=toggle)
+        second.start()
+        time.sleep(0.2)
+        slow.release.set()
+        for th in (first, second):
+            th.join(timeout=5)
+
+        assert errors == []
+        assert bot_instance.is_voice_enabled(12345) is False
+        replies = [m["text"] for m in telegram.sent_messages]
+        assert sum("enabled for this chat" in r for r in replies) == 1
+        assert sum("disabled for this chat" in r for r in replies) == 1
+
+
+def test_changing_per_chat_state_without_a_transaction_is_refused():
+    """The structural half: forgetting the coordination is not a race you have
+    to reproduce, it is an error at the first write."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+
+        with pytest.raises(bot.ChatTransactionError):
+            bot_instance.pending["12345"] = {"flow": "hire", "stage": "name"}
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending["12345"] = {"flow": "hire", "stage": "name"}
+        with pytest.raises(bot.ChatTransactionError):
+            del bot_instance.pending["12345"]
+        # reads never need one
+        assert bot_instance.pending.get("12345")["flow"] == "hire"
+
+
+def test_a_nested_transaction_is_refused_rather_than_deadlocking():
+    """A plain lock would hang here with no message. Nesting means two callers
+    each believe they own the chat, which is a design error worth seeing."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        with bot_instance.chat_txn(12345):
+            with pytest.raises(bot.ChatTransactionError):
+                with bot_instance.chat_txn(12345):
+                    pass
+        # and it is usable again afterwards
+        with bot_instance.chat_txn(12345):
+            pass
+
+
+def test_updates_for_one_chat_are_applied_in_arrival_order():
+    """Mutual exclusion is not ordering. Lock acquisition is not FIFO, so with
+    a lock alone the answers "sme-9" then "-" can be applied "-" first --
+    rejected against stage=name -- leaving the flow at profile instead of
+    provider, with nothing crashed and a normal-looking log.
+
+    ⚠ The barrier here is DISPATCH COMPLETION, not any wait helper of the
+    bot's. An earlier version waited on chat_worker(...).wait_idle(), which
+    under a thread-per-update implementation creates an unrelated empty worker
+    and returns immediately: the test then failed at stage `name` because the
+    dispatches were still running, never at the reversed-order `profile` it
+    claimed to catch. It failed for the wrong reason, which is the same thing
+    as not testing what it says.
+
+    FALSIFICATION, observed: replace submit_update's body with
+    `threading.Thread(target=self._dispatch_update, args=(update,), daemon=True).start()`
+    and this fails on `assert state["stage"] == "provider"` with the actual
+    value 'profile' -- the second answer applied first, rejected at the name
+    stage, and the first answer then advancing only one step."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=12345)
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending[12345] = {"flow": "hire", "stage": "name", "message_id": 1}
+
+        second_entered = threading.Event()
+        finished = threading.Semaphore(0)
+        real_dispatch = bot_instance._dispatch_update
+
+        def instrumented(update):
+            uid = update["update_id"]
+            if uid == 2:
+                second_entered.set()
+            if uid == 1:
+                # Give a mis-ordered implementation every chance to run the
+                # later update first. Under the worker this simply times out,
+                # because update 2 cannot start until update 1 returns.
+                second_entered.wait(timeout=0.3)
+            try:
+                real_dispatch(update)
+            finally:
+                finished.release()
+
+        # patched before the first submit, so the worker captures this handler
+        bot_instance._dispatch_update = instrumented
+
+        def update(uid, text):
+            return {"update_id": uid, "message": {"chat": {"id": 12345}, "message_id": uid, "text": text}}
+
+        bot_instance.submit_update(update(1, "sme-9"))
+        bot_instance.submit_update(update(2, "-"))
+        assert finished.acquire(timeout=5), "first dispatch never completed"
+        assert finished.acquire(timeout=5), "second dispatch never completed"
+
+        state = bot_instance.pending.get("12345")
+        assert state is not None, "the flow should still be open at the provider stage"
+        assert state["stage"] == "provider"
+        assert state["name"] == "sme-9"
+
+
+def test_a_handler_that_raises_does_not_kill_the_chat_worker():
+    """Before, each update owned a bare thread: an exception killed it
+    silently and the operator saw nothing. The worker logs and keeps going."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=12345)
+        calls = []
+
+        def explode(update):
+            calls.append(update["update_id"])
+            if update["update_id"] == 1:
+                raise RuntimeError("boom")
+
+        worker = bot.ChatWorker("12345", explode)
+        worker.submit({"update_id": 1})
+        worker.submit({"update_id": 2})
+
+        assert worker.wait_idle(timeout=5)
+        assert calls == [1, 2]
+
+
+def test_an_overlapping_reply_finalizes_the_wrong_turns_render():
+    """⚠ Pins a LIMIT WITH A FIX IN FLIGHT, not correct behaviour and not an
+    accepted decision -- api-agent's original decline was overtaken by an
+    opt-in exact-correlation change they are now building. ReplyPusher has no
+    render handle because a reply carries no link back to its prompt: the api
+    mints a fresh correlation_id per envelope and an agent's reply is its own
+    envelope. With two overlapping prompts to one agent, the first reply ends
+    whichever render is installed. ⚠ Do NOT delete this test when correlation
+    lands: it is opt-in and depends on the replying agent passing the id back,
+    so uncorrelated replies keep arriving and this becomes the test for that
+    fallback path."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        key = "12345:architect"
+        with bot_instance.chat_txn(12345):
+            render_b = ActivityRender("12345", "architect")
+            bot_instance.activity_renders[key] = render_b
+
+        # the reply to an earlier, already-swapped-out turn
+        bot_instance.finalize_activity(12345, "architect")
+
+        assert render_b.completed is True
+        assert bot_instance.activity_renders.get(key) is None
+
+
+def test_every_mutating_method_on_per_chat_state_is_refused_without_a_transaction():
+    """The previous version subclassed dict, so update/clear/popitem/|= all
+    bypassed the guard: "omission is an error" was false for four spellings of
+    the same write. ChatDict is a MutableMapping over a private dict now, so
+    every mutator routes through __setitem__/__delitem__."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending[12345] = {"flow": "hire", "stage": "name"}
+
+        for label, mutate in [
+            ("__setitem__", lambda: bot_instance.pending.__setitem__("12345", {"flow": "x"})),
+            ("update", lambda: bot_instance.pending.update({"12345": {"flow": "x"}})),
+            ("setdefault", lambda: bot_instance.pending.setdefault("999", {"flow": "x"})),
+            ("pop", lambda: bot_instance.pending.pop("12345")),
+            ("popitem", lambda: bot_instance.pending.popitem()),
+            ("clear", lambda: bot_instance.pending.clear()),
+            ("__ior__", lambda: bot_instance.pending.__ior__({"12345": {"flow": "x"}})),
+            ("__delitem__", lambda: bot_instance.pending.__delitem__("12345")),
+        ]:
+            with pytest.raises(bot.ChatTransactionError):
+                mutate()
+            assert bot_instance.pending.get("12345")["flow"] == "hire", f"{label} changed state anyway"
+
+
+def test_state_handed_out_by_a_read_cannot_be_mutated_in_place():
+    """`state = pending.get(cid); state["stage"] = ...` used to change live
+    shared state with no transaction and no error -- the guard cannot see a
+    write it never receives. Stored values are frozen, so that write is
+    refused at the point it happens."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending[12345] = {"flow": "hire", "stage": "name"}
+
+        state = bot_instance.pending.get("12345")
+        with pytest.raises(bot.ChatTransactionError):
+            state["stage"] = "provider"
+        with pytest.raises(bot.ChatTransactionError):
+            del state["stage"]
+        assert bot_instance.pending.get("12345")["stage"] == "name"
+        # the supported way round: write a successor back inside the transaction
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending["12345"] = {**dict(state), "stage": "profile"}
+        assert bot_instance.pending.get("12345")["stage"] == "profile"
+
+
+def test_a_stale_read_is_still_accepted_and_the_docs_say_so():
+    """⚠ Pins a LIMIT, not a guarantee. Reading outside a transaction and
+    writing inside one is exactly what the container cannot detect: by the
+    time the write arrives it looks identical to a fresh one. Ordering comes
+    from the per-chat worker, not from this class, and the docstring says so
+    rather than claiming the guard covers it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending[12345] = {"flow": "hire", "stage": "name"}
+
+        stale = dict(bot_instance.pending.get("12345"))  # read with no transaction
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending[12345] = {**stale, "stage": "profile"}
+
+        assert bot_instance.pending.get("12345")["stage"] == "profile"
+
+
+def test_nested_state_is_frozen_too():
+    """Shallow freezing would be the same hole one level down: a nested dict
+    left mutable takes an untracked write exactly as the top level used to."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending[12345] = {"flow": "hire", "args": {"stage": "name"}}
+
+        state = bot_instance.pending.get("12345")
+        with pytest.raises(bot.ChatTransactionError):
+            state["args"]["stage"] = "provider"
+        assert bot_instance.pending.get("12345")["args"]["stage"] == "name"
+        # objects that carry their own thread-safety are passed through, not frozen
+        event = threading.Event()
+        with bot_instance.chat_txn(777):
+            bot_instance.pane_watches[777] = {"agent": "sme-2", "stop_event": event}
+        bot_instance.pane_watches.get("777")["stop_event"].set()
+        assert event.is_set()
+
+
+def test_unauthorized_chats_never_get_a_worker():
+    """⚠ Resource exhaustion, not tidiness: a worker is a permanent thread and
+    a permanent queue. Measured before the fix, 30 updates from 30 unauthorised
+    chats left 30 live daemon threads behind, every one of those updates having
+    been correctly rejected. Authorisation has to happen before allocation."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=12345)
+        before = threading.active_count()
+
+        for i in range(30):
+            bot_instance.submit_update(
+                {"update_id": i, "message": {"chat": {"id": 900000 + i}, "message_id": i, "text": "hello"}}
+            )
+        # malformed updates must not become a chat named "None" either
+        bot_instance.submit_update({"update_id": 99, "message": {"text": "no chat at all"}})
+        bot_instance.submit_update({"update_id": 100})
+
+        assert bot_instance._chat_workers == {}
+        assert threading.active_count() == before
+        assert telegram.sent_messages == []
+
+        # the allowed chat still gets exactly one
+        bot_instance.submit_update(
+            {"update_id": 200, "message": {"chat": {"id": 12345}, "message_id": 200, "text": "/menu"}}
+        )
+        assert bot_instance.chat_worker(12345).wait_idle(timeout=5)
+        assert list(bot_instance._chat_workers) == ["12345"]
+
+
+def test_updates_are_acknowledged_to_telegram_before_they_are_handled():
+    """⚠ Pins a LOSS BOUNDARY, not a guarantee. `offset` advances when an
+    update is queued, so a crash loses operator actions Telegram believes were
+    delivered. The alternative -- acknowledging only after processing -- makes
+    restart redeliver, and a redelivered /run runs the command twice with no
+    dedupe anywhere in this client. A lost message can be sent again; a
+    duplicated side effect cannot be un-run.
+
+    ⚠ The exposure is the in-progress update PLUS anything queued behind it,
+    not just the queue: once the worker has dequeued an update, qsize reads
+    zero while the handler may still be tens of seconds inside network calls,
+    and that update is equally acknowledged and equally lost. The assertion
+    below deliberately uses unfinished_tasks rather than qsize for exactly
+    that reason, and BACKLOG_WARN never fires for a single in-flight update --
+    no warning does not mean nothing at risk."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        holding = threading.Event()
+        offsets = []
+        polls = threading.Semaphore(0)
+
+        class RecordingTelegram(DummyTelegramClient):
+            def get_updates(self, offset=None, timeout=20):
+                offsets.append(offset)
+                polls.release()
+                if len(offsets) == 1:
+                    return [{"update_id": 7,
+                             "message": {"chat": {"id": 12345}, "message_id": 1, "text": "hello"}}]
+                if len(offsets) > 3:
+                    raise SystemExit("stop the loop")  # not caught by run_polling's except Exception
+                return []
+
+        telegram = RecordingTelegram()
+        bot_instance, mesh, _ = _make_bot(telegram=telegram, tmpdir=tmpdir, allowed_chat_id=12345)
+
+        real_dispatch = bot_instance._dispatch_update
+        bot_instance._dispatch_update = lambda update: (holding.wait(timeout=5), real_dispatch(update))
+
+        def poll():
+            try:
+                bot_instance.run_polling()
+            except SystemExit:
+                pass  # the fake client's way of ending the loop
+
+        loop = threading.Thread(target=poll, daemon=True)
+        loop.start()
+        try:
+            assert polls.acquire(timeout=5), "the loop never polled at all"
+            assert polls.acquire(timeout=5), (
+                "no second poll while the update was still queued — acknowledgement "
+                "now waits for handling, which moves the loss boundary"
+            )
+            # the update is still sitting in the worker, unhandled...
+            assert bot_instance.chat_worker(12345)._queue.unfinished_tasks == 1
+            # ...and Telegram has already been told not to send it again
+            assert offsets[1] == 8
+        finally:
+            holding.set()
+            loop.join(timeout=5)
