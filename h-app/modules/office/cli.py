@@ -620,16 +620,42 @@ def _await_hire_confirmation(
     could have caused that transition. For an agent that already existed
     (a re-hire / config-change request), bare membership proves nothing
     about whether THIS request succeeded or was rejected: the row would
-    look identical either way, since lib.agentlifecycle.start_agent
-    deliberately does not publish any new marker for an idempotent-looking
-    hire of an already-registered agent ("idempotent starts do not replace
-    this marker: their envelope did not cause a new window" -- see its own
-    comment). So an already-registered agent can only ever resolve to
-    "failed" (a real, stream_id-matched rejection) or "unknown" here --
-    never "confirmed" -- because there is no request-attributable success
-    signal available to observe. UNKNOWN staying UNKNOWN, not silently
-    becoming a false CONFIRMED, is the entire point of the three-state
-    design; a wait that cannot tell the difference must time out, not lie.
+    look identical either way. lib.agentlifecycle.start_agent DOES
+    sometimes produce a real, observable side effect for this case (it
+    kills the existing pane via replace_window() when the new payload's
+    cli/profile/provider/resume/skip_permissions/claude_tools actually
+    differ from what's already published -- its own `config_changed`
+    check), but that is a *window-liveness* event, not an identity one --
+    deliberately not consumed here, the same "window readiness is a
+    separate, later state" scoping switch-agent drew for the
+    never-registered-before case too. What start_agent() never does,
+    changed or not, is touch `window.cause`/any registry-adjacent marker
+    for an already-registered agent's hire ("idempotent starts do not
+    replace this marker: their envelope did not cause a new window" --
+    its own comment; not independently asserted by that module's own test
+    suite as of this writing, only relied upon here, and this function
+    does not actually depend on it staying true either way, since it
+    never reads that key at all). So an already-registered agent can only
+    ever resolve to "failed" (a real, stream_id-matched rejection) or
+    "unknown" here -- never "confirmed" -- because no request-attributable
+    *identity* signal is consumed for it. UNKNOWN staying UNKNOWN, not
+    silently becoming a false CONFIRMED, is the entire point of the
+    three-state design; a wait that cannot tell the difference must time
+    out, not lie.
+
+    ⚠ Known, accepted residual gap, not fully closed: the caller's own
+    already_registered baseline (see _lifecycle_command) is read
+    immediately before send(), but not atomically with it -- a
+    same-name hire racing in *that* exact window (unrelated to this one)
+    could still make a genuinely-fresh request look already-registered
+    (this function then correctly stays conservative: unknown/failed,
+    never a false confirm) or, in the narrower and more concerning
+    direction, could make this function treat a transition it didn't
+    cause as if it did (a false confirm, the original defect shape at a
+    much smaller scale). Closing this fully needs an atomic read+enqueue
+    (e.g. a Lua script), which would mean changing core.channels.send()
+    itself -- out of scope here without coordinating with whoever owns
+    that function.
 
     Dead-letter evidence is checked every iteration BEFORE the registry, and
     reversing that order alone was considered and rejected (per reviewer):
