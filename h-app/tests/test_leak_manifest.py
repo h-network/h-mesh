@@ -111,32 +111,40 @@ def _describe_exit(proc: subprocess.Popen) -> str:
 
 def _wait_for_ready_line(proc: subprocess.Popen, timeout: float) -> tuple[bool, str]:
     """Wait for a "READY" line without blocking past `timeout` even if the
-    child never writes anything: a plain `proc.stdout.readline()` blocks
-    until a line arrives OR the pipe closes on exit, so it cannot tell "the
-    child is alive but silent" from "the deadline passed" -- and once the
-    pipe DOES close, `readline()` returns "" instantly forever, so a caller
-    that only checks "did I get a line" has no way to tell a dead child from
-    one still starting up. `select` on the underlying fd, re-checked against
-    a real deadline, makes both distinctions possible; captures whatever
-    output the child did produce either way, since that's the other half of
-    the evidence a bare pass/fail throws away."""
+    child never writes anything, or writes a partial, unterminated line and
+    then goes on being silently alive.
+
+    Reviewer's finding on an earlier version of this helper: `select`
+    reports the pipe readable as soon as ANY bytes exist -- it answers "is
+    there data", not "is there a line". A text-mode `proc.stdout.readline()`
+    called right after still blocks until a newline or EOF, so a child that
+    writes a partial line and then keeps running silently could hang this
+    wait past its own deadline anyway, the exact "deadline that never fires"
+    harm this helper exists to close. Fixed by reading raw, available bytes
+    directly off the fd (`os.read`, which -- unlike a buffered readline --
+    returns as soon as `select` says there's anything, never blocking for a
+    newline that hasn't arrived yet) into our own incremental buffer, and
+    detecting "READY" from that buffer rather than from the stream. Partial,
+    unterminated output is retained in the buffer either way, since that's
+    the other half of the evidence a bare pass/fail throws away."""
     deadline = time.monotonic() + timeout
-    output: list[str] = []
+    fd = proc.stdout.fileno()
+    buffer = b""
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        readable, _, _ = select.select([proc.stdout], [], [], min(0.2, remaining))
+        readable, _, _ = select.select([fd], [], [], min(0.2, remaining))
         if not readable:
             continue
-        line = proc.stdout.readline()
-        if line == "":
+        chunk = os.read(fd, 4096)
+        if chunk == b"":
             break  # EOF: the child's stdout closed, which only happens on exit.
-        output.append(line)
-        if "READY" in line:
-            return True, "".join(output)
+        buffer += chunk
+        if b"READY" in buffer:
+            return True, buffer.decode("utf-8", errors="replace")
     proc.poll()
-    return False, "".join(output)
+    return False, buffer.decode("utf-8", errors="replace")
 
 
 def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_path):
@@ -147,7 +155,7 @@ def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_pa
 
     proc = subprocess.Popen(
         [sys.executable, str(script_path), str(victim_tmpdir)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     daemon_pid: int | None = None
     manifest_entry = MANIFEST_DIR / f"{victim_tmpdir.name}.json"
@@ -203,6 +211,42 @@ def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_pa
                 pass
         manifest_entry.unlink(missing_ok=True)
         shutil.rmtree(victim_tmpdir, ignore_errors=True)
+
+
+def test_wait_for_ready_line_does_not_block_past_its_deadline_on_a_partial_line():
+    """Reviewer's finding on an earlier version of `_wait_for_ready_line`:
+    `select` reporting a pipe readable only means SOME bytes are there -- a
+    text-mode `readline()` called right after still blocks until a newline
+    or EOF, so a child that writes a PARTIAL, unterminated line and then
+    goes on being silently alive (not exiting) could still hang the wait
+    well past its own deadline, exactly the "deadline that never fires"
+    harm this helper exists to close. Reviewer's exact reproduction,
+    reused directly: a child writes and flushes "PARTIAL" with no trailing
+    newline, then sleeps well past the given timeout. Asserts BOTH the
+    message (ready is False, the partial text was captured, not lost) AND
+    the elapsed wall-clock time -- a message-only assertion would pass
+    identically whether this returned in 0.2s or 2s, which is exactly the
+    cannot-fail-in-the-direction-of-the-harm gap a bound on elapsed time
+    closes."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys, time; sys.stdout.write('PARTIAL'); sys.stdout.flush(); time.sleep(2)"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    try:
+        start = time.monotonic()
+        ready, captured = _wait_for_ready_line(proc, timeout=0.2)
+        elapsed = time.monotonic() - start
+
+        assert ready is False, "a partial, unterminated line was mistaken for READY"
+        assert "PARTIAL" in captured, "the partial, unterminated line was lost rather than captured"
+        assert elapsed < 1.0, (
+            f"wait blocked well past its own 0.2s deadline on a partial line: {elapsed:.3f}s elapsed"
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
 
 
 def test_reaper_does_not_touch_a_tmpdir_whose_owner_is_genuinely_still_running(tmp_path):
