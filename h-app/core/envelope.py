@@ -106,6 +106,7 @@ def build(
     *,
     pod: str = "default",
     tenant: str = "default",
+    in_reply_to: str | None = None,
 ) -> dict:
     """Construct a valid v4 frame after resolving its destination locally."""
     if not isinstance(kind, str) or not kind:
@@ -117,7 +118,7 @@ def build(
     if not isinstance(payload, dict):
         raise EnvelopeError("payload must be an object")
     correlation_id = uuid4().hex if correlation_id is None else _identifier(correlation_id, "correlation_id")
-    return {
+    frame = {
         "v": 4,
         "kind": kind,
         "stream_id": uuid4().hex,
@@ -129,9 +130,27 @@ def build(
         "l3": {"source": l3_source, "destination": l3_destination},
         "payload": payload,
     }
+    # Absence means the key is not in the dict at all -- not None, not "" --
+    # so a frame that never opted into correlation is structurally
+    # distinguishable from one that opted in with an (impossible, since
+    # _identifier below would reject it) empty value.
+    if in_reply_to is not None:
+        frame["in_reply_to"] = _identifier(in_reply_to, "in_reply_to")
+    return frame
 
 
 def _validate_body(frame: dict) -> None:
+    """Shared by encode() (our own outgoing frame) and parse() (arbitrary
+    wire bytes) -- which is exactly why `in_reply_to` is deliberately NOT
+    checked here. encode() validates it strictly on its own, right after
+    this call, because a bad value on an outgoing frame is a caller bug
+    worth surfacing immediately. parse() must never gain that same
+    strictness: a malformed optional field on the wire is not a reason to
+    reject an otherwise-good envelope, only a reason for the receiving
+    module (modules/api/port.py's deliver_api) to decide it isn't
+    trustworthy enough to keep. Do not "fix" this by adding an in_reply_to
+    check here -- that would make parse() reject frames it should tolerate.
+    """
     if not isinstance(frame.get("kind"), str) or not frame["kind"]:
         raise EnvelopeError("kind must be a non-empty string")
     if not isinstance(frame.get("ts"), str) or not frame["ts"]:
@@ -162,6 +181,15 @@ def encode(frame: dict) -> str:
     hops = _counter(frame.get("hops", 0), "hops")
     _validate_body(frame)
     body = {field: frame[field] for field in ("kind", "ts", "l3", "payload")}
+    if "in_reply_to" in frame:
+        # Any PRESENT value, including None, goes through the same strict
+        # check -- _identifier() already rejects non-strings, so a
+        # hand-built frame carrying an explicit `in_reply_to: None` is
+        # rejected as a caller bug rather than silently treated as absent.
+        # build() itself never produces that shape (it only sets the key
+        # when its own in_reply_to argument is not None), so this only
+        # ever fires for a frame nobody validated on the way in.
+        body["in_reply_to"] = _identifier(frame["in_reply_to"], "in_reply_to")
     return (
         VERSION
         + stream_id

@@ -34,3 +34,13 @@ Attachments are validated with the shared schema, written under
 `/sandbox/attachments/STREAM_ID` through a temporary file and atomic rename,
 then announced to the CLI. Non-empty CLI output is sent back to the envelope's
 source as a correlated `Message`.
+
+That reply also carries `in_reply_to` automatically, set directly from the
+envelope's own `stream_id` -- exact by construction, not opt-in like
+`office send --reply-to`, because there is no interactive agent here to
+cooperate or fail to: `_reply()` runs synchronously, in the same call that
+received the envelope, for Message, Command, and Attachment alike. Delivery
+is still recorded via `lib/reply_correlation.py`'s `record_delivered()`
+before the reply is sent, so `modules/api/port.py`'s `deliver_api` validates
+this path the same as tmux's opt-in one -- an automatic claim gets no less
+scrutiny than a manual one.
