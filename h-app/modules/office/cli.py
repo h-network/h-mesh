@@ -383,6 +383,9 @@ def _status_row(r, *, pod: str, tenant: str, agent: str, now: datetime) -> str:
         blocked = r.hgetall(prefix(pod, tenant, agent=agent, resource="blocked")) or None
     except Exception:
         blocked = None
+    decoded_blocked = (
+        {_text(field): _text(value) for field, value in blocked.items()} if blocked else None
+    )
     # Presence and delivery verification are different facts with different
     # owners. A blocked hash says one paste was not verified; it does not say
     # the agent is currently unable to work, and must not override the state
@@ -403,8 +406,13 @@ def _status_row(r, *, pod: str, tenant: str, agent: str, now: datetime) -> str:
     else:
         last = _age(decoded_presence.get("last_activity"), now=now)
         activity = f"last activity {last} ago" if last else "no activity yet"
-    if blocked is not None:
-        activity += "; delivery unverified"
+    if decoded_blocked is not None:
+        unverified_age = _age(decoded_blocked.get("since"), now=now)
+        activity += (
+            f"; delivery unverified for {unverified_age}"
+            if unverified_age
+            else "; delivery unverified (age unknown)"
+        )
     return f"  {agent:<12}{state:<10}{task:<35}{activity}"
 
 

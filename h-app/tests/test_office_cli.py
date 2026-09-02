@@ -1386,7 +1386,7 @@ def test_status_does_not_report_active_empty_board_as_blocked_by_delivery_marker
     assert "ci-agent    blocked" not in row
     assert "—" in row
     assert "last activity 8s ago" in row
-    assert "delivery unverified" in row
+    assert "delivery unverified for 2m" in row
 
 
 def test_status_keeps_unknown_presence_unknown_with_delivery_marker(monkeypatch, capsys):
@@ -1405,6 +1405,24 @@ def test_status_keeps_unknown_presence_unknown_with_delivery_marker(monkeypatch,
     assert "ci-agent    unknown" in row
     assert "ci-agent    idle" not in row
     assert "no activity feed; delivery unverified" in row
+
+
+def test_status_keeps_delivery_marker_visible_when_its_age_is_malformed(monkeypatch, capsys):
+    """Bad marker age degrades to explicit unknown context, not silence or blockage."""
+    _env(monkeypatch)
+    r = FakeRedis(registry={"ci-agent": "tmux"})
+    r.hashes[prefix(POD, TENANT, "ci-agent", "presence")] = {"state": "idle"}
+    r.hashes[prefix(POD, TENANT, "ci-agent", "blocked")] = {
+        "since": "not-a-timestamp",
+        "stream_id": "a" * 32,
+    }
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["status", "ci-agent"])
+
+    row = capsys.readouterr().out
+    assert "ci-agent    idle" in row
+    assert "delivery unverified (age unknown)" in row
 
 
 @patch("modules.office.cli.send")
