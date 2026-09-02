@@ -15,10 +15,12 @@ TENANT = "testtenant"
 
 
 def test_lifecycle_validation_failure_is_explicit_rejection():
-    def reject(**_kwargs):
-        raise ValueError("invalid profile")
-    with pytest.raises(DeadLetter, match="invalid profile"):
-        port._lifecycle_opener(reject)
+    for failure in (ValueError("invalid payload"), KeyError("bad profile")):
+        def reject(**_kwargs):
+            raise failure
+        with pytest.raises(DeadLetter) as raised:
+            port._lifecycle_opener(reject)
+        assert raised.value.__cause__ is failure
 
 
 def test_lifecycle_unknown_failure_is_not_misclassified_as_rejection():

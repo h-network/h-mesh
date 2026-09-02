@@ -49,7 +49,7 @@ def _lifecycle_opener(operation, **kwargs):
     """
     try:
         return operation(**kwargs)
-    except ValueError as exc:
+    except (KeyError, ValueError) as exc:
         raise DeadLetter(str(exc)) from exc
 
 
