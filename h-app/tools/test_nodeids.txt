@@ -742,6 +742,7 @@ h-app/tests/test_tmux_conf.py::test_install_tmux_conf_leaves_a_foreign_symlink_a
 h-app/tests/test_tmux_conf.py::test_shipped_tmux_conf_exists_and_is_reachable_from_the_module
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_a_failed_paste_never_counts_as_delivered
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_deliver_tmux_add_ticket
+h-app/tests/test_tmux_port.py::TmuxPortTests::test_add_ticket_nonpositive_write_result_routes_unresolved
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_deliver_tmux_attachment
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_deliver_tmux_command
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_deliver_tmux_drains_queued_envelopes_in_one_call
@@ -752,6 +753,7 @@ h-app/tests/test_tmux_port.py::TmuxPortTests::test_main_entrypoint
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_main_entrypoint_missing_arg_exits
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_main_entrypoint_skips_when_paused
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_mark_delivery_pending
+h-app/tests/test_tmux_port.py::test_add_ticket_response_loss_routes_identity_unresolved_on_real_redis
 h-app/tests/test_tmux_real.py::RealTmuxIntegrationTests::test_ambient_tmux_refusal
 h-app/tests/test_tmux_real.py::RealTmuxIntegrationTests::test_empty_roster_refusal_and_override
 h-app/tests/test_tmux_real.py::RealTmuxIntegrationTests::test_generate_agents_md_command_derivation

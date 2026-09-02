@@ -7,7 +7,6 @@ import json
 import os
 from datetime import datetime, timezone
 
-from core.channels import DeadLetter
 from core.keys import prefix
 from core.logging import log_record, record_task_event
 
@@ -77,7 +76,13 @@ def serialize_ticket(ticket: dict) -> str:
 
 
 def add_ticket(r, *, pod: str, tenant: str, agent: str, envelope: dict) -> None:
-    """Write an AddTicket envelope to the recipient's board."""
+    """Write an AddTicket envelope to the recipient's board.
+
+    An exception from RPUSH is outcome-unknown: Redis may have committed the
+    ticket and lost the response. Preserve that generic exception so receive
+    custody routes the exact envelope to ``unresolved``. A dead letter is
+    reserved for failures proven to reject the envelope before any effect.
+    """
     corr_id = envelope.get("correlation_id")
     source = envelope.get("l2", {}).get("source", "unknown")
     payload = envelope.get("payload", {})
@@ -137,14 +142,15 @@ def add_ticket(r, *, pod: str, tenant: str, agent: str, envelope: dict) -> None:
             destination=agent, reason=f"board write outcome UNKNOWN after {exc}",
             task_id=ticket_obj.get("id", ""),
         )
-        raise DeadLetter("board_write_unknown") from exc
+        raise
     if not isinstance(depth, int) or depth < 1:
         log_record(
-            "board_interaction", "board_write_failed", correlation_id=corr_id,
-            destination=agent, reason="RPUSH did not return a positive list length",
+            "board_interaction", "board_write_unknown", correlation_id=corr_id,
+            destination=agent,
+            reason="board write outcome UNKNOWN: RPUSH did not return a positive list length",
             task_id=ticket_obj.get("id", ""),
         )
-        raise DeadLetter("board_write_failed")
+        raise RuntimeError("board_write_unknown")
 
     log_record(
         "board_interaction", "board_write_confirmed", correlation_id=corr_id,
