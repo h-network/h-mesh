@@ -876,14 +876,11 @@ except DaemonError as exc:
     # -- an honest per-agent dispatch is worthless if the script's own exit
     # code still says success. Reviewer FAILED an earlier version of this
     # branch for exactly that: every "•" line below could say "hire setup
-    # error" or "hire failed" and the script still exited 0, so an
-    # unattended caller (CI, an installer) saw a clean setup while a
-    # requested roster hire was never admitted. A proven rejection (exit 1)
-    # counts as an error here too, not just an unenumerated exit -- the
-    # operator asked for a roster and did not get it, and that must be
-    # detectable without parsing stderr (architect's explicit call: prefer
-    # a human occasionally re-running a setup that mostly worked over CI
-    # recording a partial roster as success).
+    # error" and the script still exited 0, so an unattended caller (CI, an
+    # installer) saw a clean setup while a requested roster hire was never
+    # admitted. That must be detectable without parsing stderr (architect's
+    # explicit call: prefer a human occasionally re-running a setup that
+    # mostly worked over CI recording a partial roster as success).
     HIRE_HAD_ERROR=0
     HIRE_ERROR_SUMMARY=()
     ROSTER_CSV="$("$PYTHON" -m services.tenant_config get "$TENANT" AGENTS "")"
@@ -912,55 +909,45 @@ print("1" if pt == "tmux" else "0")
             EP_FOR_A=""
             for pair in ${PROVIDER_MAP_EXISTING//,/ }; do [ "${pair%%=*}" = "$a" ] && EP_FOR_A="${pair#*=}"; done
 
-            # ⚠ --wait, not a bare exit-code check -- hire's own exit 0
-            # without it only proves the StartAgent envelope was durably
-            # enqueued (ADMITTED), not that the agent actually registered
-            # (CREATED). Printing "hired" off that alone told an operator
-            # their office came up when it knew only that a request was
-            # accepted -- a real incident, in this exact summary.
+            # ⚠ hire is fire-and-forget -- its own exit 0 only proves the
+            # StartAgent envelope was durably enqueued (ADMITTED), never
+            # that the agent actually registered (CREATED). Printing
+            # "hired" off that alone told an operator their office came up
+            # when it knew only that a request was accepted -- the real
+            # incident this whole block exists to correct. Say "requested",
+            # never "hired".
             #
-            # ⚠ --wait can only prove a real rejection (exit 1) or time out
-            # (exit 2) -- it cannot currently prove success, for a brand-new
-            # agent or a re-hire of an existing one alike (see
-            # modules/office/cli.py's own --wait help text for why: no
-            # signal anywhere ties a *successful* StartAgent back to the
-            # specific request that caused it, so confirming one would risk
-            # the exact same lie this fixed -- ticket ff53e7e9 tracks the
-            # real fix).
+            # ⚠ There used to be a --wait flag here to poll for stronger
+            # evidence (a real rejection, or a timeout). Removed, not
+            # fixed: exit 0 from --wait was never reachable (nothing in
+            # this codebase ties a *successful* StartAgent back to the
+            # specific request that caused it), so every hire paid up to
+            # 30s to learn "unknown" -- and because --wait was documented
+            # in `office hire --help`, agents actually used it and burned
+            # that time on every hire for no signal at all. See held
+            # ticket 74f1edf3 for the attributable-completion work a
+            # future --wait would need before it could mean anything.
             #
             # ⚠ Every status handled EXPLICITLY, none folded into a soft
             # "probably fine" default -- reviewer FAILED an earlier version
-            # of this block for exactly that: `if status==1 then failed
-            # else requested` treated any OTHER exit (a parse failure, a
-            # launcher error, a signal death, an exit code this script has
-            # never seen) as if the request had at least been sent, which
-            # is the same false-positive shape this whole branch exists to
-            # remove, rebuilt one layer out in the wrapper that reads the
-            # CLI's own honest exit code. An unenumerated status means "I
-            # do not know what happened", never "probably fine".
-            HIRE_ARGS=("$a" --cli "$CLI_FOR_A" --wait)
+            # of this block for exactly that: any OTHER exit (a parse
+            # failure, a launcher error, a signal death, an exit code this
+            # script has never seen) was treated as if the request had at
+            # least been sent, the same false-positive shape this whole
+            # branch exists to remove. An unenumerated status means "I do
+            # not know what happened", never "probably fine".
+            HIRE_ARGS=("$a" --cli "$CLI_FOR_A")
             [ "$PROF_FOR_A" != "default" ] && HIRE_ARGS+=(--profile "$PROF_FOR_A")
             [ -n "$EP_FOR_A" ] && HIRE_ARGS+=(--provider "$EP_FOR_A")
             HIRE_OUTPUT="$(AGENT_NAME=host POD="$POD" TENANT="$TENANT" REDIS_URL="$REDIS_URL" \
                 "$PYTHON" -m modules.office.cli hire "${HIRE_ARGS[@]}" 2>&1)"
             HIRE_STATUS=$?
-            if [ "$HIRE_STATUS" -eq 1 ]; then
-                echo "  • $a: hire failed -- $HIRE_OUTPUT" >&2
-                HIRE_HAD_ERROR=1
-                HIRE_ERROR_SUMMARY+=("$a: hire failed (rejected -- see the line above for detail)")
-            elif [ "$HIRE_STATUS" -eq 2 ]; then
-                echo "  • $a: requested ($CLI_FOR_A${PROF_FOR_A:+, account=$PROF_FOR_A}${EP_FOR_A:+, provider=$EP_FOR_A}) -- no rejection seen; run 'office status' if you want to confirm it came up"
-            elif [ "$HIRE_STATUS" -eq 0 ]; then
-                # Not currently reachable via --wait (see modules/office/
-                # cli.py's own contract) -- kept as its own explicit case,
-                # not folded into the error branch below, so a future
-                # attributable-success signal can land here without this
-                # dispatch silently mis-routing it.
-                echo "  • $a: hired ($CLI_FOR_A${PROF_FOR_A:+, account=$PROF_FOR_A}${EP_FOR_A:+, provider=$EP_FOR_A})"
+            if [ "$HIRE_STATUS" -eq 0 ]; then
+                echo "  • $a: requested ($CLI_FOR_A${PROF_FOR_A:+, account=$PROF_FOR_A}${EP_FOR_A:+, provider=$EP_FOR_A}) -- envelope accepted, not confirmed; run 'office status' if you want to check it came up"
             else
-                echo "  • $a: hire setup error (unexpected exit $HIRE_STATUS, not admitted or rejected -- treat as not sent) -- $HIRE_OUTPUT" >&2
+                echo "  • $a: hire setup error (exit $HIRE_STATUS, not sent) -- $HIRE_OUTPUT" >&2
                 HIRE_HAD_ERROR=1
-                HIRE_ERROR_SUMMARY+=("$a: hire setup error (unexpected exit $HIRE_STATUS -- see the line above for detail)")
+                HIRE_ERROR_SUMMARY+=("$a: hire setup error (exit $HIRE_STATUS -- see the line above for detail)")
             fi
         done
         echo
@@ -979,8 +966,7 @@ print("1" if pt == "tmux" else "0")
     # failure (a later agent's hire is still attempted), but the script's
     # OWN exit code must not say success when the roster it was asked to
     # produce is incomplete. See the HIRE_HAD_ERROR comment above the
-    # roster loop for why both a proven rejection and an unenumerated exit
-    # count here.
+    # roster loop for why a nonzero hire exit counts here.
     if [ "$HIRE_HAD_ERROR" -eq 1 ]; then
         echo >&2
         echo "One or more roster hires did not succeed:" >&2
