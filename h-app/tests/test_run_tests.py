@@ -67,10 +67,18 @@ def test_runner_refuses_before_pytest_when_child_import_path_is_missing(
         tmp_path, "def test_target_tree_marker():\n    assert True\n"
     )
     (target / "h-app" / "services" / "daemons.py").unlink()
+    isolated_venv = tmp_path / "isolated-python"
+    subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(isolated_venv)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    isolated_python = isolated_venv / "bin" / "python"
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
     result = subprocess.run(
-        [sys.executable, str(target / "h-app" / "tools" / "run_tests.py")],
+        [str(isolated_python), str(target / "h-app" / "tools" / "run_tests.py")],
         cwd=target,
         env=env,
         capture_output=True,
@@ -79,7 +87,7 @@ def test_runner_refuses_before_pytest_when_child_import_path_is_missing(
 
     output = result.stdout + result.stderr
     assert result.returncode != 0
-    assert f"interpreter: {sys.executable}" in output
+    assert f"interpreter: {isolated_python}" in output
     assert "module: services.daemons" in output
     assert "resolved module: <not importable>" in output
     assert "ModuleNotFoundError" in output
