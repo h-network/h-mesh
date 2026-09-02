@@ -32,6 +32,25 @@ manifest. A zero exit with an absent, partial, stale, or mismatched attestation
 is a failure. Selection alone and absence of a reported error are not execution
 evidence.
 
+Execution accounting requires a non-skipped call-phase report. A setup skip
+produces no call report; an in-body `pytest.skip()` produces a skipped call
+report. Neither counts as execution. The harness distinguishes `not executed:
+skipped` (including pytest's reason) from `not executed: no call-phase report`,
+returns non-zero, and issues no certificate.
+
+This makes the required environment a hard prerequisite for merge evidence. In
+particular, tests gate on Redis during their call phase, so a machine without
+reachable Redis cannot produce a suite certificate. Start the required service
+and rerun; the diagnostic enumerates the exact skipped nodes. A skip failure is
+not a manifest mismatch, and regenerating the manifest cannot fix it.
+
+Bare focused pytest can exit zero while reporting skips. That is valid pytest
+behavior, but it is not merge evidence: it proves neither that the skipped test
+body ran nor that its guarantee held. Use bare pytest for focused development
+feedback and the canonical runner for merge evidence. A terminal call-phase
+outcome is execution accounting; it is not by itself proof that the test's
+assertions adequately verify their intended guarantee.
+
 The evidence is the pair of runner exit status zero **and** its post-validation
 certificate line. Pytest and the tests share stdout with the runner, so child
 code can print identical text; line presence alone is never evidence. Every
