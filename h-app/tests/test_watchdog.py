@@ -254,18 +254,16 @@ def _watchdog_records(out, destination="architect"):
 # recognized is rejected, including vocabulary nobody has written yet.
 _ADMISSION_ONLY_EVIDENCE = frozenset({"admitted", "rejected", "unknown", "no_lead"})
 
-# ⚠ `evidence` alone is not sufficient. Reviewer constructed a record with a
-# truthful evidence="admitted" tag that ALSO carried outcome="delivered" and
-# reason="alert sent" -- a correct tag next to a contradicting claim still
-# misleads a human or any other consumer of the record, and the field-only
-# check accepted it. _log_lead_alert (service.py) now makes `outcome`/
-# `title`/`old_title` structurally impossible for this code path -- it does
-# not expose them as parameters at all, so nothing calling through it can
-# set them regardless of future changes. `reason` remains free text (it
-# legitimately interpolates runtime values that can't be reduced to a fixed
-# template), so it is the one field this scan still covers as defense in
-# depth: the primary contract is the closed `evidence` set above, this is a
-# backstop specifically for the field that couldn't be eliminated.
+# ⚠ `evidence` alone is not sufficient -- kept as a scenario-level backstop
+# below even though `_log_lead_alert` now makes the contradiction reviewer
+# found (evidence="admitted" next to outcome="delivered"/reason="alert
+# sent") structurally unreachable through the real code path: `event`,
+# `evidence` and the `reason` template are all sourced together from one
+# entry in `Watchdog._LEAD_ALERT_TEMPLATES`, keyed by a closed `kind`
+# string, so nothing calling through the wrapper can set any of them
+# independently. `reason`'s runtime-interpolated *values* (a lead name, an
+# exception's text) are still free text, so this scan stays as defense in
+# depth against a future template whose fixed wording itself overclaims.
 _OVERCLAIM_WORD = re.compile(r"\b(sent|delivered)\b", re.IGNORECASE)
 _NEGATION_BEFORE = re.compile(r"\b(?:not|never|no)\s+(?:\w+\s+){0,2}$", re.IGNORECASE)
 
@@ -385,61 +383,153 @@ class AdmissionEvidenceContractTests(unittest.TestCase):
             )
 
 
+def _log_emitting_calls(func):
+    """Every call to `log_record`/`_log_lead_alert` in `func`'s own source,
+    as raw AST nodes. Shared by the two structural checks below: one reads
+    the call target's name, the other reads its first argument -- neither
+    can be right if this collection is wrong, so it exists once."""
+    source = textwrap.dedent(inspect.getsource(func))
+    tree = ast.parse(source)
+    return [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Attribute) and node.func.attr in ("log_record", "_log_lead_alert"))
+            or (isinstance(node.func, ast.Name) and node.func.id in ("log_record", "_log_lead_alert"))
+        )
+    ]
+
+
 class LeadAlertLoggingStructureTests(unittest.TestCase):
     """Structural pins on _log_lead_alert itself and on _notify_lead's
     source, answering reviewer's "ninth call site" question: what
-    necessarily catches a future lead-alert log call that forgets its
-    evidence tag, independent of whether any test scenario happens to
-    exercise that specific code path?
+    necessarily catches a future lead-alert log call that overclaims,
+    independent of whether any test scenario happens to exercise that
+    specific code path?
 
-    Two guarantees, neither depending on runtime scenario coverage:
-    1. `_log_lead_alert` cannot be called without `evidence` (no default) --
-       a missing tag is a TypeError, not a silently-logged record.
-    2. `_log_lead_alert` does not expose `outcome`/`title`/`old_title` as
-       parameters, so the exact contradiction reviewer constructed cannot
-       be built by anything calling through it, regardless of intent.
-    3. A static AST walk of _notify_lead's own source confirms every
-       log-emitting call in it is a call to `_log_lead_alert` -- so a
-       "ninth call site" that logs through `log_record` directly (bypassing
-       the wrapper's guarantees entirely) is caught by inspection, at test
-       time, before it ships -- not only if some scenario reaches it.
+    ⚠ This is the SECOND version of the AST check below. The first one
+    verified only that every log-emitting call in _notify_lead named
+    `_log_lead_alert` as its target -- it never inspected that call's
+    arguments at all. Reviewer's exact finding: "the AST test checks only
+    that calls are named `_log_lead_alert`; it does NOT check that the
+    `evidence=` keyword is present." A call missing its required argument
+    still passed this check statically and would only have failed the
+    first time that exact line executed at runtime -- a guarantee asserted
+    at a boundary (the callee name) wider than the mechanism it claimed to
+    enforce (evidence always present) is not a guarantee. Falsified by hand
+    before being trusted this time, the same discipline already proven on
+    the Lua-preflight branch: a real call site in _notify_lead was
+    temporarily edited to drop its `kind` argument entirely, the rewritten
+    test below (`test_every_log_emitting_call_in_notify_lead_goes_through_
+    the_wrapper_with_a_registered_kind`) was run and confirmed to fail with
+    exactly the missing-argument assertion, and the call site was then
+    restored -- recorded in the branch's commit message rather than kept as
+    a permanent fixture in this file, since a test asserting its own
+    assertion logic against a synthetic broken function would not actually
+    exercise this test the way mutating the real source and rerunning it
+    did.
+
+    Four guarantees now, three static (checked by parsing source, not by
+    running it) and one enforced by Python itself:
+    1. `_log_lead_alert` cannot be called without `kind` (no default) --
+       Python raises TypeError immediately, before any record is built.
+    2. An unrecognized `kind` is a KeyError inside `_log_lead_alert` itself
+       -- there is no way to reach the log_record call with a `kind` that
+       is not a real entry in `_LEAD_ALERT_TEMPLATES`.
+    3. `_log_lead_alert`'s own log_record call passes only stream_id,
+       destination, reason and evidence -- never a caller-supplied
+       `outcome`/`title`/`old_title`, regardless of what extra `**context`
+       a caller passes (those keys can only feed a reason template's named
+       placeholders, and are silently unused otherwise).
+    4. A static AST walk of _notify_lead's source confirms every
+       log-emitting call in it (a) targets `_log_lead_alert`, not
+       `log_record` directly, and (b) passes a `kind` whose literal string
+       value is an actual key in `_LEAD_ALERT_TEMPLATES` -- so neither a
+       bypass of the wrapper NOR a call through the wrapper with a
+       fabricated/unregistered kind string can ship unnoticed.
     """
 
-    def test_log_lead_alert_requires_evidence(self):
+    def test_log_lead_alert_requires_kind(self):
         watchdog = service.Watchdog(object(), pod="p", tenant="t", session_name="t")
         with self.assertRaises(TypeError):
-            watchdog._log_lead_alert("some_event", "lead", "stream-1")
+            watchdog._log_lead_alert()
 
-    def test_log_lead_alert_does_not_expose_outcome_title_or_old_title(self):
+    def test_log_lead_alert_rejects_an_unregistered_kind(self):
         watchdog = service.Watchdog(object(), pod="p", tenant="t", session_name="t")
-        for forbidden_kwarg in ("outcome", "title", "old_title"):
-            with self.assertRaises(TypeError):
-                watchdog._log_lead_alert(
-                    "some_event", "lead", "stream-1",
-                    evidence="admitted", **{forbidden_kwarg: "delivered"},
+        with self.assertRaises(KeyError):
+            watchdog._log_lead_alert("paste_landed", "lead", "stream-1")
+
+    def test_log_lead_alert_never_forwards_outcome_title_or_old_title(self):
+        """`_log_lead_alert` accepts arbitrary **context (to fill a reason
+        template's named placeholders), so passing outcome/title/old_title
+        as context does not raise -- str.format silently ignores unused
+        keywords. The actual guarantee is that they never reach the
+        record regardless: log_record captures stdout here and the parsed
+        line must not carry any of the three keys reviewer's counterexample
+        used, no matter what a caller hands _log_lead_alert."""
+        watchdog = service.Watchdog(object(), pod="p", tenant="t", session_name="t")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            watchdog._log_lead_alert(
+                "admitted", "lead", "stream-1",
+                outcome="delivered", title="t", old_title="o",
+            )
+        record = json.loads(out.getvalue().strip())
+        for forbidden_key in ("outcome", "title", "old_title"):
+            self.assertNotIn(forbidden_key, record, f"record {record!r} leaked {forbidden_key!r}")
+
+    def test_templates_are_all_admission_only_and_free_of_overclaim_words(self):
+        """Every entry in `_LEAD_ALERT_TEMPLATES` is the whole vocabulary
+        `_log_lead_alert` can ever emit -- a closed, hardcoded table, not
+        runtime input. Checking it once here covers every record that
+        table can ever produce, forever, the same way checking a type's
+        constructor once covers every instance -- no scenario test needs
+        to independently re-earn this for each `kind`."""
+        for kind, (event, evidence, reason_template) in service.Watchdog._LEAD_ALERT_TEMPLATES.items():
+            self.assertIn(
+                evidence, _ADMISSION_ONLY_EVIDENCE,
+                f"template {kind!r} carries a non-admission-only evidence tag {evidence!r}",
+            )
+            self.assertFalse(
+                _OVERCLAIM_WORD.search(event),
+                f"template {kind!r}'s event name {event!r} overclaims",
+            )
+            if reason_template is not None:
+                self.assertFalse(
+                    _OVERCLAIM_WORD.search(reason_template),
+                    f"template {kind!r}'s reason template {reason_template!r} overclaims",
                 )
 
-    def test_every_log_emitting_call_in_notify_lead_goes_through_the_wrapper(self):
-        source = textwrap.dedent(inspect.getsource(service.Watchdog._notify_lead))
-        tree = ast.parse(source)
-        calls = [
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-            and node.func.attr in ("log_record", "_log_lead_alert")
-        ] + [
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-            and node.func.id in ("log_record", "_log_lead_alert")
-        ]
+    def test_every_log_emitting_call_in_notify_lead_goes_through_the_wrapper_with_a_registered_kind(self):
+        calls = _log_emitting_calls(service.Watchdog._notify_lead)
         self.assertTrue(calls, "expected at least one lead-alert log call in _notify_lead")
+        known_kinds = set(service.Watchdog._LEAD_ALERT_TEMPLATES)
         for call in calls:
             name = call.func.attr if isinstance(call.func, ast.Attribute) else call.func.id
             self.assertEqual(
                 name, "_log_lead_alert",
                 f"_notify_lead calls {name}(...) directly at line {call.lineno} "
                 "(source-relative) instead of going through _log_lead_alert -- "
-                "this bypasses the evidence-required and outcome/title/old_title "
-                "-excluded guarantees entirely",
+                "this bypasses every guarantee the wrapper owns entirely",
+            )
+            # `self` is the first positional arg of a bound-method AST call
+            # only when written as `self._log_lead_alert(...)`, which every
+            # call site here is -- so `args[0]` is the `kind` argument, not
+            # `self` (that's implicit in the Attribute access, not a
+            # separate call argument).
+            self.assertTrue(
+                call.args, f"_log_lead_alert call at line {call.lineno} passes no `kind` argument",
+            )
+            kind_arg = call.args[0]
+            self.assertIsInstance(
+                kind_arg, ast.Constant,
+                f"_log_lead_alert call at line {call.lineno} passes a non-literal `kind` "
+                "-- this check can only verify a literal string against the template table",
+            )
+            self.assertIn(
+                kind_arg.value, known_kinds,
+                f"_log_lead_alert call at line {call.lineno} passes kind={kind_arg.value!r}, "
+                "which is not a key in _LEAD_ALERT_TEMPLATES",
             )
 
 

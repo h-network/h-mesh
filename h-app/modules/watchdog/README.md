@@ -61,24 +61,38 @@ deliberately rather than by accident (2026-09-02):
   discipline correctly before it had a name: "not confirmed... cannot
   distinguish loss from a landed paste."
 
-  The claim is enforced structurally, not by trusting a naming convention.
-  `core.logging.log_record` gained a new optional `evidence` field -- a
-  canonical, machine-checkable claim-level tag, separate from the free-text
-  `reason` a human reads -- and `_log_lead_alert` is the *only* way
-  `_notify_lead` may log anything: it requires `evidence` (no default, so
-  an omitted tag is a loud `TypeError` at the call, not a silently untagged
-  record) and does not expose `outcome`/`title`/`old_title` as parameters
-  at all, so a caller cannot independently contradict a correct `evidence`
-  tag through those fields the way an early version of this fix's own test
-  helper missed (a record with `evidence="admitted"` alongside
-  `outcome="delivered"` still overclaims, even though the canonical tag is
-  truthful). `reason` stays free text -- it legitimately interpolates
-  runtime values a fixed template can't capture -- so the test suite keeps
-  a narrow, scoped check on that one remaining field as defense in depth.
-  A static AST check over `_notify_lead`'s own source (not a runtime
-  scenario) confirms every log call in it goes through `_log_lead_alert`,
-  so a future call site that bypasses the wrapper entirely is caught at
-  test time regardless of whether any test scenario happens to exercise it.
+  The claim is enforced structurally, not by trusting a naming convention --
+  and not by closing off fields one at a time either. Two earlier rounds
+  each closed one leak and opened another: first `outcome`/`title`/
+  `old_title` (closed by not exposing those parameters), then an arbitrary
+  caller-supplied `event` string and free `reason` prose (reviewer's next
+  counterexample: `event="lead_alert_delivered"` next to a truthful
+  `evidence="admitted"` -- a delivery claim sitting in the field naming the
+  record, which nothing was checking). The actual fix: if a caller can pass
+  a string that reaches the record, the caller owns the vocabulary, not
+  this module. So `_log_lead_alert` accepts no caller-composed string at
+  all -- only a closed `kind` key into `Watchdog._LEAD_ALERT_TEMPLATES`,
+  which is the *sole* source of `event`, `evidence`, and the `reason`
+  template together, as one hardcoded entry. A caller supplies only
+  structured values (a lead name, an exception's text, a queue depth) to
+  fill that template's named placeholders; it can never set `event` or
+  `evidence` independently, so the two cannot disagree. An unrecognized or
+  omitted `kind` is a `KeyError`/`TypeError` at the call, immediately --
+  never a malformed or contradictory record reaching the log.
+
+  This is checked two ways, not one, per the lesson that a guarantee
+  asserted at a boundary wider than the mechanism enforcing it is not a
+  guarantee: a static AST check over `_notify_lead`'s own source confirms
+  every log call in it targets `_log_lead_alert` (not `log_record`
+  directly) *and* passes a `kind` whose literal value is a real key in
+  `_LEAD_ALERT_TEMPLATES` -- not just that the call is named right, which
+  is what an earlier version of this check verified and reviewer found
+  insufficient (a call missing `kind` entirely still named
+  `_log_lead_alert` and passed that check, and would only have failed the
+  first time it actually executed). Falsified by hand before being
+  trusted: a real call site was temporarily edited to drop its `kind`
+  argument, the AST check was confirmed to fail on it, and the call site
+  was restored.
 
 - **`blocked` self-heals.** `DeliveryVerifier` used to only ever CLEAR
   `blocked` in response to a NEW delivery marker verifying -- an agent

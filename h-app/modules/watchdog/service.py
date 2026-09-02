@@ -312,37 +312,63 @@ class Watchdog:
     def _lead(self) -> str | None:
         return _text(self.r.get(prefix(self.pod, self.tenant, resource="lead")))
 
+    # ⚠ The COMPLETE, closed vocabulary for every lead-alert record
+    # _notify_lead can ever produce. `event`, `evidence`, and the `reason`
+    # WORDING are all owned here -- a caller never supplies any of the
+    # three as free text. This is the third narrowing of this same defect:
+    # first a caller could contradict a correct `evidence` tag via
+    # `outcome`/`title`/`old_title` (closed by not exposing those
+    # parameters); then via an arbitrary `event` string or free `reason`
+    # prose (reviewer's next counterexample: event="lead_alert_delivered"
+    # with evidence="admitted" -- a delivery claim in the field naming the
+    # record, which nothing was checking). Closing individual fields one at
+    # a time kept relocating the same overclaim into whichever field was
+    # still open. The actual fix: if a caller can pass a string that reaches
+    # the record, the caller owns the vocabulary, not this module. So no
+    # caller-supplied string reaches the record at all -- only a `kind` key
+    # into this table, and structured values to fill each template's named
+    # placeholders.
+    _LEAD_ALERT_TEMPLATES: dict[str, tuple[str, str, str | None]] = {
+        # kind -> (event, evidence, reason template or None)
+        "no_lead_unregistered": (
+            "lead_alert_no_lead", "no_lead", "lead {lead!r} is not a registered agent",
+        ),
+        "no_lead_wrong_port_type": (
+            "lead_alert_no_lead", "no_lead", "lead {lead!r} port_type is not tmux",
+        ),
+        "unknown": (
+            "lead_alert_unknown", "unknown",
+            "admission outcome UNKNOWN after {detail}",
+        ),
+        "capacity": (
+            "lead_alert_capacity", "rejected",
+            "lead ingress full: depth {depth} has reached INGRESS_MAX {ingress_max}",
+        ),
+        "admitted": ("lead_alert_admitted", "admitted", None),
+    }
+
     # ⚠ The ONLY way _notify_lead may log anything about a lead-alert
-    # attempt. A canonical `evidence` tag next to free-form `reason`/
-    # `outcome` fields was not enough by itself: a caller could set a
-    # truthful `evidence="admitted"` while independently writing
-    # `outcome="delivered"` or "sent" into `reason` -- a correct tag next
-    # to a contradicting claim, which still misleads a human or any other
-    # consumer reading the record. Confirmed live: reviewer constructed
-    # exactly that record and the field-level check accepted it.
+    # attempt. `kind` is required (no default) and must be a key in
+    # _LEAD_ALERT_TEMPLATES -- an unrecognized or omitted `kind` is a
+    # KeyError/TypeError at the call, immediately, not a malformed or
+    # untagged record reaching the log. `**context` fills the chosen
+    # template's named placeholders with structured values (a lead name, an
+    # exception's text, a queue depth) -- never a caller-composed sentence.
     #
-    # This wrapper makes that structurally impossible for `outcome`
-    # specifically, not just discouraged: it does not expose `outcome`,
-    # `title`, or `old_title` as parameters at all, so nothing calling
-    # through here can set them, regardless of what future evidence values
-    # or event names get added. `reason` stays free text -- it genuinely
-    # needs to interpolate runtime values (an agent name, a ticket title,
-    # an exception, a queue depth) that cannot be reduced to a fixed
-    # template -- so it is not eliminated as an attack surface, only
-    # narrowed to the one field defense-in-depth already covers via
-    # `_assert_admission_only_evidence` in the test suite.
-    #
-    # `evidence` has no default: a call site that omits it fails LOUDLY at
-    # the call, a TypeError raised the first time that path executes,
-    # rather than silently logging an untagged record. Combined with
-    # tests.test_watchdog's AST-based structural check (every log_record-
-    # shaped call inside _notify_lead's own source is confirmed to pass
-    # evidence=), a future "ninth call site" that forgets it is caught at
-    # test time, before it ever reaches this required-argument runtime
-    # failure in the field at all.
-    def _log_lead_alert(
-        self, event: str, lead: str, stream_id: str, *, evidence: str, reason: str | None = None
-    ) -> None:
+    # This is checked two ways, not one, per the lesson that a guarantee
+    # asserted at a boundary wider than the mechanism enforcing it is not a
+    # guarantee: `evidence` used to be a keyword-only parameter with no
+    # default, and the claim was "an omitted tag fails at the call, which
+    # the AST test catches before it ships." The AST test only checked the
+    # CALL TARGET's name, never its arguments -- a call missing `evidence=`
+    # passed the static check and would only have raised in production, the
+    # first time that path executed. Falsified before trusting it fixed:
+    # see tests.test_watchdog's LeadAlertLoggingStructureTests, which
+    # constructs a call missing the required argument and confirms the AST
+    # check itself catches it, not just Python's own TypeError at runtime.
+    def _log_lead_alert(self, kind: str, lead: str, stream_id: str, **context: object) -> None:
+        event, evidence, reason_template = self._LEAD_ALERT_TEMPLATES[kind]
+        reason = reason_template.format(lead=lead, **context) if reason_template else None
         log_record(
             "watchdog", event,
             stream_id=stream_id, destination=lead, reason=reason, evidence=evidence,
@@ -419,18 +445,10 @@ class Watchdog:
             self._error("lead_alert", exc)
             return
         if not is_member(self.r, pod=self.pod, tenant=self.tenant, agent=lead):
-            self._log_lead_alert(
-                "lead_alert_no_lead", lead, envelope["stream_id"],
-                evidence="no_lead",
-                reason=f"lead {lead!r} is not a registered agent",
-            )
+            self._log_lead_alert("no_lead_unregistered", lead, envelope["stream_id"])
             return
         if port_type(self.r, pod=self.pod, tenant=self.tenant, agent=lead) != "tmux":
-            self._log_lead_alert(
-                "lead_alert_no_lead", lead, envelope["stream_id"],
-                evidence="no_lead",
-                reason=f"lead {lead!r} port_type is not tmux",
-            )
+            self._log_lead_alert("no_lead_wrong_port_type", lead, envelope["stream_id"])
             return
         try:
             admitted, _, depth = admit_ingress(
@@ -443,26 +461,24 @@ class Watchdog:
             )
         except Exception as exc:
             self._log_lead_alert(
-                "lead_alert_unknown", lead, envelope["stream_id"],
-                evidence="unknown",
-                reason=f"admission outcome UNKNOWN after {exc}",
+                "unknown", lead, envelope["stream_id"],
+                detail=str(exc),
             )
             return
         if not admitted:
             self._log_lead_alert(
-                "lead_alert_capacity", lead, envelope["stream_id"],
-                evidence="rejected",
-                reason=f"lead ingress full: depth {depth} has reached INGRESS_MAX {self.ingress_max}",
+                "capacity", lead, envelope["stream_id"],
+                depth=depth, ingress_max=self.ingress_max,
             )
             return
         # ⚠ ADMITTED, not sent/delivered: this only proves the envelope was
         # durably written to the lead's ingress list. deliver_tmux has not
         # been called yet, let alone confirmed -- admission and delivery are
         # different facts, and this event must not be read as the second one.
-        # `evidence="admitted"` (core.logging.log_record) is the enforceable
-        # form of that claim -- a closed, machine-checkable tag a test can
-        # assert against directly, not a word a reviewer has to trust nobody
-        # contradicted in `reason` or some other free-text field.
+        # kind="admitted" resolves via _LEAD_ALERT_TEMPLATES to event=
+        # "lead_alert_admitted" and evidence="admitted" together, from one
+        # owned entry -- there is no way to reach this call with an event
+        # name that disagrees with its evidence tag.
         #
         # ⚠ No second "attempted"/"delivered" event is logged here on purpose.
         # deliver_tmux -> core.channels.receive() catches DeadLetter INSIDE
@@ -476,10 +492,7 @@ class Watchdog:
         # logged by channels.receive() itself under module="tmux", each
         # backed by an actual distinguishing fact instead of an absence of
         # exception.
-        self._log_lead_alert(
-            "lead_alert_admitted", lead, envelope["stream_id"],
-            evidence="admitted",
-        )
+        self._log_lead_alert("admitted", lead, envelope["stream_id"])
         try:
             deliver_tmux(
                 self.r, self.pod, self.tenant, lead,
