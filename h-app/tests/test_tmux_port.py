@@ -35,7 +35,6 @@ class FakeRedis:
         self.hashes = defaultdict(dict)
         self.kv = {}
         self.streams = defaultdict(list)
-        self.zsets = defaultdict(dict)
 
     def rpush(self, key, *values):
         self.lists[key].extend(values)
@@ -119,18 +118,15 @@ class FakeRedis:
             self.hset(key, client, json.dumps(value, separators=(",", ":")))
             return value["count"]
         if "reply_correlation record_delivered" in script:
-            hash_key, order_key = keys
+            (key,) = keys
             stream_id, source, score, maxlen = argv
             maxlen = int(maxlen)
-            self.hashes[hash_key][stream_id] = source
-            self.zsets[order_key][stream_id] = float(score)
-            count = len(self.zsets[order_key])
-            if count > maxlen:
-                ordered = sorted(self.zsets[order_key].items(), key=lambda kv: kv[1])
-                stale = [member for member, _ in ordered[: count - maxlen]]
-                for member in stale:
-                    self.zsets[order_key].pop(member, None)
-                    self.hashes[hash_key].pop(member, None)
+            bucket = self.hashes[key]
+            bucket[stream_id] = json.dumps({"source": source, "score": float(score)})
+            if len(bucket) > maxlen:
+                ordered = sorted(bucket.items(), key=lambda kv: json.loads(kv[1])["score"])
+                for member, _ in ordered[: len(bucket) - maxlen]:
+                    bucket.pop(member, None)
             return 1
         raise AssertionError(f"unexpected Lua script: {script}")
 

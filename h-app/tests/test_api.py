@@ -29,7 +29,6 @@ class FakeRedis:
         self.hashes = {}
         self.lists = {}
         self.streams = {}
-        self.zsets = {}
 
     def hset(self, key, field, value):
         self.hashes.setdefault(key, {})[field] = value
@@ -92,18 +91,15 @@ class FakeRedis:
         if "LRANGE" in script and "DEL" in script:
             return self.lists.pop(keys[0], [])
         if "reply_correlation record_delivered" in script:
-            hash_key, order_key = keys
+            (key,) = keys
             stream_id, source, score, maxlen = argv
             maxlen = int(maxlen)
-            self.hashes.setdefault(hash_key, {})[stream_id] = source
-            self.zsets.setdefault(order_key, {})[stream_id] = float(score)
-            count = len(self.zsets[order_key])
-            if count > maxlen:
-                ordered = sorted(self.zsets[order_key].items(), key=lambda kv: kv[1])
-                stale = [member for member, _ in ordered[: count - maxlen]]
-                for member in stale:
-                    self.zsets[order_key].pop(member, None)
-                    self.hashes[hash_key].pop(member, None)
+            bucket = self.hashes.setdefault(key, {})
+            bucket[stream_id] = json.dumps({"source": source, "score": float(score)})
+            if len(bucket) > maxlen:
+                ordered = sorted(bucket.items(), key=lambda kv: json.loads(kv[1])["score"])
+                for member, _ in ordered[: len(bucket) - maxlen]:
+                    bucket.pop(member, None)
             return 1
         return 1
 

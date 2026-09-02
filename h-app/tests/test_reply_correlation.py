@@ -1,11 +1,16 @@
+import json
+import os
 import sys
 import unittest
 from pathlib import Path
+
+import redis
 
 H_APP = Path(__file__).resolve().parents[1]
 if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
+from core.keys import prefix
 from lib.reply_correlation import (
     DELIVERED_MAXLEN,
     is_valid_reply_id,
@@ -16,13 +21,14 @@ from lib.reply_correlation import (
 
 class FakeRedis:
     """Executes the real _RECORD_DELIVERED Lua script's externally visible
-    effect atomically -- HSET + ZADD + bounded trim in one call, same as
-    real Redis would, so a test against this fake cannot observe a torn
-    write the way separate HSET/ZADD/ZREM/HDEL calls could."""
+    effect for a well-typed key -- one hash, HSET + bounded trim in a
+    single eval() call. This fake has no notion of Redis's own per-key type
+    system, so it cannot reproduce the WRONGTYPE-preflight scenario; that
+    regression lives in RealRedisRecordDeliveredTests below, against actual
+    Redis, deliberately."""
 
     def __init__(self):
         self.hashes = {}
-        self.zsets = {}
 
     def hget(self, key, field):
         return self.hashes.get(key, {}).get(field)
@@ -31,41 +37,17 @@ class FakeRedis:
         keys = args[:numkeys]
         argv = args[numkeys:]
         if "reply_correlation record_delivered" in script:
-            hash_key, order_key = keys
+            (key,) = keys
             stream_id, source, score, maxlen = argv
             maxlen = int(maxlen)
-            self.hashes.setdefault(hash_key, {})[stream_id] = source
-            self.zsets.setdefault(order_key, {})[stream_id] = float(score)
-            count = len(self.zsets[order_key])
-            if count > maxlen:
-                ordered = sorted(self.zsets[order_key].items(), key=lambda kv: kv[1])
-                stale = [member for member, _ in ordered[: count - maxlen]]
-                for member in stale:
-                    self.zsets[order_key].pop(member, None)
-                    self.hashes[hash_key].pop(member, None)
+            bucket = self.hashes.setdefault(key, {})
+            bucket[stream_id] = json.dumps({"source": source, "score": float(score)})
+            if len(bucket) > maxlen:
+                ordered = sorted(bucket.items(), key=lambda kv: json.loads(kv[1])["score"])
+                for member, _ in ordered[: len(bucket) - maxlen]:
+                    bucket.pop(member, None)
             return 1
         raise AssertionError(f"unexpected eval script: {script[:60]!r}")
-
-
-class SplitBoundaryRedis(FakeRedis):
-    """A double that does NOT execute the script atomically -- it performs
-    the equivalent HSET then ZADD as two separate steps, so a failure can be
-    injected between them. This exists ONLY to prove the earlier
-    multi-command design's exact failure mode and confirm the real
-    (atomic) implementation cannot be made to reach it: record_delivered
-    always calls eval() as a single operation, so this class's split
-    behavior is unreachable from the real code -- it is exercised directly
-    in the test below, not through record_delivered."""
-
-    def __init__(self, fail_after_hset=False):
-        super().__init__()
-        self.fail_after_hset = fail_after_hset
-
-    def hset_then_zadd_split(self, hash_key, order_key, stream_id, source, score):
-        self.hashes.setdefault(hash_key, {})[stream_id] = source
-        if self.fail_after_hset:
-            raise ConnectionError("injected failure between HSET and ZADD")
-        self.zsets.setdefault(order_key, {})[stream_id] = score
 
 
 VALID_ID = "a" * 32
@@ -116,7 +98,6 @@ class ReplyCorrelationTests(unittest.TestCase):
             was_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id="not-an-id", source="telegram")
         )
         self.assertEqual(self.r.hashes, {})
-        self.assertEqual(self.r.zsets, {})
 
     def test_bounded_to_maxlen_oldest_evicted_first(self):
         ids = [format(i, "032x") for i in range(DELIVERED_MAXLEN + 5)]
@@ -136,9 +117,6 @@ class ReplyCorrelationTests(unittest.TestCase):
         )
 
     def test_record_delivered_swallows_eval_errors_and_logs(self):
-        # Same policy as mark_delivery_pending and _record elsewhere: a
-        # bookkeeping write failure must never propagate and fail the
-        # delivery it's recording.
         class BrokenRedis(FakeRedis):
             def eval(self, script, numkeys, *args):
                 raise ConnectionError("redis unavailable")
@@ -158,14 +136,15 @@ class ReplyCorrelationTests(unittest.TestCase):
         result = was_delivered(broken, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram")
         self.assertIsNone(result)
 
-    def test_record_delivered_calls_eval_exactly_once_not_separate_commands(self):
-        # This is the actual guarantee against the reviewer-found defect:
-        # record_delivered never has an opportunity to fail BETWEEN a
-        # provenance write and its eviction index, because there is only
-        # ever one call to Redis, not several. Proven by counting calls
-        # rather than by re-deriving end state, which the original bug's
-        # own regression test (asserting only the end state) failed to
-        # catch.
+    def test_record_delivered_calls_eval_exactly_once(self):
+        # Necessary, not sufficient: this only proves record_delivered
+        # issues one Redis command rather than several. It does NOT by
+        # itself prove that command can't half-apply -- Redis Lua provides
+        # isolation, not transactional rollback, so a runtime error partway
+        # through a script can still leave earlier writes in that same
+        # script applied (see RealRedisRecordDeliveredTests below, and the
+        # module docstring). The type preflight is what actually closes
+        # that gap for this script's specific single-key design.
         calls = []
 
         class CountingRedis(FakeRedis):
@@ -177,21 +156,78 @@ class ReplyCorrelationTests(unittest.TestCase):
         record_delivered(counting, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram")
         self.assertEqual(len(calls), 1)
 
-    def test_the_old_split_command_design_could_reach_the_exact_defect_state(self):
-        # Demonstrates, directly, the failure mode reviewer found in the
-        # prior (non-atomic) implementation: HSET succeeds, ZADD raises.
-        # This does NOT exercise record_delivered (which no longer has a
-        # split boundary to inject into) -- it exercises the split
-        # primitive above to show what that old shape produced, as the
-        # concrete evidence for why the atomic rewrite was necessary, and
-        # as a regression should anyone ever "simplify" record_delivered
-        # back into separate commands.
-        split = SplitBoundaryRedis(fail_after_hset=True)
-        hash_key, order_key = "hk", "ok"
-        with self.assertRaises(ConnectionError):
-            split.hset_then_zadd_split(hash_key, order_key, VALID_ID, "telegram", 1.0)
-        self.assertEqual(split.hashes[hash_key], {VALID_ID: "telegram"})
-        self.assertEqual(split.zsets.get(order_key, {}), {})
+
+class RealRedisRecordDeliveredTests(unittest.TestCase):
+    """Exercises real Redis, not a fake. The regression below reproduces a
+    genuine bug found on real Redis: a Lua script's redis.call()s are not
+    rolled back on a later runtime error within the same script, so a
+    two-key version of this script (HSET a provenance hash, then ZADD a
+    separate eviction-order zset) left permanent, unindexed, always-valid
+    provenance if the second key ever held the wrong type -- reproduced by
+    seeding that key as a plain string before calling record_delivered. No
+    in-memory fake enforces Redis's own per-key type system, so this cannot
+    be exercised any other way.
+    """
+
+    def setUp(self):
+        self.redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+        self.r = redis.Redis.from_url(self.redis_url)
+        self.r.ping()
+        self.pod = "real-reply-correlation-test"
+        self.tenant = f"tenant-{os.urandom(4).hex()}"
+
+    def tearDown(self):
+        keys = self.r.keys(f"pod:{self.pod}:tenant:{self.tenant}:*")
+        if keys:
+            self.r.delete(*keys)
+
+    def test_delivered_id_is_later_found_with_matching_source(self):
+        record_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
+        self.assertTrue(
+            was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
+        )
+        self.assertFalse(
+            was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="webconsole")
+        )
+
+    def test_wrong_type_key_is_rejected_before_any_write_not_after(self):
+        # The exact reviewer reproduction, against the CURRENT single-key
+        # design: seed the one key this script would use as a plain
+        # string (simulating the class of key-collision/corruption that
+        # produced the original bug), then call record_delivered.
+        key = prefix(self.pod, self.tenant, agent="bob", resource="delivered")
+        self.r.set(key, "not-a-hash")
+
+        record_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
+
+        # The preflight must reject this before the script's first
+        # mutation -- the key must be untouched (still the string we
+        # seeded, not partially overwritten), and the id must not be
+        # trusted afterward.
+        self.assertEqual(self.r.type(key), b"string")
+        self.assertEqual(self.r.get(key), b"not-a-hash")
+        result = was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
+        # was_delivered's own HGET against a string-typed key also raises
+        # WRONGTYPE -- correctly reported as "could not verify" (None),
+        # not a confirmed negative, since the true cause is a corrupted
+        # key, not an absence of provenance.
+        self.assertIsNone(result)
+
+    def test_wrong_type_key_failure_is_logged(self):
+        import contextlib
+        import io
+
+        key = prefix(self.pod, self.tenant, agent="bob", resource="delivered")
+        self.r.set(key, "not-a-hash")
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            record_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
+
+        lines = [json.loads(line) for line in captured.getvalue().splitlines()]
+        failures = [line for line in lines if line.get("event") == "record_delivered_failed"]
+        self.assertEqual(len(failures), 1)
+        self.assertIn("wrong type", failures[0]["reason"])
 
 
 if __name__ == "__main__":
