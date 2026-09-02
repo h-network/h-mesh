@@ -17,6 +17,7 @@ practice: at the start of the NEXT pytest session, not the one that died.
 import errno
 import json
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -93,6 +94,51 @@ def _alive(pid: int) -> bool:
     return True
 
 
+def _describe_exit(proc: subprocess.Popen) -> str:
+    """Distinguish "still running" from "exited" from "killed by a signal" --
+    the three outcomes a bare `assert ready` used to collapse into one
+    indistinguishable message."""
+    code = proc.returncode
+    if code is None:
+        return "still running"
+    if code < 0:
+        try:
+            return f"killed by signal {signal.Signals(-code).name}"
+        except ValueError:
+            return f"killed by signal {-code}"
+    return f"exited with code {code}"
+
+
+def _wait_for_ready_line(proc: subprocess.Popen, timeout: float) -> tuple[bool, str]:
+    """Wait for a "READY" line without blocking past `timeout` even if the
+    child never writes anything: a plain `proc.stdout.readline()` blocks
+    until a line arrives OR the pipe closes on exit, so it cannot tell "the
+    child is alive but silent" from "the deadline passed" -- and once the
+    pipe DOES close, `readline()` returns "" instantly forever, so a caller
+    that only checks "did I get a line" has no way to tell a dead child from
+    one still starting up. `select` on the underlying fd, re-checked against
+    a real deadline, makes both distinctions possible; captures whatever
+    output the child did produce either way, since that's the other half of
+    the evidence a bare pass/fail throws away."""
+    deadline = time.monotonic() + timeout
+    output: list[str] = []
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        readable, _, _ = select.select([proc.stdout], [], [], min(0.2, remaining))
+        if not readable:
+            continue
+        line = proc.stdout.readline()
+        if line == "":
+            break  # EOF: the child's stdout closed, which only happens on exit.
+        output.append(line)
+        if "READY" in line:
+            return True, "".join(output)
+    proc.poll()
+    return False, "".join(output)
+
+
 def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_path):
     script_path = tmp_path / "victim.py"
     script_path.write_text(_VICTIM_SCRIPT.format(tests_dir=str(REPO_ROOT / "h-app" / "tests")))
@@ -106,17 +152,11 @@ def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_pa
     daemon_pid: int | None = None
     manifest_entry = MANIFEST_DIR / f"{victim_tmpdir.name}.json"
     try:
-        deadline = time.monotonic() + 10.0
-        ready = False
-        while time.monotonic() < deadline:
-            line = proc.stdout.readline()
-            if not line:
-                time.sleep(0.05)
-                continue
-            if "READY" in line:
-                ready = True
-                break
-        assert ready, "victim process never signalled readiness"
+        ready, captured = _wait_for_ready_line(proc, timeout=10.0)
+        assert ready, (
+            f"victim process never signalled readiness -- {_describe_exit(proc)}; "
+            f"captured output: {captured!r}"
+        )
 
         assert manifest_entry.exists(), "victim never registered before we killed it"
         daemon_pid = int((victim_tmpdir / "run" / "switch.pid").read_text().strip())
