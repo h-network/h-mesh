@@ -253,6 +253,31 @@ class DeliveryVerifierTests(unittest.TestCase):
         self.assertEqual(r.deleted, [])
         self.assertEqual(out, "")
 
+    def test_responsive_agent_never_reads_blocked(self):
+        """A `blocked` entry only ever gets SET by a failed marker
+        verification, but until now it only ever got CLEARED by a later
+        marker's succeeding -- an asymmetry. An agent nobody sends anything
+        to again after one unverified paste stayed "blocked" forever, even
+        while producing its own activity, because with no new marker there
+        is nothing to re-verify against. Confirmed live (office status
+        reported responsive agents as blocked; `last activity` updated on a
+        probe while `state` did not) before writing this.
+
+        The agent's own later activity is exactly the evidence a marker-based
+        verification would have accepted anyway -- self-heal on it without
+        requiring anyone to send the agent something new first.
+        """
+        r = FakeRedis()
+        r.hashes[_key("blocked")] = {"since": "2026-08-09T11:00:00Z", "stream_id": "stale"}
+        # Real, unprompted activity well after the stale block -- no new
+        # pending.verify marker exists at all, simulating an agent who kept
+        # working on its own and was simply never messaged again.
+        r.streams[_key("activity")] = [_activity("tool", "2026-08-09T11:30:00Z")]
+
+        DeliveryVerifier(r, pod=POD, tenant=TENANT).poll({"sme-2"}, now=NOW)
+
+        self.assertNotIn(_key("blocked"), r.hashes)
+
     def test_pending_verify_key_follows_the_dotted_resource_convention(self):
         """Resources compose with a dot, like tasks.todo and activity.offset.
 

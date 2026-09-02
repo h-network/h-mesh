@@ -115,6 +115,10 @@ class FakeRedis:
         stream.append((entry_id, dict(fields)))
         return entry_id
 
+    def xrevrange(self, key, max="+", min="-", count=None):
+        entries = list(reversed(self.streams.get(key, [])))
+        return entries[:count] if count is not None else entries
+
     def eval(self, script, numkeys, *args):
         self._fault("eval")
         keys = args[:numkeys]
@@ -195,12 +199,14 @@ def _todo_agent(r, agent="sme-2", *, created="2026-08-09T13:55:00Z", ticket_id="
         r.lists[key] = [entry]
 
 
-def _hold_agent(r, agent="sme-2", *, held="2026-08-09T13:00:00Z", ticket_id="ticket-1", title="wait on the vendor reply", append=False, created=None):
+def _hold_agent(r, agent="sme-2", *, held="2026-08-09T13:00:00Z", ticket_id="ticket-1", title="wait on the vendor reply", append=False, created=None, reason=None):
     entry = {"id": ticket_id, "title": title}
     if held is not None:
         entry["held_ts"] = held
     if created is not None:
         entry["created_ts"] = created
+    if reason is not None:
+        entry["hold_reason"] = reason
     key = _key(agent, "tasks.hold")
     if append:
         r.lists.setdefault(key, []).append(json.dumps(entry))
@@ -285,6 +291,48 @@ class WatchdogTests(unittest.TestCase):
 
         watchdog.poll(now=NOW)
         self.assertEqual(len(r.streams[prefix(POD, TENANT, resource="alerts")]), 1)
+
+    def test_stall_alert_carries_last_activity_kind_as_context_not_suppression(self):
+        """The three-signal stall check cannot tell "stuck" from "waiting on
+        a reply" -- an agent whose last action was `output` may just be
+        waiting on someone. That ambiguity is surfaced as extra context on
+        the alert, not used to silence it (the goal is fewer false alerts,
+        not fewer alerts)."""
+        r = FakeRedis()
+        _stalled_agent(r)
+        r.streams[_key("sme-2", "activity")] = [
+            ("1-0", {"event": json.dumps({
+                "v": 1, "agent": "sme-2", "ts": "2026-08-09T13:51:00Z", "kind": "output",
+            })}),
+        ]
+        self._set(service, "run_tmux", lambda *args, socket=None: (
+            (0, "architect\t1786283999\nsme-2\t1786283580", "") if args[0] == "list-windows" else (0, "", "")
+        ))
+
+        _watchdog(r).poll(now=NOW)
+
+        alert = json.loads(r.streams[prefix(POD, TENANT, resource="alerts")][0][1]["alert"])
+        self.assertEqual(alert["last_activity_kind"], "output")
+        self.assertNotIn("last_activity_tool", alert)
+
+    def test_stall_alert_carries_the_tool_name_when_last_activity_was_a_tool_call(self):
+        r = FakeRedis()
+        _stalled_agent(r)
+        r.streams[_key("sme-2", "activity")] = [
+            ("1-0", {"event": json.dumps({
+                "v": 1, "agent": "sme-2", "ts": "2026-08-09T13:51:00Z",
+                "kind": "tool", "tool": "Bash",
+            })}),
+        ]
+        self._set(service, "run_tmux", lambda *args, socket=None: (
+            (0, "architect\t1786283999\nsme-2\t1786283580", "") if args[0] == "list-windows" else (0, "", "")
+        ))
+
+        _watchdog(r).poll(now=NOW)
+
+        alert = json.loads(r.streams[prefix(POD, TENANT, resource="alerts")][0][1]["alert"])
+        self.assertEqual(alert["last_activity_kind"], "tool")
+        self.assertEqual(alert["last_activity_tool"], "Bash")
 
     def test_printing_window_or_working_presence_suppresses_stall(self):
         r = FakeRedis()
@@ -701,6 +749,41 @@ class WatchdogTests(unittest.TestCase):
         ))
         self.assertEqual(kicks, ["architect"])
 
+    def test_todo_duration_does_not_fire_for_a_ticket_queued_behind_active_work(self):
+        """A todo ticket behind an agent's current `doing` ticket cannot be
+        started yet no matter how old it gets -- that is queueing, not
+        neglect (confirmed live: this fired on tickets deliberately queued
+        behind active work)."""
+        r = FakeRedis()
+        _todo_agent(r)
+        # started recently -- must not also cross doing-duration's own
+        # threshold and confound this test with a different alert.
+        _doing_agent(r, started="2026-08-09T13:55:00Z")
+        _lead(r)
+        self._set(service, "run_tmux", _quiet_windows())
+        self._set(service, "deliver_tmux", _no_kick())
+
+        _watchdog(r).poll(now=NOW)
+
+        self.assertNotIn(_key("architect", "ingress"), r.lists)
+
+    def test_todo_duration_fires_once_the_agent_finishes_its_doing_ticket(self):
+        r = FakeRedis()
+        _todo_agent(r)
+        _doing_agent(r, started="2026-08-09T13:55:00Z")
+        _lead(r)
+        self._set(service, "run_tmux", _quiet_windows())
+        self._set(service, "deliver_tmux", _no_kick())
+        watchdog = _watchdog(r)
+        watchdog.poll(now=NOW)
+        self.assertNotIn(_key("architect", "ingress"), r.lists)
+
+        r.lists[_key("sme-2", "tasks.doing")] = []  # finished or held
+        kicks, fake = _kicks()
+        self._set(service, "deliver_tmux", fake)
+        watchdog.poll(now=NOW)
+        self.assertEqual(len(kicks), 1)
+
     def test_todo_duration_does_not_fire_before_five_minutes(self):
         r = FakeRedis()
         _todo_agent(r, created="2026-08-09T13:56:00Z")  # 240s old, under the 300s default
@@ -824,6 +907,57 @@ class WatchdogTests(unittest.TestCase):
             '"wait on the vendor reply" on hold for 60 min'
         ))
         self.assertEqual(kicks, ["architect"])
+
+    def test_hold_duration_carries_the_hold_reason_into_the_alert_text(self):
+        r = FakeRedis()
+        _hold_agent(r, reason="waiting on vendor confirmation")
+        _lead(r)
+        kicks, fake = _kicks()
+        self._set(service, "run_tmux", _quiet_windows())
+        self._set(service, "deliver_tmux", fake)
+
+        _watchdog(r).poll(now=NOW)
+
+        envelope = parse(r.lists[_key("architect", "ingress")][-1])
+        self.assertEqual(envelope["payload"]["text"], (
+            '[alert from watchdog] sme-2 has had "wait on the vendor reply" '
+            'on hold for 60 min (reason: waiting on vendor confirmation)'
+        ))
+        self.assertEqual(kicks, ["architect"])
+
+    def test_hold_duration_still_fires_without_a_reason_on_a_legacy_entry(self):
+        """A ticket held before --reason was mandatory has no `hold_reason`
+        at all -- must degrade gracefully, not crash or suppress the alert."""
+        r = FakeRedis()
+        _hold_agent(r)  # no reason= passed
+        _lead(r)
+        kicks, fake = _kicks()
+        self._set(service, "run_tmux", _quiet_windows())
+        self._set(service, "deliver_tmux", fake)
+
+        _watchdog(r).poll(now=NOW)
+
+        envelope = parse(r.lists[_key("architect", "ingress")][-1])
+        self.assertEqual(envelope["payload"]["text"], (
+            '[alert from watchdog] sme-2 has had "wait on the vendor reply" '
+            'on hold for 60 min'
+        ))
+        self.assertEqual(kicks, ["architect"])
+
+    def test_hold_duration_still_fires_with_a_reason_present(self):
+        """The goal is fewer false alerts, not fewer alerts -- a reason
+        explains why the wait started, not that it is still justified;
+        having one must not silence or delay the alert."""
+        r = FakeRedis()
+        _hold_agent(r, reason="deliberately parked, revisit later")
+        _lead(r)
+        kicks, fake = _kicks()
+        self._set(service, "run_tmux", _quiet_windows())
+        self._set(service, "deliver_tmux", fake)
+
+        _watchdog(r).poll(now=NOW)
+
+        self.assertEqual(len(kicks), 1)
 
     def test_hold_duration_does_not_fire_before_sixty_minutes(self):
         r = FakeRedis()
