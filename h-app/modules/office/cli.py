@@ -1039,12 +1039,25 @@ def _add_command(argv: list[str]) -> None:
     r, pod, tenant, source = _context()
     if not is_member(r, pod=pod, tenant=tenant, agent=args.agent):
         raise OfficeError(f"unknown destination agent {args.agent!r}")
-    payload = {"title": args.title, "description": args.description, "priority": args.priority}
+    ticket_id = os.urandom(4).hex()
+    payload = {
+        "v": 1,
+        "id": ticket_id,
+        "title": args.title,
+        "description": args.description,
+        "created_by": source,
+        "status": "todo",
+        "created_ts": _now(),
+        "started_ts": None,
+        "done_ts": None,
+        "held_ts": None,
+        "priority": args.priority,
+    }
     if args.related:
         related = list(dict.fromkeys(value.strip() for value in args.related.split(",") if value.strip()))
         if related:
             payload["related"] = related
-    stream_id = send(
+    send(
         r,
         pod=pod,
         tenant=tenant,
@@ -1054,7 +1067,7 @@ def _add_command(argv: list[str]) -> None:
         kind="AddTicket",
         module="office",
     )
-    print(stream_id)
+    print(ticket_id)
 
 
 # ---------------------------------------------------------------------------

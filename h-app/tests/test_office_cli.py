@@ -819,7 +819,7 @@ def test_concurrent_takes_leave_exactly_one_doing_ticket(monkeypatch):
 
 
 @patch("modules.office.cli.send")
-def test_add_sends_envelope_and_never_writes_recipient_board(mock_send, monkeypatch):
+def test_add_sends_envelope_and_prints_the_ticket_id(mock_send, monkeypatch, capsys):
     _env(monkeypatch)
     mock_send.return_value = "stream-1"
     r = FakeRedis(registry={"backend": "tmux"})
@@ -828,6 +828,9 @@ def test_add_sends_envelope_and_never_writes_recipient_board(mock_send, monkeypa
     kwargs = mock_send.call_args[1]
     assert kwargs["kind"] == "AddTicket"
     assert kwargs["payload"]["title"] == "title"
+    ticket_id = kwargs["payload"]["id"]
+    assert capsys.readouterr().out.strip() == ticket_id
+    assert ticket_id != "stream-1"
     todo_key = prefix(POD, TENANT, "backend", "tasks.todo")
     assert r.lists[todo_key] == []
 

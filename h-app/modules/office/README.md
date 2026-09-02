@@ -54,6 +54,10 @@ is the inspection path; taking a ticket is reserved for actually starting it.
 board (`todo`, `doing`, or `hold`) without changing its identity, timestamps,
 state, or queue position. It does not edit another agent's board or closed
 work. Both audit channels record the old and replacement title.
+`office add` allocates the ticket id before sending its asynchronous envelope,
+includes that id in the ticket payload, and prints the ticket id—not the
+transport stream id—so the returned value is the identity later stored on the
+recipient's board.
 For review work, use `passed` or `failed`. Hold a QUESTIONS review while its
 answers block the verdict; use `completed` only when its questions are
 non-blocking. Returned work joins the back of a nonempty `todo` queue.
