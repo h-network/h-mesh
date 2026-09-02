@@ -603,8 +603,8 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
             f"unknown: no proof of failure for {args.agent} within {args.wait:.0f}s -- "
             "this does NOT mean it failed, it may well have succeeded; there is "
             "currently no way to prove success for this request, only to disprove "
-            "it (see ticket ff53e7e9 for why). Check 'office status' or the "
-            "registry directly if you want to look for yourself.",
+            "it. Check 'office status' or the registry directly if you want to "
+            "look for yourself.",
             file=sys.stderr,
         )
         raise SystemExit(2)

@@ -885,14 +885,22 @@ print("1" if pt == "tmux" else "0")
             # ⚠ --wait can only prove a real rejection (exit 1) or time out
             # (exit 2) -- it cannot currently prove success, for a brand-new
             # agent or a re-hire of an existing one alike (see
-            # modules/office/cli.py's own --wait help text and ticket
-            # ff53e7e9 for why: no signal anywhere ties a *successful*
-            # StartAgent back to the specific request that caused it, so
-            # confirming one would risk the exact same lie this fixed).
-            # That makes "no proof of rejection" the EXPECTED outcome for a
-            # hire that actually worked, not a warning sign -- worded
-            # calmly below, not as an alarm, and exit 0 isn't special-cased
-            # since --wait cannot currently produce it.
+            # modules/office/cli.py's own --wait help text for why: no
+            # signal anywhere ties a *successful* StartAgent back to the
+            # specific request that caused it, so confirming one would risk
+            # the exact same lie this fixed -- ticket ff53e7e9 tracks the
+            # real fix).
+            #
+            # ⚠ Every status handled EXPLICITLY, none folded into a soft
+            # "probably fine" default -- reviewer FAILED an earlier version
+            # of this block for exactly that: `if status==1 then failed
+            # else requested` treated any OTHER exit (a parse failure, a
+            # launcher error, a signal death, an exit code this script has
+            # never seen) as if the request had at least been sent, which
+            # is the same false-positive shape this whole branch exists to
+            # remove, rebuilt one layer out in the wrapper that reads the
+            # CLI's own honest exit code. An unenumerated status means "I
+            # do not know what happened", never "probably fine".
             HIRE_ARGS=("$a" --cli "$CLI_FOR_A" --wait)
             [ "$PROF_FOR_A" != "default" ] && HIRE_ARGS+=(--profile "$PROF_FOR_A")
             [ -n "$EP_FOR_A" ] && HIRE_ARGS+=(--provider "$EP_FOR_A")
@@ -901,8 +909,17 @@ print("1" if pt == "tmux" else "0")
             HIRE_STATUS=$?
             if [ "$HIRE_STATUS" -eq 1 ]; then
                 echo "  • $a: hire failed -- $HIRE_OUTPUT" >&2
-            else
+            elif [ "$HIRE_STATUS" -eq 2 ]; then
                 echo "  • $a: requested ($CLI_FOR_A${PROF_FOR_A:+, account=$PROF_FOR_A}${EP_FOR_A:+, provider=$EP_FOR_A}) -- no rejection seen; run 'office status' if you want to confirm it came up"
+            elif [ "$HIRE_STATUS" -eq 0 ]; then
+                # Not currently reachable via --wait (see modules/office/
+                # cli.py's own contract) -- kept as its own explicit case,
+                # not folded into the error branch below, so a future
+                # attributable-success signal can land here without this
+                # dispatch silently mis-routing it.
+                echo "  • $a: hired ($CLI_FOR_A${PROF_FOR_A:+, account=$PROF_FOR_A}${EP_FOR_A:+, provider=$EP_FOR_A})"
+            else
+                echo "  • $a: hire setup error (unexpected exit $HIRE_STATUS, not admitted or rejected -- treat as not sent) -- $HIRE_OUTPUT" >&2
             fi
         done
         echo
