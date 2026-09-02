@@ -11,7 +11,15 @@ from collections.abc import Callable
 
 import redis
 
-from .envelope import EnvelopeError, advance_hop, header_record_fields, parse_for_switch, stamp_source
+from .envelope import (
+    EnvelopeError,
+    advance_hop,
+    build,
+    encode,
+    header_record_fields,
+    parse_for_switch,
+    stamp_source,
+)
 from .keys import prefix
 from .logging import configure_logging, emit, log_record, publish
 from .queues import admit_ingress
@@ -184,7 +192,7 @@ class Switch:
             limit=self.ingress_max,
         )
 
-    def _kick(self, agent: str, port_type_name: str | None, envelope: dict) -> None:
+    def _kick(self, agent: str, port_type_name: str | None, envelope: dict) -> bool:
         if port_type_name is None:
             _log_observation(
                 "kick_skipped",
@@ -194,7 +202,7 @@ class Switch:
                 destination=agent,
                 reason="port_type is unresolved; no delivery attempt started",
             )
-            return
+            return False
         if self.kick is None:
             _log_observation(
                 "kick_skipped",
@@ -204,7 +212,7 @@ class Switch:
                 destination=agent,
                 reason="no delivery kick callback configured",
             )
-            return
+            return False
         try:
             self.kick(agent, port_type_name, envelope)
         except Exception as exc:
@@ -216,7 +224,7 @@ class Switch:
                 destination=agent,
                 reason=f"delivery kick outcome UNKNOWN after {exc}",
             )
-            return
+            return True
         # A callback return proves only that the switch started a delivery
         # attempt; it does not claim that the edge reached or popped ingress.
         _log_observation(
@@ -226,6 +234,45 @@ class Switch:
             source=envelope.get("l2", {}).get("source"),
             destination=agent,
         )
+        return True
+
+    def _notify_broadcast_sender(
+        self, *, sender: str, sender_type: str | None,
+        envelope: dict, skipped: list[str],
+    ) -> None:
+        """Best-effort fact-only feedback at the initiating participant."""
+        notice = build(
+            "Message",
+            "switch",
+            sender,
+            {
+                "text": (
+                    "Broadcast notice: no delivery attempt was started for "
+                    + ", ".join(skipped)
+                    + "."
+                )
+            },
+            envelope.get("stream_id"),
+            pod=self.pod,
+            tenant=self.tenant,
+        )
+        raw = encode(notice)
+        try:
+            admitted, _, depth = self._admit([sender], raw)
+        except Exception as exc:
+            _emit_observation(
+                "forward_unknown", notice,
+                f"broadcast notice ingress write outcome UNKNOWN after {exc}",
+            )
+            return
+        if not admitted:
+            _emit_observation(
+                "dead_lettered", notice,
+                f"broadcast notice ingress full at depth {depth}",
+            )
+            return
+        _emit_observation("forwarded", notice)
+        self._kick(sender, sender_type, notice)
 
     def step(self, timeout: float | None = None) -> bool:
         agents = sorted(self._agents())
@@ -281,7 +328,7 @@ class Switch:
         destination = envelope["l2"]["destination"]
         if destination == "all":
             recipient_types = member_types(self.r, pod=self.pod, tenant=self.tenant)
-            recipient_types.pop(sender, None)
+            sender_type = recipient_types.pop(sender, None)
             recipients = sorted(recipient_types)
             if not recipients:
                 _emit_observation("forwarded", envelope, count=0)
@@ -298,8 +345,15 @@ class Switch:
                 self._dead_letter_full(sender, "all", raw, envelope, depth)
                 return True
             _emit_observation("forwarded", envelope, count=len(recipients))
+            skipped = []
             for agent in recipients:
-                self._kick(agent, recipient_types[agent] or None, envelope)
+                if not self._kick(agent, recipient_types[agent] or None, envelope):
+                    skipped.append(agent)
+            if skipped:
+                self._notify_broadcast_sender(
+                    sender=sender, sender_type=sender_type,
+                    envelope=envelope, skipped=skipped,
+                )
             return True
         destination_type = port_type(
             self.r, pod=self.pod, tenant=self.tenant, agent=destination

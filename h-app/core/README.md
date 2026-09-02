@@ -39,6 +39,11 @@ delivery port. Each resolvable recipient therefore records `kick_started` or
 records terminal `kick_skipped`; it is not a promise of later retry. Resolvable
 members still start delivery when another member is unresolvable, making a
 partial outcome explicit instead of discarding the whole broadcast.
+After fan-out, the switch also sends the initiating participant one consolidated
+fact-only notice naming skipped recipients: it says no delivery attempt was
+started, not that later receipt is impossible. This makes the partial outcome
+visible at the initiating office/API surface without contradicting an existing
+port that may independently drain an already-admitted queue.
 
 Core logging uses the `H_MESH_WRITER`, `H_MESH_CUSTODY_FILE`,
 `H_MESH_LOG_FILE`, `H_MESH_LOG_QUIET`, and

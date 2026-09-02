@@ -288,11 +288,19 @@ class ChannelTests(unittest.TestCase):
         with patch("core.service._emit_observation"), patch("core.service._log_observation") as log:
             self.assertTrue(switch.step(timeout=0))
 
-        self.assertEqual(kicks, [("bob", "tmux", stream_id)])
+        self.assertEqual(kicks[0], ("bob", "tmux", stream_id))
+        self.assertEqual(kicks[1][0:2], ("alice", "tmux"))
         skipped = [call for call in log.call_args_list if call.args == ("kick_skipped",)]
         self.assertEqual(len(skipped), 1)
         self.assertEqual(skipped[0].kwargs["destination"], "unresolved")
         self.assertIn("no delivery attempt started", skipped[0].kwargs["reason"])
+        notice = parse(self.redis.lists[prefix(POD, TENANT, "alice", "ingress")][0])
+        self.assertEqual(notice["l2"], {"source": "switch", "destination": "alice"})
+        self.assertEqual(
+            notice["payload"]["text"],
+            "Broadcast notice: no delivery attempt was started for unresolved.",
+        )
+        self.assertEqual(notice["correlation_id"], stream_id)
 
     def test_unicast_missing_hget_value_dead_letters_without_kick(self):
         self.register(alice="tmux")
