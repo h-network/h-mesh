@@ -67,6 +67,19 @@ server (not a `services.daemons` module, no existing pidfd helper) gets the
 same treatment built locally: `os.pidfd_open` immediately upon a match,
 re-verified while that fd is held, signalled through the fd.
 
+⚠ THAT DELEGATION ALONE WAS NOT ENOUGH, next reviewer pass, same day:
+`stop_daemons()` processes its known daemons sequentially and stops
+whichever DO authenticate even if a later one in the same run_dir fails --
+so calling it directly could stop and remove evidence for some daemons
+while the whole tmpdir was reported as untouched, contradicting the
+whole-entry preflight-before-any-kill property this module promises. See
+`reap_orphan`'s own docstring for the restored read-only preflight and,
+just as importantly, for the honest residual it does NOT close (the brief
+gap between that preflight and `stop_daemons`' own re-authentication) --
+this paragraph describes only the TOCTOU-on-signalling half of the fix, not
+the whole-entry half, and should not be read as claiming the stronger
+property on its own.
+
 ⚠ The same reviewer pass, same reasons, on two smaller gaps: an entry whose
 OWNER authentication itself failed at registration time (`owner_start_time`
 recorded as `None`) was silently treated as "still running" forever --
