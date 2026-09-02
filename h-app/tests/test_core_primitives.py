@@ -157,6 +157,73 @@ class EnvelopeTests(unittest.TestCase):
                 with self.assertRaisesRegex(EnvelopeError, message):
                     parse(raw)
 
+    def test_build_without_in_reply_to_leaves_it_absent_not_null(self):
+        frame = self.frame()
+        self.assertNotIn("in_reply_to", frame)
+        raw = encode(frame)
+        parsed = parse(raw)
+        self.assertNotIn("in_reply_to", parsed)
+
+    def test_build_with_in_reply_to_round_trips_the_exact_value(self):
+        target = "b" * 32
+        frame = build(
+            "Message", "alice", "bob", {"text": "hello"},
+            pod=POD, tenant=TENANT, in_reply_to=target,
+        )
+        self.assertEqual(frame["in_reply_to"], target)
+        parsed = parse(encode(frame))
+        self.assertEqual(parsed["in_reply_to"], target)
+
+    def test_encode_rejects_malformed_in_reply_to(self):
+        with self.assertRaisesRegex(EnvelopeError, "in_reply_to must be"):
+            encode(self.frame(in_reply_to="not-a-valid-id"))
+
+    def test_encode_rejects_present_none_in_reply_to_as_a_caller_bug(self):
+        # build() itself never produces this shape -- it only sets the key
+        # when its own in_reply_to argument is not None. A frame with the
+        # key explicitly present and set to None can only come from a
+        # caller that didn't go through build() correctly, and that must be
+        # rejected outright, not silently treated as "absent" (which would
+        # hide the bug and, on the receiving side, is exactly the
+        # distinction clients-agent asked to keep -- present-and-empty must
+        # never be confused with genuinely absent).
+        with self.assertRaisesRegex(EnvelopeError, "in_reply_to must be"):
+            encode(self.frame(in_reply_to=None))
+
+    def test_encode_rejects_present_empty_string_in_reply_to(self):
+        with self.assertRaisesRegex(EnvelopeError, "in_reply_to must be"):
+            encode(self.frame(in_reply_to=""))
+
+    def test_parse_tolerates_malformed_in_reply_to_on_the_wire(self):
+        # parse() must never dead-letter an otherwise-valid envelope over a
+        # bad optional field -- that judgment belongs to the receiving
+        # module (deliver_api), not the wire layer. A hand-built body with a
+        # garbage in_reply_to must still parse, carrying the value through
+        # unvalidated for the caller to judge.
+        for bad_value in ("not-a-valid-id", None, ""):
+            with self.subTest(bad_value=bad_value):
+                frame = self.frame()
+                raw = encode(frame)
+                header, body = raw[:HEADER_WIDTH], raw[HEADER_WIDTH:]
+                import json
+                body_dict = json.loads(body)
+                body_dict["in_reply_to"] = bad_value
+                tampered = header + json.dumps(body_dict, separators=(",", ":"))
+                parsed = parse(tampered)
+                self.assertIn("in_reply_to", parsed)
+                self.assertEqual(parsed["in_reply_to"], bad_value)
+
+    def test_old_frame_produced_before_the_field_existed_still_round_trips(self):
+        # Simulates a frame from before in_reply_to existed: no key at all,
+        # not even in the raw wire bytes, not just absent from build()'s
+        # kwargs.
+        frame = self.frame()
+        raw = encode(frame)
+        self.assertNotIn('"in_reply_to"', raw[HEADER_WIDTH:])
+        parsed = parse(raw)
+        self.assertNotIn("in_reply_to", parsed)
+        self.assertEqual(parsed["payload"], {"text": "hello", "nested": {"ok": True}})
+
     def test_encode_rejects_invalid_counters_and_body(self):
         cases = (
             ({"ttl": -1}, "ttl must be"),

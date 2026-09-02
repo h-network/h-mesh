@@ -276,7 +276,15 @@ class DeliveryVerifierTests(unittest.TestCase):
 
         DeliveryVerifier(r, pod=POD, tenant=TENANT).poll({"sme-2"}, now=NOW)
 
-        self.assertNotIn(_key("blocked"), r.hashes)
+        # Assert the harm avoided, not the mechanism: `office status`'s own
+        # check is `blocked = r.hgetall(blocked_key) or None` -- a falsy
+        # hgetall is what actually stops a responsive agent reading as
+        # blocked. Checking key-membership in the fake would still pass a
+        # correct alternate fix that emptied the hash instead of deleting
+        # it, but would also pass a WRONG fix that left it non-empty in a
+        # way `dict` membership doesn't catch; hgetall is what the real
+        # downstream reader evaluates, so assert exactly that.
+        self.assertFalse(r.hgetall(_key("blocked")))
 
     def test_self_heal_requires_activity_strictly_after_since_not_at_it(self):
         """Pin the safety side of the self-heal boundary: activity AT or
@@ -285,8 +293,7 @@ class DeliveryVerifierTests(unittest.TestCase):
         strictly after `since` counts, same `>` the marker-based verified
         check already uses."""
         r = FakeRedis()
-        blocked = {"since": "2026-08-09T11:00:00Z", "stream_id": "stale"}
-        r.hashes[_key("blocked")] = dict(blocked)
+        r.hashes[_key("blocked")] = {"since": "2026-08-09T11:00:00Z", "stream_id": "stale"}
         # Activity exactly AT `since`, and one before it -- neither is
         # "later" activity.
         r.streams[_key("activity")] = [
@@ -296,7 +303,12 @@ class DeliveryVerifierTests(unittest.TestCase):
 
         DeliveryVerifier(r, pod=POD, tenant=TENANT).poll({"sme-2"}, now=NOW)
 
-        self.assertEqual(r.hashes[_key("blocked")], blocked)
+        # Harm avoided here is the opposite: a still-genuinely-blocked agent
+        # must still read as blocked to `office status`. Truthy hgetall is
+        # what that check evaluates -- not whether this implementation left
+        # since/stream_id byte-for-byte untouched, which a different correct
+        # implementation need not guarantee.
+        self.assertTrue(r.hgetall(_key("blocked")))
 
     def test_pending_verify_key_follows_the_dotted_resource_convention(self):
         """Resources compose with a dot, like tasks.todo and activity.offset.

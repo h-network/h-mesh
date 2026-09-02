@@ -31,6 +31,7 @@ from core.registry import is_member, members, port_type
 from lib.attachment_schema import ATTACHMENT_MAX_BYTES, MIME_TYPE_REGEX
 from lib.board_interaction import BoardError, normalize_ticket, serialize_ticket
 from lib.paths import get_workdir_root
+from lib.reply_correlation import is_valid_reply_id
 
 from .pricing import calculate_cost, load_pricing
 
@@ -62,7 +63,10 @@ def _operation_parser(command: str, description: str) -> argparse.ArgumentParser
 # ---------------------------------------------------------------------------
 
 
-def _message(r, *, pod: str, tenant: str, source: str, destination: str, text: str) -> str:
+def _message(
+    r, *, pod: str, tenant: str, source: str, destination: str, text: str,
+    in_reply_to: str | None = None,
+) -> str:
     return send(
         r,
         pod=pod,
@@ -72,6 +76,7 @@ def _message(r, *, pod: str, tenant: str, source: str, destination: str, text: s
         payload={"text": text},
         kind="Message",
         module="office",
+        in_reply_to=in_reply_to,
     )
 
 
@@ -81,6 +86,16 @@ def _send_command(argv: list[str]) -> None:
     sources = parser.add_mutually_exclusive_group()
     sources.add_argument("--stdin", action="store_true", help="read message text from stdin")
     sources.add_argument("--file", type=Path, metavar="PATH", help="read message text from a file")
+    parser.add_argument(
+        "--reply-to",
+        metavar="STREAM_ID",
+        help=(
+            "opt in to exact reply correlation: name the stream_id shown in the "
+            "'[message <id> from ...]' line you are answering. Best-effort -- "
+            "silently dropped by the recipient's door if it doesn't validate, "
+            "same as not passing it at all."
+        ),
+    )
     parser.add_argument(
         "text",
         nargs="?",
@@ -106,11 +121,17 @@ def _send_command(argv: list[str]) -> None:
     else:
         raise OfficeError("office send requires message text, --stdin, or --file")
 
+    if args.reply_to is not None and not is_valid_reply_id(args.reply_to):
+        raise OfficeError(
+            f"--reply-to {args.reply_to!r} is not a 32-character lowercase hex stream_id"
+        )
+
     r, pod, tenant, source = _context()
     if not is_member(r, pod=pod, tenant=tenant, agent=args.agent):
         raise OfficeError(f"unknown destination agent {args.agent!r}")
     stream_id = _message(
-        r, pod=pod, tenant=tenant, source=source, destination=args.agent, text=text
+        r, pod=pod, tenant=tenant, source=source, destination=args.agent, text=text,
+        in_reply_to=args.reply_to,
     )
     print(f"sent to {args.agent}: {len(text.encode('utf-8'))} bytes ({stream_id})")
 
@@ -542,8 +563,19 @@ def _task_keys(pod: str, tenant: str, agent: str) -> dict[str, str]:
     }
 
 
-_ATOMIC_TRANSITION = """
--- office atomic task transition v1
+_PREFLIGHTED_TRANSITION = """
+-- office preflighted task transition v2
+local source_type = redis.call('TYPE', KEYS[1]).ok
+if source_type == 'none' then
+    return {0, 'changed'}
+end
+if source_type ~= 'list' then
+    return {0, 'source_type'}
+end
+local destination_type = redis.call('TYPE', KEYS[2]).ok
+if destination_type ~= 'none' and destination_type ~= 'list' then
+    return {0, 'destination_type'}
+end
 if ARGV[3] == '1' and redis.call('LLEN', KEYS[2]) > 0 then
     return {0, 'busy'}
 end
@@ -567,7 +599,7 @@ return 0
 """
 
 def _quarantine_invalid(r, *, source_key: str, invalid_key: str, raw) -> None:
-    """Atomically preserve an unreadable entry off the actionable queues."""
+    """Preserve an unreadable entry through the preflighted board transition."""
     _transition_selected(
         r,
         source_key=source_key,
@@ -597,9 +629,14 @@ def _transition_selected(
     replacement,
     require_destination_empty: bool = False,
 ) -> None:
-    """Atomically rewrite and move one entry, optionally requiring an empty destination."""
+    """Move one entry after preflighting every key-type command error.
+
+    Source and destination types are checked before the first mutation. Take's
+    destination-empty guard also runs before LREM. Once LREM begins, RPUSH has
+    a preflighted list-or-absent destination and fixed valid arguments.
+    """
     result = r.eval(
-        _ATOMIC_TRANSITION,
+        _PREFLIGHTED_TRANSITION,
         2,
         source_key,
         destination_key,
@@ -613,11 +650,20 @@ def _transition_selected(
         return
     if reason == "busy":
         raise OfficeError("you already have one open task")
+    if reason == "source_type":
+        raise OfficeError("source task list has wrong Redis type; no changes made")
+    if reason == "destination_type":
+        raise OfficeError("destination task list has wrong Redis type; no changes made")
     raise OfficeError("task changed while the command was running; try again")
 
 
 def _rewrite_selected(r, *, key: str, raw, replacement) -> None:
-    """Atomically rewrite one exact list entry without changing its position."""
+    """Rewrite one exact entry without a partial multi-command state.
+
+    LRANGE preflights list type and finds the index before the only mutation,
+    LSET. Nothing mutating follows LSET, so a later command cannot expose a
+    partially applied rewrite.
+    """
     if not r.eval(_ATOMIC_REWRITE, 1, key, raw, replacement):
         raise OfficeError("task changed while the command was running; try again")
 
