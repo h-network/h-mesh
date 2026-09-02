@@ -14,7 +14,7 @@ if str(H_APP) not in sys.path:
 
 from core.channels import send
 from core.envelope import parse
-from core.keys import prefix
+from core.keys import incarnation_key, prefix
 from modules.tmux import (
     attachment_opener,
     command_opener,
@@ -199,6 +199,11 @@ class TmuxPortTests(unittest.TestCase):
         # pane, so a later --reply-to naming this id must not validate.
         from lib.reply_correlation import was_delivered
 
+        # An established incarnation for bob, so the eventual False below is
+        # proven by the failed-paste protection this test names, not merely
+        # by the absence of an incarnation (a different, unrelated reason
+        # was_delivered would also return False for).
+        self.redis.set(incarnation_key(POD, TENANT, "bob"), "test-incarnation")
         self.register(alice="tmux", bob="tmux")
         stream_id = send(
             self.redis, pod=POD, tenant=TENANT, source="alice",

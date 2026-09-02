@@ -93,3 +93,15 @@ def receive_unresolved_key(pod: str, tenant: str) -> str:
 def receive_undeliverable_key(pod: str, tenant: str) -> str:
     """Tenant evidence for envelopes whose destination retired before opening."""
     return prefix(pod, tenant, resource="undeliverable")
+
+
+def incarnation_key(pod: str, tenant: str, agent: str) -> str:
+    """One agent's current incarnation id -- minted atomically with registry
+    membership on a genuinely NEW hire (never on an idempotent re-enrol of an
+    already-registered name), deleted at retirement. Absent means no
+    incarnation has been established: a legacy pre-feature agent, or the
+    window between a stop and that name's next hire. Consumers that bind a
+    claim's validity to a specific incarnation (lib/reply_correlation.py)
+    must treat an absent id as "matches nothing", never "matches anything".
+    """
+    return prefix(pod, tenant, agent=agent, resource="incarnation")

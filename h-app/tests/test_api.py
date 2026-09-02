@@ -17,7 +17,7 @@ if str(H_APP) not in sys.path:
 
 from core.channels import send
 from core.envelope import build, encode, parse
-from core.keys import prefix
+from core.keys import incarnation_key, prefix
 from modules.api import server as server_module
 from modules.api.port import deliver_api
 from modules.api.server import ApiSettings, create_app
@@ -487,6 +487,7 @@ class ApiTests(unittest.TestCase):
         from lib.reply_correlation import record_delivered
 
         target = "a" * 32
+        self.redis.set(incarnation_key("test", "office", "alice"), "test-incarnation")
         # alice was really sent `target` by telegram, and is now replying
         # to telegram -- the claimed source matches deliver_api's own agent.
         record_delivered(self.redis, pod="test", tenant="office", agent="alice", stream_id=target, source="telegram")
@@ -531,6 +532,7 @@ class ApiTests(unittest.TestCase):
         from lib.reply_correlation import record_delivered
 
         target = "c" * 32
+        self.redis.set(incarnation_key("test", "office", "alice"), "test-incarnation")
         record_delivered(self.redis, pod="test", tenant="office", agent="alice", stream_id=target, source="telegram")
         ingress = prefix("test", "office", "webconsole", "ingress")
         envelope = build(
@@ -559,6 +561,7 @@ class ApiTests(unittest.TestCase):
         from lib.reply_correlation import record_delivered
 
         target = "e" * 32
+        self.redis.set(incarnation_key("test", "office", "bob"), "test-incarnation")
         record_delivered(self.redis, pod="test", tenant="office", agent="bob", stream_id=target, source="alice")
         ingress = prefix("test", "office", "telegram", "ingress")
         envelope = build(
@@ -581,6 +584,7 @@ class ApiTests(unittest.TestCase):
         from unittest.mock import MagicMock
         from modules.tmux.port import message_opener
 
+        self.redis.set(incarnation_key("test", "office", "bob"), "test-incarnation")
         target = send(
             self.redis, pod="test", tenant="office", source="alice",
             destination="bob", payload={"text": "peer message"},
@@ -614,6 +618,7 @@ class ApiTests(unittest.TestCase):
         # concurrency that motivated it, not just sequentially.
         from modules.tmux.port import message_opener
 
+        self.redis.set(incarnation_key("test", "office", "bob"), "test-incarnation")
         target_a = send(
             self.redis, pod="test", tenant="office", source="telegram",
             destination="bob", payload={"text": "question A"},

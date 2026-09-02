@@ -13,7 +13,7 @@ from core.channels import receive
 from core.dispatch import delivery_lock_key
 from core.envelope import build, encode, parse
 from core.keys import (
-    prefix, receive_opened_key, receive_opening_key, receive_processing_key,
+    incarnation_key, prefix, receive_opened_key, receive_opening_key, receive_processing_key,
     receive_undeliverable_key, receive_unresolved_key,
 )
 from core.policy import tags_key
@@ -22,6 +22,8 @@ from lib.agentlifecycle.lifecycle import (
     ProvableLifecycleRejection,
     _IncompleteLifecycle,
     _PUBLISH_LEAD_MEMBERSHIP_LUA,
+    _PUBLISH_MEMBERSHIP_LUA,
+    _PUBLISH_WINDOW_CAUSE_LUA,
     _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
     _PartialLifecycle,
     resume_agent,
@@ -306,7 +308,7 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
     assert r.method_calls == [
         call.eval(
             ANY,
-            18,
+            19,
             prefix(POD, TENANT, resource="registry"),
             prefix(POD, TENANT, resource="lead"),
             receive_processing_key(POD, TENANT, "worker-1"),
@@ -317,6 +319,7 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
             *_instance_config_keys(POD, TENANT, "worker-1"),
             receive_undeliverable_key(POD, TENANT),
             receive_unresolved_key(POD, TENANT),
+            incarnation_key(POD, TENANT, "worker-1"),
             "worker-1",
         ),
     ]
@@ -424,6 +427,111 @@ def test_rehired_name_cannot_inherit_predecessor_runtime_identity(real_redis):
         assert real_redis.get(
             prefix(POD, tenant, agent=agent, resource="window.cause")
         ) is None
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
+def test_fresh_hire_mints_an_incarnation_id(real_redis):
+    """Ticket 97ad745c's foundation: a same-name successor must not inherit
+    a predecessor's delivered.s* provenance, which requires the delivery
+    claim to be bound to something that changes across a stop/rehire but
+    survives an ordinary restart. Confirms the id actually gets minted at
+    all, for the plain membership-only path (no lead, no correlation_id
+    cause) telegram bot's own StartAgent payload takes."""
+    tenant = f"incarnation-fresh-{uuid4().hex[:12]}"
+    agent = "worker"
+    try:
+        start_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent, "port_type": "api"}},
+            replace_window=lambda _agent: None,
+            available_profiles=lambda *_: None,
+        )
+        minted = real_redis.get(incarnation_key(POD, tenant, agent))
+        assert minted is not None
+        assert len(minted) == 32  # uuid4().hex
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
+def test_idempotent_reenrol_does_not_change_incarnation(real_redis):
+    """Architect's explicit inverse case, and the exact bug a naive
+    unconditional mint would cause: clients/telegram/bot.py calls
+    StartAgent on every process restart, documented there as safe and
+    idempotent. If start_agent rebound the incarnation id on every such
+    call, a bot crash-restart would invalidate its OWN just-established
+    delivered.s* claims and cause redelivery of messages a human already
+    saw -- a worse, quieter bug than the one this feature closes. Calls
+    start_agent twice for the same never-stopped name and confirms the
+    incarnation id is identical both times."""
+    tenant = f"incarnation-reenrol-{uuid4().hex[:12]}"
+    agent = "worker"
+    try:
+        for _ in range(2):
+            start_agent(
+                real_redis, pod=POD, tenant=tenant,
+                envelope={"payload": {"agent": agent, "port_type": "api"}},
+                replace_window=lambda _agent: None,
+                available_profiles=lambda *_: None,
+            )
+        # A third call through the window-cause path (a real envelope's
+        # correlation_id is always present) exercises the other Lua branch
+        # a restart could equally take.
+        start_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={
+                "correlation_id": "b" * 32,
+                "payload": {"agent": agent, "port_type": "api"},
+            },
+            replace_window=lambda _agent: None,
+            available_profiles=lambda *_: None,
+        )
+        final = real_redis.get(incarnation_key(POD, tenant, agent))
+        assert final is not None
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
+def test_stop_then_rehire_mints_a_new_incarnation_id(real_redis):
+    """The exposure ticket 97ad745c exists to close: a same-named
+    successor must get a genuinely different incarnation id than its
+    predecessor had, so lib/reply_correlation.py's incarnation-bound
+    delivered.s* records structurally cannot match the successor's
+    queries."""
+    tenant = f"incarnation-rehire-{uuid4().hex[:12]}"
+    agent = "worker"
+    try:
+        start_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent, "port_type": "api"}},
+            replace_window=lambda _agent: None,
+            available_profiles=lambda *_: None,
+        )
+        predecessor_incarnation = real_redis.get(incarnation_key(POD, tenant, agent))
+        assert predecessor_incarnation is not None
+
+        stop_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent}},
+            kill_window=lambda _agent: None,
+        )
+        assert real_redis.get(incarnation_key(POD, tenant, agent)) is None
+
+        start_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent, "port_type": "api"}},
+            replace_window=lambda _agent: None,
+            available_profiles=lambda *_: None,
+        )
+        successor_incarnation = real_redis.get(incarnation_key(POD, tenant, agent))
+        assert successor_incarnation is not None
+        assert successor_incarnation != predecessor_incarnation
     finally:
         keys = real_redis.keys(prefix(POD, tenant) + ":*")
         if keys:
@@ -549,13 +657,15 @@ def test_start_agent_publishes_lead_with_membership_and_window_cause_atomically(
         call.set(prefix(POD, TENANT, agent="new-lead", resource="launch"), "claude"),
         call.eval(
             ANY,
-            3,
+            4,
             prefix(POD, TENANT, resource="lead"),
             prefix(POD, TENANT, resource="registry"),
             prefix(POD, TENANT, agent="new-lead", resource="window.cause"),
+            incarnation_key(POD, TENANT, "new-lead"),
             "new-lead",
             "tmux",
             "a" * 32,
+            ANY,
         ),
     ]
 
@@ -657,6 +767,12 @@ def test_logging_failure_does_not_replace_success(_mock_port_type, _mock_log_rec
         replace_window=MagicMock(),
         available_profiles=lambda *_: None,
     )
-    r.hset.assert_called_once_with(
-        prefix(POD, TENANT, resource="registry"), "worker", "tmux"
+    r.eval.assert_called_once_with(
+        _PUBLISH_MEMBERSHIP_LUA,
+        2,
+        prefix(POD, TENANT, resource="registry"),
+        incarnation_key(POD, TENANT, "worker"),
+        "worker",
+        "tmux",
+        ANY,
     )

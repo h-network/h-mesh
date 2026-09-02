@@ -18,7 +18,7 @@ from openshell import ExecResult
 
 from core.channels import send
 from core.envelope import parse
-from core.keys import prefix
+from core.keys import incarnation_key, prefix
 from modules.openshell.headless import headless_command
 from modules.openshell.client import OpenShellUnavailable
 from modules.openshell.naming import sandbox_name, short_name, workspace_name
@@ -90,6 +90,7 @@ class OpenShellPortTests(unittest.TestCase):
     def test_reply_correlation_records_delivery_for_validation(self):
         from lib.reply_correlation import was_delivered
 
+        self.redis.set(incarnation_key(POD, TENANT, "bob"), "test-incarnation")
         stream_id = self.queue()
         self.assertFalse(
             was_delivered(self.redis, pod=POD, tenant=TENANT, agent="bob", stream_id=stream_id, source="alice")

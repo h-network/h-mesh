@@ -72,7 +72,7 @@ and it is the same failure a too-small count-based cap already produced.
 
 import re
 
-from core.keys import prefix
+from core.keys import incarnation_key, prefix
 from core.logging import log_record
 
 # Generous relative to any realistic reply latency; small enough that a
@@ -88,32 +88,62 @@ def is_valid_reply_id(value: object) -> bool:
     return isinstance(value, str) and bool(_ID_RE.match(value))
 
 
-def _key(pod: str, tenant: str, agent: str, stream_id: str) -> str:
-    # The "s" prefix is load-bearing, not cosmetic: core.keys rejects any
-    # dotted-resource segment that is ALL digits (tmux resolves an
+def _key(pod: str, tenant: str, agent: str, stream_id: str, incarnation: str) -> str:
+    # The "s"/"i" prefixes are load-bearing, not cosmetic: core.keys rejects
+    # any dotted-resource segment that is ALL digits (tmux resolves an
     # all-digit agent name as a window *index*, a different module's
     # concern entirely, but the segment validator is shared and doesn't
-    # know this segment is a stream_id, not an agent name). A 32-hex-char
-    # stream_id is all-digits whenever it happens to contain no a-f
-    # characters -- rare, but real: it must not make certain otherwise-
-    # valid stream_ids permanently unable to be recorded. "s" guarantees
-    # the segment can never be all-digits, regardless of the id itself.
-    return prefix(pod, tenant, agent=agent, resource=f"delivered.s{stream_id}")
+    # know these segments are a stream_id/incarnation id, not an agent
+    # name). Both are 32 lowercase hex characters and each is all-digits
+    # whenever it happens to contain no a-f characters -- rare, but real:
+    # it must not make certain otherwise-valid ids permanently unable to
+    # be recorded. The letter prefixes guarantee neither segment can ever
+    # be all-digits, regardless of the id itself.
+    return prefix(
+        pod, tenant, agent=agent, resource=f"delivered.s{stream_id}.i{incarnation}"
+    )
+
+
+def _incarnation(r, pod: str, tenant: str, agent: str) -> str | None:
+    """The agent's CURRENT incarnation id, or None if none is established
+    (a legacy pre-feature agent, or the window between a stop and that
+    name's next hire -- see core.keys.incarnation_key). Raises on a
+    storage failure rather than swallowing it: callers already wrap their
+    own surrounding Redis call in a try/except and must treat this
+    lookup's failure the same way as that call's, preserving the
+    verified-false vs could-not-verify distinction was_delivered's own
+    docstring describes."""
+    value = r.get(incarnation_key(pod, tenant, agent))
+    if value is None:
+        return None
+    return value.decode() if isinstance(value, bytes) else value
 
 
 def record_delivered(r, *, pod: str, tenant: str, agent: str, stream_id: str, source: str) -> None:
-    """Remember that `stream_id` was delivered to `agent`, originating from
-    `source`, for DELIVERED_TTL_SECONDS.
+    """Remember that `stream_id` was delivered to `agent`'s CURRENT
+    incarnation, originating from `source`, for DELIVERED_TTL_SECONDS.
 
-    One `SET key source EX DELIVERED_TTL_SECONDS` per (agent, stream_id) --
-    see the module docstring for why this replaced a hand-rolled bounded,
-    ordered structure that went through four real-bug generations. SET is
-    a single Redis command: there is no multi-step script for a runtime
-    error to land inside, and it overwrites a key of any prior type
-    unconditionally, so there is no type contract to violate. A
-    redelivery is exactly the same call again, which resets the TTL --
-    recency-refresh is a property of the primitive, not code this module
-    has to get right on its own.
+    One `SET key source EX DELIVERED_TTL_SECONDS` per (agent, stream_id,
+    incarnation) -- see the module docstring for why this replaced a
+    hand-rolled bounded, ordered structure that went through four real-bug
+    generations. SET is a single Redis command: there is no multi-step
+    script for a runtime error to land inside, and it overwrites a key of
+    any prior type unconditionally, so there is no type contract to
+    violate. A redelivery within the SAME incarnation is exactly the same
+    call again, which resets the TTL -- recency-refresh is a property of
+    the primitive, not code this module has to get right on its own.
+
+    The incarnation binding (ticket 97ad745c) closes a name-reuse exposure
+    a pure (agent, stream_id) key could not: without it, a same-named
+    successor hired within DELIVERED_TTL_SECONDS of a predecessor's
+    retirement could have its own reply validated against provenance the
+    PREDECESSOR incarnation actually established -- a confident, wrong
+    correlation reached through name reuse rather than the cross-client
+    path this feature already defended. If no incarnation is currently
+    established for `agent`, this returns without writing anything: a
+    record nothing could ever match is not worth writing, and lifecycle's
+    own SETNX-at-hire/DEL-at-stop keeps that window bounded to legacy
+    agents and the brief span between a stop and the next hire.
 
     Best-effort, same policy as modules/tmux/port.py's mark_delivery_pending
     and modules/api/port.py's _record: a bookkeeping write failure here
@@ -125,7 +155,10 @@ def record_delivered(r, *, pod: str, tenant: str, agent: str, stream_id: str, so
     if not is_valid_reply_id(stream_id):
         return
     try:
-        r.set(_key(pod, tenant, agent, stream_id), source, ex=DELIVERED_TTL_SECONDS)
+        incarnation = _incarnation(r, pod, tenant, agent)
+        if incarnation is None:
+            return
+        r.set(_key(pod, tenant, agent, stream_id, incarnation), source, ex=DELIVERED_TTL_SECONDS)
     except Exception as exc:
         try:
             log_record(
@@ -137,24 +170,40 @@ def record_delivered(r, *, pod: str, tenant: str, agent: str, stream_id: str, so
 
 
 def was_delivered(r, *, pod: str, tenant: str, agent: str, stream_id: str, source: str) -> bool | None:
-    """Whether `stream_id` was recorded as delivered to `agent` from
-    `source` specifically, within the last DELIVERED_TTL_SECONDS -- not
-    merely delivered to `agent` from anywhere, and not indefinitely.
+    """Whether `stream_id` was recorded as delivered to `agent`'s CURRENT
+    incarnation from `source` specifically, within the last
+    DELIVERED_TTL_SECONDS -- not merely delivered to that agent NAME from
+    anywhere, not across a stop/rehire boundary, and not indefinitely.
 
     Returns True (verified match), False (verified mismatch, never
-    delivered, or expired), or None (could not verify -- storage was
-    unreachable). False and None both mean "do not trust this" to a caller
-    deciding whether to keep or drop a claimed correlation -- that is the
-    fail-safe direction either way -- but they are not the same *fact*,
-    and a caller that logs why must not report "never delivered" when the
-    true reason was "could not check". modules/api/port.py's deliver_api
-    is the one caller today and preserves that distinction in its own log
-    reason.
+    delivered, expired, or no incarnation currently established), or None
+    (could not verify -- storage was unreachable). False and None both
+    mean "do not trust this" to a caller deciding whether to keep or drop
+    a claimed correlation -- that is the fail-safe direction either way --
+    but they are not the same *fact*, and a caller that logs why must not
+    report "never delivered" when the true reason was "could not check".
+    modules/api/port.py's deliver_api is the one caller today and
+    preserves that distinction in its own log reason.
+
+    ⚠ ABSENT INCARNATION MEANS "MATCHES NOTHING", NEVER "MATCHES ANYTHING"
+    -- the deliberate, explicit choice for every agent alive before this
+    binding shipped: its first was_delivered check returns False even for
+    a delivery that just happened, until that agent's next stop+rehire
+    establishes an incarnation id. Bounded to at most DELIVERED_TTL_SECONDS
+    of "reply correlation does not confirm, the field gets dropped" after
+    an upgrade -- failing toward absent, the same posture this feature has
+    held through every prior generation, never toward a wrong confirmation.
     """
     if not is_valid_reply_id(stream_id):
         return False
     try:
-        stored = r.get(_key(pod, tenant, agent, stream_id))
+        incarnation = _incarnation(r, pod, tenant, agent)
+    except Exception:
+        return None
+    if incarnation is None:
+        return False
+    try:
+        stored = r.get(_key(pod, tenant, agent, stream_id, incarnation))
     except Exception:
         return None
     if stored is None:
