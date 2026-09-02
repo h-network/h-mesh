@@ -39,10 +39,10 @@ skipped` (including pytest's reason) from `not executed: no call-phase report`,
 returns non-zero, and issues no certificate.
 
 This makes the required environment a hard prerequisite for merge evidence. In
-particular, eleven tests currently gate on Redis during their call phase: a
-machine without reachable Redis cannot produce a suite certificate. Start the
-required service and rerun; a skip failure is not a manifest mismatch and
-regenerating the manifest cannot fix it.
+particular, tests gate on Redis during their call phase, so a machine without
+reachable Redis cannot produce a suite certificate. Start the required service
+and rerun; the diagnostic enumerates the exact skipped nodes. A skip failure is
+not a manifest mismatch, and regenerating the manifest cannot fix it.
 
 Bare focused pytest can exit zero while reporting skips. That is valid pytest
 behavior, but it is not merge evidence: it proves neither that the skipped test
