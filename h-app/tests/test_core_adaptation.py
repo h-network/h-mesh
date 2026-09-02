@@ -22,6 +22,205 @@ from core.service import Switch, _forward_port_custody, main, transmission
 from core.windowlog import WindowLogTailer
 
 
+LEGACY_BANNED_NAMES = (
+    "f" + "lock",
+    "f" + "lock_",
+    "f" + "lockclient",
+    "h" + "f" + "lock_",
+    "h" + "f" + "lock_session",
+)
+# An allowance is deliberately attached to the violating line and names the
+# exact legacy identifier it permits. Position changes cannot transfer it.
+LEGACY_ALLOW_MARKER = "# legacy-name-" + "allow:"
+
+
+def _identifier_spans(text: str, identifier: str) -> list[tuple[int, int]]:
+    """Find exact identifier occurrences using Python continuation semantics."""
+    spans = []
+    start = 0
+    while (found := text.find(identifier, start)) != -1:
+        end = found + len(identifier)
+        preceding_continues = found > 0 and ("a" + text[found - 1]).isidentifier()
+        following_continues = end < len(text) and ("a" + text[end]).isidentifier()
+        if not preceding_continues and not following_continues:
+            spans.append((found, end))
+        start = found + 1
+    return spans
+
+
+def _remove_exact_identifiers(text: str, identifiers: list[str]) -> str:
+    # Resolve every span against the original text. Sequential substitution
+    # must not create a new occurrence eligible for a later allowance.
+    spans = sorted(
+        {
+            span
+            for identifier in identifiers
+            for span in _identifier_spans(text, identifier)
+        }
+    )
+    pieces = []
+    cursor = 0
+    for start, end in spans:
+        pieces.append(text[cursor:start])
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def legacy_name_violations(root: Path) -> tuple[int, list[str]]:
+    checked = 0
+    violations = []
+    excluded_dirs = {".git", ".pytest_cache", "__pycache__"}
+
+    for path in root.rglob("*"):
+        if (
+            not path.is_file()
+            or any(part in excluded_dirs or part.endswith(".egg-info") for part in path.parts)
+        ):
+            continue
+        relative = path.relative_to(root)
+        checked += 1
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            code, marker, allowance_text = line.partition(LEGACY_ALLOW_MARKER)
+            folded = code.casefold()
+            if marker:
+                allowance_values = [
+                    value.strip()
+                    for value in allowance_text.split(",")
+                    if value.strip()
+                ]
+                allowed_literals = [value.casefold() for value in allowance_values]
+                invalid = [
+                    value
+                    for value in allowance_values
+                    if not value.isidentifier()
+                    or value != value.upper()
+                    or not _identifier_spans(code, value)
+                ]
+                if not allowed_literals or invalid:
+                    violations.append(
+                        f"{relative}:{line_number}: invalid legacy allowance"
+                    )
+                folded = _remove_exact_identifiers(
+                    code,
+                    [value for value in allowance_values if value not in invalid],
+                ).casefold()
+            matches = [name for name in LEGACY_BANNED_NAMES if name in folded]
+            if matches:
+                violations.append(f"{relative}:{line_number}: {', '.join(matches)}")
+
+    return checked, violations
+
+
+def test_legacy_name_allowance_follows_content_not_line_position(tmp_path: Path):
+    session_test = tmp_path / "tests" / "test_session.py"
+    session_test.parent.mkdir(parents=True)
+    new_violation = "F" + "LOCK_NEW_REFERENCE"
+    legitimate_legacy_name = "F" + "LOCK_ALLOW_PLAINTEXT"
+    lines = ["# filler"] * 370
+    lines.extend(
+        (
+            f"NEW_SETTING = {new_violation!r}",  # old exempt line 371
+            "# inserted line one",
+            "# inserted line two",
+            f"with patch.dict(os.environ, {{{legitimate_legacy_name!r}: '1'}}): "
+            f"{LEGACY_ALLOW_MARKER} {legitimate_legacy_name}",
+        )
+    )
+    session_test.write_text("\n".join(lines) + "\n")
+
+    _, violations = legacy_name_violations(tmp_path)
+
+    assert any("tests/test_session.py:371:" in item for item in violations), (
+        "a new legacy reference must fail even when it lands on an old exempt line; "
+        f"observed {violations}"
+    )
+    assert not any("tests/test_session.py:374:" in item for item in violations), (
+        "shifting the legitimate legacy reference must not change its verdict; "
+        f"observed {violations}"
+    )
+
+
+def test_legacy_name_allowance_cannot_hide_an_unlisted_reference(tmp_path: Path):
+    source = tmp_path / "module.py"
+    allowed_name = "F" + "LOCK_ALLOW_PLAINTEXT"
+    new_violation = "F" + "LOCK_NEW_REFERENCE"
+    source.write_text(
+        f"VALUES = ({allowed_name!r}, {new_violation!r})  "
+        f"{LEGACY_ALLOW_MARKER} {allowed_name}\n"
+    )
+
+    _, violations = legacy_name_violations(tmp_path)
+
+    banned_fragment = "f" + "lock"
+    assert any(
+        "module.py:1:" in item and banned_fragment in item for item in violations
+    ), (
+        "an explicit allowance must remove only the literal it names; "
+        f"observed {violations}"
+    )
+
+
+def test_legacy_name_allowance_does_not_apply_inside_longer_identifier(tmp_path: Path):
+    source = tmp_path / "module.py"
+    allowed_name = "F" + "LOCK"
+    longer_violation = allowed_name + "_NEW_REFERENCE"
+    source.write_text(
+        f'{allowed_name} = "{longer_violation}"  '
+        f"{LEGACY_ALLOW_MARKER} {allowed_name}\n"
+    )
+
+    _, violations = legacy_name_violations(tmp_path)
+
+    banned_match = "f" + "lock"
+    assert violations == [f"module.py:1: {banned_match}, {banned_match}_"], (
+        "an allowance for one identifier must not erase the same substring "
+        f"inside an unlisted longer identifier; observed {violations}"
+    )
+
+
+def test_legacy_name_allowance_respects_unicode_identifier_boundaries(tmp_path: Path):
+    source = tmp_path / "module.py"
+    allowed_name = "F" + "LOCK"
+    unicode_identifier = f"α{allowed_name}β"
+    source.write_text(
+        f"{allowed_name} = 1; {unicode_identifier} = 2  "
+        f"{LEGACY_ALLOW_MARKER} {allowed_name}\n"
+    )
+
+    _, violations = legacy_name_violations(tmp_path)
+
+    banned_match = "f" + "lock"
+    assert violations == [f"module.py:1: {banned_match}"], (
+        "an allowance must not erase its substring from a Unicode identifier; "
+        f"observed {violations}"
+    )
+
+
+def test_legacy_name_allowance_must_name_a_literal_on_its_line(tmp_path: Path):
+    source = tmp_path / "module.py"
+    absent_name = "F" + "LOCK_ALLOW_PLAINTEXT"
+    overly_broad_name = "F" + "LOCK"
+    source.write_text(
+        f"VALUE = 'safe'  {LEGACY_ALLOW_MARKER} {absent_name}\n"
+        f"VALUE = {absent_name!r}  {LEGACY_ALLOW_MARKER} {overly_broad_name}\n"
+        f"VALUE = {absent_name!r}  {LEGACY_ALLOW_MARKER} F, LOCK_ALLOW_PLAINTEXT\n"
+    )
+
+    _, violations = legacy_name_violations(tmp_path)
+
+    banned_match = "f" + "lock"
+    assert violations == [
+        "module.py:1: invalid legacy allowance",
+        "module.py:2: invalid legacy allowance",
+        f"module.py:2: {banned_match}, {banned_match}_",
+        "module.py:3: invalid legacy allowance",
+        f"module.py:3: {banned_match}, {banned_match}_",
+    ]
+
+
 class RegistryRedis:
     def __init__(self):
         self.calls = []
@@ -45,38 +244,7 @@ class RegistryRedis:
 
 class CoreAdaptationTests(unittest.TestCase):
     def test_tree_contains_no_old_project_names(self):
-        banned = (
-            "f" + "lock",
-            "f" + "lock_",
-            "f" + "lockclient",
-            "h" + "f" + "lock_",
-            "h" + "f" + "lock_session",
-        )
-        allowed = {
-            (Path("tests/test_session.py"), 371),
-            (Path("tests/test_session.py"), 372),
-        }
-        checked = 0
-        violations = []
-        excluded_dirs = {".git", ".pytest_cache", "__pycache__"}
-
-        for path in H_APP.rglob("*"):
-            if (
-                not path.is_file()
-                or any(part in excluded_dirs or part.endswith(".egg-info") for part in path.parts)
-            ):
-                continue
-            relative = path.relative_to(H_APP)
-            checked += 1
-            for line_number, line in enumerate(
-                path.read_text(encoding="utf-8").splitlines(), start=1
-            ):
-                if (relative, line_number) in allowed:
-                    continue
-                folded = line.casefold()
-                matches = [name for name in banned if name in folded]
-                if matches:
-                    violations.append(f"{relative}:{line_number}: {', '.join(matches)}")
+        checked, violations = legacy_name_violations(H_APP)
 
         self.assertGreater(checked, 100, "Expected to scan the complete h-app tree")
         self.assertEqual(violations, [], "Old project names found:\n" + "\n".join(violations))
