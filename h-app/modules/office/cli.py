@@ -542,8 +542,19 @@ def _task_keys(pod: str, tenant: str, agent: str) -> dict[str, str]:
     }
 
 
-_ATOMIC_TRANSITION = """
--- office atomic task transition v1
+_PREFLIGHTED_TRANSITION = """
+-- office preflighted task transition v2
+local source_type = redis.call('TYPE', KEYS[1]).ok
+if source_type == 'none' then
+    return {0, 'changed'}
+end
+if source_type ~= 'list' then
+    return {0, 'source_type'}
+end
+local destination_type = redis.call('TYPE', KEYS[2]).ok
+if destination_type ~= 'none' and destination_type ~= 'list' then
+    return {0, 'destination_type'}
+end
 if ARGV[3] == '1' and redis.call('LLEN', KEYS[2]) > 0 then
     return {0, 'busy'}
 end
@@ -555,7 +566,7 @@ return {1, 'ok'}
 """
 
 def _quarantine_invalid(r, *, source_key: str, invalid_key: str, raw) -> None:
-    """Atomically preserve an unreadable entry off the actionable queues."""
+    """Preserve an unreadable entry through the preflighted board transition."""
     _transition_selected(
         r,
         source_key=source_key,
@@ -585,9 +596,14 @@ def _transition_selected(
     replacement,
     require_destination_empty: bool = False,
 ) -> None:
-    """Atomically rewrite and move one entry, optionally requiring an empty destination."""
+    """Move one entry after preflighting every key-type command error.
+
+    Source and destination types are checked before the first mutation. Take's
+    destination-empty guard also runs before LREM. Once LREM begins, RPUSH has
+    a preflighted list-or-absent destination and fixed valid arguments.
+    """
     result = r.eval(
-        _ATOMIC_TRANSITION,
+        _PREFLIGHTED_TRANSITION,
         2,
         source_key,
         destination_key,
@@ -601,6 +617,10 @@ def _transition_selected(
         return
     if reason == "busy":
         raise OfficeError("you already have one open task")
+    if reason == "source_type":
+        raise OfficeError("source task list has wrong Redis type; no changes made")
+    if reason == "destination_type":
+        raise OfficeError("destination task list has wrong Redis type; no changes made")
     raise OfficeError("task changed while the command was running; try again")
 
 

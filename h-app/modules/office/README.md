@@ -31,8 +31,11 @@ clears the selection. Hire a replacement with `--lead` before retiring the old
 lead when the office should always have one; retiring a former lead cannot
 clear a leadership transfer that has already happened.
 
-Board transitions keep the one-doing-ticket invariant atomically, including
-concurrent `office take` calls. A malformed todo/held entry is moved without
+Board transitions run in one isolated Lua script and preflight both Redis key
+types before mutation; `take` also checks destination emptiness before its
+first write. This keeps the one-doing-ticket invariant under concurrent
+`office take` calls and prevents WRONGTYPE from leaving a removed-only ticket.
+A malformed todo/held entry is moved without
 rewriting into the visible `invalid` list instead of being discarded or
 permanently blocking later tickets. `office hold --reason TEXT [ID]` requires
 and stores the blocking reason; `office list` shows it on held tickets. Use
