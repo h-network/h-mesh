@@ -580,7 +580,7 @@ def _render_restdoc_html(app: FastAPI) -> str:
         <tr>
           <td><code>StartAgent</code></td>
           <td><code>{{"agent": "...", "cli": "claude", "lead": true}}</code></td>
-          <td>Enrols agent in registry, creates a terminal window, and starts the CLI (defaults to <code>claude</code>). Optional <code>lead: true</code> atomically transfers leadership to this tmux agent as it is enrolled.</td>
+          <td>Enrols agent in registry, creates a terminal window, and starts the CLI (defaults to <code>claude</code>). The first tmux hire becomes lead when no lead is configured; later hires preserve the incumbent.</td>
         </tr>
         <tr>
           <td><code>StopAgent</code></td>

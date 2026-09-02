@@ -331,16 +331,6 @@ def test_hire_carries_profile_provider_resume_permissions_and_tools(mock_send, m
     assert payload["claude_tools"] == ""
 
 
-@patch("modules.office.cli.send")
-def test_hire_can_transfer_leadership(mock_send, monkeypatch):
-    _env(monkeypatch)
-    mock_send.return_value = "stream-1"
-    r = FakeRedis()
-    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
-        office_main(["hire", "replacement", "--lead"])
-    assert mock_send.call_args.kwargs["payload"]["lead"] is True
-
-
 # ---------------------------------------------------------------------------
 # hire --wait: distinguish confirmed (CREATED)/failed/unknown, not just that
 # the request was accepted. Real incident: setup.sh's own roster-hire loop

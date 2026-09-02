@@ -24,15 +24,9 @@ same reason. `hire --provider NAME` likewise passes an explicit provider to
 the lifecycle payload, where the existing StartAgent validation applies.
 `hire` starts a fresh CLI session by default, including when an agent name has
 local session history; use `hire --resume` to restore that history explicitly.
-Use `hire NAME --lead` to hire a lead or transfer leadership to a tmux agent;
-the registry row and lead selection are published atomically, before tmuxhost
-creates the pane and its lead-specific `AGENTS.md`. This is no-write-or-all-
-write atomicity: the Lua primitive preflights every type-sensitive operation
-before mutating, since Redis isolates `EVAL` but does not roll back writes after
-a runtime error. Retiring the current lead clears the selection under the same
-preflight rule. Hire a replacement with `--lead` before retiring the old lead
-when the office should always have one; retiring a former lead cannot clear a
-leadership transfer that has already happened.
+The first tmux hire becomes lead when the registry is empty; later hires
+preserve the incumbent. Registry membership and the lead selection are
+published atomically before tmuxhost creates panes and their guides.
 
 Board transitions run in one isolated Lua script and preflight both Redis key
 types before mutation; `take` also checks destination emptiness before its

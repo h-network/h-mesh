@@ -219,15 +219,16 @@ TENANT=my-throwaway-tenant ./lead-replacement.sh
 Same real-hire requirements as `tmux-concurrent-hire.sh` (a provider-backed
 `claude`).
 
-**This is now the regression test for two fixes, not just a discovery
-script.** The first run (2026-09-01) found two real bugs: the `lead`
+**This scenario is retired.** Dynamic leadership transfer and the `--lead`
+hire flag were removed; the first tmux hire now claims an empty lead and later
+hires preserve it. Use the lifecycle tests for that behavior. The first run
+(2026-09-01) found two real bugs: the `lead`
 registry key was never written anywhere in the codebase and `StopAgent`
 never cleared it (dangled at whatever name was last lead), and watchdog's
 `_notify_lead()` returned silently with zero trace when the lead was
 unregistered. Both are fixed on main — lifecycle-agent's
-`leadership-transfer` (`StartAgent` now accepts a `lead: true` payload /
-`office hire NAME --lead`, atomically publishing the lead key and registry
-row together; `StopAgent` does a Lua compare-then-delete that only clears
+the lifecycle first-hire publication (atomically publishing the lead key and
+registry row together; `StopAgent` does a Lua compare-then-delete that only clears
 the lead key if it currently equals the agent being stopped) and
 watchdog-agent's `lead-alert-custody` (`_notify_lead()` now logs a
 structured `lead_alert_no_lead` record before returning). The probe
@@ -235,10 +236,9 @@ assertions below test the *fixed* behavior; if a future change to
 `lifecycle.py`/`watchdog/service.py` makes one fail, that's the scenario
 doing its job.
 
-Six probes, current findings summarized (full reasoning and code citations
-are in the script's own output/comments):
+ Six probes from the removed transfer behavior are no longer applicable.
 
-1. **Self-retirement circularity.** Does a lead's own `letGo`+`hire --lead`
+1. **Self-retirement circularity (retired).** This transfer probe is retired.
    sequence, issued from its own pane, survive past the pane's death and
    come back as lead (not just alive)? **Yes** — `hire`/`letGo` are
    fire-and-forget bus sends (`modules/office/cli.py`), not synchronous
@@ -246,12 +246,9 @@ are in the script's own output/comments):
    before the actual (asynchronous) window-kill could ever interrupt the
    issuing shell. Verified live: a real self-issued retire+rehire produces
    a live replacement window whose `AGENTS.md` is the lead version.
-2. **The lead brief.** Does a transferred lead's `AGENTS.md` regenerate the
+2. **The lead brief (retired).** Transfer probes are retired; the first hire
    lead-specific paragraph? **Yes, deliberately now** — verified for both a
-   same-name rehire (`hire NAME --lead`) and, more importantly, a
-   *differently-named* replacement hired with `--lead` while the old lead
-   is still alive: the new name's `AGENTS.md` is the lead version
-   immediately, no coincidence involved.
+   now receives the lead guide and later hires preserve the incumbent.
 3. **The lead registry key.** Does `StopAgent` clear it? **It's exactly
    right now, in both directions** — verified live: retiring a
    *non-current* lead (leadership already transferred elsewhere) leaves the
