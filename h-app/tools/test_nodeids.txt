@@ -64,6 +64,9 @@ h-app/clients/web/tests/test_web_server.py::test_demo_websocket_handshake
 h-app/clients/web/tests/test_web_server.py::test_demo_messages_and_activity_history_endpoints
 h-app/clients/web/tests/test_web_server.py::test_conversation_audit_prompts_and_client_mailbox_replies
 h-app/clients/web/tests/test_web_server.py::test_proxy_422_policy_refusal
+h-app/clients/web/tests/test_web_server.py::test_a_login_record_is_readable_by_the_caller_that_just_logged_in
+h-app/clients/web/tests/test_web_server.py::test_a_telegram_auth_record_is_durable_before_the_caller_is_told
+h-app/clients/web/tests/test_web_server.py::test_no_audit_record_is_written_after_its_response
 h-app/tests/test_agentlifecycle.py::test_lead_publish_wrongtype_is_no_write
 h-app/tests/test_agentlifecycle.py::test_lead_removal_wrongtype_is_no_write
 h-app/tests/test_agentlifecycle.py::test_stop_agent_purges_instance_delivery_state_before_killing_window

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
 import hmac
 import json
 import socket
@@ -15,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from clients.web import server
 from clients.web.server import OfficeHandler, _telegram_read_allowed, verify_telegram_init_data
 
 
@@ -1325,3 +1328,203 @@ def test_proxy_422_policy_refusal(tmp_path):
         upstream_server.shutdown()
         upstream_server.server_close()
 
+
+# ── the operator action log is written BEFORE the caller is told ────────────
+
+def _delaying_audit(monkeypatch, seconds=0.3):
+    """Make the audit write slow, and change nothing else.
+
+    ⚠ The shim only DELAYS: no value, branch or call is altered. The
+    interleaving it produces is one the runtime produces unaided — the flake
+    was seen three times in suite order on two agents' machines, and passes in
+    isolation precisely because the window is narrow there. Delaying makes the
+    window reliable; it does not invent it.
+
+    ⚠ To watch this fail against the unfixed code, move the `self._audit_log(...)`
+    call in `_handle_login` back below the `self._json(...)` that follows it.
+    """
+    original = OfficeHandler._audit_log
+
+    def slow_audit(self, event, details, session_id=None):
+        time.sleep(seconds)
+        return original(self, event, details, session_id)
+
+    monkeypatch.setattr(OfficeHandler, "_audit_log", slow_audit)
+
+
+def test_a_login_record_is_readable_by_the_caller_that_just_logged_in(tmp_path, monkeypatch):
+    """⚠ HARM: the operator acts, is told it worked, reads the log back, and
+    the log is empty. /login wrote its whole response — including Set-Cookie —
+    before writing the audit record, and a DIFFERENT thread serves the next
+    request, so nothing made the reader wait for the writer.
+
+    Observed with the audit call back below the response: `records visible to
+    the caller that just acted: 0`, and `assert len(records) == 1` failing with
+    `len(records) == 0` — the same assertion, on the same line, as the
+    intermittent failure of
+    test_direct_api_traffic_bypasses_operator_action_log in suite order."""
+    audit_file = tmp_path / "audit.jsonl"
+    _delaying_audit(monkeypatch)
+    web_server = _telegram_web_server(audit_log=str(audit_file))
+    web_port = web_server.server_address[1]
+    threading.Thread(target=web_server.serve_forever, daemon=True).start()
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{web_port}/login",
+            data=json.dumps({"secret": "topsecret123"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            cookie = resp.headers.get("Set-Cookie").split(";")[0]
+
+        audit_req = urllib.request.Request(
+            f"http://127.0.0.1:{web_port}/api/audit", headers={"Cookie": cookie})
+        with urllib.request.urlopen(audit_req) as resp:
+            records = json.loads(resp.read().decode("utf-8"))["records"]
+
+        assert len(records) == 1, (
+            "the operator read back the log immediately after logging in and the "
+            "record of that login was not there yet"
+        )
+        assert records[0]["event"] == "login_success"
+    finally:
+        web_server.shutdown()
+        web_server.server_close()
+
+
+def test_a_telegram_auth_record_is_durable_before_the_caller_is_told(tmp_path, monkeypatch):
+    """⚠ HARM, same defect on the Mini App's login. A session created here is
+    functionally identical to an operator one, so its record has to be on disk
+    before the response says the session exists.
+
+    Asserted against the FILE rather than /api/audit, because that is the
+    stronger statement: not "a reader can see it" but "it is durable by the
+    time the caller is told". Observed with the audit call back below the
+    response: `FileNotFoundError: .../audit.jsonl` — not a short file, no file
+    at all, while the caller already holds a valid session cookie."""
+    audit_file = tmp_path / "audit.jsonl"
+    _delaying_audit(monkeypatch)
+    web_server = _telegram_web_server(audit_log=str(audit_file))
+    web_port = web_server.server_address[1]
+    threading.Thread(target=web_server.serve_forever, daemon=True).start()
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{web_port}/api/telegram-auth",
+            data=json.dumps({"initData": _signed_init_data("test-bot-token", 555)}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            assert resp.status == 200
+            assert resp.headers.get("Set-Cookie")
+
+        lines = audit_file.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 1, (
+            "the caller holds a session cookie for a login that is not in the log yet"
+        )
+        assert json.loads(lines[0])["event"] == "telegram_auth_success"
+    finally:
+        web_server.shutdown()
+        web_server.server_close()
+
+
+_RESPONSE_WRITES = {"send_response", "end_headers", "send_error", "_json"}
+# the events whose call sites this guard must find. Keyed on EVENT NAMES from
+# the discovered calls, not on file text: if `_audit_log` is renamed and the
+# walk finds nothing, an assertion about text would still pass against
+# orphaned literals, and this fails instead.
+_EXPECTED_AUDIT_EVENTS = {"login_success", "login_failure", "telegram_auth_success",
+                          "telegram_auth_failure", "logout", "operator_action"}
+
+
+def _audit_calls_after_a_response(tree):
+    """Audit calls that follow a response write ON THE SAME PATH.
+
+    ⚠ Per path, not per function, and the difference is not cosmetic: a
+    line-order scan comparing every audit call against the first response
+    write anywhere in the function flags four sites here, two of them on
+    branches that never ran a response — `login_failure` audits and THEN
+    responds, and reading it as a violation would have had me 'fix' correct
+    code. Sibling statements carry the flag; branches get a copy of it."""
+    found, events = [], set()
+
+    def direct_calls(stmt):
+        nested = (ast.If, ast.For, ast.While, ast.Try, ast.With, ast.FunctionDef)
+        out = []
+
+        def rec(node, top=False):
+            if isinstance(node, nested) and not top:
+                return
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.Call):
+                    func = child.func
+                    name = (func.attr if isinstance(func, ast.Attribute)
+                            else func.id if isinstance(func, ast.Name) else None)
+                    out.append((child, name))
+                rec(child)
+
+        if isinstance(stmt, nested):
+            for field in ("test", "iter", "items", "value"):
+                value = getattr(stmt, field, None)
+                for node in (value if isinstance(value, list) else [value]) if value else []:
+                    rec(node)
+        else:
+            rec(stmt, top=True)
+        return out
+
+    def blocks(stmt):
+        for field in ("body", "orelse", "finalbody"):
+            block = getattr(stmt, field, None)
+            if block:
+                yield block
+        for handler in getattr(stmt, "handlers", []) or []:
+            yield handler.body
+
+    def walk(statements, responded):
+        for stmt in statements:
+            for call, name in direct_calls(stmt):
+                if name != "_audit_log":
+                    continue
+                event = (call.args[0].value if call.args and isinstance(call.args[0], ast.Constant)
+                         else "<not a literal>")
+                events.add(event)
+                if responded:
+                    found.append((call.lineno, event))
+            for block in blocks(stmt):
+                walk(block, responded)
+            if any(name in _RESPONSE_WRITES for _, name in direct_calls(stmt)):
+                responded = True
+
+    for func in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+        walk(func.body, False)
+    return found, events
+
+
+def test_no_audit_record_is_written_after_its_response():
+    """⚠ THE PROPERTY, not the two sites. Both authentication success paths
+    had it, and both had it for the same reason: they needed a Set-Cookie
+    header, `_json` did not take headers, so they hand-rolled the response and
+    the audit call ended up on the far side of it. Anything that reaches past
+    `_json` again can land in the same place.
+
+    The vacuity check is keyed on the EVENT NAMES this walk discovers. Renaming
+    `_audit_log` makes the walk find nothing, which a check on file text would
+    survive by reading orphaned literals — verified by renaming the method in a
+    scratch copy of server.py, where this fails with `discovered no audit call
+    sites at all` rather than passing."""
+    source = inspect.getsource(server)
+    tree = ast.parse(source)
+    late, events = _audit_calls_after_a_response(tree)
+
+    assert events, (
+        "discovered no audit call sites at all — has _audit_log been renamed? "
+        "this guard is reading nothing and would pass regardless of the code"
+    )
+    missing = _EXPECTED_AUDIT_EVENTS - events
+    assert not missing, f"the walk no longer reaches these audit sites: {sorted(missing)}"
+
+    assert late == [], (
+        "these write an audit record after the response that reports the action, "
+        f"so a caller reading the log back can see nothing: {late}"
+    )

@@ -789,14 +789,15 @@ class OfficeHandler(SimpleHTTPRequestHandler):
             cookie_header = f"hmesh_session={token}; Path=/; HttpOnly; SameSite=Strict"
             if getattr(self.server, "api_base", "").startswith("https://"):
                 cookie_header += "; Secure"
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Set-Cookie", cookie_header)
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(json.dumps({"authenticated": True}).encode("utf-8"))
+            # ⚠ AUDIT BEFORE RESPONDING. The record used to be written after
+            # the body, so an operator who logged in and immediately read
+            # /api/audit could see zero records — the action had happened, the
+            # response said so, and the log did not yet. A different thread
+            # serves that next request, so nothing made it wait.
             session_id_str = token[:12] + "..."
             self._audit_log("login_success", {}, session_id=session_id_str)
+            self._json(200, {"authenticated": True},
+                       headers=[("Set-Cookie", cookie_header)])
         else:
             if lock is not None:
                 with lock:
@@ -894,13 +895,12 @@ class OfficeHandler(SimpleHTTPRequestHandler):
         cookie_header = f"hmesh_session={token}; Path=/; HttpOnly; SameSite=Strict"
         if getattr(self.server, "api_base", "").startswith("https://"):
             cookie_header += "; Secure"
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Set-Cookie", cookie_header)
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(json.dumps({"authenticated": True, "read_only": True}).encode("utf-8"))
+        # ⚠ AUDIT BEFORE RESPONDING, for the same reason as /login above: the
+        # Mini App's session is functionally identical to an operator one, and
+        # its record was on the wrong side of the body in the same way.
         self._audit_log("telegram_auth_success", {"user_id": user_id}, session_id=f"{token[:12]}...")
+        self._json(200, {"authenticated": True, "read_only": True},
+                   headers=[("Set-Cookie", cookie_header)])
 
     def _handle_logout(self) -> None:
         self._audit_log("logout", {})
@@ -1429,12 +1429,25 @@ class OfficeHandler(SimpleHTTPRequestHandler):
         except Exception:
             pass
 
-    def _json(self, status: int, value: object) -> None:
+    def _json(self, status: int, value: object,
+              headers: list[tuple[str, str]] | None = None) -> None:
+        """A JSON response, optionally with extra headers.
+
+        ⚠ `headers` exists so that a handler needing `Set-Cookie` does not have
+        to hand-roll the response. Both authentication SUCCESS paths did, and
+        both then wrote their audit record AFTER the body — so an operator who
+        logged in and immediately read the log back could legitimately see
+        nothing. Reaching past this helper is what put the audit call on the
+        wrong side of the response, so the helper now covers the case that
+        made someone reach past it.
+        """
         body = json.dumps(value).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, header_value in headers or []:
+            self.send_header(name, header_value)
         self.end_headers()
         self.wfile.write(body)
 
