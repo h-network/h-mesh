@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import threading
 from collections import defaultdict
@@ -6,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import redis
 
 H_APP = Path(__file__).resolve().parents[1]
 if str(H_APP) not in sys.path:
@@ -103,7 +105,7 @@ class FakeRedis:
     def eval(self, script, key_count, *args):
         keys = args[:key_count]
         argv = args[key_count:]
-        if "office atomic task transition" in script:
+        if "office preflighted task transition" in script:
             source_key, doing_key = keys
             raw, serialized, require_empty = argv
             if require_empty == "1" and self.lists[doing_key]:
@@ -396,7 +398,7 @@ def test_board_moves_preserve_doing_ticket_when_transition_fails_before_executio
     r.lists[doing_key].append(original)
 
     def fail_atomic_move(*args):
-        if "office atomic task transition" in args[0]:
+        if "office preflighted task transition" in args[0]:
             raise ConnectionError("injected pre-execution failure")
         raise AssertionError("unexpected script")
 
@@ -421,6 +423,39 @@ def test_take_preserves_todo_ticket_when_atomic_transition_fails(monkeypatch):
             office_main(["take"])
 
     assert r.lists[todo_key] == [original]
+
+
+def test_real_redis_wrongtype_transition_preserves_source_and_destination():
+    r = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"))
+    try:
+        r.ping()
+    except Exception:
+        pytest.skip("Redis server not available at REDIS_URL")
+
+    suffix = os.urandom(8).hex()
+    source_key = f"test:office:transition:{suffix}:source"
+    destination_key = f"test:office:transition:{suffix}:destination"
+    raw = b'{"id":"ticket","title":"must survive"}'
+    replacement = b'{"id":"ticket","title":"replacement"}'
+    try:
+        r.rpush(source_key, raw)
+        r.set(destination_key, b"wrong-type-sentinel")
+
+        with pytest.raises(
+            office_cli.OfficeError, match="destination task list has wrong Redis type"
+        ):
+            office_cli._transition_selected(
+                r,
+                source_key=source_key,
+                destination_key=destination_key,
+                raw=raw,
+                replacement=replacement,
+            )
+
+        assert r.lrange(source_key, 0, -1) == [raw]
+        assert r.get(destination_key) == b"wrong-type-sentinel"
+    finally:
+        r.delete(source_key, destination_key)
 
 
 def test_plain_done_prompts_for_outcome_in_legacy_interactive_guides(monkeypatch):
