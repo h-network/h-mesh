@@ -205,41 +205,12 @@ workaround; rerun after the merge to get a clean-install result.
 
 ## lead-replacement.sh (retired)
 
-Not a port — no reference implementation exists for this one. Built fresh
-against architect's explicit brief: retire and re-hire the office's *lead*,
-not an ordinary agent, and report per-probe rather than one pass/fail. Runs
-entirely against synthetic leads (`synth-lead`/`synth-lead-2`/
-`synth-lead-3` by default) on a throwaway tenant — never against the real
-office this agent runs in.
+This executable scenario was removed when dynamic leadership transfer was
+removed. It is retained only as a historical heading; there is no command,
+probe list, or current retirement claim here.
 
-```
-This historical scenario was removed when dynamic lead transfer was removed.
-```
-
-It is retained here only as historical context; it is not an executable or a
-description of current retirement behavior.
-
-**Historical note:** dynamic leadership transfer is no longer supported. The
-first tmux hire when the lead key is absent or empty claims it and later hires
-silently preserve the incumbent. Use lifecycle tests for current behavior. The
-original investigation found bugs in the lead key and alert routing; details
-registry key was never written anywhere in the codebase and `StopAgent`
-never cleared it (dangled at whatever name was last lead), and watchdog's
-`_notify_lead()` returned silently with zero trace when the lead was
-unregistered. Both are fixed on main — lifecycle-agent's
-the lifecycle first-hire publication (atomically publishing the lead key and
-registry row together; `StopAgent` does a Lua compare-then-delete that only clears
-the lead key if it currently equals the agent being stopped) and
-watchdog-agent's `lead-alert-custody` (`_notify_lead()` now logs a
-structured `lead_alert_no_lead` record before returning). The probe
-assertions below test the *fixed* behavior; if a future change to
-`lifecycle.py`/`watchdog/service.py` makes one fail, that's the scenario
-doing its job.
-
-The former transfer probes are removed and make no claims about retirement.
-
-The former six transfer probes are retained only in git history; they are not
-current behavior specifications, especially for lead retirement.
+The former six transfer probes were removed with the executable; this note
+makes no claim about current leadership-retirement behavior.
    sequence, issued from its own pane, survive past the pane's death and
    come back as lead (not just alive)? **Yes** — `hire`/`letGo` are
    fire-and-forget bus sends (`modules/office/cli.py`), not synchronous

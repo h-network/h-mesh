@@ -9,8 +9,9 @@ module actually exists in h-mesh.
 The first tmux hire when the lead key is absent or empty becomes lead; later
 hires silently preserve the incumbent. Registry membership and lead selection
 are published atomically so a reconciler cannot create a new pane with a
-non-lead guide. There is currently no supported operation to change the lead;
-retirement behavior for a current lead is intentionally unspecified here.
+non-lead guide. There is currently no direct leadership-transfer operation; a
+retire followed by a later hire changes ownership: retiring the current lead
+clears the key, and the next tmux hire claims it.
 
 ## State ownership at stop/re-hire
 

@@ -585,7 +585,7 @@ def _render_restdoc_html(app: FastAPI) -> str:
         <tr>
           <td><code>StopAgent</code></td>
           <td><code>{{"agent": "..."}}</code></td>
-          <td>Reverses all three: terminates the CLI process, kills the terminal window, and removes it from the registry. Retiring the current lead also clears the lead selection, unless leadership was already transferred.</td>
+          <td>Reverses all three: terminates the CLI process, kills the terminal window, and removes it from the registry. Retiring the current lead clears the lead key; the next tmux hire claims it.</td>
         </tr>
       </tbody>
     </table>
