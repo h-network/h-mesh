@@ -40,6 +40,11 @@ and stores the blocking reason; `office list` shows it on held tickets. Use
 auditable state and `delete` is the explicit permanent-removal operation.
 `office done --outcome {completed,passed,failed} [ID]` requires and records the
 result, so completed review work retains its verdict in `office list`.
+An interactive legacy invocation of plain `office done` prompts for that
+outcome; a non-interactive invocation fails with the exact replacement syntax.
+For review work, use `passed` or `failed`. Hold a QUESTIONS review while its
+answers block the verdict; use `completed` only when its questions are
+non-blocking. Returned work joins the back of a nonempty `todo` queue.
 
 The receiving port delegates to the settled `lib.agentlifecycle` API.
 `stop_agent` removes the retired instance's ingress queue and paused marker as

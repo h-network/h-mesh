@@ -143,6 +143,14 @@ def test_upgrade_restarts_daemons_without_duplicating_and_preserves_the_tmux_ses
             time.sleep(0.2)
         assert "worker1" in windows
 
+        code, worker_cwd, stderr = run_tmux(
+            "display-message", "-p", "-t", f"{session_name}:worker1", "#{pane_current_path}",
+            socket=socket_path,
+        )
+        assert code == 0, stderr
+        worker_guide = Path(worker_cwd) / "AGENTS.md"
+        worker_guide.write_text("stale guide: run h-mesh-office done\n", encoding="utf-8")
+
         # Run upgrade: skip git pull (no real remote to pull from in a
         # test) and skip pip install (this venv already has h-mesh
         # editable-installed, same reasoning as test_setup_script.py).
@@ -164,6 +172,9 @@ def test_upgrade_restarts_daemons_without_duplicating_and_preserves_the_tmux_ses
             timeout=30,
         )
         assert upg_res.returncode == 0, f"upgrade failed: {upg_res.stderr}\nstdout: {upg_res.stdout}"
+        deployed_guide = worker_guide.read_text(encoding="utf-8")
+        assert " done --outcome completed" in deployed_guide
+        assert " return" in deployed_guide
 
         with open(os.path.join(run_dir, "switch.pid")) as f:
             switch_pid = int(f.read().strip())

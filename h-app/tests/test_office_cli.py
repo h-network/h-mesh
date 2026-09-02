@@ -103,24 +103,16 @@ class FakeRedis:
     def eval(self, script, key_count, *args):
         keys = args[:key_count]
         argv = args[key_count:]
-        if "office atomic take" in script:
+        if "office atomic task transition" in script:
             source_key, doing_key = keys
-            raw, serialized = argv
-            if self.lists[doing_key]:
+            raw, serialized, require_empty = argv
+            if require_empty == "1" and self.lists[doing_key]:
                 return [0, "busy"]
             if raw not in self.lists[source_key]:
                 return [0, "changed"]
             self.lists[source_key].remove(raw)
             self.lists[doing_key].append(serialized)
             return [1, "ok"]
-        if "office quarantine invalid ticket" in script:
-            source_key, invalid_key = keys
-            raw = argv[0]
-            if raw not in self.lists[source_key]:
-                return 0
-            self.lists[source_key].remove(raw)
-            self.lists[invalid_key].append(raw)
-            return 1
         raise AssertionError("unexpected Lua script")
 
     # --- streams (usage) ---
@@ -332,11 +324,13 @@ def test_take_refuses_when_doing_nonempty(monkeypatch, capsys):
     assert "already have one open task" in capsys.readouterr().err
 
 
-def test_return_moves_doing_ticket_back_to_todo(monkeypatch):
+def test_return_moves_doing_ticket_to_back_of_todo(monkeypatch):
     _env(monkeypatch)
     r = FakeRedis()
     doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
     todo_key = prefix(POD, TENANT, "architect", "tasks.todo")
+    queued = json.dumps(_ticket("architect", task_id="queued"))
+    r.lists[todo_key].append(queued)
     r.lists[doing_key].append(
         json.dumps(_ticket("architect", status="doing", started_ts="2026-09-01T00:00:00Z"))
     )
@@ -345,7 +339,8 @@ def test_return_moves_doing_ticket_back_to_todo(monkeypatch):
         office_main(["return"])
 
     assert r.lists[doing_key] == []
-    returned = json.loads(r.lists[todo_key][0])
+    assert r.lists[todo_key][0] == queued
+    returned = json.loads(r.lists[todo_key][1])
     assert returned["status"] == "todo"
     assert returned["started_ts"] is None
 
@@ -365,6 +360,91 @@ def test_done_requires_and_lists_outcome(monkeypatch, capsys):
         office_main(["list"])
 
     assert "outcome:failed" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["return"],
+        ["hold", "--reason", "blocked"],
+        ["done", "--outcome", "failed"],
+        ["cancel"],
+    ],
+)
+def test_board_moves_preserve_doing_ticket_when_atomic_move_fails(
+    command, monkeypatch
+):
+    _env(monkeypatch)
+    r = FakeRedis()
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    original = json.dumps(_ticket("architect", status="doing"))
+    r.lists[doing_key].append(original)
+
+    def fail_atomic_move(*args):
+        if "office atomic task transition" in args[0]:
+            raise ConnectionError("injected destination failure")
+        raise AssertionError("unexpected script")
+
+    r.eval = fail_atomic_move
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(ConnectionError, match="injected destination failure"):
+            office_main(command)
+
+    assert r.lists[doing_key] == [original]
+
+
+def test_take_preserves_todo_ticket_when_atomic_transition_fails(monkeypatch):
+    _env(monkeypatch)
+    r = FakeRedis()
+    todo_key = prefix(POD, TENANT, "architect", "tasks.todo")
+    original = json.dumps(_ticket("architect"))
+    r.lists[todo_key].append(original)
+    r.eval = lambda *args: (_ for _ in ()).throw(ConnectionError("injected failure"))
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(ConnectionError, match="injected failure"):
+            office_main(["take"])
+
+    assert r.lists[todo_key] == [original]
+
+
+def test_plain_done_prompts_for_outcome_in_legacy_interactive_guides(monkeypatch):
+    _env(monkeypatch)
+    r = FakeRedis()
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    done_key = prefix(POD, TENANT, "architect", "tasks.done")
+    r.lists[doing_key].append(json.dumps(_ticket("architect", status="doing")))
+
+    with (
+        patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")),
+        patch("modules.office.cli.sys.stdin.isatty", return_value=True),
+        patch("builtins.input", return_value="completed"),
+    ):
+        office_main(["done"])
+
+    assert json.loads(r.lists[done_key][0])["outcome"] == "completed"
+
+
+def test_done_writes_outcome_to_both_audit_channels(monkeypatch, tmp_path):
+    _env(monkeypatch)
+    task_record = tmp_path / "tasks.jsonl"
+    window_log = tmp_path / "window.jsonl"
+    monkeypatch.setenv("TASK_RECORD", str(task_record))
+    monkeypatch.setenv("H_MESH_LOG_FILE", str(window_log))
+    monkeypatch.setenv("H_MESH_LOG_QUIET", "1")
+    r = FakeRedis()
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    r.lists[doing_key].append(json.dumps(_ticket("architect", status="doing")))
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["done", "--outcome", "failed"])
+
+    task_event = json.loads(task_record.read_text().splitlines()[-1])
+    log_event = json.loads(window_log.read_text().splitlines()[-1])
+    assert task_event["event"] == "done"
+    assert task_event["outcome"] == "failed"
+    assert log_event["event"] == "task_done"
+    assert log_event["outcome"] == "failed"
 
 
 def test_hold_then_list_shows_priority_and_age(monkeypatch, capsys):
@@ -391,6 +471,21 @@ def test_hold_requires_and_lists_reason(monkeypatch, capsys):
         capsys.readouterr()
         office_main(["list"])
     assert "reason:waiting for API credentials" in capsys.readouterr().out
+
+
+def test_list_accepts_legacy_hold_and_done_without_new_fields(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis()
+    keys = office_cli._task_keys(POD, TENANT, "architect")
+    r.lists[keys["hold"]].append(json.dumps(_ticket("architect", status="hold")))
+    r.lists[keys["done"]].append(json.dumps(_ticket("architect", task_id="legacy-done", status="done")))
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["list"])
+
+    listed = capsys.readouterr().out
+    assert "a1b2c3d4  do the thing" in listed
+    assert "legacy-d  do the thing" in listed
 
 
 def test_malformed_board_entry_raises_office_error_not_board_error(monkeypatch, capsys):
