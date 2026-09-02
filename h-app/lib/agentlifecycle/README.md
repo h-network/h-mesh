@@ -18,14 +18,29 @@ reassigns leadership if another lead is configured: hire the replacement with
 selection only when the retired agent still owns it, so retiring the former
 lead cannot undo that transfer.
 
-The stop linearization script touches every Redis key that `stop_agent` cleans:
-the registry row, an owned tenant lead, and the retired name's `processing`,
-`opening`, `opened`, `ingress`, `paused`, and `delivering` keys. All eight keys
-are handled inside that one isolated, preflighted operation; no by-name Redis
-cleanup runs afterward where it could erase a successor published in the gap.
-The tenant-level `unresolved` list is deliberately not touched because it is
-durable evidence that survives name reuse. Actual window teardown remains an
-external callback after the Redis transition, not another Redis key mutation.
+## State ownership at stop/re-hire
+
+A Redis key containing an agent name does not by itself say whether the state
+belongs to one lifecycle instance, to the durable logical name, or to another
+module's evidence. The stop boundary uses the following explicit ownership
+map; an unlisted key is a defect, not implied permission to inherit it.
+
+| state | classification and stop policy |
+|---|---|
+| registry field; owned tenant `lead` | Instance membership. Removed or compare-deleted in the stop script. |
+| `processing`, `opening`, `opened`, `ingress`, `paused`, `delivering` | Instance-owned receive and delivery state. Deleted in the same script. Tenant `unresolved` is the durable exception below. |
+| `launch`, `profile`, `provider`, `resume`, `skip-permissions`, `claude-tools`, `tags`, `hmac-keys`, `window.cause` | Instance-owned launch, permission, policy, credential, and creation state. Deleted in the same script. A successor must state its own optional configuration; omission means the default, never predecessor inheritance. |
+| tenant `unresolved` | Durable custody evidence. Preserved across retirement and name reuse; each record carries the destination name and exact raw envelope. |
+| `dead`, API `inbox`, `egress` | Durable message custody or outcome evidence, preserved to avoid silent deletion. Their current name-keying can expose predecessor data or queued sends to a successor; core/API owns the identity-aware resolution and must not replace this with lifecycle `DEL`. |
+| `activity`, `delivery.markers`, `pending.verify`, `usage.attributed`, `usage.requests`, `delivered.s<stream-id>` | Durable observation, verification, usage-dedup, or reply-provenance evidence. Preserved. Watchdog/tmux/reply-correlation own the remaining name-reuse attribution question; `delivered.*` is time-bounded by its owner. |
+| `tasks.todo`, `tasks.doing`, `tasks.hold`, `tasks.done`, `tasks.invalid` | Intentionally inherited logical-name work. A re-hired agent resumes the board assigned to that name; lifecycle does not delete it. |
+| `presence`, `blocked`, `unreplied`, `acks`, and per-agent `*.alerted` watchdog suppression keys | Instance-derived status that a successor should not inherit, but owned and interpreted by watchdog/core conversation tracking. Those owners need a retirement/reset boundary; lifecycle does not silently delete their state in this branch. |
+| `activity.offset` | Intentionally preserved observer cursor over the likewise-preserved activity stream. Resetting it would replay predecessor history as new activity. |
+
+Tenant-wide keys such as `alerts`, `usage`, `credential.alerted`, and
+`window.log.offset` are not per-name successor state. Actual window teardown
+also remains an external callback after the Redis transition, not a Redis key
+mutation.
 
 | file | what it holds |
 |---|---|

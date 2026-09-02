@@ -81,6 +81,17 @@ redis.call('DEL', KEYS[5])
 redis.call('DEL', KEYS[6])
 redis.call('DEL', KEYS[7])
 redis.call('DEL', KEYS[8])
+-- Desired launch identity and security configuration must not cross a
+-- stop/re-hire boundary when the successor omits optional StartAgent fields.
+redis.call('DEL', KEYS[9])
+redis.call('DEL', KEYS[10])
+redis.call('DEL', KEYS[11])
+redis.call('DEL', KEYS[12])
+redis.call('DEL', KEYS[13])
+redis.call('DEL', KEYS[14])
+redis.call('DEL', KEYS[15])
+redis.call('DEL', KEYS[16])
+redis.call('DEL', KEYS[17])
 return 1
 """
 
@@ -525,7 +536,7 @@ def stop_agent(
         committed, "registry row removed and owned lead cleared", "registry/lead removal",
         lambda: r.eval(
             _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
-            8,
+            17,
             registry_key,
             prefix(pod, tenant, resource="lead"),
             receive_processing_key(pod, tenant, agent),
@@ -534,6 +545,15 @@ def stop_agent(
             prefix(pod, tenant, agent=agent, resource="ingress"),
             prefix(pod, tenant, agent=agent, resource="paused"),
             delivery_lock_key(pod, tenant, agent),
+            prefix(pod, tenant, agent=agent, resource="launch"),
+            prefix(pod, tenant, agent=agent, resource="profile"),
+            prefix(pod, tenant, agent=agent, resource="provider"),
+            prefix(pod, tenant, agent=agent, resource="resume"),
+            prefix(pod, tenant, agent=agent, resource="skip-permissions"),
+            prefix(pod, tenant, agent=agent, resource="claude-tools"),
+            tags_key(pod, tenant, agent),
+            prefix(pod, tenant, agent=agent, resource="hmac-keys"),
+            prefix(pod, tenant, agent=agent, resource="window.cause"),
             agent,
         ),
     )

@@ -13,6 +13,7 @@ from core.channels import receive
 from core.dispatch import delivery_lock_key
 from core.envelope import build, encode
 from core.keys import prefix, receive_opened_key, receive_opening_key, receive_processing_key, receive_unresolved_key
+from core.policy import tags_key
 from lib.agentlifecycle.lifecycle import (
     ProvableActualFailure,
     ProvableLifecycleRejection,
@@ -24,10 +25,25 @@ from lib.agentlifecycle.lifecycle import (
     start_agent,
     stop_agent,
 )
+from modules.tmux.reconciler import TmuxReconciler
 
 
 POD = "testpod"
 TENANT = "testtenant"
+
+
+def _instance_config_keys(pod, tenant, agent):
+    return [
+        prefix(pod, tenant, agent=agent, resource=resource)
+        for resource in (
+            "launch", "profile", "provider", "resume", "skip-permissions",
+            "claude-tools",
+        )
+    ] + [
+        tags_key(pod, tenant, agent),
+        prefix(pod, tenant, agent=agent, resource="hmac-keys"),
+        prefix(pod, tenant, agent=agent, resource="window.cause"),
+    ]
 
 
 @pytest.fixture
@@ -76,6 +92,7 @@ def test_lead_removal_wrongtype_is_no_write(real_redis):
     ingress_key = prefix(POD, tenant, agent="old-lead", resource="ingress")
     paused_key = prefix(POD, tenant, agent="old-lead", resource="paused")
     lock_key = delivery_lock_key(POD, tenant, "old-lead")
+    config_keys = _instance_config_keys(POD, tenant, "old-lead")
     real_redis.hset(registry_key, "old-lead", "tmux")
     real_redis.hset(lead_key, "wrong", "type")
     cleanup_keys = [processing_key, opening_key, opened_key, ingress_key]
@@ -83,11 +100,13 @@ def test_lead_removal_wrongtype_is_no_write(real_redis):
         real_redis.rpush(key, f"identity:{key}")
     real_redis.set(paused_key, "paused-identity")
     real_redis.set(lock_key, "lock-identity")
+    for key in config_keys:
+        real_redis.set(key, f"identity:{key}")
     try:
         with pytest.raises(redis.ResponseError, match="WRONGTYPE"):
             real_redis.eval(
                 _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
-                8,
+                17,
                 registry_key,
                 lead_key,
                 processing_key,
@@ -96,6 +115,7 @@ def test_lead_removal_wrongtype_is_no_write(real_redis):
                 ingress_key,
                 paused_key,
                 lock_key,
+                *config_keys,
                 "old-lead",
             )
 
@@ -105,10 +125,13 @@ def test_lead_removal_wrongtype_is_no_write(real_redis):
             assert real_redis.lrange(key, 0, -1) == [f"identity:{key}".encode()]
         assert real_redis.get(paused_key) == b"paused-identity"
         assert real_redis.get(lock_key) == b"lock-identity"
+        for key in config_keys:
+            assert real_redis.get(key) == f"identity:{key}".encode()
     finally:
         real_redis.delete(
             lead_key, registry_key, processing_key, opening_key, opened_key,
             ingress_key, paused_key, lock_key,
+            *config_keys,
         )
 
 
@@ -131,7 +154,7 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
     assert r.method_calls == [
         call.eval(
             ANY,
-            8,
+            17,
             prefix(POD, TENANT, resource="registry"),
             prefix(POD, TENANT, resource="lead"),
             receive_processing_key(POD, TENANT, "worker-1"),
@@ -140,6 +163,7 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
             prefix(POD, TENANT, agent="worker-1", resource="ingress"),
             prefix(POD, TENANT, agent="worker-1", resource="paused"),
             delivery_lock_key(POD, TENANT, "worker-1"),
+            *_instance_config_keys(POD, TENANT, "worker-1"),
             "worker-1",
         ),
     ]
@@ -185,6 +209,68 @@ def test_stop_cleanup_cannot_erase_successor_delivery_identity(real_redis):
         assert real_redis.lrange(ingress_key, 0, -1) == [successor_raw.encode()]
         assert real_redis.get(paused_key) == b"successor-paused"
         assert real_redis.get(lock_key) == b"successor-lock"
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
+def test_rehired_name_cannot_inherit_predecessor_runtime_identity(real_redis):
+    tenant = f"config-reuse-{uuid4().hex[:12]}"
+    agent = "reused-worker"
+    registry_key = prefix(POD, tenant, resource="registry")
+    config = {
+        "launch": "agy",
+        "profile": "predecessor-account",
+        "provider": "predecessor-provider",
+        "resume": "1",
+        "skip-permissions": "1",
+        "claude-tools": "",
+        "window.cause": "predecessor-cause",
+    }
+    real_redis.hset(registry_key, agent, "tmux")
+    for resource, value in config.items():
+        real_redis.set(prefix(POD, tenant, agent=agent, resource=resource), value)
+    real_redis.hset(tags_key(POD, tenant, agent), "export", '["predecessor-tag"]')
+    real_redis.hset(
+        prefix(POD, tenant, agent=agent, resource="hmac-keys"),
+        "predecessor-kid", "predecessor-secret",
+    )
+    try:
+        stop_agent(
+            real_redis,
+            pod=POD,
+            tenant=tenant,
+            envelope={"payload": {"agent": agent}},
+            kill_window=lambda _agent: None,
+        )
+        start_agent(
+            real_redis,
+            pod=POD,
+            tenant=tenant,
+            envelope={"payload": {"agent": agent}},
+            replace_window=lambda _agent: None,
+            available_profiles=lambda *_: None,
+        )
+
+        reconciler = TmuxReconciler(POD, tenant, "redis://unused")
+        with patch.dict(
+            os.environ,
+            {"PROVIDER_PREDECESSOR_PROVIDER_URL": "https://predecessor.invalid"},
+        ):
+            assert reconciler.get_agent_profile(real_redis, agent) is None
+            assert reconciler.get_agent_provider(real_redis, agent) is None
+        assert reconciler.get_agent_resume(real_redis, agent) is None
+        assert reconciler.get_agent_skip_permissions(real_redis, agent) is None
+        assert reconciler.get_agent_claude_tools(real_redis, agent) is None
+        assert reconciler.get_agent_cli(real_redis, agent) == "claude"
+        assert real_redis.exists(tags_key(POD, tenant, agent)) == 0
+        assert real_redis.exists(
+            prefix(POD, tenant, agent=agent, resource="hmac-keys")
+        ) == 0
+        assert real_redis.get(
+            prefix(POD, tenant, agent=agent, resource="window.cause")
+        ) is None
     finally:
         keys = real_redis.keys(prefix(POD, tenant) + ":*")
         if keys:
