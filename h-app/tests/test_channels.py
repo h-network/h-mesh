@@ -26,6 +26,7 @@ class FakeRedis:
     def __init__(self):
         self.lists = defaultdict(deque)
         self.hashes = defaultdict(dict)
+        self.values = {}
         self.hget_calls = []
         self.hgetall_calls = []
         self.hexists_calls = []
@@ -36,6 +37,18 @@ class FakeRedis:
 
     def lpop(self, key):
         return self.lists[key].popleft() if self.lists[key] else None
+
+    def llen(self, key):
+        return len(self.lists[key])
+
+    def lindex(self, key, index):
+        try:
+            return self.lists[key][index]
+        except IndexError:
+            return None
+
+    def get(self, key):
+        return self.values.get(key)
 
     def blpop(self, keys, timeout=0):
         if isinstance(keys, str):
@@ -354,6 +367,29 @@ class ChannelTests(unittest.TestCase):
             [(self.registry, "ghost")],
         )
         self.assertEqual(self.redis.hexists_calls, [])
+
+    def test_backlog_reconciliation_rekicks_queue_after_delivery_lease_is_gone(self):
+        self.register(host="office")
+        stream_id = send(
+            self.redis, pod=POD, tenant=TENANT, source="host",
+            destination="host", kind="StartAgent", payload={"agent": "worker"},
+        )
+        raw = self.redis.lpop(prefix(POD, TENANT, "host", "egress"))
+        self.redis.rpush(prefix(POD, TENANT, "host", "ingress"), raw)
+        kicks = []
+        switch = Switch(
+            self.redis, pod=POD, tenant=TENANT,
+            kick=lambda agent, port_type, envelope: kicks.append(
+                (agent, port_type, envelope["stream_id"])
+            ),
+        )
+
+        with patch("core.service._log_observation") as log:
+            switch._reconcile_ingress()
+
+        self.assertEqual(kicks, [("host", "office", stream_id)])
+        self.assertEqual(log.call_args.args, ("kick_restarted",))
+        self.assertIn("non-empty ingress", log.call_args.kwargs["reason"])
 
 
 if __name__ == "__main__":
