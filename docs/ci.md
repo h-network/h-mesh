@@ -31,6 +31,13 @@ the nonce-bound attestation matches that invocation and manifest. A zero exit
 with an absent, partial, stale, or mismatched attestation is a failure. Selection
 alone and absence of a reported error are not execution evidence.
 
+This is a positive-evidence boundary: only the outer runner prints the
+certificate, after the pytest child has returned and the attestation validates.
+An unenumerated termination that prevents the outer runner from completing that
+check—such as an external timeout, supervisor kill, signal, or native
+crash—cannot print a certificate. The harness does not need to predict every
+way either process can die in order for those paths to fail safe.
+
 The runner removes external `PYTEST_ADDOPTS` and `PYTEST_PLUGINS`, disables
 ambient plugin autoloading, overrides repository `addopts`, and rejects parsed
 zero-runtest modes. This prevents a collect-only or setup-only invocation from
