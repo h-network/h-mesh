@@ -539,7 +539,7 @@ def test_start_agent_publishes_lead_with_membership_and_window_cause_atomically(
         tenant=TENANT,
         envelope={
             "correlation_id": "a" * 32,
-            "payload": {"agent": "new-lead", "lead": True},
+            "payload": {"agent": "new-lead"},
         },
         replace_window=MagicMock(),
         available_profiles=lambda _pod, _tenant: None,
@@ -556,27 +556,9 @@ def test_start_agent_publishes_lead_with_membership_and_window_cause_atomically(
             "new-lead",
             "tmux",
             "a" * 32,
+            "0",
         ),
     ]
-
-
-@patch("lib.agentlifecycle.lifecycle.log_record")
-def test_start_agent_rejects_api_lead_before_mutation(_mock_log_record):
-    r = MagicMock()
-    try:
-        start_agent(
-            r,
-            pod=POD,
-            tenant=TENANT,
-            envelope={"payload": {"agent": "client", "port_type": "api", "lead": True}},
-            replace_window=MagicMock(),
-            available_profiles=lambda _pod, _tenant: None,
-        )
-    except ValueError as exc:
-        assert str(exc) == "StartAgent payload.lead only applies to port_type 'tmux'"
-    else:
-        raise AssertionError("api lead was accepted")
-    assert r.method_calls == []
 
 
 @patch("lib.agentlifecycle.lifecycle.log_record", side_effect=RuntimeError("log unavailable"))
@@ -657,6 +639,5 @@ def test_logging_failure_does_not_replace_success(_mock_port_type, _mock_log_rec
         replace_window=MagicMock(),
         available_profiles=lambda *_: None,
     )
-    r.hset.assert_called_once_with(
-        prefix(POD, TENANT, resource="registry"), "worker", "tmux"
-    )
+    assert r.hset.call_count == 0
+    assert r.eval.call_count == 1
