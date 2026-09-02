@@ -332,8 +332,16 @@ class MeshClient:
             time.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
 
-    def stream_activity(self, agent: str, after: str | None = None):
-        """Yield activity dicts from GET /agents/{agent}/activity/stream as they arrive."""
+    def stream_activity(self, agent: str, after: str | None = None, heartbeat: bool = False):
+        """Yield activity dicts from GET /agents/{agent}/activity/stream as they arrive.
+
+        ⚠ With `heartbeat=True`, also yields None whenever the stream says
+        "still here and still idle" — a keepalive frame, or a reconnect after
+        a read timeout. A consumer with a deadline needs those: blocked in
+        `next()` on a silent stream it cannot check the clock, and the only
+        thing an idle agent produces is keepalives. Default False so the
+        alerts consumer, which has no deadline, is unaffected.
+        """
         cursor = after
         backoff = 1.0
         while True:
@@ -348,6 +356,8 @@ class MeshClient:
                         if event_id:
                             cursor = event_id
                         if event_type == "error" or data is None:
+                            if heartbeat:
+                                yield None
                             continue
                         try:
                             parsed = json.loads(data)
@@ -380,7 +390,13 @@ def _parse_sse_events(line_iter):
             event_type, data_lines = None, []
             continue
         if line.startswith(":"):
-            continue  # comment / keepalive
+            # ⚠ Reported, not swallowed. A keepalive comment is the ONLY thing
+            # an idle stream sends, and a consumer that never sees one has no
+            # opportunity to check its own deadline — which is exactly how the
+            # activity watcher leaked threads against a quiet agent. Callers
+            # that don't care filter it out; the one that does gets a tick.
+            yield "keepalive", event_id, None
+            continue
         if line.startswith("event:"):
             event_type = line[len("event:"):].strip()
         elif line.startswith("data:"):
@@ -3007,15 +3023,44 @@ class TelegramBot:
         timeout_s: float = 300.0,
         stream_fn=None,
     ) -> None:
-        """Background thread consuming activity events for a prompted turn."""
-        stream_gen = stream_fn or (lambda: self.mesh.stream_activity(agent, after=after_cursor))
+        """Background thread consuming activity events for a prompted turn.
+
+        ⚠ THE DEADLINE HAS TO HOLD WHEN NOTHING IS HAPPENING, which is the
+        only case it exists for. This loop checks `timeout_s` per iteration,
+        so with an idle agent — no events, ever — it never got an iteration
+        and the thread lived until the connection died, which with SSE
+        keepalives is never. Measured on the acceptance instance: four live
+        watcher threads and four held connections for one agent. A guard whose
+        trigger condition is a subset of the condition it guards against is
+        not a guard, and it is the second of that shape found in one day (the
+        first was require_isolated_tmux, unfireable because the container
+        always sets TMUX_TMPDIR).
+
+        The fix is `heartbeat=True`: the stream now yields None on keepalives
+        and reconnects, so an idle stream still gives this loop a turn to look
+        at the clock and at its stop switch.
+
+        ⚠ Replaced, not stacked: a newer prompt for the same chat and agent
+        sets this watcher's `stop_event` (see handle_user_prompt), so the old
+        one ends at its next tick instead of running out its own deadline
+        alongside the new one.
+        """
+        stream_gen = stream_fn or (lambda: self.mesh.stream_activity(agent, after=after_cursor, heartbeat=True))
         start_time = time.time()
+        stop_event = getattr(render, "stop_event", None)
         try:
             for event in stream_gen():
                 if render.completed or (time.time() - start_time > timeout_s):
+                    logger.debug(
+                        f"activity watcher for {agent} ending: "
+                        f"{'render completed' if render.completed else f'{timeout_s:.0f}s deadline'}"
+                    )
+                    break
+                if stop_event is not None and stop_event.is_set():
+                    logger.debug(f"activity watcher for {agent} ending: replaced by a newer turn")
                     break
                 if not isinstance(event, dict):
-                    continue
+                    continue  # heartbeat: the checks above are the point of it
                 if event.get("agent") and event.get("agent") != agent:
                     continue
                 render.add_event(event)
@@ -3273,10 +3318,19 @@ class TelegramBot:
             # and holding a chat's lock across that would stall its next
             # message for no benefit — by then the old render is already
             # unreachable from the map, so nothing else can touch it.
+            render.stop_event = threading.Event()
             with self.chat_txn(cid):
                 old_render = self.activity_renders.get(key)
                 self.activity_renders[key] = render
             if old_render:
+                # ⚠ Stop the thread, not just the render. Finalizing the old
+                # render left its watcher running against the same agent until
+                # its own deadline — four prompts, four live threads and four
+                # held SSE connections for one agent. Its stop_event is
+                # checked on every tick, and heartbeats guarantee ticks.
+                old_stop = getattr(old_render, "stop_event", None)
+                if old_stop is not None:
+                    old_stop.set()
                 old_render.finalize()
                 old_render.flush(self.telegram, force=True)
 

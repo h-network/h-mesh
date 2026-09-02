@@ -465,6 +465,28 @@ retained history as if every alert were new.
 
 ## 2c. Live Activity Progress (Rolling `editMessageText`)
 
+⚠ **The watcher's deadline holds when nothing is happening**, which is the
+only case it exists for. `timeout_s` is evaluated once per iteration of the
+activity stream, so against an IDLE agent — one producing no activity events
+at all — the loop never got an iteration, the deadline never fired, and the
+thread lived indefinitely holding an SSE connection. Measured on the
+acceptance instance: four live watcher threads and four held connections for a
+single agent. `_parse_sse_events` now reports keepalive comments rather than
+swallowing them, and `MeshClient.stream_activity(..., heartbeat=True)` passes
+them through as `None`, so an idle stream still gives the loop a turn to check
+its clock and its stop switch. Alerts are unaffected: that consumer has no
+deadline and filters heartbeats out.
+
+⚠ **A newer turn stops the previous watcher rather than stacking beside it.**
+Swapping in a new render finalized the old one but left its thread running
+against the same agent until its own deadline. Each render now carries a
+`stop_event` that the swap sets and the loop checks on every tick.
+
+`/watch`'s pane watcher does **not** have this shape and needed no equivalent
+fix: it drives its own loop (`ws.recv` with a drain deadline, then
+`stop_event.wait(refresh_s)`) and checks its max duration at the top of every
+iteration regardless of traffic. A test pins that so it stays true.
+
 When a user sends a prompt to an agent via Telegram, the bot starts an activity watcher that tails the agent's real-time execution stream (`GET /agents/{agent}/activity/stream`). As the agent executes tools (`Bash`, `Read`, `Edit`, `Grep`, etc.) and transitions between states (`input`, `tool`, `output`), the bot maintains a live-updating message using Telegram's `editMessageText`:
 
 ```text
