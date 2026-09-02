@@ -38,6 +38,45 @@ Two channels, deliberately different:
   `Watchdog._notify_lead`'s docstring for the full reasoning, including why a
   full lead ingress drops the alert instead of dead-lettering or retrying it.
 
+## Board truthfulness
+
+The watchdog exists to report reality, so a false positive here is worse
+than in most modules -- the whole point is trust. A few decisions, made
+deliberately rather than by accident (2026-09-02):
+
+- **`blocked` self-heals.** `DeliveryVerifier` used to only ever CLEAR
+  `blocked` in response to a NEW delivery marker verifying -- an agent
+  nobody messaged again after one unverified paste stayed `blocked` in
+  `office status` forever, regardless of its own ongoing activity. It now
+  re-checks every poll: activity after the recorded `since` is exactly the
+  evidence a marker-based verification would have accepted anyway, so it is
+  granted without requiring a new delivery first.
+- **`todo`-duration skips an agent with something in `doing`.** One agent
+  works one ticket at a time; anything queued behind it in `todo` cannot be
+  started yet no matter how old it gets. That is queueing, not neglect. An
+  agent with nothing in `doing` is genuinely free, and an old `todo` entry
+  for *that* agent still means what the check exists to catch.
+- **`hold`-duration carries `hold_reason`** (the field `office hold
+  --reason` now requires; gracefully absent on older entries) into the
+  alert text. It still fires on the same schedule -- a stated reason
+  explains why a wait *started*, not that it is still justified, and the
+  goal is fewer *false* alerts, not fewer alerts. Silencing a held ticket
+  because it has a reason would make the watchdog quieter by being blind,
+  which is the one failure mode explicitly rejected here.
+- **`stalled` alerts carry `last_activity_kind`** (and `last_activity_tool`
+  for a tool call) as honest extra context, never as a suppression signal.
+  The three-signal stall check cannot tell "genuinely stuck" from "idle
+  because it's waiting on a reply" -- from the lead, from a client, from
+  anything. A real fix needs a real signal that does not exist yet: peer-
+  to-peer unreplied tracking in `core.channels.send()`, symmetric to the
+  api-to-tmux `unreplied` it already writes. Until that lands, the alert
+  still fires and lets the reader weigh the ambiguity themselves, rather
+  than the watchdog guessing wrong in the direction of silence.
+- **`_check_ack_loop`'s `acks` hash has no writer yet** in h-mesh's
+  `core.channels.send()` (confirmed by reading it directly) -- that family
+  is dormant, not broken. Documented in its own docstring so a quiet ack-
+  loop check is not mistaken for "no ack-looping happening."
+
 ## Imports from core
 
 `core.registry` (`is_member`/`members`/`port_type`), `core.keys` (`prefix`),

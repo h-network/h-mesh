@@ -85,6 +85,24 @@ class DeliveryVerifier:
         for agent in sorted(agents):
             pending_key = prefix(self.pod, self.tenant, agent, "pending.verify")
             blocked_key = prefix(self.pod, self.tenant, agent, "blocked")
+
+            # ⚠ SELF-HEAL, independent of any new pending marker. `blocked` is
+            # only ever SET below, by a marker failing verification -- but
+            # until this check existed it was only ever CLEARED by a LATER
+            # marker succeeding. That asymmetry left it stuck: an agent nobody
+            # sends anything to again after one unverified paste read
+            # `blocked` in `office status` forever, even while its own
+            # activity kept updating normally, because nothing ever created a
+            # new marker to re-verify against. Confirmed live, not assumed --
+            # `last activity` advanced on a presence probe while `state` did
+            # not. The agent's own activity after `since` is exactly the
+            # evidence a marker-based verification would have accepted
+            # anyway, so grant it without requiring a new delivery first.
+            blocked_fields = _fields(self.r.hgetall(blocked_key) or {})
+            since = _timestamp(blocked_fields.get("since"))
+            if since is not None and any(t > since for t in self._input_times(agent, since)):
+                self.r.delete(blocked_key)
+
             pending = self.r.xrange(pending_key, min="-", max="+")
             eligible = []
             for entry_id, raw_fields in pending:
