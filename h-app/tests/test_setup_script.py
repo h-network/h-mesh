@@ -42,6 +42,11 @@ def _fake_h_agent_installer(tmpdir: str, *, behavior: str) -> str:
                               where re-running the same installer by hand
                               right after a failure succeeded with no
                               other change.
+      "fail_differently"   -- exits 1 on the first invocation, 42 on the
+                              second, neither placing h-agent -- a
+                              deliberately NON-identical pair of failures,
+                              so the "both attempts failed identically"
+                              reporting only fires when it's actually true.
     """
     script_path = os.path.join(tmpdir, "fake_h_agent_install.sh")
     counter_path = os.path.join(tmpdir, "h_agent_install_attempts")
@@ -57,6 +62,8 @@ exit 0
         body = "exit 1\n"
     elif behavior == "fail_then_succeed":
         body = f'if [ "$count" -eq 1 ]; then exit 1; fi\n{place_binary}'
+    elif behavior == "fail_differently":
+        body = 'if [ "$count" -eq 1 ]; then exit 1; fi\nexit 42\n'
     else:
         raise ValueError(behavior)
 
@@ -113,11 +120,39 @@ def test_setup_fails_loudly_when_h_agent_installer_fails_twice():
         )
         assert res.returncode != 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
         assert "h-agent installer failed twice" in res.stderr, res.stderr
+        # Both attempts here exit 1, identically -- a repeated, deterministic
+        # refusal (e.g. an exact upstream version pin), not a fluke. The
+        # report must say so explicitly rather than leave "attempt 2/2"
+        # reading as possibly-flaky on its own.
+        assert "Both attempts failed identically (exit 1 both times)" in res.stderr, res.stderr
         assert "✓ h-agent installed" not in res.stdout
         assert "✓ Daemons are healthy" not in res.stdout, (
             "setup.sh must not proceed past a failed h-agent install:\n" + res.stdout
         )
         assert os.path.exists(counter_path)
+        assert open(counter_path).read().strip() == "2", "expected exactly 2 attempts"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_setup_does_not_claim_identical_failure_when_attempts_actually_differ():
+    # The identical-failure line is only honest when both attempts really did
+    # fail the same way -- assert it's absent when they didn't, so the
+    # reporting can't be implemented as "always say this on the second
+    # failure" and still pass the identical-failure test above.
+    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_setup_h_agent_")
+    try:
+        h_agent_url, counter_path = _fake_h_agent_installer(tmpdir, behavior="fail_differently")
+        run_dir = os.path.join(tmpdir, "run")
+        env = _dep_check_env(tmpdir, h_agent_url=h_agent_url)
+        env["H_MESH_RUN_DIR"] = run_dir
+        res = subprocess.run(
+            [str(SETUP_SH), "--pod", "p", "--tenant", "t", "--non-interactive"],
+            env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+        assert res.returncode != 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+        assert "h-agent installer failed twice (last exit 42)" in res.stderr, res.stderr
+        assert "Both attempts failed identically" not in res.stderr, res.stderr
         assert open(counter_path).read().strip() == "2", "expected exactly 2 attempts"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

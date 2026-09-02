@@ -188,6 +188,7 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
         # with no other change. One retry covers that cheaply; a second
         # failure is treated as real.
         h_agent_installed=0
+        h_agent_install_statuses=()
         for attempt in 1 2; do
             echo "  h-agent not found -- installing via its own installer (attempt $attempt/2)..."
             if command -v curl >/dev/null 2>&1; then
@@ -196,6 +197,7 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
                 wget -qO- "$H_AGENT_URL" | bash
             fi
             h_agent_install_status=$?
+            h_agent_install_statuses+=("$h_agent_install_status")
             # ⚠ h-agent's installer only updates ~/.bashrc/~/.profile, for
             # FUTURE shells -- it never touches this process's own PATH. Left
             # alone, the daemons this same run starts later (which is what
@@ -223,6 +225,21 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
         # can exit 0 and still not place the binary where this expects it.
         if [ "$h_agent_installed" -ne 1 ]; then
             echo "error: h-agent installer failed twice (last exit $h_agent_install_status) -- h-agent is still not on PATH or at ${PREFIX:-$HOME/.local}/bin/h-agent." >&2
+            # ⚠ Exit code only, never upstream's message text -- matching a
+            # phrase from an installer we don't own is a dependency on a
+            # string nobody promised us, the same "trust a moving external
+            # thing exactly" shape as the agy version pin that produced this
+            # exact incident. Both retry attempts exiting identically is
+            # itself evidence worth surfacing (a real host once needed the
+            # retry for a genuinely transient ordering bug -- see above --
+            # so this isn't every failure, just repeated-identical ones): a
+            # human reading "attempt 2/2" on its own can read as possibly
+            # flaky and be tempted to just run it again; a repeated,
+            # identical exit code is not that.
+            if [ "${#h_agent_install_statuses[@]}" -eq 2 ] \
+                && [ "${h_agent_install_statuses[0]}" = "${h_agent_install_statuses[1]}" ]; then
+                echo "  Both attempts failed identically (exit ${h_agent_install_statuses[0]} both times) -- this is a repeated, deterministic failure, not a transient one; re-running setup.sh will not help without a change upstream or to this host." >&2
+            fi
             echo "  Install it manually (see $H_AGENT_URL) and re-run setup.sh." >&2
             exit 1
         fi
