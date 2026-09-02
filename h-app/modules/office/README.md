@@ -41,7 +41,10 @@ first write. This keeps the one-doing-ticket invariant under concurrent
 A malformed todo/held entry is moved without
 rewriting into the visible `invalid` list instead of being discarded or
 permanently blocking later tickets. `office hold --reason TEXT [ID]` requires
-and stores the blocking reason; `office list` shows it on held tickets. Use
+and stores the blocking reason; with an explicit ID it can park a queued ticket
+without taking it or displacing the active ticket. The one-open-task limit
+applies to `doing`, not `hold`: parked tickets remain visible in `office list`
+with their reasons and are still subject to hold-duration alerts. Use
 `office return [ID]` to put work back in `todo`; `cancel` remains a terminal,
 auditable state and `delete` is the explicit permanent-removal operation.
 `office done --outcome {completed,passed,failed} [ID]` requires and records the
