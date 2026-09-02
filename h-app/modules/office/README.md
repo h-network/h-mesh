@@ -26,10 +26,13 @@ the lifecycle payload, where the existing StartAgent validation applies.
 local session history; use `hire --resume` to restore that history explicitly.
 Use `hire NAME --lead` to hire a lead or transfer leadership to a tmux agent;
 the registry row and lead selection are published atomically, before tmuxhost
-creates the pane and its lead-specific `AGENTS.md`. Retiring the current lead
-clears the selection. Hire a replacement with `--lead` before retiring the old
-lead when the office should always have one; retiring a former lead cannot
-clear a leadership transfer that has already happened.
+creates the pane and its lead-specific `AGENTS.md`. This is no-write-or-all-
+write atomicity: the Lua primitive preflights every type-sensitive operation
+before mutating, since Redis isolates `EVAL` but does not roll back writes after
+a runtime error. Retiring the current lead clears the selection under the same
+preflight rule. Hire a replacement with `--lead` before retiring the old lead
+when the office should always have one; retiring a former lead cannot clear a
+leadership transfer that has already happened.
 
 Board transitions keep the one-doing-ticket invariant atomically, including
 concurrent `office take` calls. A malformed todo/held entry is moved without
@@ -56,4 +59,5 @@ The receiving port delegates to the settled `lib.agentlifecycle` API.
 well as its registry membership and delivery lock, so a later hire that reuses
 the name cannot inherit queued messages or paused state. Registry removal also
 atomically clears the tenant lead key when (and only when) it still names the
-retired agent.
+retired agent; all type checks occur before the first removal, so a runtime
+error cannot leave only half of that combined transition applied.
