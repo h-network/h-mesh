@@ -1,18 +1,29 @@
-"""setup.sh's roster-hire summary must never say "requested" for a status
-it doesn't recognize, AND the script's own exit code must not say success
-when the roster it was asked to produce is incomplete.
+"""setup.sh's roster-hire summary must never say "requested" (or "hired")
+for a status it doesn't recognize, AND the script's own exit code must not
+say success when the roster it was asked to produce is incomplete. This
+branch has now produced the same falsehood three times, each time one
+layer further out:
 
-`office hire` lost its --wait flag (see modules/office/cli.py --
-exit 0 from --wait was never reachable, so every
-call paid up to 30s to learn "unknown", and because it was documented in
---help agents actually used it and burned that time on every hire for no
-signal at all). Removed, not fixed -- see held ticket 74f1edf3 for the
-attributable-completion work a future --wait would need before it could
-mean anything. The roster-hire dispatch this file tests is therefore two
-outcomes, not four: exit 0 means the envelope was admitted ("requested",
-never "hired" -- ADMITTED is not CREATED, the real incident this whole
-area exists to correct); any other exit is an unenumerated setup error,
-reported as such and never folded into a soft "probably fine" default.
+  round 1  the CLI reported confirmed for a hire it could not attribute
+  round 2  the CLI was honest, and setup.sh's dispatch collapsed every
+           unexpected status into "requested"
+  round 3  the dispatch was honest, and the PROCESS EXIT CODE collapsed it
+           into success -- reviewer and architect both FAILED this: an
+           unattended installer or CI checking only the process boundary
+           saw a clean setup while a requested roster hire was never
+           admitted, and the regression at the time actively asserted
+           `res.returncode == 0` for that case -- a test that pins the
+           wrong behaviour is worse than no test, since it makes the real
+           fix look like a regression.
+
+setup.sh now accumulates a HIRE_HAD_ERROR flag across the whole roster loop
+(never aborting early -- a later agent's hire is still attempted after an
+earlier one fails) and exits nonzero, after every summary/instruction line
+has printed, if any agent's hire was a proven rejection (exit 1) OR an
+unenumerated/unexpected exit. Architect's explicit call: a proven rejection
+counts too, not just an unrecognized exit -- the operator asked for a
+roster and did not get it, and that must be detectable without parsing
+stderr.
 
 These tests inject real, deterministic exit codes via a python wrapper
 standing in for the venv's real interpreter -- not a signal race against a
@@ -162,7 +173,7 @@ def test_setup_never_says_requested_for_an_unexpected_hire_exit():
     )
 
     # The per-agent error line goes to stderr (setup.sh's own convention
-    # for anything that isn't a plain requested hire) -- check both, same
+    # for anything that isn't a plain confirmed hire) -- check both, same
     # as an operator watching a real terminal would see both streams.
     combined = res.stdout.splitlines() + res.stderr.splitlines()
     worker1_line = next((l for l in combined if "worker1" in l and "•" in l), None)
@@ -175,7 +186,7 @@ def test_setup_never_says_requested_for_an_unexpected_hire_exit():
     assert "hired" not in worker1_line, (
         f"an unexpected (simulated signal-death) hire exit was reported as a confirmed hire: {worker1_line!r}"
     )
-    assert "setup error" in worker1_line and "exit 137" in worker1_line, (
+    assert "setup error" in worker1_line and "unexpected exit 137" in worker1_line, (
         f"an unexpected exit must say so explicitly and name the exit code: {worker1_line!r}"
     )
     assert "One or more roster hires did not succeed" in res.stderr and "worker1" in res.stderr, (
@@ -190,7 +201,7 @@ def test_setup_continues_roster_and_exits_nonzero_after_an_unexpected_hire_exit(
     say failure overall."""
     _skip_unless_redis()
     res = _run_setup_with_forced_hire_exits(
-        ["worker1", "worker2"], {"worker1": 137, "worker2": 0},
+        ["worker1", "worker2"], {"worker1": 137, "worker2": 2},
     )
 
     assert res.returncode != 0, (
@@ -206,7 +217,7 @@ def test_setup_continues_roster_and_exits_nonzero_after_an_unexpected_hire_exit(
         "later entry missing would mean the loop stopped after the "
         f"earlier failure:\nstdout:\n{res.stdout}\nstderr:\n{res.stderr}"
     )
-    assert "setup error" in worker1_line and "exit 137" in worker1_line, (
+    assert "setup error" in worker1_line and "unexpected exit 137" in worker1_line, (
         f"worker1: {worker1_line!r}"
     )
     assert "requested" in worker2_line, (
@@ -214,9 +225,44 @@ def test_setup_continues_roster_and_exits_nonzero_after_an_unexpected_hire_exit(
         f"roster loop must not abort early: {worker2_line!r}"
     )
 
-    # worker2's own outcome (exit 0, "requested") is not itself an error --
+    # worker2's own outcome (exit 2, "requested") is not itself an error --
     # it must not appear anywhere in stderr, including the failure summary.
     assert "worker1" in res.stderr and "worker2" not in res.stderr, (
         f"the failure summary must name only the agent that actually "
         f"failed:\n{res.stderr}"
+    )
+
+
+def test_setup_exits_nonzero_after_a_proven_hire_rejection():
+    """Architect's explicit call: a proven rejection (--wait's real
+    exit 1, not just an unenumerated exit) must also make setup.sh's own
+    exit code say failure -- the operator asked for a roster and did not
+    get it, and that must be detectable without parsing stderr. A later
+    agent is still attempted (worker2 forced to a plain "requested")."""
+    _skip_unless_redis()
+    res = _run_setup_with_forced_hire_exits(
+        ["worker1", "worker2"], {"worker1": 1, "worker2": 2},
+    )
+
+    assert res.returncode != 0, (
+        "a proven hire rejection anywhere in the roster must make setup.sh "
+        f"exit nonzero overall:\nstdout:{res.stdout}\nstderr:{res.stderr}"
+    )
+
+    combined = res.stdout.splitlines() + res.stderr.splitlines()
+    worker1_line = next((l for l in combined if "worker1" in l and "•" in l), None)
+    worker2_line = next((l for l in combined if "worker2" in l and "•" in l), None)
+    assert worker1_line is not None and worker2_line is not None, (
+        "both roster entries must produce a per-agent summary line -- a "
+        "later entry missing would mean the loop stopped after the "
+        f"earlier rejection:\nstdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+    )
+    assert "hire failed" in worker1_line, f"worker1: {worker1_line!r}"
+    assert "requested" in worker2_line, (
+        "worker2 was never attempted after worker1's rejection -- the "
+        f"roster loop must not abort early: {worker2_line!r}"
+    )
+    assert "worker1" in res.stderr and "worker2" not in res.stderr, (
+        f"the failure summary must name only the agent that was actually "
+        f"rejected:\n{res.stderr}"
     )
