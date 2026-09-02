@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -111,6 +112,8 @@ def main() -> int:
     expected_package_root = (repo_root / "h-app").resolve()
     if imported_path is None or not imported_path.is_relative_to(expected_package_root):
         rendered_import = str(imported_path) if imported_path is not None else "<not importable>"
+        isolated_venv = repo_root / ".venv"
+        isolated_python = isolated_venv / "bin" / "python"
         print(
             "error: the test interpreter cannot import first-party children from "
             "the tree being certified\n"
@@ -119,8 +122,12 @@ def main() -> int:
             f"resolved module: {rendered_import}\n"
             f"child import error: {import_error or '<none>'}\n"
             f"expected under: {expected_package_root}\n"
-            "install this tree into the environment before running the suite:\n"
-            f"  {sys.executable} -m pip install -e {repo_root}",
+            "create a tree-local environment and install this tree before running "
+            "the suite; do not install into the invoking interpreter unless you "
+            "own it:\n"
+            f"  {shlex.join(['python3', '-m', 'venv', str(isolated_venv)])}\n"
+            f"  {shlex.join([str(isolated_python), '-m', 'pip', 'install', '-e', str(repo_root)])}\n"
+            f"  {shlex.join([str(isolated_python), '-m', 'tools.run_tests'])}",
             file=sys.stderr,
         )
         return 1

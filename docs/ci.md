@@ -117,8 +117,10 @@ must import `services.daemons` from the named tree. A missing or cross-tree
 import fails immediately with the interpreter, module path, expected tree, and
 editable-install command instead of surfacing later as a product-test failure.
 The runner deliberately does not inject the checkout into `PYTHONPATH`: doing
-so would let source imports hide a broken installation. Install the tree with
-the command in the diagnostic, then rerun the canonical suite. A manually
+so would let source imports hide a broken installation. The diagnostic creates
+and installs into the checkout's own `.venv`; it never tells you to install
+into the invoking interpreter, which may be a shared runtime you do not own.
+Follow those tree-local commands, then rerun the canonical suite. A manually
 supplied `PYTHONPATH` that points at the named tree can satisfy the child-import
 check, but that only demonstrates the import property for that invocation; the
 documented production-equivalent setup remains an editable install from the

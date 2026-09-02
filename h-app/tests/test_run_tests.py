@@ -84,7 +84,10 @@ def test_runner_refuses_before_pytest_when_child_import_path_is_missing(
     assert "resolved module: <not importable>" in output
     assert "ModuleNotFoundError" in output
     assert f"expected under: {(target / 'h-app').resolve()}" in output
-    assert "pip install -e" in output
+    expected_venv = target / ".venv"
+    assert f"python3 -m venv {expected_venv}" in output
+    assert f"{expected_venv / 'bin' / 'python'} -m pip install -e {target}" in output
+    assert f"{sys.executable} -m pip install" not in output
     assert "collected" not in output
     assert "suite execution invariant satisfied" not in output
 
@@ -115,7 +118,10 @@ def test_runner_refuses_before_pytest_when_child_imports_another_tree(
     assert "module: services.daemons" in output
     assert f"resolved module: {foreign_daemons.resolve()}" in output
     assert f"expected under: {(target / 'h-app').resolve()}" in output
-    assert "pip install -e" in output
+    expected_venv = target / ".venv"
+    assert f"python3 -m venv {expected_venv}" in output
+    assert f"{expected_venv / 'bin' / 'python'} -m pip install -e {target}" in output
+    assert f"{sys.executable} -m pip install" not in output
     assert "collected" not in output
     assert "suite execution invariant satisfied" not in output
 

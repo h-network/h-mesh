@@ -58,7 +58,27 @@ def _env(install_dir: str, home_dir: str, tmpdir: str) -> dict:
     env["TMUX_TMPDIR"] = tmpdir
     env["TMUX_SESSION"] = f"sess-{os.urandom(4).hex()}"
     env["TMUX_SOCKET"] = os.path.join(tmpdir, "isolated.sock")
+    # setup.sh otherwise inherits VIRTUAL_ENV and installs into it. The test
+    # owns only tmpdir, so make any interpreter outside that cleanup boundary
+    # unreachable rather than relying on callers to sanitize their shell.
+    env.pop("VIRTUAL_ENV", None)
+    env["VENV_PATH"] = os.path.join(tmpdir, "venv")
     return env
+
+
+def test_install_fixture_never_targets_an_ambient_virtualenv(monkeypatch):
+    external_venv = "/environment-this-test-does-not-own"
+    monkeypatch.setenv("VIRTUAL_ENV", external_venv)
+    monkeypatch.setenv("VENV_PATH", external_venv)
+
+    env = _env("/tmp/checkout", "/tmp/home", "/tmp/fixture-owned")
+
+    assert env.get("VIRTUAL_ENV") != external_venv, (
+        "an install test must not select an ambient interpreter it does not own"
+    )
+    assert env["VENV_PATH"] == "/tmp/fixture-owned/venv", (
+        "the install target must be contained by the fixture's cleanup boundary"
+    )
 
 
 def test_install_sh_is_valid_posix_sh():
