@@ -3,9 +3,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import secrets
 import subprocess
 import sys
-import os
+import tempfile
 from pathlib import Path
 
 
@@ -67,23 +71,67 @@ def main() -> int:
         )
         return 1
 
-    pytest_env = os.environ.copy()
-    pytest_env.pop("PYTEST_ADDOPTS", None)
-    pytest_env.pop("PYTEST_PLUGINS", None)
-    pytest_env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
-    return subprocess.call(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-o",
-            "addopts=",
-            "-p",
-            "tools.manifest_plugin",
-        ],
-        cwd=repo_root,
-        env=pytest_env,
+    manifest = repo_root / "h-app" / "tools" / "test_nodeids.txt"
+    manifest_bytes = manifest.read_bytes()
+    expected_count = len([line for line in manifest_bytes.splitlines() if line.strip()])
+    nonce = secrets.token_hex(32)
+    with tempfile.TemporaryDirectory(prefix="h-mesh-test-attestation-") as temp_dir:
+        attestation_path = Path(temp_dir) / "complete.json"
+        pytest_env = os.environ.copy()
+        pytest_env.pop("PYTEST_ADDOPTS", None)
+        pytest_env.pop("PYTEST_PLUGINS", None)
+        pytest_env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+        pytest_env["H_MESH_TEST_ATTESTATION_PATH"] = str(attestation_path)
+        pytest_env["H_MESH_TEST_ATTESTATION_NONCE"] = nonce
+        child_status = subprocess.call(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-o",
+                "addopts=",
+                "-p",
+                "tools.manifest_plugin",
+            ],
+            cwd=repo_root,
+            env=pytest_env,
+        )
+        if child_status != 0:
+            return child_status
+        if not attestation_path.is_file():
+            print(
+                "error: pytest exited 0 without a suite-completion attestation; "
+                "the test process did not prove completion",
+                file=sys.stderr,
+            )
+            return 1
+
+        expected_attestation = {
+            "version": 1,
+            "nonce": nonce,
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "terminal_count": expected_count,
+        }
+        try:
+            actual_attestation = json.loads(attestation_path.read_text())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            print(
+                f"error: pytest produced an invalid suite-completion attestation: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        if actual_attestation != expected_attestation:
+            print(
+                "error: pytest suite-completion attestation does not match this "
+                "runner invocation, manifest, or tree",
+                file=sys.stderr,
+            )
+            return 1
+
+    print(
+        f"suite execution invariant satisfied: {expected_count} terminal outcomes"
     )
+    return 0
 
 
 if __name__ == "__main__":

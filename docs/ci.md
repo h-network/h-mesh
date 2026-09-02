@@ -25,8 +25,11 @@ above for merge evidence.
 The reviewed node set is checked in at `h-app/tools/test_nodeids.txt`. A plugin
 inside the pytest process compares its selected items to that manifest before
 the first test runs, then records actual runtest reports. It issues the suite
-certificate only at successful session completion, after every expected node
-has reached a terminal test outcome. Selection alone is not execution evidence.
+attestation only after every expected node has reached a terminal test outcome.
+The outer runner issues the public certificate only after pytest exits zero and
+the nonce-bound attestation matches that invocation and manifest. A zero exit
+with an absent, partial, stale, or mismatched attestation is a failure. Selection
+alone and absence of a reported error are not execution evidence.
 
 The runner removes external `PYTEST_ADDOPTS` and `PYTEST_PLUGINS`, disables
 ambient plugin autoloading, overrides repository `addopts`, and rejects parsed

@@ -207,3 +207,91 @@ def test_setup_phase_skip_cannot_satisfy_execution_invariant(tmp_path: Path) -> 
     )
     assert "not executed: h-app/tests/test_target.py::test_target_tree_marker" in output
     assert "suite execution invariant satisfied" not in output
+
+
+def test_later_finish_failure_cannot_leave_a_public_suite_certificate(tmp_path: Path) -> None:
+    target = _make_isolated_harness_tree(
+        tmp_path, "def test_target_tree_marker():\n    assert True\n"
+    )
+    (target / "h-app" / "conftest.py").write_text(
+        "import pytest\n"
+        "@pytest.hookimpl(hookwrapper=True, tryfirst=True)\n"
+        "def pytest_sessionfinish():\n"
+        "    yield\n"
+        "    raise RuntimeError('failure after manifest sessionfinish')\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(target / "h-app")
+    result = subprocess.run(
+        [sys.executable, "-m", "tools.run_tests"],
+        cwd=target,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "failure after manifest sessionfinish" in output
+    assert "suite execution invariant satisfied" not in output, (
+        "a certificate must not precede a later failure in pytest process completion"
+    )
+
+
+def test_clean_child_exit_before_finish_cannot_make_runner_succeed(tmp_path: Path) -> None:
+    target = _make_isolated_harness_tree(
+        tmp_path,
+        "import os\n"
+        "def test_target_tree_marker():\n"
+        "    os._exit(0)\n",
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(target / "h-app")
+    result = subprocess.run(
+        [sys.executable, "-m", "tools.run_tests"],
+        cwd=target,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, (
+        "child exit 0 without completed finish attestation must not make the runner pass"
+    )
+    assert "exited 0 without a suite-completion attestation" in output
+    assert "suite execution invariant satisfied" not in output
+
+
+def test_mismatched_attestation_is_distinct_from_absent_attestation(tmp_path: Path) -> None:
+    target = _make_isolated_harness_tree(
+        tmp_path, "def test_target_tree_marker():\n    assert True\n"
+    )
+    (target / "h-app" / "conftest.py").write_text(
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "import pytest\n"
+        "@pytest.hookimpl(hookwrapper=True, tryfirst=True)\n"
+        "def pytest_sessionfinish():\n"
+        "    yield\n"
+        "    path = Path(os.environ['H_MESH_TEST_ATTESTATION_PATH'])\n"
+        "    attestation = json.loads(path.read_text())\n"
+        "    attestation['nonce'] = 'stale-or-foreign-invocation'\n"
+        "    path.write_text(json.dumps(attestation))\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(target / "h-app")
+    result = subprocess.run(
+        [sys.executable, "-m", "tools.run_tests"],
+        cwd=target,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "attestation does not match this runner invocation" in output
+    assert "without a suite-completion attestation" not in output
+    assert "suite execution invariant satisfied" not in output

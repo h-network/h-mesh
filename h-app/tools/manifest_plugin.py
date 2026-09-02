@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -21,6 +24,12 @@ def manifest_difference(actual: set[str]) -> tuple[list[str], list[str]]:
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    if not os.environ.get("H_MESH_TEST_ATTESTATION_PATH") or not os.environ.get(
+        "H_MESH_TEST_ATTESTATION_NONCE"
+    ):
+        raise pytest.UsageError(
+            "manifest plugin requires a runner-created attestation path and nonce"
+        )
     zero_runtest_modes = [
         name
         for name in ("collectonly", "setuponly", "setupplan")
@@ -77,8 +86,15 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
                 reporter.write_line(f"  not executed: {nodeid}", red=True)
         return
 
-    if reporter is not None:
-        reporter.write_line(
-            f"suite execution invariant satisfied: "
-            f"{len(_terminal_nodeids)} terminal outcomes"
-        )
+    attestation_path = Path(os.environ["H_MESH_TEST_ATTESTATION_PATH"])
+    attestation = {
+        "version": 1,
+        "nonce": os.environ["H_MESH_TEST_ATTESTATION_NONCE"],
+        "manifest_sha256": hashlib.sha256(NODEID_MANIFEST.read_bytes()).hexdigest(),
+        "terminal_count": len(_terminal_nodeids),
+    }
+    temporary_path = attestation_path.with_name(
+        f".{attestation_path.name}.{os.getpid()}.tmp"
+    )
+    temporary_path.write_text(json.dumps(attestation, sort_keys=True) + "\n")
+    os.replace(temporary_path, attestation_path)
