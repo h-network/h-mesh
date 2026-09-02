@@ -370,3 +370,80 @@ def test_tmux_kill_does_not_match_a_socket_path_that_is_only_a_prefix(tmp_path):
         )
     finally:
         subprocess.run(["tmux", "-S", prefix_colliding_socket, "kill-server"], capture_output=True, timeout=5)
+
+
+def _alive2(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def test_pidfd_kill_never_signals_a_live_process_that_fails_verification(tmp_path):
+    """The core guarantee of `_pidfd_kill_if_matches`, tested directly: a
+    real, alive, unrelated process is left completely untouched when
+    `verify()` returns False -- proving the decision to signal is bound to
+    what `verify` says WHILE the pidfd is held, not to an earlier scan's
+    result. This is what closes the concurrent-reaper pid-reuse race: a
+    lagging reaper whose earlier scan matched a pid that has since been
+    reused calls `verify()` again itself, fresh, with its OWN pidfd open on
+    whatever now holds that number -- and a genuinely different process's
+    current identity will not satisfy it."""
+    from _leak_manifest import _pidfd_kill_if_matches
+
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        result = _pidfd_kill_if_matches(unrelated.pid, verify=lambda pid: False, log=lambda *_: None)
+
+        assert result == "no-match"
+        assert _alive2(unrelated.pid), "a process was signalled despite verify() returning False"
+    finally:
+        if unrelated.poll() is None:
+            unrelated.kill()
+        unrelated.wait(timeout=5)
+
+
+def test_pidfd_kill_signals_through_the_fd_when_verification_passes(tmp_path):
+    """The mirror of the test above: when `verify()` genuinely matches, the
+    process IS killed -- proving the fix does not simply refuse to act."""
+    from _leak_manifest import _pidfd_kill_if_matches
+
+    target = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        result = _pidfd_kill_if_matches(target.pid, verify=lambda pid: True, log=lambda *_: None)
+
+        assert result == "killed"
+        target.wait(timeout=5)
+        assert not _alive2(target.pid)
+    finally:
+        if target.poll() is None:
+            target.kill()
+            target.wait(timeout=5)
+
+
+def test_pidfd_kill_detects_a_process_that_exits_between_open_and_signal_as_stale(tmp_path):
+    """The other half of the race: a process that exits in the window
+    between the pidfd being opened and the signal being sent (simulated
+    here inside `verify()` itself, the same position in the call sequence a
+    real race would land in) is detected via the pidfd's own readability,
+    not signalled as if still present -- proving detection does not depend
+    on a fresh `/proc` read at signal time, which would itself be exactly
+    the re-introduced TOCTOU gap."""
+    from _leak_manifest import _pidfd_kill_if_matches
+
+    victim = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
+    def verify_then_die(pid: int) -> bool:
+        os.kill(pid, signal.SIGKILL)
+        victim.wait(timeout=5)
+        return True  # a stale verify result -- the pidfd's own check must catch this regardless
+
+    try:
+        result = _pidfd_kill_if_matches(victim.pid, verify=verify_then_die, log=lambda *_: None)
+
+        assert result == "stale"
+    finally:
+        if victim.poll() is None:
+            victim.kill()
+            victim.wait(timeout=5)
