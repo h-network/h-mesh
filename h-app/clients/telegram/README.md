@@ -665,10 +665,10 @@ not a path shared out of band. An earlier version of this feature (before
 the Attachment kind existed) saved the file under the agent's own workdir
 and sent a plain `Message` naming the path; that's gone now that there's a
 real envelope kind to send it as, and the tmux opener does the filesystem
-work instead (`/workdir/<recipient>/attachments/<stream_id>/`, entirely its
-own to create/write/clean up — confirmed directly with the tmux lane rather
-than assumed. This client never touches a filesystem for a received photo
-at all).
+work instead (`<recipient's workdir>/attachments/<stream_id>/`, entirely
+its own to create/write/clean up — confirmed directly with the tmux lane
+rather than assumed. This client never touches a filesystem for a received
+photo at all).
 
 - **Routing is identical to a text message.** The caption is the
   `Attachment` envelope's `caption` field — the persistent chat target (🎯
