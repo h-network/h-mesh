@@ -92,13 +92,21 @@ an unauthenticatable daemon pid does -- see `reap_all_orphans`.
 ⚠ Two sessions starting and reaping at once: every action taken here
 RE-AUTHENTICATES FRESH at the moment of that action -- via pidfd for a
 signal, via a freshly-opened directory fd for a deletion (see
-`_fd_safe_remove_owned_tmpdir`) -- never trusting a value read earlier in
-the race, which is what actually makes concurrent reaping safe. Two
-reapers independently authenticating the same genuinely-dead entry reach
-the same conclusion and do the same idempotent work twice (a pidfd opened
-against an already-exited pid raises `ProcessLookupError`, caught; opening
-a directory fd against an already-removed tree raises `OSError`, caught;
-unlinking an already-unlinked manifest entry is a no-op) -- safe. A
+`_fd_safe_remove_owned_tmpdir`) -- but fresh authentication does NOT make
+the whole multi-step removal idempotent. Repeated concurrent runs observed
+one reaper removing a pidfile or nested file while another was using it,
+and one removing the tmpdir while another still owned the manifest entry.
+Those are several symptoms of one missing ownership boundary, not several
+independent read/unlink defects. Before any destructive action, a reaper now
+atomically renames the public entry to a unique claim stamped with its PID
+and `/proc` start time. Only the rename winner acts. This is a claim rather
+than a lock: there is no separate lock object or acquisition window, and a
+claim whose authenticated owner died can itself be atomically reclaimed by
+a later process without a guessed timeout. An attempt that returns incomplete
+atomically restamps its one claim with confirmed-absent PID 0, making the next
+invocation retry it without creating a second name. A live claimant is left alone;
+unverifiable identity fails closed and stays visible as a hidden `.claim.*`
+entry in the manifest directory. A
 registration race (one process mid-`register()` while another reaps) cannot
 produce a corrupt read either: `register()` writes to a temp file and
 `os.replace()`s it into place, so a concurrent reader only ever sees the
@@ -112,6 +120,7 @@ import errno
 import json
 import os
 import select
+import secrets
 import signal
 import stat
 import time
@@ -120,8 +129,56 @@ from pathlib import Path
 from services.daemons import ALL_DAEMON_MODULES, stop_daemons
 
 MANIFEST_DIR = Path("/tmp/h_mesh_test_manifests")
+CLAIM_DIR = MANIFEST_DIR
 _OWNED_ROOT = Path("/tmp")
 _OWNED_PREFIX = "h_mesh_test_"
+
+# A STUCK claim whose target cannot be proven to be an owned test directory is
+# deliberate fail-closed retention, not a reaper bug: its evidence is kept
+# because the target's identity is unknown. Operators may clear one manually
+# by first stopping and coordinating all known test runners. This is best-effort
+# only: there is no shared lock or maintenance flag, so exclusion is not
+# guaranteed and prose cannot create one. A target judged unowned may still
+# satisfy the reaper's owned-root and prefix checks, so a concurrent reaper may
+# already be acting on it while its claim evidence is removed. Inspect the
+# claim JSON, verify that the target is invalid or unowned, quarantine the
+# corresponding public entry first, then remove all matching claim files, and
+# verify both public and claim forms are absent. Repeat, or fail and leave
+# evidence, if either form reappears. Automatic deletion is refused by the
+# reaper because it would destroy evidence this module is designed to preserve
+# and silently reopen arbitrary-tree risk; guaranteed cleanup would require a
+# shared lock or maintenance flag used by reapers, which is outside this change.
+
+
+def _plausible_tmpdir_path(entry: Path, tmpdir_str: str) -> Path | None:
+    """Return the normalized path when the manifest's naming facts hold.
+
+    This is deliberately not ownership proof. It exists separately so a
+    claimed entry can distinguish a valid target that is confirmed absent
+    (cleanup already completed) from malformed or unsafe evidence, without
+    weakening the lstat ownership checks in ``_validated_tmpdir``.
+    """
+    try:
+        tmpdir = Path(tmpdir_str)
+    except (TypeError, ValueError):
+        return None
+    if not tmpdir.is_absolute():
+        return None
+    try:
+        resolved = tmpdir.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    try:
+        relative = resolved.relative_to(_OWNED_ROOT)
+    except ValueError:
+        return None
+    if len(relative.parts) != 1:
+        return None
+    if not relative.parts[0].startswith(_OWNED_PREFIX):
+        return None
+    if resolved.name != entry.stem:
+        return None
+    return resolved
 
 
 def _validated_tmpdir(entry: Path, tmpdir_str: str) -> Path | None:
@@ -192,26 +249,9 @@ def _validated_tmpdir(entry: Path, tmpdir_str: str) -> Path | None:
     validation and deletion; see `_fd_safe_remove_owned_tmpdir` for what
     does.
     """
-    try:
-        tmpdir = Path(tmpdir_str)
-    except (TypeError, ValueError):
+    resolved = _plausible_tmpdir_path(entry, tmpdir_str)
+    if resolved is None:
         return None
-    if not tmpdir.is_absolute():
-        return None
-    try:
-        resolved = tmpdir.resolve(strict=False)
-    except (OSError, RuntimeError):
-        return None
-    try:
-        relative = resolved.relative_to(_OWNED_ROOT)
-    except ValueError:
-        return None
-    if len(relative.parts) != 1:
-        return None  # not a DIRECT child of _OWNED_ROOT -- e.g. a nested escape
-    if not relative.parts[0].startswith(_OWNED_PREFIX):
-        return None
-    if resolved.name != entry.stem:
-        return None  # claimed tmpdir doesn't match the manifest file that named it
     try:
         st = os.lstat(resolved)
     except OSError:
@@ -221,6 +261,20 @@ def _validated_tmpdir(entry: Path, tmpdir_str: str) -> Path | None:
     if st.st_uid != os.getuid():
         return None  # conforms in name only; owned by a different user
     return resolved
+
+
+def _tmpdir_confirmed_absent(entry: Path, tmpdir_str: str) -> bool:
+    """True only for a safely-shaped target whose directory is now absent."""
+    target = _plausible_tmpdir_path(entry, tmpdir_str)
+    if target is None:
+        return False
+    try:
+        os.lstat(target)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def _process_start_time(pid: int) -> str | None:
@@ -288,6 +342,71 @@ def clear(entry: Path) -> None:
     gone -- this is the signal a reaper trusts to mean "nothing to clean up
     here," so it must not be removed first."""
     entry.unlink(missing_ok=True)
+
+
+def _new_claim_path(entry: Path) -> Path | None:
+    """Return a unique claim path stamped with this process's identity."""
+    pid = os.getpid()
+    start_time = _process_start_time(pid)
+    if start_time is None:
+        return None
+    return CLAIM_DIR / f".claim.{pid}.{start_time}.{secrets.token_hex(8)}.{entry.name}"
+
+
+def _claim_identity(claim: Path) -> tuple[int, str, str] | None:
+    """Return claimant pid/starttime and original entry name, or ``None``."""
+    try:
+        empty, marker, pid_text, start_time, _token, entry_name = claim.name.split(".", 5)
+        if empty or marker != "claim":
+            return None
+        pid = int(pid_text)
+    except (TypeError, ValueError):
+        return None
+    if not start_time or not entry_name.endswith(".json") or Path(entry_name).name != entry_name:
+        return None
+    return pid, start_time, entry_name
+
+
+def _take_claim(source: Path, original_entry: Path, log=print) -> Path | None:
+    """Atomically become the only reaper allowed to act on ``source``.
+
+    A unique rename, rather than a separate lock, makes removing the public
+    entry and acquiring ownership one filesystem operation.  A loser sees
+    ``FileNotFoundError`` and does nothing.  Other I/O failures leave the
+    source intact and visible rather than guessing that ownership transferred.
+    """
+    claim = _new_claim_path(original_entry)
+    if claim is None:
+        log(f"  • STUCK, leaving {source}: cannot authenticate this reaper for a claim")
+        return None
+    try:
+        CLAIM_DIR.mkdir(parents=True, exist_ok=True)
+        source.rename(claim)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        log(f"  • STUCK, leaving {source}: cannot claim manifest entry ({exc})")
+        return None
+    return claim
+
+
+def _retire_claim(claim: Path, entry: Path, log=print) -> Path | None:
+    """Atomically mark a finished-but-incomplete attempt retryable now.
+
+    PID 0 is outside the process namespace and `/proc/0` is confirmed absent,
+    so the ordinary claimant authentication classifies the new stamp dead
+    without a timeout. A crash before this rename leaves the real live stamp;
+    later recovery waits until that claimant is authentically dead instead.
+    """
+    retired = CLAIM_DIR / f".claim.0.0.{secrets.token_hex(8)}.{entry.name}"
+    try:
+        claim.rename(retired)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        log(f"  • STUCK, leaving live claim {claim}: cannot mark it retryable ({exc})")
+        return None
+    return retired
 
 
 def _owner_status(owner_pid: int, owner_start_time: str | None) -> str:
@@ -878,6 +997,75 @@ def reap_orphan(tmpdir: Path, log=print) -> bool:
     return _fd_safe_remove_owned_tmpdir(tmpdir, log=log)
 
 
+def _reap_claimed_entry(claim: Path, entry: Path, log=print) -> tuple[int, int]:
+    """Process one exclusively claimed entry, returning reaped/stuck counts.
+
+    Every fact used before the rename is re-read from the claimed file.  If
+    work cannot finish, the one stamped claim remains visible and recoverable
+    after this claimant exits. It is deliberately NOT republished under a
+    second name: creating public and claimed links in two syscalls would let a
+    crash between them recreate the double-ownership bug this claim removes.
+    """
+    try:
+        data = json.loads(claim.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        log(f"  • STUCK, leaving {claim}: unreadable claimed entry ({exc})")
+        return 0, 1
+    owner_pid = data.get("owner_pid")
+    owner_start_time = data.get("owner_start_time")
+    tmpdir = data.get("tmpdir")
+    if not isinstance(owner_pid, int) or not isinstance(tmpdir, str):
+        log(
+            f"  • STUCK, leaving {claim}: malformed claimed entry "
+            f"(owner_pid={owner_pid!r} tmpdir={tmpdir!r})"
+        )
+        return 0, 1
+    status = _owner_status(owner_pid, owner_start_time)
+    if status == "running":
+        return 0, 0
+    if status == "unverifiable":
+        log(
+            f"  • STUCK, leaving {tmpdir}: owner pid {owner_pid}'s "
+            "liveness could not be authenticated"
+        )
+        return 0, 1
+    validated = _validated_tmpdir(entry, tmpdir)
+    if validated is None:
+        if _tmpdir_confirmed_absent(entry, tmpdir):
+            # The authenticated claimant may have died after removing the
+            # directory, or its final evidence unlink may have failed. The
+            # valid target's confirmed absence proves there is no destructive
+            # work left; completing evidence removal is recovery, not a reason
+            # to retain an otherwise permanent claim.
+            try:
+                claim.unlink(missing_ok=True)
+            except OSError as exc:
+                log(
+                    f"  • STUCK, retaining completed claim {claim}: "
+                    f"cannot remove it ({exc})"
+                )
+                return 0, 1
+            return 1, 0
+        log(
+            f"  • STUCK, leaving {claim}: claimed tmpdir {tmpdir!r} "
+            "failed ownership validation -- not touching it"
+        )
+        return 0, 1
+    log(
+        f"  • reaping orphaned test tmpdir {validated} "
+        f"(owner pid {owner_pid} authenticated dead)"
+    )
+    if not reap_orphan(validated, log=log):
+        log(f"  • STUCK, retaining claim {claim}: orphan cleanup incomplete")
+        return 0, 1
+    try:
+        claim.unlink(missing_ok=True)
+    except OSError as exc:
+        log(f"  • STUCK, retaining completed claim {claim}: cannot remove it ({exc})")
+        return 0, 1
+    return 1, 0
+
+
 def reap_all_orphans(log=print) -> tuple[int, int]:
     """Reap every manifest entry whose registering process is authenticated
     as no longer running (see `_owner_status` -- never bare pid liveness).
@@ -907,11 +1095,44 @@ def reap_all_orphans(log=print) -> tuple[int, int]:
         return 0, 0
     reaped = 0
     stuck = 0
-    for entry in MANIFEST_DIR.glob("*.json"):
+    CLAIM_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Recover claims whose previous owner provably died. A live claimant is
+    # still legitimately working; an unverifiable claimant fails closed.
+    for abandoned in list(CLAIM_DIR.glob(".claim.*")):
+        identity = _claim_identity(abandoned)
+        if identity is None:
+            log(f"  • STUCK, leaving {abandoned}: malformed claim identity")
+            stuck += 1
+            continue
+        claimant_pid, claimant_start_time, entry_name = identity
+        claim_status = _owner_status(claimant_pid, claimant_start_time)
+        if claim_status == "running":
+            continue
+        if claim_status == "unverifiable":
+            log(
+                f"  • STUCK, leaving {abandoned}: claimant pid "
+                f"{claimant_pid}'s liveness could not be authenticated"
+            )
+            stuck += 1
+            continue
+        entry = MANIFEST_DIR / entry_name
+        claim = _take_claim(abandoned, entry, log=log)
+        if claim is None:
+            continue
+        claimed_reaped, claimed_stuck = _reap_claimed_entry(claim, entry, log=log)
+        if claim.exists():
+            _retire_claim(claim, entry, log=log)
+        reaped += claimed_reaped
+        stuck += claimed_stuck
+
+    for entry in list(MANIFEST_DIR.glob("*.json")):
         if entry.name.startswith("."):
             continue  # a register() temp file mid-write, not a real entry
         try:
             data = json.loads(entry.read_text())
+        except FileNotFoundError:
+            continue  # another reaper atomically claimed it after this glob snapshot
         except (OSError, json.JSONDecodeError) as exc:
             log(f"  • STUCK, leaving {entry}: unreadable manifest entry ({exc})")
             stuck += 1
@@ -935,10 +1156,12 @@ def reap_all_orphans(log=print) -> tuple[int, int]:
             log(f"  • STUCK, leaving {entry}: claimed tmpdir {tmpdir!r} failed ownership validation -- not touching it")
             stuck += 1
             continue
-        log(f"  • reaping orphaned test tmpdir {validated} (owner pid {owner_pid} authenticated dead)")
-        if not reap_orphan(validated, log=log):
-            stuck += 1
-            continue  # left in place on purpose; entry stays for a later retry
-        entry.unlink(missing_ok=True)
-        reaped += 1
+        claim = _take_claim(entry, entry, log=log)
+        if claim is None:
+            continue
+        claimed_reaped, claimed_stuck = _reap_claimed_entry(claim, entry, log=log)
+        if claim.exists():
+            _retire_claim(claim, entry, log=log)
+        reaped += claimed_reaped
+        stuck += claimed_stuck
     return reaped, stuck
