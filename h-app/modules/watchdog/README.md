@@ -61,6 +61,60 @@ deliberately rather than by accident (2026-09-02):
   discipline correctly before it had a name: "not confirmed... cannot
   distinguish loss from a landed paste."
 
+  The claim is enforced structurally, not by trusting a naming convention --
+  and not by closing off fields one at a time either. Two earlier rounds
+  each closed one leak and opened another: first `outcome`/`title`/
+  `old_title` (closed by not exposing those parameters), then an arbitrary
+  caller-supplied `event` string and free `reason` prose (reviewer's next
+  counterexample: `event="lead_alert_delivered"` next to a truthful
+  `evidence="admitted"` -- a delivery claim sitting in the field naming the
+  record, which nothing was checking). The actual fix: if a caller can pass
+  a string that reaches the record, the caller owns the vocabulary, not
+  this module. So `_log_lead_alert` accepts no caller-composed string at
+  all -- only a closed `kind` key into `Watchdog._LEAD_ALERT_TEMPLATES`,
+  which is the *sole* source of `event`, `evidence`, and the `reason`
+  template together, as one hardcoded entry. A caller supplies only
+  structured values (a lead name, a closed error category, a queue depth)
+  to fill that template's named placeholders; it can never set `event` or
+  `evidence` independently, so the two cannot disagree. An unrecognized or
+  omitted `kind` is a `KeyError`/`TypeError` at the call, immediately --
+  never a malformed or contradictory record reaching the log.
+
+  This is checked two ways, not one, per the lesson that a guarantee
+  asserted at a boundary wider than the mechanism enforcing it is not a
+  guarantee: a static AST check over `_notify_lead`'s own source confirms
+  every log call in it targets `_log_lead_alert` (not `log_record`
+  directly) *and* passes a `kind` whose literal value is a real key in
+  `_LEAD_ALERT_TEMPLATES` -- not just that the call is named right, which
+  is what an earlier version of this check verified and reviewer found
+  insufficient (a call missing `kind` entirely still named
+  `_log_lead_alert` and passed that check, and would only have failed the
+  first time it actually executed). Falsified by hand before being
+  trusted: a real call site was temporarily edited to drop its `kind`
+  argument, the AST check was confirmed to fail on it, and the call site
+  was restored.
+
+  A fourth leak, found after the above three: closing the *sentence
+  frame* (`event`/`evidence`/`reason`-wording) is not the same as closing
+  its *content*. The `unknown` template used to interpolate a
+  caller-supplied `detail=str(exc)` -- a fixed template around free text
+  is still free text reaching the record, and an exception's message is
+  remote-influenced by construction (a Redis/proxy error can embed a
+  connection string, a key name, or arbitrary backend text nothing here
+  can bound). Every placeholder in every template now has to answer one
+  provenance question before it's allowed to exist: *could this value be
+  influenced by anything outside this process?* `{lead}` passes (a
+  registered agent name, only ever set by an authenticated `office` admin
+  action, already carried by the same record's `destination` field
+  regardless); `{depth}`/`{ingress_max}` pass (plain ints, never text).
+  `{detail}` didn't, and is gone -- replaced by `{category}`, drawn from
+  `_admission_error_category`, a small CLOSED mapping this module
+  hardcodes by `isinstance` (never `str(exc)`, and never even
+  `type(exc).__name__`, since that vocabulary belongs to whichever
+  library raised it, not to this module). An exception type nobody has
+  enumerated there yet falls back to `"unexpected_error"` rather than
+  widening what gets logged to cover it.
+
 - **`blocked` self-heals.** `DeliveryVerifier` used to only ever CLEAR
   `blocked` in response to a NEW delivery marker verifying -- an agent
   nobody messaged again after one unverified paste stayed `blocked` in
