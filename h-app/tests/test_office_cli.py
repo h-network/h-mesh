@@ -15,7 +15,7 @@ if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
 from core.envelope import build, encode
-from core.keys import prefix, receive_unresolved_key
+from core.keys import prefix, receive_undeliverable_key, receive_unresolved_key
 from modules.office import cli as office_cli
 from modules.office.cli import main as office_main
 
@@ -184,6 +184,50 @@ def test_unresolved_names_exact_identity_without_consuming(monkeypatch, capsys):
         "agent": "worker-1", "stream_id": envelope["stream_id"],
         "kind": "Command", "source": "alice", "reason": "ack outcome unknown",
     }
+    assert r.lrange(key, 0, -1) == [record]
+
+
+def test_undeliverable_names_terminal_identity_without_consuming(monkeypatch, capsys):
+    r = FakeRedis()
+    _env(monkeypatch)
+    envelope = build(
+        "Command", "alice", "worker-1", {"text": "never opened"},
+        pod=POD, tenant=TENANT,
+    )
+    record = json.dumps({
+        "agent": "worker-1",
+        "reason": "destination retired before opening",
+        "encoding": "hex",
+        "envelope": encode(envelope).encode().hex(),
+    })
+    key = receive_undeliverable_key(POD, TENANT)
+    r.rpush(key, record)
+    with patch("modules.office.cli.redis.Redis.from_url", return_value=r):
+        office_main(["undeliverable", "--agent", "worker-1"])
+    shown = json.loads(capsys.readouterr().out)
+    assert shown == {
+        "agent": "worker-1", "stream_id": envelope["stream_id"],
+        "kind": "Command", "source": "alice",
+        "reason": "destination retired before opening",
+    }
+    assert r.lrange(key, 0, -1) == [record]
+
+
+def test_undeliverable_malformed_record_is_reported_without_consuming(monkeypatch, capsys):
+    r = FakeRedis()
+    _env(monkeypatch)
+    record = json.dumps({
+        "agent": "worker-1", "encoding": "hex", "envelope": [],
+    })
+    key = receive_undeliverable_key(POD, TENANT)
+    r.rpush(key, record)
+
+    with patch("modules.office.cli.redis.Redis.from_url", return_value=r):
+        office_main(["undeliverable"])
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "unparseable undeliverable custody record\n"
     assert r.lrange(key, 0, -1) == [record]
 
 

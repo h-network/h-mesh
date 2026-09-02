@@ -12,8 +12,8 @@ from collections.abc import Callable
 from functools import wraps
 
 from core.keys import (
-    SEGMENT_REGEX, prefix, receive_opened_key, receive_opening_key,
-    receive_processing_key,
+    SEGMENT_REGEX, prefix, receive_opening_key, receive_processing_key,
+    receive_undeliverable_key, receive_unresolved_key,
 )
 from core.dispatch import delivery_lock_key
 from core.logging import log_record
@@ -58,31 +58,66 @@ return 1
 """
 
 _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA = """
--- Atomic through preflight, not because EVAL rolls back (it does not). Check
--- both type-sensitive reads before HDEL becomes the first mutation; otherwise
--- a WRONGTYPE from GET would leave membership removed but the lead untouched.
+-- Atomic through deterministic preflight, not because EVAL rolls back (it
+-- does not). Validate every type-sensitive source and destination, snapshot
+-- every raw, and encode every evidence record before HDEL is the first write.
 redis.call('HEXISTS', KEYS[1], ARGV[1])
 local current_lead = redis.call('GET', KEYS[2])
+for _, index in ipairs({3, 4, 5, 17, 18}) do
+    local kind = redis.call('TYPE', KEYS[index])['ok']
+    if kind ~= 'none' and kind ~= 'list' then
+        return redis.error_reply('lifecycle custody key is not a list: ' .. KEYS[index])
+    end
+end
+
+local processing = redis.call('LRANGE', KEYS[3], 0, -1)
+local opening = redis.call('LRANGE', KEYS[4], 0, -1)
+local ingress = redis.call('LRANGE', KEYS[5], 0, -1)
+local function hex(raw)
+    local encoded = {}
+    for index = 1, #raw do
+        encoded[index] = string.format('%02x', string.byte(raw, index))
+    end
+    return table.concat(encoded)
+end
+local undeliverable = {}
+for _, raw in ipairs(processing) do
+    table.insert(undeliverable, cjson.encode({
+        agent=ARGV[1], reason='destination retired before opening',
+        encoding='hex', envelope=hex(raw)
+    }))
+end
+for _, raw in ipairs(ingress) do
+    table.insert(undeliverable, cjson.encode({
+        agent=ARGV[1], reason='destination retired before opening',
+        encoding='hex', envelope=hex(raw)
+    }))
+end
+local unresolved = {}
+for _, raw in ipairs(opening) do
+    table.insert(unresolved, cjson.encode({
+        agent=ARGV[1], reason='opener outcome unknown when destination retired',
+        encoding='hex', envelope=hex(raw)
+    }))
+end
+
 redis.call('HDEL', KEYS[1], ARGV[1])
 if current_lead == ARGV[1] then
     redis.call('DEL', KEYS[2])
 end
--- In-flight receive custody and bounded completion receipts belong to the
--- membership removed at this linearization point. Keeping these DELs here
--- prevents a later hire reusing ARGV[1] from losing successor state.
+if #undeliverable > 0 then redis.call('RPUSH', KEYS[17], unpack(undeliverable)) end
+if #unresolved > 0 then redis.call('RPUSH', KEYS[18], unpack(unresolved)) end
 redis.call('DEL', KEYS[3])
 redis.call('DEL', KEYS[4])
 redis.call('DEL', KEYS[5])
--- Ingress, pause state, and the delivery lease belong to the same removed
--- membership. Deleting them inside this isolated script prevents cleanup for
--- the predecessor from racing a successor published after this script.
--- DEL accepts keys of every Redis type, so the two reads above are the full
--- runtime-error preflight before HDEL becomes the first mutation.
+-- Opened receipts are deliberately absent from KEYS: completed effects are
+-- never replayed, and their bounded acknowledgement evidence survives stop.
+-- Pause state and the delivery lease are disposable instance state.
 redis.call('DEL', KEYS[6])
 redis.call('DEL', KEYS[7])
-redis.call('DEL', KEYS[8])
 -- Desired launch identity and security configuration must not cross a
 -- stop/re-hire boundary when the successor omits optional StartAgent fields.
+redis.call('DEL', KEYS[8])
 redis.call('DEL', KEYS[9])
 redis.call('DEL', KEYS[10])
 redis.call('DEL', KEYS[11])
@@ -91,8 +126,7 @@ redis.call('DEL', KEYS[13])
 redis.call('DEL', KEYS[14])
 redis.call('DEL', KEYS[15])
 redis.call('DEL', KEYS[16])
-redis.call('DEL', KEYS[17])
-return 1
+return {#processing, #ingress, #opening}
 """
 
 
@@ -536,12 +570,11 @@ def stop_agent(
         committed, "registry row removed and owned lead cleared", "registry/lead removal",
         lambda: r.eval(
             _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
-            17,
+            18,
             registry_key,
             prefix(pod, tenant, resource="lead"),
             receive_processing_key(pod, tenant, agent),
             receive_opening_key(pod, tenant, agent),
-            receive_opened_key(pod, tenant, agent),
             prefix(pod, tenant, agent=agent, resource="ingress"),
             prefix(pod, tenant, agent=agent, resource="paused"),
             delivery_lock_key(pod, tenant, agent),
@@ -554,6 +587,8 @@ def stop_agent(
             tags_key(pod, tenant, agent),
             prefix(pod, tenant, agent=agent, resource="hmac-keys"),
             prefix(pod, tenant, agent=agent, resource="window.cause"),
+            receive_undeliverable_key(pod, tenant),
+            receive_unresolved_key(pod, tenant),
             agent,
         ),
     )

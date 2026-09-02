@@ -73,9 +73,21 @@ answers block the verdict; use `completed` only when its questions are
 non-blocking. Returned work joins the back of a nonempty `todo` queue.
 
 The receiving port delegates to the settled `lib.agentlifecycle` API.
-`stop_agent` removes the retired instance's ingress queue and paused marker as
-well as its registry membership and delivery lock, so a later hire that reuses
-the name cannot inherit queued messages or paused state. Registry removal also
+
+Delivery evidence has three read paths because it has three different facts:
+`dead` contains raw envelopes explicitly rejected by a recipient;
+`office unresolved [--agent AGENT]` shows envelopes whose external effect may
+have happened; and `office undeliverable [--agent AGENT]` shows envelopes known
+not to have begun because their destination retired. The latter two are
+tenant-level, read-only evidence. Neither has replay, delete, or expiry today;
+those missing exact-identity resolution verbs are a deliberate product gap,
+not permission to discard the records automatically.
+`stop_agent` transfers the retired instance's queued receive custody to the
+phase-appropriate tenant evidence list, then removes its per-name receive keys
+and paused marker with its registry membership and delivery lock. A later hire
+that reuses the name therefore cannot inherit either messages or coordination
+state, while every transferred envelope remains named by exact identity.
+Registry removal also
 atomically clears the tenant lead key when (and only when) it still names the
 retired agent; all type checks occur before the first removal, so a runtime
 error cannot leave only half of that combined transition applied.

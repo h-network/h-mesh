@@ -11,8 +11,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.channels import receive
 from core.dispatch import delivery_lock_key
-from core.envelope import build, encode
-from core.keys import prefix, receive_opened_key, receive_opening_key, receive_processing_key, receive_unresolved_key
+from core.envelope import build, encode, parse
+from core.keys import (
+    prefix, receive_opened_key, receive_opening_key, receive_processing_key,
+    receive_undeliverable_key, receive_unresolved_key,
+)
 from core.policy import tags_key
 from lib.agentlifecycle.lifecycle import (
     ProvableActualFailure,
@@ -93,6 +96,8 @@ def test_lead_removal_wrongtype_is_no_write(real_redis):
     paused_key = prefix(POD, tenant, agent="old-lead", resource="paused")
     lock_key = delivery_lock_key(POD, tenant, "old-lead")
     config_keys = _instance_config_keys(POD, tenant, "old-lead")
+    undeliverable_key = receive_undeliverable_key(POD, tenant)
+    unresolved_key = receive_unresolved_key(POD, tenant)
     real_redis.hset(registry_key, "old-lead", "tmux")
     real_redis.hset(lead_key, "wrong", "type")
     cleanup_keys = [processing_key, opening_key, opened_key, ingress_key]
@@ -106,16 +111,17 @@ def test_lead_removal_wrongtype_is_no_write(real_redis):
         with pytest.raises(redis.ResponseError, match="WRONGTYPE"):
             real_redis.eval(
                 _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
-                17,
+                18,
                 registry_key,
                 lead_key,
                 processing_key,
                 opening_key,
-                opened_key,
                 ingress_key,
                 paused_key,
                 lock_key,
                 *config_keys,
+                undeliverable_key,
+                unresolved_key,
                 "old-lead",
             )
 
@@ -132,7 +138,91 @@ def test_lead_removal_wrongtype_is_no_write(real_redis):
             lead_key, registry_key, processing_key, opening_key, opened_key,
             ingress_key, paused_key, lock_key,
             *config_keys,
+            undeliverable_key, unresolved_key,
         )
+
+
+@pytest.mark.parametrize(
+    "wrong_index",
+    [2, 3, 4, 16, 17],
+    ids=["processing", "opening", "ingress", "undeliverable", "unresolved"],
+)
+def test_stop_custody_type_preflight_preserves_every_identity(real_redis, wrong_index):
+    tenant = f"stop-type-{uuid4().hex[:12]}"
+    agent = "worker"
+    registry_key = prefix(POD, tenant, resource="registry")
+    lead_key = prefix(POD, tenant, resource="lead")
+    list_keys = [
+        receive_processing_key(POD, tenant, agent),
+        receive_opening_key(POD, tenant, agent),
+        prefix(POD, tenant, agent=agent, resource="ingress"),
+    ]
+    paused_key = prefix(POD, tenant, agent=agent, resource="paused")
+    lock_key = delivery_lock_key(POD, tenant, agent)
+    config_keys = _instance_config_keys(POD, tenant, agent)
+    list_keys.extend([
+        receive_undeliverable_key(POD, tenant),
+        receive_unresolved_key(POD, tenant),
+    ])
+    keys = [registry_key, lead_key, *list_keys[:3], paused_key, lock_key,
+            *config_keys, *list_keys[3:]]
+
+    real_redis.hset(registry_key, agent, "tmux")
+    real_redis.set(lead_key, agent)
+    for key in list_keys:
+        real_redis.rpush(key, f"identity:{key}")
+    real_redis.set(keys[wrong_index], "wrong-type-identity")
+    for key in [paused_key, lock_key, *config_keys]:
+        real_redis.set(key, f"identity:{key}")
+    try:
+        with pytest.raises(redis.ResponseError, match="custody key is not a list"):
+            real_redis.eval(
+                _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA, 18, *keys, agent
+            )
+
+        assert real_redis.hget(registry_key, agent) == b"tmux"
+        assert real_redis.get(lead_key) == agent.encode()
+        for key in list_keys:
+            if key == keys[wrong_index]:
+                assert real_redis.get(key) == b"wrong-type-identity"
+            else:
+                assert real_redis.lrange(key, 0, -1) == [f"identity:{key}".encode()]
+        for key in [paused_key, lock_key, *config_keys]:
+            assert real_redis.get(key) == f"identity:{key}".encode()
+    finally:
+        real_redis.delete(*keys)
+
+
+def test_undeliverable_record_preserves_non_utf8_raw_exactly(real_redis):
+    tenant = f"stop-bytes-{uuid4().hex[:12]}"
+    agent = "worker"
+    registry_key = prefix(POD, tenant, resource="registry")
+    ingress_key = prefix(POD, tenant, agent=agent, resource="ingress")
+    undeliverable_key = receive_undeliverable_key(POD, tenant)
+    hostile_raw = b"\xff\x00not-an-envelope"
+    real_redis.hset(registry_key, agent, "tmux")
+    real_redis.rpush(ingress_key, hostile_raw)
+    try:
+        stop_agent(
+            real_redis,
+            pod=POD,
+            tenant=tenant,
+            envelope={"payload": {"agent": agent}},
+            kill_window=lambda _agent: None,
+        )
+
+        [record_raw] = real_redis.lrange(undeliverable_key, 0, -1)
+        record = json.loads(record_raw)
+        assert record["agent"] == agent
+        assert record["reason"] == "destination retired before opening"
+        assert record["encoding"] == "hex"
+        assert bytes.fromhex(record["envelope"]) == hostile_raw
+        assert real_redis.lrange(ingress_key, 0, -1) == []
+        assert real_redis.hget(registry_key, agent) is None
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
 
 
 @patch("lib.agentlifecycle.lifecycle.log_record")
@@ -154,16 +244,17 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
     assert r.method_calls == [
         call.eval(
             ANY,
-            17,
+            18,
             prefix(POD, TENANT, resource="registry"),
             prefix(POD, TENANT, resource="lead"),
             receive_processing_key(POD, TENANT, "worker-1"),
             receive_opening_key(POD, TENANT, "worker-1"),
-            receive_opened_key(POD, TENANT, "worker-1"),
             prefix(POD, TENANT, agent="worker-1", resource="ingress"),
             prefix(POD, TENANT, agent="worker-1", resource="paused"),
             delivery_lock_key(POD, TENANT, "worker-1"),
             *_instance_config_keys(POD, TENANT, "worker-1"),
+            receive_undeliverable_key(POD, TENANT),
+            receive_unresolved_key(POD, TENANT),
             "worker-1",
         ),
     ]
@@ -285,20 +376,26 @@ def test_stop_and_rehire_cannot_open_predecessor_processing_custody(real_redis):
     opening_key = receive_opening_key(POD, tenant, agent)
     opened_key = receive_opened_key(POD, tenant, agent)
     unresolved_key = receive_unresolved_key(POD, tenant)
+    undeliverable_key = receive_undeliverable_key(POD, tenant)
     ingress_key = prefix(POD, tenant, agent=agent, resource="ingress")
     paused_key = prefix(POD, tenant, agent=agent, resource="paused")
     lock_key = delivery_lock_key(POD, tenant, agent)
-    old = build("Message", "sender", agent, {"text": "predecessor"}, pod=POD, tenant=tenant)
+    ingress = build("Message", "sender", agent, {"phase": "ingress"}, pod=POD, tenant=tenant)
+    processing = build(
+        "Message", "sender", agent, {"phase": "processing"}, pod=POD, tenant=tenant
+    )
+    opening = build("Message", "sender", agent, {"phase": "opening"}, pod=POD, tenant=tenant)
+    opened_receipt = build(
+        "Message", "sender", agent, {"phase": "opened"}, pod=POD, tenant=tenant
+    )
     new = build("Message", "sender", agent, {"text": "successor"}, pod=POD, tenant=tenant)
     real_redis.hset(registry_key, agent, "tmux")
-    real_redis.rpush(processing_key, encode(old))
-    real_redis.rpush(opening_key, encode(old))
-    real_redis.rpush(opened_key, encode(old))
-    real_redis.rpush(ingress_key, encode(old))
+    real_redis.rpush(processing_key, encode(processing))
+    real_redis.rpush(opening_key, encode(opening))
+    real_redis.rpush(opened_key, encode(opened_receipt))
+    real_redis.rpush(ingress_key, encode(ingress))
     real_redis.set(paused_key, "predecessor-paused")
     real_redis.set(lock_key, "predecessor-lock")
-    unresolved_record = json.dumps({"agent": agent, "envelope": encode(old), "reason": "unknown"})
-    real_redis.rpush(unresolved_key, unresolved_record)
     try:
         stop_agent(
             real_redis,
@@ -309,8 +406,36 @@ def test_stop_and_rehire_cannot_open_predecessor_processing_custody(real_redis):
         )
         assert real_redis.lrange(processing_key, 0, -1) == []
         assert real_redis.lrange(opening_key, 0, -1) == []
-        assert real_redis.lrange(opened_key, 0, -1) == []
         assert real_redis.lrange(ingress_key, 0, -1) == []
+        assert [
+            parse(raw)["stream_id"] for raw in real_redis.lrange(opened_key, 0, -1)
+        ] == [opened_receipt["stream_id"]]
+
+        undeliverable = [
+            json.loads(raw) for raw in real_redis.lrange(undeliverable_key, 0, -1)
+        ]
+        assert [record["agent"] for record in undeliverable] == [agent, agent]
+        assert [record["reason"] for record in undeliverable] == [
+            "destination retired before opening", "destination retired before opening"
+        ]
+        assert [
+            parse(bytes.fromhex(record["envelope"]))["stream_id"]
+            for record in undeliverable
+        ] == [
+            processing["stream_id"], ingress["stream_id"]
+        ]
+
+        unresolved = [json.loads(raw) for raw in real_redis.lrange(unresolved_key, 0, -1)]
+        assert [record["agent"] for record in unresolved] == [agent]
+        assert [record["reason"] for record in unresolved] == [
+            "opener outcome unknown when destination retired"
+        ]
+        assert [
+            parse(bytes.fromhex(record["envelope"]))["stream_id"]
+            for record in unresolved
+        ] == [
+            opening["stream_id"]
+        ]
         assert real_redis.get(paused_key) is None
         assert real_redis.get(lock_key) is None
         real_redis.hset(registry_key, agent, "tmux")
@@ -328,8 +453,11 @@ def test_stop_and_rehire_cannot_open_predecessor_processing_custody(real_redis):
         )
 
         assert [envelope["stream_id"] for envelope in opened] == [new["stream_id"]]
-        assert old["stream_id"] not in [envelope["stream_id"] for envelope in opened]
-        assert real_redis.lrange(unresolved_key, 0, -1) == [unresolved_record.encode()]
+        predecessor_ids = {
+            ingress["stream_id"], processing["stream_id"], opening["stream_id"],
+            opened_receipt["stream_id"],
+        }
+        assert predecessor_ids.isdisjoint(envelope["stream_id"] for envelope in opened)
     finally:
         keys = real_redis.keys(prefix(POD, tenant) + ":*")
         if keys:
