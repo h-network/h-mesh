@@ -38,17 +38,30 @@ Board transitions run in one isolated Lua script and preflight both Redis key
 types before mutation; `take` also checks destination emptiness before its
 first write. This keeps the one-doing-ticket invariant under concurrent
 `office take` calls and prevents WRONGTYPE from leaving a removed-only ticket.
-A malformed todo/held entry is moved without
-rewriting into the visible `invalid` list instead of being discarded or
-permanently blocking later tickets. `office hold --reason TEXT [ID]` requires
+A malformed todo/held entry is moved without rewriting into the stored
+`invalid` list instead of being discarded or permanently blocking later
+tickets; the h-mesh CLI renders that list without interpreting its contents.
+`office hold --reason TEXT [ID]` requires
 and stores the blocking reason; with an explicit ID it can park a queued ticket
 without taking it or displacing the active ticket. The one-open-task limit
 applies to `doing`, not `hold`: parked tickets remain visible in `office list`
-with their reasons and are still subject to hold-duration alerts. Use
-`office return [ID]` to put work back in `todo`; `cancel` remains a terminal,
+with their reasons and are still subject to hold-duration alerts.
+
+That visibility depends on the reader as well as the stored record. h-mesh
+stores `hold_reason` and its CLI renders it, but a reader running an older CLI
+can show the ticket's held state, title, and age without showing the reason.
+A guarantee that depends on what the reader is running is not a guarantee
+about the record. In a mixed-version office, communicate the reason through a
+channel every intended reader can consume until their CLI deployment supports
+it; otherwise the work is visibly parked but its explanation is effectively
+hidden.
+
+Use `office return [ID]` to put work back in `todo`; `cancel` remains a terminal,
 auditable state and `delete` is the explicit permanent-removal operation.
 `office done --outcome {completed,passed,failed} [ID]` requires and records the
-result, so completed review work retains its verdict in `office list`.
+result in the ticket. The h-mesh CLI renders that stored verdict in `office
+list`; an older reader can list the completed ticket without displaying its
+outcome, just as it can omit `hold_reason`.
 An interactive legacy invocation of plain `office done` prompts for that
 outcome; a non-interactive invocation fails with the exact replacement syntax.
 Already-hired agents deliberately keep their existing guides indefinitely,
