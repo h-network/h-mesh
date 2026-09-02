@@ -173,8 +173,8 @@ def test_root_help_lists_every_command_without_environment_or_redis(capsys):
 def test_send_stdin_identity_reaches_recipient_on_real_redis(monkeypatch, capsys):
     """Pin h-mesh's working boundary by what the recipient opens.
 
-    This is a negative regression for a live h-flock defect, not evidence that
-    every implementation named `office` behaves the same way. The sender's
+    This is a negative regression for a live legacy-CLI defect, not evidence
+    that every implementation named `office` behaves the same way. The sender's
     success line and byte count are deliberately insufficient assertions.
     """
     r = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"))
