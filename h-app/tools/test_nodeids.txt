@@ -70,6 +70,13 @@ h-app/tests/test_agentlifecycle.py::test_stop_agent_purges_instance_delivery_sta
 h-app/tests/test_agentlifecycle.py::test_stop_and_rehire_cannot_open_predecessor_processing_custody
 h-app/tests/test_agentlifecycle.py::test_start_agent_publishes_lead_with_membership_and_window_cause_atomically
 h-app/tests/test_agentlifecycle.py::test_start_agent_rejects_api_lead_before_mutation
+h-app/tests/test_agentlifecycle.py::test_logging_failure_does_not_replace_proven_rejection
+h-app/tests/test_agentlifecycle.py::test_hostile_payload_shape_is_proven_rejection_without_writes[None]
+h-app/tests/test_agentlifecycle.py::test_hostile_payload_shape_is_proven_rejection_without_writes[payload1]
+h-app/tests/test_agentlifecycle.py::test_hostile_payload_shape_is_proven_rejection_without_writes[agent=worker]
+h-app/tests/test_agentlifecycle.py::test_logging_failure_does_not_replace_unknown_write_outcome
+h-app/tests/test_agentlifecycle.py::test_logging_failure_does_not_replace_partial_actual_failure
+h-app/tests/test_agentlifecycle.py::test_logging_failure_does_not_replace_success
 h-app/tests/test_api.py::ApiTests::test_api_port_writes_mailbox_and_dead_letters_corrupt_input
 h-app/tests/test_api.py::ApiTests::test_auth_and_health
 h-app/tests/test_api.py::ApiTests::test_deliver_api_drops_a_peer_tmux_originated_id_toward_any_api_client
@@ -324,6 +331,7 @@ h-app/tests/test_office_cli.py::test_status_reports_unknown_with_no_activity_fee
 h-app/tests/test_office_cli.py::test_broadcast_resolves_tmux_peers_without_self
 h-app/tests/test_office_port.py::test_lifecycle_validation_failure_is_explicit_rejection
 h-app/tests/test_office_port.py::test_lifecycle_unknown_failure_is_not_misclassified_as_rejection
+h-app/tests/test_office_port.py::test_late_validation_rejection_writes_nothing_and_is_dead_letterable
 h-app/tests/test_office_port.py::test_deliver_office_registers_all_lifecycle_openers
 h-app/tests/test_office_port.py::test_start_opener_injects_catalog_and_replace_window
 h-app/tests/test_office_port.py::test_resume_opener_injects_tmux_resume_and_kick
@@ -339,6 +347,8 @@ h-app/tests/test_openshell_port.py::OpenShellPortTests::test_main_contract
 h-app/tests/test_openshell_port.py::OpenShellPortTests::test_message_executes_and_replies
 h-app/tests/test_openshell_port.py::OpenShellPortTests::test_remote_outcome_failure_is_unresolved_not_dead
 h-app/tests/test_openshell_port.py::OpenShellPortTests::test_reply_correlation_records_delivery_for_validation
+h-app/tests/test_openshell_port.py::OpenShellPortTests::test_sandbox_lookup_failure_is_proven_dead_before_submission
+h-app/tests/test_openshell_port.py::OpenShellPortTests::test_unsupported_cli_is_proven_dead_before_submission
 h-app/tests/test_paths.py::PathsTests::test_build_pane_path_deduplication_and_order
 h-app/tests/test_paths.py::PathsTests::test_build_pane_path_includes_venv_and_user_and_system_locations
 h-app/tests/test_paths.py::PathsTests::test_build_pane_path_with_prefix_env
