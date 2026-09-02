@@ -158,7 +158,10 @@ You have a task board. Nothing will notify you about it — check it yourself:
 
     {cmd} list        titles waiting for you
     {cmd} take        take the next one, and it prints in full
-    {cmd} done        when it is finished
+    {cmd} done --outcome completed
+                      when ordinary work is finished; use passed or failed
+                      for a review verdict
+    {cmd} return      put the open ticket back in todo without cancelling it
 
 Take a ticket *before* you start work, not after. `doing` is how the office
 knows what you are on.

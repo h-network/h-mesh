@@ -29,6 +29,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+
 from services.claude_statusline import install_statusline
 from services.daemons import (
     REPO_ROOT,
@@ -62,6 +63,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    # ⚠ A self-upgrade runs the code imported before ``main`` started for this
+    # entire process. ``git pull`` and an editable reinstall only affect future
+    # Python processes. A migration, cleanup, or one-time fix added here cannot
+    # run on the first upgrade that installs it; without an explicit re-exec it
+    # begins running on the second upgrade. Do not use this function as a
+    # first-transition migration hook.
     args = _build_parser().parse_args(argv)
     config = resolve_config(args)
 
