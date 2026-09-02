@@ -3143,31 +3143,36 @@ class TelegramBot:
         completed and nothing tracking it. A caller that installed a render
         passes it here and only its own is taken.
 
-        ⚠ ACCEPTED BEHAVIOUR, BY DECISION — not a limit awaiting a fix.
-        `ReplyPusher` calls this with no render handle, because a reply
-        carries no link back to the prompt that caused it: the api door mints
-        a fresh `correlation_id` per envelope and an agent's reply is its own
-        envelope, so nothing in a mailbox message says which turn it answers.
-        With two overlapping prompts to one agent, the first reply therefore
-        ends whichever render is installed — possibly the second,
+        ⚠ A LIMIT WITH A FIX IN FLIGHT — not accepted behaviour, and not
+        settled. `ReplyPusher` calls this with no render handle, because a
+        reply carries no link back to the prompt that caused it: the api door
+        mints a fresh `correlation_id` per envelope and an agent's reply is
+        its own envelope, so nothing in a mailbox message says which turn it
+        answers. With two overlapping prompts to one agent, the first reply
+        therefore ends whichever render is installed — possibly the second,
         still-running turn's. The display stops early; no state is corrupted.
 
-        api-agent considered and declined the wire change (their ticket
-        783f2634, raised from here): an optional `in_reply_to` is nearly free
-        on the wire, but nothing populates it without the agent cooperating,
-        and the only no-cooperation mechanism available — FIFO
-        oldest-delivered-first, mirroring tmux's delivery markers — assumes
-        replies come back in order, which is exactly what is false in the
-        overlapping case. It would narrow the single-turn case and leave this
-        one. A cross-module version remains architect's to route.
+        api-agent first declined a wire change and that decline has been
+        OVERTAKEN: architect put an opt-in exact-correlation option to them,
+        they specified it, and it is now being built across the tmux port,
+        `office send` and the openshell port — additive, opt-in, and
+        dependent on the replying agent passing the id back. So this docstring
+        does not get to say "by decision".
 
-        This ALSO is not only a correlation gap: it is an ordering dependency
-        between ReplyPusher's thread and the polling worker, which the chat
-        transaction excludes but does not order. Dropping the reply-triggered
-        finalize would remove the dependency at the cost of every turn's
-        display lingering until the watcher notices (up to its 300s timeout),
-        which architect ruled against: a certain cost on every turn against a
-        rare one. Pinned by
+        ⚠ When it lands, the fallback still matters and this code path stays.
+        Correlation is opt-in, so uncorrelated replies keep arriving — from
+        agents that don't pass it, from anything replying by another route —
+        and the by-key behaviour below is what serves them. The pinning test
+        becomes the fallback's test rather than something to delete.
+
+        Note also that this is an ordering dependency between ReplyPusher's
+        thread and the polling worker, which the chat transaction excludes but
+        does not order; correlation is what would let us break the dependency
+        rather than schedule around it. Dropping the reply-triggered finalize
+        would remove it too, at the cost of every turn's display lingering
+        until the watcher notices (up to its 300s timeout), which architect
+        ruled against: a certain cost on every turn against a rare one. Pinned
+        by
         test_an_overlapping_reply_finalizes_the_wrong_turns_render.
         """
         cid = str(chat_id)

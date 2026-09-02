@@ -4179,16 +4179,16 @@ def test_a_handler_that_raises_does_not_kill_the_chat_worker():
 
 
 def test_an_overlapping_reply_finalizes_the_wrong_turns_render():
-    """⚠ Pins ACCEPTED BEHAVIOUR, not correct behaviour, and the difference
-    is a decision rather than a hope. ReplyPusher has no render handle because
-    a reply carries no link back to its prompt: the api mints a fresh
-    correlation_id per envelope and an agent's reply is its own envelope. With
-    two overlapping prompts to one agent, the first reply ends whichever
-    render is installed. api-agent declined the wire change (783f2634) --
-    nothing populates an in_reply_to without agent cooperation, and the
-    no-cooperation fallback assumes in-order replies, which is exactly false
-    here. This test exists so the behaviour is deliberate and would be
-    noticed if a cross-module correlation change ever lands."""
+    """⚠ Pins a LIMIT WITH A FIX IN FLIGHT, not correct behaviour and not an
+    accepted decision -- api-agent's original decline was overtaken by an
+    opt-in exact-correlation change they are now building. ReplyPusher has no
+    render handle because a reply carries no link back to its prompt: the api
+    mints a fresh correlation_id per envelope and an agent's reply is its own
+    envelope. With two overlapping prompts to one agent, the first reply ends
+    whichever render is installed. ⚠ Do NOT delete this test when correlation
+    lands: it is opt-in and depends on the replying agent passing the id back,
+    so uncorrelated replies keep arriving and this becomes the test for that
+    fallback path."""
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         key = "12345:architect"
