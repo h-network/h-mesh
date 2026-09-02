@@ -2843,7 +2843,11 @@ class TelegramBot:
             logger.info(f"hire submit: chat={cid} agent={name} status={code}")
             if code == 202:
                 extras = ", ".join(f"{k} {v}" for k, v in (("profile", profile), ("provider", provider)) if v)
-                reply = f"✅ Hire accepted for {name}" + (f" ({extras})" if extras else "") + " · window and CLI follow shortly."
+                reply = (
+                    f"⏳ Hire request admitted for {name}"
+                    + (f" ({extras})" if extras else "")
+                    + " · agent creation is not yet confirmed."
+                )
                 # A fresh name is the one thing here worth handing back
                 # verbatim -- to @mention it, or type it into another chat --
                 # without retyping it by hand.

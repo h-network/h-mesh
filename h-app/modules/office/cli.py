@@ -554,6 +554,18 @@ redis.call('RPUSH', KEYS[2], ARGV[2])
 return {1, 'ok'}
 """
 
+_ATOMIC_REWRITE = """
+-- office atomic task rewrite v1
+local entries = redis.call('LRANGE', KEYS[1], 0, -1)
+for index, value in ipairs(entries) do
+    if value == ARGV[1] then
+        redis.call('LSET', KEYS[1], index - 1, ARGV[2])
+        return 1
+    end
+end
+return 0
+"""
+
 def _quarantine_invalid(r, *, source_key: str, invalid_key: str, raw) -> None:
     """Atomically preserve an unreadable entry off the actionable queues."""
     _transition_selected(
@@ -602,6 +614,75 @@ def _transition_selected(
     if reason == "busy":
         raise OfficeError("you already have one open task")
     raise OfficeError("task changed while the command was running; try again")
+
+
+def _rewrite_selected(r, *, key: str, raw, replacement) -> None:
+    """Atomically rewrite one exact list entry without changing its position."""
+    if not r.eval(_ATOMIC_REWRITE, 1, key, raw, replacement):
+        raise OfficeError("task changed while the command was running; try again")
+
+
+def _replace_top_level_title(raw, title: str):
+    """Replace exactly one top-level title token, preserving every other byte."""
+    was_bytes = isinstance(raw, bytes)
+    text = raw.decode() if was_bytes else raw
+    decoder = json.JSONDecoder()
+
+    def skip_space(position: int) -> int:
+        while position < len(text) and text[position].isspace():
+            position += 1
+        return position
+
+    position = skip_space(0)
+    if position >= len(text) or text[position] != "{":
+        raise OfficeError("stored ticket is not a JSON object")
+    position += 1
+    title_spans = []
+    while True:
+        position = skip_space(position)
+        if position < len(text) and text[position] == "}":
+            position += 1
+            break
+        try:
+            key, position = decoder.raw_decode(text, position)
+        except json.JSONDecodeError as exc:
+            raise OfficeError("cannot safely locate stored ticket title") from exc
+        if not isinstance(key, str):
+            raise OfficeError("cannot safely locate stored ticket title")
+        position = skip_space(position)
+        if position >= len(text) or text[position] != ":":
+            raise OfficeError("cannot safely locate stored ticket title")
+        value_start = skip_space(position + 1)
+        try:
+            value, value_end = decoder.raw_decode(text, value_start)
+        except json.JSONDecodeError as exc:
+            raise OfficeError("cannot safely locate stored ticket title") from exc
+        if key == "title":
+            title_spans.append((value_start, value_end, value))
+        position = skip_space(value_end)
+        if position < len(text) and text[position] == ",":
+            position += 1
+            continue
+        if position < len(text) and text[position] == "}":
+            position += 1
+            break
+        raise OfficeError("cannot safely locate stored ticket title")
+
+    if skip_space(position) != len(text) or len(title_spans) != 1:
+        raise OfficeError("stored ticket must contain exactly one top-level title")
+    value_start, value_end, old_title = title_spans[0]
+    if not isinstance(old_title, str):
+        raise OfficeError("stored ticket title is not text")
+    replacement_token = json.dumps(title, ensure_ascii=False)
+    rewritten = text[:value_start] + replacement_token + text[value_end:]
+
+    expected = json.loads(text)
+    expected["title"] = title
+    if json.loads(rewritten) != expected:
+        # Refusal is the safety behavior. Never fall back to re-serializing a
+        # document whose one-field edit could not be proved.
+        raise OfficeError("could not verify title-only ticket rewrite")
+    return rewritten.encode() if was_bytes else rewritten
 
 
 def _entries(r, keys: dict[str, str], states: Sequence[str]):
@@ -856,6 +937,56 @@ def _return_command(argv: list[str]) -> None:
     print(serialize_ticket(ticket))
 
 
+def _show_command(argv: list[str]) -> None:
+    parser = _operation_parser("show", "Read one ticket without changing its board state.")
+    parser.add_argument("id", help="ticket id or unique prefix")
+    parser.add_argument("-a", "--agent", metavar="AGENT", help="board owner (default: you)")
+    args = parser.parse_args(argv)
+    r, pod, tenant, source = _context()
+    agent = args.agent or source
+    if agent != source and not is_member(r, pod=pod, tenant=tenant, agent=agent):
+        raise OfficeError(f"unknown board owner {agent!r}")
+    keys = _task_keys(pod, tenant, agent)
+    _, raw, _ = _select(r, keys, ("todo", "doing", "hold", "done"), args.id)
+    print(raw.decode() if isinstance(raw, bytes) else raw)
+
+
+def _retitle_command(argv: list[str]) -> None:
+    parser = _operation_parser("retitle", "Correct the title of your open task.")
+    parser.add_argument("id", nargs="?", help="ticket id or unique prefix")
+    parser.add_argument("--title", required=True, help="replacement title")
+    args = parser.parse_args(argv)
+    title = args.title.strip()
+    if not title:
+        raise OfficeError("replacement title cannot be empty")
+    r, pod, tenant, source = _context()
+    keys = _task_keys(pod, tenant, source)
+    state, raw, normalized = _select(r, keys, ("todo", "doing", "hold"), args.id)
+    # A targeted edit owns exactly one field. Unknown extensions and legacy
+    # spellings are preservation obligations, not migration opportunities, so
+    # rewrite the original object rather than normalize_ticket's projection.
+    old_title = normalized["title"]
+    replacement = _replace_top_level_title(raw, title)
+    _rewrite_selected(r, key=keys[state], raw=raw, replacement=replacement)
+    record_task_event(
+        "retitle",
+        id=normalized["id"],
+        title=title,
+        old_title=old_title,
+        agent=source,
+        actor=source,
+    )
+    log_record(
+        "office",
+        "task_retitled",
+        destination=source,
+        task_id=normalized["id"],
+        title=title,
+        old_title=old_title,
+    )
+    print(replacement.decode() if isinstance(replacement, bytes) else replacement)
+
+
 def _hold_command(argv: list[str]) -> None:
     parser = _operation_parser("hold", "Put your open task on hold.")
     parser.add_argument("id", nargs="?", help="ticket id or unique prefix")
@@ -908,12 +1039,28 @@ def _add_command(argv: list[str]) -> None:
     r, pod, tenant, source = _context()
     if not is_member(r, pod=pod, tenant=tenant, agent=args.agent):
         raise OfficeError(f"unknown destination agent {args.agent!r}")
-    payload = {"title": args.title, "description": args.description, "priority": args.priority}
+    # Allocate the established 32-lowercase-hex identity locally. This state is
+    # ALLOCATED; send returning below advances the envelope to ADMITTED, while
+    # only downstream custody can prove the board ticket was CREATED.
+    ticket_id = os.urandom(16).hex()
+    payload = {
+        "v": 1,
+        "id": ticket_id,
+        "title": args.title,
+        "description": args.description,
+        "created_by": source,
+        "status": "todo",
+        "created_ts": _now(),
+        "started_ts": None,
+        "done_ts": None,
+        "held_ts": None,
+        "priority": args.priority,
+    }
     if args.related:
         related = list(dict.fromkeys(value.strip() for value in args.related.split(",") if value.strip()))
         if related:
             payload["related"] = related
-    stream_id = send(
+    send(
         r,
         pod=pod,
         tenant=tenant,
@@ -923,7 +1070,7 @@ def _add_command(argv: list[str]) -> None:
         kind="AddTicket",
         module="office",
     )
-    print(stream_id)
+    print(ticket_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1229,6 +1376,8 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("done",), "finish your open task and record its outcome", _done_command),
     (("cancel",), "cancel your open task", _cancel_command),
     (("return",), "return your open task to todo", _return_command),
+    (("show",), "read one ticket without changing it", _show_command),
+    (("retitle",), "correct the title of your open task", _retitle_command),
     (("hold",), "put your open task on hold", _hold_command),
     (("delete",), "permanently remove a task", _delete_command),
     (("add",), "add a task to another agent's board", _add_command),
