@@ -16,6 +16,16 @@ Report both the collection count and the pass count. Do not substitute
 `pytest tests/`, `unittest discover`, or another explicit subtree; those
 commands collect less than the complete suite.
 
+The runner binds the suite to the h-mesh tree containing the directory from
+which it was invoked. On every run it prints that tree, the resolved runner
+module, and the directory handed to pytest. Quote those paths with the counts
+when reporting suite evidence. If an installed `tools.run_tests` resolves from
+a different clone than the invoking tree (for example, in a worktree using the
+main clone's editable environment), the runner exits non-zero before collection
+instead of silently testing the installed clone. Run it with an environment
+installed from the tree being verified; do not treat that refusal as a reason
+to fall back to a narrower pytest command.
+
 ## Required repository rule
 
 The stronger enforcement is an organization or enterprise ruleset targeting

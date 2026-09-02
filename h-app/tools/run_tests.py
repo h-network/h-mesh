@@ -9,14 +9,53 @@ import sys
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_MINIMUM_TEST_COUNT = 660
+RUNNER_PATH = Path(__file__).resolve()
+EXPECTED_MINIMUM_TEST_COUNT = 759
+
+
+def _find_invoked_tree(start: Path) -> Path | None:
+    """Return the repository containing the caller's cwd, if it is h-mesh."""
+    resolved = start.resolve()
+    for candidate in (resolved, *resolved.parents):
+        if (
+            (candidate / "pyproject.toml").is_file()
+            and (candidate / "h-app" / "tools" / "run_tests.py").is_file()
+        ):
+            return candidate
+    return None
+
+
+def _print_provenance(tree: Path | None) -> None:
+    rendered_tree = str(tree) if tree is not None else "<unresolved>"
+    print(f"test tree: {rendered_tree}", flush=True)
+    print(f"runner module: {RUNNER_PATH}", flush=True)
+    print(f"pytest cwd: {rendered_tree}", flush=True)
 
 
 def main() -> int:
+    repo_root = _find_invoked_tree(Path.cwd())
+    _print_provenance(repo_root)
+    if repo_root is None:
+        print(
+            "error: the invoking cwd is not inside an h-mesh repository; "
+            "refusing to guess which tree to test",
+            file=sys.stderr,
+        )
+        return 1
+
+    expected_runner = (repo_root / "h-app" / "tools" / "run_tests.py").resolve()
+    if RUNNER_PATH != expected_runner:
+        print(
+            "error: the imported test runner does not belong to the invoking tree; "
+            "refusing to report a suite result\n"
+            f"invoking tree runner: {expected_runner}",
+            file=sys.stderr,
+        )
+        return 1
+
     collect = subprocess.run(
         [sys.executable, "-m", "pytest", "--collect-only", "-q"],
-        cwd=REPO_ROOT,
+        cwd=repo_root,
         capture_output=True,
         text=True,
     )
@@ -45,7 +84,7 @@ def main() -> int:
     print(f"collection invariant satisfied: {collected} tests")
     return subprocess.call(
         [sys.executable, "-m", "pytest", *sys.argv[1:]],
-        cwd=REPO_ROOT,
+        cwd=repo_root,
     )
 
 
