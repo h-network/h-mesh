@@ -4247,3 +4247,23 @@ def test_a_stale_read_is_still_accepted_and_the_docs_say_so():
             bot_instance.pending[12345] = {**stale, "stage": "profile"}
 
         assert bot_instance.pending.get("12345")["stage"] == "profile"
+
+
+def test_nested_state_is_frozen_too():
+    """Shallow freezing would be the same hole one level down: a nested dict
+    left mutable takes an untracked write exactly as the top level used to."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending[12345] = {"flow": "hire", "args": {"stage": "name"}}
+
+        state = bot_instance.pending.get("12345")
+        with pytest.raises(bot.ChatTransactionError):
+            state["args"]["stage"] = "provider"
+        assert bot_instance.pending.get("12345")["args"]["stage"] == "name"
+        # objects that carry their own thread-safety are passed through, not frozen
+        event = threading.Event()
+        with bot_instance.chat_txn(777):
+            bot_instance.pane_watches[777] = {"agent": "sme-2", "stop_event": event}
+        bot_instance.pane_watches.get("777")["stop_event"].set()
+        assert event.is_set()

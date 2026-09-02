@@ -1137,7 +1137,25 @@ class ChatWorker:
 
     A handler that raises is logged and the worker continues. Before this,
     each update owned a bare thread, so an exception killed that thread
-    silently and the operator saw nothing at all.
+    silently and the operator saw nothing at all. `BaseException` is
+    deliberately not caught: KeyboardInterrupt and SystemExit are the process
+    ending, and a worker that swallowed them would keep a dying bot alive.
+
+    ⚠ LIFECYCLE. Workers are created on a chat's first update and never
+    stopped. They are daemon threads, so the process exits without joining
+    them; there is no shutdown handshake because there is nothing to flush —
+    an update half-handled at exit was going to be lost either way, and
+    Telegram redelivers anything not acknowledged by the cursor. The map of
+    workers is bounded in practice by the chats the bot answers, which
+    `_chat_allowed` already restricts to one.
+
+    ⚠ BACKPRESSURE. The queue is unbounded ON PURPOSE. The alternatives are
+    dropping an operator's message (silent data loss, the failure this whole
+    branch exists to stop) or blocking the polling loop (which freezes every
+    chat, the failure that put updates on their own threads in the first
+    place). Growth is bounded by how fast one operator can type; a chat stuck
+    behind a slow call announces itself at BACKLOG_WARN queued updates rather
+    than growing quietly.
     """
 
     BACKLOG_WARN = 20
@@ -1197,8 +1215,16 @@ class FrozenChatState(Mapping):
 
     __slots__ = ("_data",)
 
-    def __init__(self, data: dict):
-        object.__setattr__(self, "_data", dict(data))
+    def __init__(self, data):
+        # ⚠ Deep, not shallow. A nested dict left mutable would be the same
+        # hole one level down: `state["flow_args"]["stage"] = ...` bypasses the
+        # guard exactly as `state["stage"] = ...` used to. Non-dict values
+        # (renders, Events, Threads) are passed through untouched — they are
+        # objects with their own thread-safety story, not state this class can
+        # or should freeze.
+        object.__setattr__(
+            self, "_data", {k: _frozen(v) for k, v in dict(data).items()}
+        )
 
     def __getitem__(self, key):
         return self._data[key]
