@@ -16,6 +16,66 @@ Report both the collection count and the pass count. Do not substitute
 `pytest tests/`, `unittest discover`, or another explicit subtree; those
 commands collect less than the complete suite.
 
+The complete-suite runner accepts no additional pytest arguments. Paths,
+selectors, verbosity flags, and configuration overrides are all refused because
+the harness must collect and execute one identical, reviewed node set. Use bare
+pytest directly for focused development runs, then use the argument-free command
+above for merge evidence.
+
+The reviewed node set is checked in at `h-app/tools/test_nodeids.txt`. A plugin
+inside the pytest process compares its selected items to that manifest before
+the first test runs, then records actual runtest reports. It issues the suite
+attestation only after every expected node has reached a terminal test outcome.
+The outer runner returns success and issues its public certificate only after
+pytest exits zero and the nonce-bound attestation matches that invocation and
+manifest. A zero exit with an absent, partial, stale, or mismatched attestation
+is a failure. Selection alone and absence of a reported error are not execution
+evidence.
+
+The evidence is the pair of runner exit status zero **and** its post-validation
+certificate line. Pytest and the tests share stdout with the runner, so child
+code can print identical text; line presence alone is never evidence. Every
+human verifier, script, and CI job consuming this result must check the runner
+process's exit status. Grepping stdout for the certificate sentence is not
+verification. An unenumerated termination that prevents the outer runner from
+completing its check cannot produce the success pair, although the harness does
+not diagnose why the process ended.
+
+The runner removes external `PYTEST_ADDOPTS` and `PYTEST_PLUGINS`, disables
+ambient plugin autoloading, overrides repository `addopts`, and rejects parsed
+zero-runtest modes. This prevents a collect-only or setup-only invocation from
+being reported as a successful suite.
+
+Any test addition, removal, or rename makes the harness fail with separately
+labeled `added` and `missing` node IDs. `missing` means a previously reviewed
+test would not execute; `added` means a new or renamed test has not yet been
+accounted for in the manifest. Regenerating the file mechanically clears the
+mismatch whether or not anyone reviewed it. The team procedure is therefore to
+explain every missing and added entry in independent review, then regenerate the
+manifest from the repository root and review its diff before running the
+harness again:
+
+```bash
+PYTHONPATH=h-app python -m pytest --collect-only -q \
+  | sed -n '/^h-app\/.*::/p' > h-app/tools/test_nodeids.txt
+```
+
+The harness makes node-set drift visible; it cannot prove that a branch author
+reviewed or honestly accounted for a regenerated manifest. In this repository,
+independent review of the manifest diff is a procedural trust boundary because
+there is no protected review or signing mechanism that the branch author cannot
+also change.
+
+The runner binds the suite to the h-mesh tree containing the directory from
+which it was invoked. On every run it prints that tree, the resolved runner
+module, and the directory handed to pytest. Quote those paths with the counts
+when reporting suite evidence. If an installed `tools.run_tests` resolves from
+a different clone than the invoking tree (for example, in a worktree using the
+main clone's editable environment), the runner exits non-zero before collection
+instead of silently testing the installed clone. Run it with an environment
+installed from the tree being verified; do not treat that refusal as a reason
+to fall back to a narrower pytest command.
+
 ## There is no enforced merge gate, and that is deliberate
 
 Nothing in the repository prevents a change from reaching `main` without
@@ -79,20 +139,11 @@ What gates a merge here today is procedural, not mechanical:
    evidence about the change; only a full run on the merge result is evidence
    about the suite.
 
-   ⚠ State which tree the run was in. `python -m tools.run_tests` resolves its
-   repository root from the *resolved module's* path, not from your working
-   directory. So invoking it from a git worktree or a second checkout **can**
-   run the suite against a different clone while you stand in the branch,
-   exiting 0 with a believable count. Whether it does depends on how import
-   resolution lands: a clone with its own editable install or `PYTHONPATH` is
-   unaffected. Do not reason about which case you are in — check:
-
-   ```bash
-   python -c "import tools.run_tests as m; print(m.REPO_ROOT)"
-   ```
-
-   The path it prints is the tree that will be tested. If it is not the tree
-   you meant, the number you get is about something else.
+   ⚠ State which tree the run was in. `python -m tools.run_tests` prints the
+   invoking repository tree, the resolved runner module, and the cwd handed to
+   pytest on every run. If the runner module belongs to a different checkout,
+   it refuses with a non-zero exit before collection rather than producing a
+   believable pass number about the wrong tree.
 
 Both steps are human discipline and can be skipped by anyone who decides to
 skip them. That is the honest cost of not having a mechanical gate, and it
