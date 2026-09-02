@@ -849,6 +849,22 @@ except DaemonError as exc:
     # 7. Hire any agent from the wizard's roster that isn't already running.
     # Only runs at all if a roster was ever persisted -- a flags-only host
     # that never used the wizard keeps today's behavior: hire manually.
+    #
+    # ⚠ HIRE_HAD_ERROR/HIRE_ERROR_SUMMARY, checked after this whole section
+    # (including the no-roster branch below and the "attach to tmux" lines)
+    # -- an honest per-agent dispatch is worthless if the script's own exit
+    # code still says success. Reviewer FAILED an earlier version of this
+    # branch for exactly that: every "•" line below could say "hire setup
+    # error" or "hire failed" and the script still exited 0, so an
+    # unattended caller (CI, an installer) saw a clean setup while a
+    # requested roster hire was never admitted. A proven rejection (exit 1)
+    # counts as an error here too, not just an unenumerated exit -- the
+    # operator asked for a roster and did not get it, and that must be
+    # detectable without parsing stderr (architect's explicit call: prefer
+    # a human occasionally re-running a setup that mostly worked over CI
+    # recording a partial roster as success).
+    HIRE_HAD_ERROR=0
+    HIRE_ERROR_SUMMARY=()
     ROSTER_CSV="$("$PYTHON" -m services.tenant_config get "$TENANT" AGENTS "")"
     if [ -n "$ROSTER_CSV" ]; then
         echo "Hiring agents from the roster (skipping any already running)..."
@@ -875,14 +891,55 @@ print("1" if pt == "tmux" else "0")
             EP_FOR_A=""
             for pair in ${PROVIDER_MAP_EXISTING//,/ }; do [ "${pair%%=*}" = "$a" ] && EP_FOR_A="${pair#*=}"; done
 
-            HIRE_ARGS=("$a" --cli "$CLI_FOR_A")
+            # ⚠ --wait, not a bare exit-code check -- hire's own exit 0
+            # without it only proves the StartAgent envelope was durably
+            # enqueued (ADMITTED), not that the agent actually registered
+            # (CREATED). Printing "hired" off that alone told an operator
+            # their office came up when it knew only that a request was
+            # accepted -- a real incident, in this exact summary.
+            #
+            # ⚠ --wait can only prove a real rejection (exit 1) or time out
+            # (exit 2) -- it cannot currently prove success, for a brand-new
+            # agent or a re-hire of an existing one alike (see
+            # modules/office/cli.py's own --wait help text for why: no
+            # signal anywhere ties a *successful* StartAgent back to the
+            # specific request that caused it, so confirming one would risk
+            # the exact same lie this fixed -- ticket ff53e7e9 tracks the
+            # real fix).
+            #
+            # ⚠ Every status handled EXPLICITLY, none folded into a soft
+            # "probably fine" default -- reviewer FAILED an earlier version
+            # of this block for exactly that: `if status==1 then failed
+            # else requested` treated any OTHER exit (a parse failure, a
+            # launcher error, a signal death, an exit code this script has
+            # never seen) as if the request had at least been sent, which
+            # is the same false-positive shape this whole branch exists to
+            # remove, rebuilt one layer out in the wrapper that reads the
+            # CLI's own honest exit code. An unenumerated status means "I
+            # do not know what happened", never "probably fine".
+            HIRE_ARGS=("$a" --cli "$CLI_FOR_A" --wait)
             [ "$PROF_FOR_A" != "default" ] && HIRE_ARGS+=(--profile "$PROF_FOR_A")
             [ -n "$EP_FOR_A" ] && HIRE_ARGS+=(--provider "$EP_FOR_A")
-            if AGENT_NAME=host POD="$POD" TENANT="$TENANT" REDIS_URL="$REDIS_URL" \
-                "$PYTHON" -m modules.office.cli hire "${HIRE_ARGS[@]}" >/dev/null; then
+            HIRE_OUTPUT="$(AGENT_NAME=host POD="$POD" TENANT="$TENANT" REDIS_URL="$REDIS_URL" \
+                "$PYTHON" -m modules.office.cli hire "${HIRE_ARGS[@]}" 2>&1)"
+            HIRE_STATUS=$?
+            if [ "$HIRE_STATUS" -eq 1 ]; then
+                echo "  • $a: hire failed -- $HIRE_OUTPUT" >&2
+                HIRE_HAD_ERROR=1
+                HIRE_ERROR_SUMMARY+=("$a: hire failed (rejected -- see the line above for detail)")
+            elif [ "$HIRE_STATUS" -eq 2 ]; then
+                echo "  • $a: requested ($CLI_FOR_A${PROF_FOR_A:+, account=$PROF_FOR_A}${EP_FOR_A:+, provider=$EP_FOR_A}) -- no rejection seen; run 'office status' if you want to confirm it came up"
+            elif [ "$HIRE_STATUS" -eq 0 ]; then
+                # Not currently reachable via --wait (see modules/office/
+                # cli.py's own contract) -- kept as its own explicit case,
+                # not folded into the error branch below, so a future
+                # attributable-success signal can land here without this
+                # dispatch silently mis-routing it.
                 echo "  • $a: hired ($CLI_FOR_A${PROF_FOR_A:+, account=$PROF_FOR_A}${EP_FOR_A:+, provider=$EP_FOR_A})"
             else
-                echo "  • $a: hire failed -- check switch.log/tmux_reconciler.log" >&2
+                echo "  • $a: hire setup error (unexpected exit $HIRE_STATUS, not admitted or rejected -- treat as not sent) -- $HIRE_OUTPUT" >&2
+                HIRE_HAD_ERROR=1
+                HIRE_ERROR_SUMMARY+=("$a: hire setup error (unexpected exit $HIRE_STATUS -- see the line above for detail)")
             fi
         done
         echo
@@ -895,4 +952,21 @@ print("1" if pt == "tmux" else "0")
 
     echo "To attach to the tmux session:"
     echo "  TMUX_TMPDIR=$TMUX_TMPDIR tmux attach -t $TMUX_SESSION"
+
+    # ⚠ Checked last, after every summary and instruction above has already
+    # printed -- the roster loop never aborts early on an individual
+    # failure (a later agent's hire is still attempted), but the script's
+    # OWN exit code must not say success when the roster it was asked to
+    # produce is incomplete. See the HIRE_HAD_ERROR comment above the
+    # roster loop for why both a proven rejection and an unenumerated exit
+    # count here.
+    if [ "$HIRE_HAD_ERROR" -eq 1 ]; then
+        echo >&2
+        echo "One or more roster hires did not succeed:" >&2
+        for line in "${HIRE_ERROR_SUMMARY[@]}"; do
+            echo "  • $line" >&2
+        done
+        echo "Re-run setup.sh, or hire the missing agent(s) manually, once you've resolved the cause above." >&2
+        exit 1
+    fi
 fi

@@ -12,12 +12,14 @@ agentlifecycle itself, the same separation `office/cli.py` and
 import argparse
 import base64
 import json
+import math
 import mimetypes
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +27,7 @@ from pathlib import Path
 import redis
 
 from core.channels import send
+from core.envelope import EnvelopeError, parse
 from core.keys import prefix
 from core.logging import log_record, record_task_event
 from core.registry import is_member, members, port_type
@@ -450,6 +453,33 @@ def _now() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _wait_seconds(raw: str) -> float:
+    """argparse type= for --wait -- rejects anything that would break the
+    bounded-wait contract, before parse_args() returns and long before any
+    send() call.
+
+    ⚠ Bare `float()` accepts "nan"/"inf"/"-inf" without complaint. NaN is
+    the dangerous one: every comparison against NaN is False, so `remaining
+    <= 0` in _await_hire_confirmation's poll loop never becomes true and
+    `min(POLL_INTERVAL, nan)` returns POLL_INTERVAL unchanged -- the loop
+    polls forever and the exit-2 "unknown" outcome the whole three-state
+    design exists to guarantee never fires. +inf is a real, finite-looking
+    value that is unbounded by definition, contradicting "wait up to
+    SECONDS". A negative value would make the deadline already-past,
+    returning "unknown" immediately with a nonsensical negative duration in
+    the message. All four are rejected here, not handled downstream.
+    """
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid SECONDS value: {raw!r}") from exc
+    if math.isnan(value) or math.isinf(value) or value < 0:
+        raise argparse.ArgumentTypeError(
+            f"--wait SECONDS must be a finite, non-negative number, got {raw!r}"
+        )
+    return value
+
+
 def _lifecycle_command(command: str, argv: list[str]) -> None:
     descriptions = {
         "hire": "Enrol a new agent.",
@@ -505,6 +535,46 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
             help="claude's --tools list, space-separated (default: Bash Read Write Edit "
                  "Glob Grep); '' means unrestricted. claude only, ignored by codex/agy",
         )
+        # ⚠ Opt-in, not the default -- a StartAgent envelope is fire-and-forget
+        # by design (see core.channels.send's own docstring), and a caller that
+        # wants that stays fire-and-forget. This exists because printing the
+        # word "hired" off nothing but this command's exit code is ADMITTED
+        # (the envelope was durably enqueued) reported as CREATED (the agent
+        # actually exists) -- exactly the shape of a real incident where an
+        # operator was told an agent existed when it did not.
+        #
+        # ⚠ Cannot currently report success, only the ABSENCE of a proven
+        # failure -- read this before scripting against exit 0. "hire" is
+        # really two operations sharing one name: identity creation (a
+        # genuinely new agent, where CREATED could in principle be
+        # observed once an attributable signal exists) and idempotent
+        # re-hire/reconfiguration of an agent that already exists (where
+        # bare registry membership says NOTHING about whether THIS
+        # request did anything -- no amount of polling membership will
+        # ever be conclusive for it, even in principle, since a
+        # different, unrelated request for the same agent name is
+        # observationally identical). Nothing in this codebase today
+        # writes a signal tying a *successful* StartAgent back to the
+        # specific stream_id that caused it, for either case -- so
+        # neither can be safely confirmed, only proven failed or left
+        # unknown. See ticket ff53e7e9 for the attributable-completion
+        # signal (success AND failure, keyed by stream_id, covering both
+        # operations) this would need to safely report a real success.
+        parser.add_argument(
+            "--wait", nargs="?", const=30.0, type=_wait_seconds, default=None, metavar="SECONDS",
+            help="wait up to SECONDS (default 30) and report what can be proven about "
+                 "this request, instead of returning as soon as it's merely accepted. "
+                 "Two outcomes today, not three: exit 1 = failed (a real, stream_id-"
+                 "matched rejection, seen in the destination's dead-letter list); "
+                 "exit 2 = unknown -- no proof of failure within SECONDS. Exit 0 is "
+                 "NOT currently reachable: bare registry membership cannot be "
+                 "attributed to this specific request under concurrency (a different "
+                 "request for the same agent name could be the one that actually "
+                 "registered it, or already had), so this never claims success -- "
+                 "only the absence of a proven failure. A timeout is not a failure: "
+                 "a stranded request can still complete later once switch recovery "
+                 "re-kicks it (see switch-agent's drain/recovery fix).",
+        )
     args = parser.parse_args(argv)
     r, pod, tenant, source = _context()
     # ⚠ No client-side --profile validation here. `available_profiles()` (an
@@ -543,7 +613,93 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
         kind=kinds[command],
         module="office",
     )
+    if command == "hire" and args.wait is not None:
+        outcome, detail = _await_hire_confirmation(
+            r, pod=pod, tenant=tenant, stream_id=stream_id, timeout=args.wait,
+        )
+        if outcome == "failed":
+            print(f"failed: {args.agent} was not registered -- {detail}", file=sys.stderr)
+            raise SystemExit(1)
+        print(
+            f"unknown: no proof of failure for {args.agent} within {args.wait:.0f}s -- "
+            "this does NOT mean it failed, it may well have succeeded; there is "
+            "currently no way to prove success for this request, only to disprove "
+            "it. Check 'office status' or the registry directly if you want to "
+            "look for yourself.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     print(stream_id)
+
+
+_HIRE_CONFIRMATION_POLL_INTERVAL_S = 0.5
+
+
+def _await_hire_confirmation(
+    r, *, pod: str, tenant: str, stream_id: str, timeout: float,
+) -> tuple[str, str | None]:
+    """Poll for the only outcome this can currently prove: a real,
+    stream_id-matched rejection. Deliberately does NOT check registry
+    membership as evidence of success, in any case -- not even a
+    genuinely-first-ever hire of a brand-new agent name.
+
+    An earlier version of this function DID check bare registry
+    port_type()=="tmux" as confirmation once the target had never been
+    seen before, reasoning that "absent, then tmux" was unambiguous since
+    nothing else could cause that transition. Reviewer FAILED that
+    version too: it is not unambiguous under concurrency. A DIFFERENT,
+    unrelated StartAgent for the same agent name -- already queued, or
+    racing in around the same time -- can register the agent while THIS
+    request is independently rejected, with its dead-letter simply not
+    landed yet by the time of an early poll. Both worlds -- "this request
+    succeeded" and "a different request succeeded while this one failed"
+    -- look identical from here: no dead-letter match (yet) and
+    port_type()=="tmux". An earlier attempt to fix this by requiring the
+    agent to have been absent at a pre-send baseline (this function's own
+    previous revision) does not close it either: another same-name hire
+    can already be sitting in ingress, unprocessed, when that baseline is
+    read -- the baseline sees absence, this request is enqueued behind
+    the other one, the other one registers the agent, this one is
+    rejected, and the poll still observes tmux before the rejection lands.
+
+    "hire" is really two operations sharing one name and this one --wait
+    flag: identity creation (a genuinely new agent -- CREATED could in
+    principle be observed once an attributable signal exists) and
+    idempotent re-hire/reconfiguration of an agent that already exists
+    (where bare membership can never be conclusive, even in principle,
+    since a different request is observationally identical). Neither
+    currently has a success signal keyed by stream_id anywhere in this
+    codebase, so neither can be safely confirmed -- only proven failed,
+    or left honestly unknown. See ticket ff53e7e9 for the real fix shape:
+    stream-id-attributable lifecycle completion, covering explicit
+    idempotent-success and reconfiguration-success signals, not just a
+    reordered or better-gated registry check.
+
+    ⚠ Read-only against the dead-letter list (LRANGE, never pop) -- popping
+    it here would consume evidence a human or another tool still needs to
+    see, for a check this command has no ownership over.
+
+    ⚠ Only the destination ("host") ever dead-letters a StartAgent it
+    itself rejected -- the tmux-source-only feedback path
+    (_notify_dead_letter_sender in core.channels) never reaches a caller
+    like this one (source is usually "host" itself, not a tmux agent), so
+    this reads the recipient's dead list directly instead of waiting for a
+    reply message that would never arrive.
+    """
+    dead_key = prefix(pod, tenant, agent="host", resource="dead")
+    deadline = time.monotonic() + timeout
+    while True:
+        for raw in r.lrange(dead_key, 0, -1):
+            try:
+                envelope = parse(raw)
+            except EnvelopeError:
+                continue
+            if envelope.get("stream_id") == stream_id:
+                return "failed", "rejected by host -- see host's activity log for the reason"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "unknown", None
+        time.sleep(min(_HIRE_CONFIRMATION_POLL_INTERVAL_S, remaining))
 
 
 # ---------------------------------------------------------------------------
