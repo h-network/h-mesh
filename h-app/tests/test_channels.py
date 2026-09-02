@@ -27,6 +27,7 @@ class FakeRedis:
         self.lists = defaultdict(deque)
         self.hashes = defaultdict(dict)
         self.hget_calls = []
+        self.hgetall_calls = []
         self.hexists_calls = []
 
     def rpush(self, key, *values):
@@ -51,6 +52,10 @@ class FakeRedis:
     def hget(self, key, field):
         self.hget_calls.append((key, field))
         return self.hashes[key].get(field)
+
+    def hgetall(self, key):
+        self.hgetall_calls.append(key)
+        return dict(self.hashes[key])
 
     def hdel(self, key, field):
         return int(self.hashes[key].pop(field, None) is not None)
@@ -240,7 +245,7 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(opened[0]["ttl"], 15)
         self.assertEqual(opened[0]["hops"], 1)
 
-    def test_broadcast_keeps_membership_only_kick_path(self):
+    def test_broadcast_resolves_each_member_type_and_kicks_all(self):
         self.register(alice="tmux", bob="tmux", carol="api")
         stream_id = send(
             self.redis, pod=POD, tenant=TENANT, source="alice",
@@ -256,11 +261,46 @@ class ChannelTests(unittest.TestCase):
         )
         with patch("core.service._emit_observation"), patch("core.service._log_observation") as log:
             self.assertTrue(switch.step(timeout=0))
-        self.assertEqual(kicks, [])
-        deferred = [call for call in log.call_args_list if call.args == ("kick_deferred",)]
-        self.assertEqual([call.kwargs["destination"] for call in deferred], ["bob", "carol"])
+        self.assertEqual(kicks, [
+            ("bob", "tmux", stream_id),
+            ("carol", "api", stream_id),
+        ])
+        skipped = [call for call in log.call_args_list if call.args == ("kick_skipped",)]
+        self.assertEqual(skipped, [])
         self.assertEqual(self.redis.hget_calls[hgets_before_step:], [])
+        self.assertEqual(self.redis.hgetall_calls, [self.registry])
         self.assertEqual(self.redis.hexists_calls, [])
+
+    def test_broadcast_kicks_resolved_members_and_records_unresolved_member(self):
+        self.register(alice="tmux", bob="tmux", unresolved="")
+        stream_id = send(
+            self.redis, pod=POD, tenant=TENANT, source="alice",
+            destination="all", payload={"text": "broadcast"},
+        )
+        kicks = []
+        switch = Switch(
+            self.redis, pod=POD, tenant=TENANT,
+            kick=lambda agent, port_type, envelope: kicks.append(
+                (agent, port_type, envelope["stream_id"])
+            ),
+        )
+
+        with patch("core.service._emit_observation"), patch("core.service._log_observation") as log:
+            self.assertTrue(switch.step(timeout=0))
+
+        self.assertEqual(kicks[0], ("bob", "tmux", stream_id))
+        self.assertEqual(kicks[1][0:2], ("alice", "tmux"))
+        skipped = [call for call in log.call_args_list if call.args == ("kick_skipped",)]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0].kwargs["destination"], "unresolved")
+        self.assertIn("no delivery attempt started", skipped[0].kwargs["reason"])
+        notice = parse(self.redis.lists[prefix(POD, TENANT, "alice", "ingress")][0])
+        self.assertEqual(notice["l2"], {"source": "switch", "destination": "alice"})
+        self.assertEqual(
+            notice["payload"]["text"],
+            "Broadcast notice: no delivery attempt was started for unresolved.",
+        )
+        self.assertEqual(notice["correlation_id"], stream_id)
 
     def test_unicast_missing_hget_value_dead_letters_without_kick(self):
         self.register(alice="tmux")
