@@ -833,6 +833,94 @@ class ReplyPusher:
             )
 
 
+# ⚠ THE COMPLETE SET THIS BOT DISPATCHES, asserted on every getUpdates call.
+#
+# `allowed_updates` PERSISTS SERVER-SIDE PER TOKEN. Omitting it does not mean
+# "send everything" — it means "reuse whatever was last set for this token, by
+# anyone". So if any other process, an old webhook configuration, or a previous
+# experiment ever set a narrower list, this bot inherits that filter forever:
+# `callback_query` stops arriving, every button dies, our code is unchanged and
+# our logs say nothing. It also produces exactly the intermittency an operator
+# sees when something else touches the token between attempts.
+#
+# ⚠ THIS IS NOT THE FILTERING `_handle_edited_message` ARGUES AGAINST, and that
+# argument is sound: narrowing here would drop update types silently and at a
+# distance, so a later handler would fail by never being called. This does the
+# opposite — it ASSERTS the full set, so the SERVER-SIDE value cannot be
+# inherited from whatever last touched this token.
+#
+# ⚠ That leaves the other direction — this list going stale while dispatch
+# routes something new — and it is handled structurally rather than by a check:
+# `_routed_type` is the only place a type is decided and it iterates this
+# tuple, and `_dispatch_update` unbinds the raw update immediately after
+# calling it. So a handler cannot acquire a new top-level type without a
+# visible edit at that boundary. Not "cannot drift": code above the unbinding,
+# or deleting it, still reaches the raw update — which is why the unbinding has
+# a test of its own.
+ALLOWED_UPDATE_TYPES = ("message", "edited_message", "callback_query")
+
+
+def _routed_type(update: dict) -> "tuple[str | None, dict | None]":
+    """The one place an update's TYPE is decided, and it iterates the list.
+
+    ⚠ THIS EXISTS SO THE ALLOWED SET OWNS THE ROUTING rather than describing
+    it. The previous attempt was a test that derived the routed types by
+    scanning `_dispatch_update` for `update.get("...")` literals, and reviewer
+    defeated it in one pass: `update["poll"]`, `"chat_member" in update`,
+    `update.pop(...)`, a computed key, or a helper handed the raw update all
+    route a type the scan cannot see. Enumerating spellings certifies the
+    spellings, never the property — the same defect this office retreated from
+    in the provenance checker four hours ago.
+
+    So routing a new type now requires adding it to `ALLOWED_UPDATE_TYPES`,
+    because nothing else looks for one, and the dispatcher unbinds the raw
+    update immediately after calling this.
+    """
+    present = [kind for kind in ALLOWED_UPDATE_TYPES if update.get(kind) is not None]
+    if len(present) > 1:
+        # ⚠ REFUSED, NOT RESOLVED. Telegram sends one type per update, so a
+        # shape carrying two is malformed — and reviewer showed what "resolve
+        # it" costs: a `message` from an unauthorised chat paired with a
+        # `callback_query` from the allowed one had its TEXT routed and the
+        # OTHER type's chat used as the identity, so unauthorised content was
+        # admitted and sent on. Picking a winner leaves that pairing possible
+        # in whatever direction the priorities disagree; refusing removes it.
+        logger.warning(
+            f"update carries {len(present)} routable types at once, which Telegram does "
+            "not send; refusing it rather than choosing one"
+        )
+        return None, None
+    if present:
+        return present[0], update[present[0]]
+    return None, None
+
+
+def _chat_id_of(kind: str | None, payload: dict | None) -> str | None:
+    """The chat of the SELECTED payload — never a second look at the update.
+
+    ⚠ THIS IS THE HALF THAT MADE THE FIRST STRUCTURAL ATTEMPT UNSOUND. Routing
+    chose a type from `ALLOWED_UPDATE_TYPES` while a separate helper re-parsed
+    the raw update with its own priority, so the two could disagree: one type's
+    payload paired with another type's authorisation identity. Deriving the id
+    from the payload that was actually selected makes disagreement
+    unexpressible rather than unlikely.
+
+    ⚠ Returns None rather than the string "None" when the id is missing: a
+    malformed update must not become a chat named None with a thread of its
+    own.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if kind == "callback_query":
+        holder = payload.get("message")
+        holder = holder if isinstance(holder, dict) else {}
+    else:
+        holder = payload
+    chat = holder.get("chat")
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    return None if chat_id is None else str(chat_id)
+
+
 class TelegramClient:
     """Wrapper for Telegram Bot HTTP API."""
 
@@ -1071,8 +1159,14 @@ class TelegramClient:
         takes roughly half the updates — so running this against a token another
         bot is already using makes that bot drop messages, silently, for as long
         as this runs. Keep the window short, or use a token of your own.
+
+        ⚠ `allowed_updates` IS SENT ON EVERY CALL, and that is the point of it
+        rather than tidiness: the value persists server-side per token, so
+        omitting it inherits whatever was last set by anything that ever held
+        this token. Asserting the complete set makes the filter ours instead of
+        something we can silently inherit.
         """
-        params = {"timeout": timeout}
+        params = {"timeout": timeout, "allowed_updates": list(ALLOWED_UPDATE_TYPES)}
         if offset is not None:
             params["offset"] = offset
         res = self.request("getUpdates", params)
@@ -2467,8 +2561,9 @@ class TelegramBot:
         Sends a real `Attachment` envelope (`docs/CONTRACTS.md`) — file
         bytes on the bus, `content_base64`, not a path shared out of band.
         The tmux opener owns writing it to
-        `/workdir/<recipient>/attachments/<stream_id>/` and everything about
-        that directory's lifecycle (confirmed with tmux directly); this
+        `<recipient's workdir>/attachments/<stream_id>/` (see
+        `lib.paths.get_agent_workdir`) and everything about that
+        directory's lifecycle (confirmed with tmux directly); this
         method never touches a filesystem at all.
         """
         cid = str(chat_id)
@@ -3389,7 +3484,24 @@ class TelegramBot:
         reply_text = f"✅ Ran on {agent}." if raw else f"✅ Sent to {agent}."
         if delivery_unverified:
             reply_text += " A prior delivery remains unverified; this send is fresh evidence."
-        if not reacted or delivery_unverified:
+        # ⚠ THE HAPPY PATH MUST NOT TELL THE OPERATOR LESS THAN THE FAILURE
+        # PATH. A 👀 reaction confirms "dispatched" and names nothing, so when
+        # the destination came from STATE THE OPERATOR CANNOT SEE, the reaction
+        # alone leaves the conversation silent about where the message went.
+        #
+        # Traced live: after "🎯 Message agent", three plain prompts reached
+        # `test1` and nothing in the chat said so. The sticky keyboard does
+        # carry a "🎯 Message: <target>" button — but Telegram lets that
+        # keyboard be collapsed and this bot offers "🙈 Hide menu", so the one
+        # persistent indicator is exactly as visible as the operator's last UI
+        # gesture. Two silences meeting, neither a bug alone.
+        #
+        # ⚠ Gated on ROUTING THE OPERATOR CANNOT SEE, not merely "not the
+        # default": an `@mention` or `/run <agent>` names its destination in
+        # the text the operator just typed, so repeating it is noise. Sticky
+        # targeting is the case where the destination lives only in state.
+        routed_by_invisible_state = agent_override is None and agent != self.target_agent
+        if not reacted or routed_by_invisible_state or delivery_unverified:
             self._post_admission_notice(cid, reply_text)
         return reply_text
 
@@ -3417,11 +3529,20 @@ class TelegramBot:
         whether a flow happens to be open, which is precisely the invisible
         state-dependence that made be9cbedd undiagnosable.
 
-        ⚠ Not filtered at `getUpdates` with `allowed_updates` instead, which
-        would be tidier and is deliberately not done: that drops update types
-        silently and at a distance, so the next handler someone adds would
-        fail by never being called. Declining here is one visible line in the
-        log for every edit.
+        ⚠ Not NARROWED at `getUpdates` with `allowed_updates`, which would be
+        tidier and is deliberately not done: that drops update types silently
+        and at a distance, so the next handler someone adds would fail by never
+        being called. Declining here is one visible line in the log for every
+        edit.
+
+        ⚠ That is not the same as SENDING the parameter, which this client now
+        does on every call with the complete set (`ALLOWED_UPDATE_TYPES`). The
+        value persists server-side per token, so omitting it inherits whatever
+        another process last set — the failure this reasoning was protecting
+        against, arriving from outside instead. The objection above still
+        holds and is answered by deriving the routed types from this
+        dispatcher in the test, so a handler added without the list is a
+        failure rather than a silence.
 
         The operator is told ONLY when a flow is open, because that is the
         case where saying nothing leaves them waiting on an answer the bot has
@@ -3442,22 +3563,6 @@ class TelegramBot:
             f"✏️ Editing a message doesn't send it, so that wasn't read as an answer — {waiting}. "
             "Send it as a new message, or /cancel.",
         )
-
-    @staticmethod
-    def _update_chat_id(update: dict) -> str | None:
-        """The chat an update belongs to, for routing only — `_dispatch_update`
-        does its own extraction and its own authorisation check.
-
-        ⚠ Returns None rather than the string "None" when the id is missing:
-        a malformed update must not become a chat named None with a thread of
-        its own."""
-        callback = update.get("callback_query")
-        if callback:
-            chat_id = callback.get("message", {}).get("chat", {}).get("id")
-        else:
-            msg = update.get("message") or update.get("edited_message")
-            chat_id = msg.get("chat", {}).get("id") if msg else None
-        return None if chat_id is None else str(chat_id)
 
     def chat_worker(self, chat_id: int | str) -> ChatWorker:
         """That chat's serial worker, created under the same guard as its
@@ -3482,8 +3587,15 @@ class TelegramBot:
         after every one of those updates had been correctly rejected. The
         rejection has to happen before anything is allocated, not after.
         `_dispatch_update` still re-checks — this is a gate, not a
-        replacement for the authorisation it does."""
-        cid = self._update_chat_id(update)
+        replacement for the authorisation it does.
+
+        ⚠ AND IT AUTHORISES OFF THE SAME SINGLE DECISION the dispatcher uses.
+        A second parser here was how an unauthorised `message` could be paired
+        with an allowed `callback_query`'s chat id: two parsers with different
+        priorities, one identity, the wrong one. Routing once and deriving the
+        id from what was routed is what makes that unexpressible."""
+        kind, payload = _routed_type(update)
+        cid = _chat_id_of(kind, payload)
         if cid is None or not self._chat_allowed(cid):
             # Handled inline: logging and dropping costs nothing and needs no
             # thread of its own, and an unauthorised chat must never get one.
@@ -3497,12 +3609,28 @@ class TelegramBot:
         is logged in full because it is one of this bot's own short codes
         ("hi", "at:agent"), not something a person typed."""
         update_id = update.get("update_id")
-        callback = update.get("callback_query")
+        kind, payload = _routed_type(update)
+        chat_id = _chat_id_of(kind, payload)
+        # ⚠ EVERYTHING THE RAW UPDATE IS ALLOWED TO PROVIDE HAS BEEN TAKEN, so
+        # it is unbound here on purpose. A handler added below that reads
+        # `update["poll"]` — the way a new Telegram type would ordinarily be
+        # picked up — is a NameError on the first update dispatched, rather
+        # than a type silently routed while `ALLOWED_UPDATE_TYPES` stays stale
+        # and getUpdates never asks for it.
+        #
+        # ⚠ The bound, stated at its real strength: this does not make a new
+        # type impossible. Code inserted ABOVE this line, or deleting this
+        # line, still gets the raw update — so the claim is that a handler
+        # cannot acquire a new top-level type WITHOUT A VISIBLE EDIT AT THIS
+        # BOUNDARY, not that it cannot drift. Pinned by
+        # test_a_handler_added_after_routing_cannot_read_the_raw_update.
+        del update
+
+        callback = payload if kind == "callback_query" else None
         if callback:
             # ⚠ .get, not [...]: a malformed update must be dropped with a log
             # line, not raise out of the dispatcher. Found by the test that
             # feeds it an update with no chat at all.
-            chat_id = self._update_chat_id(update)
             if chat_id is None:
                 logger.debug(f"update {update_id}: callback with no chat id, dropped")
                 return
@@ -3522,13 +3650,12 @@ class TelegramBot:
             self.handle_callback_query(chat_id, callback["id"], callback.get("data", ""), message_id)
             return
 
-        edited = update.get("edited_message")
-        msg = update.get("message") or edited
+        edited = payload if kind == "edited_message" else None
+        msg = payload if kind in ("message", "edited_message") else None
         if not msg:
             logger.debug(f"update {update_id}: no message or callback in it, nothing to dispatch")
             return
 
-        chat_id = self._update_chat_id(update)
         if chat_id is None:
             logger.debug(f"update {update_id}: message with no chat id, dropped")
             return

@@ -142,6 +142,28 @@ def test_lead_removal_wrongtype_is_no_write(real_redis):
         )
 
 
+@patch("lib.agentlifecycle.lifecycle.log_record")
+def test_start_agent_first_claim_and_later_preserve_report_success(_log, real_redis):
+    tenant = f"public-lead-{uuid4().hex[:12]}"
+    try:
+        for agent in ("first", "second"):
+            start_agent(
+                real_redis, pod=POD, tenant=tenant,
+                envelope={"correlation_id": agent, "payload": {"agent": agent}},
+                replace_window=lambda _agent: None,
+                available_profiles=lambda *_: None,
+            )
+        assert real_redis.get(prefix(POD, tenant, resource="lead")) == b"first"
+        assert real_redis.hget(prefix(POD, tenant, resource="registry"), "first") == b"tmux"
+        assert real_redis.hget(prefix(POD, tenant, resource="registry"), "second") == b"tmux"
+        accepted = [call.kwargs for call in _log.call_args_list if call.args[1] == "start_agent_accepted"]
+        assert [item["lead_outcome"] for item in accepted] == ["lead_claimed", "lead_preserved"]
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
 @pytest.mark.parametrize(
     "wrong_index",
     [2, 3, 4, 16, 17],
@@ -321,6 +343,22 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
         ),
     ]
     kill_window.assert_called_once_with("worker-1")
+
+
+def test_successful_public_stop_clears_current_lead(real_redis):
+    tenant = f"stop-lead-{uuid4().hex[:12]}"
+    registry_key = prefix(POD, tenant, resource="registry")
+    lead_key = prefix(POD, tenant, resource="lead")
+    real_redis.hset(registry_key, "lead-agent", "tmux")
+    real_redis.set(lead_key, "lead-agent")
+    try:
+        stop_agent(real_redis, pod=POD, tenant=tenant,
+                   envelope={"payload": {"agent": "lead-agent"}},
+                   kill_window=lambda _agent: None)
+        assert real_redis.get(lead_key) is None
+        assert real_redis.hget(registry_key, "lead-agent") is None
+    finally:
+        real_redis.delete(registry_key, lead_key)
 
 
 def test_stop_cleanup_cannot_erase_successor_delivery_identity(real_redis):
@@ -539,7 +577,7 @@ def test_start_agent_publishes_lead_with_membership_and_window_cause_atomically(
         tenant=TENANT,
         envelope={
             "correlation_id": "a" * 32,
-            "payload": {"agent": "new-lead", "lead": True},
+            "payload": {"agent": "new-lead"},
         },
         replace_window=MagicMock(),
         available_profiles=lambda _pod, _tenant: None,
@@ -556,27 +594,9 @@ def test_start_agent_publishes_lead_with_membership_and_window_cause_atomically(
             "new-lead",
             "tmux",
             "a" * 32,
+            "0",
         ),
     ]
-
-
-@patch("lib.agentlifecycle.lifecycle.log_record")
-def test_start_agent_rejects_api_lead_before_mutation(_mock_log_record):
-    r = MagicMock()
-    try:
-        start_agent(
-            r,
-            pod=POD,
-            tenant=TENANT,
-            envelope={"payload": {"agent": "client", "port_type": "api", "lead": True}},
-            replace_window=MagicMock(),
-            available_profiles=lambda _pod, _tenant: None,
-        )
-    except ValueError as exc:
-        assert str(exc) == "StartAgent payload.lead only applies to port_type 'tmux'"
-    else:
-        raise AssertionError("api lead was accepted")
-    assert r.method_calls == []
 
 
 @patch("lib.agentlifecycle.lifecycle.log_record", side_effect=RuntimeError("log unavailable"))
@@ -657,6 +677,5 @@ def test_logging_failure_does_not_replace_success(_mock_port_type, _mock_log_rec
         replace_window=MagicMock(),
         available_profiles=lambda *_: None,
     )
-    r.hset.assert_called_once_with(
-        prefix(POD, TENANT, resource="registry"), "worker", "tmux"
-    )
+    assert r.hset.call_count == 0
+    assert r.eval.call_count == 1

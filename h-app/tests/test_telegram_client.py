@@ -1,5 +1,6 @@
 """Unit tests for the Telegram bot client (clients/telegram/bot.py)."""
 
+import ast
 import base64
 import inspect
 import json
@@ -7,6 +8,7 @@ import logging
 import os
 import ssl
 import tempfile
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -407,6 +409,74 @@ def test_handle_user_prompt_success():
         assert telegram.sent_messages[0]["text"] == "✅ Sent to architect."
 
 
+def test_a_sticky_target_names_itself_on_every_prompt_it_routes():
+    """⚠ HARM, traced live: after "🎯 Message agent", three plain prompts
+    reached `test1` and NOTHING in the conversation said so. Three delivery
+    failures were attributed to an agent the operator never meant to send to.
+
+    Two silences meeting, neither a bug alone. The sticky keyboard does carry a
+    "🎯 Message: <target>" button — but Telegram lets that keyboard be
+    collapsed and this bot offers "🙈 Hide menu", so the one persistent
+    indicator is as visible as the operator's last UI gesture. And the
+    acknowledgement that names the destination is SUPPRESSED PRECISELY WHEN
+    THE SEND WORKS: a 👀 reaction replaces "✅ Sent to X" and names nothing.
+
+    ⚠ Asserted on WHERE THE MESSAGE LANDED and what the operator was told —
+    never on `chat_target_agent`, which is the mechanism rather than the harm."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance.target_agent = "architect"
+
+        bot_instance.handle_message_agent_pick(12345, "test1")
+        telegram.sent_messages.clear()
+
+        bot_instance.handle_user_prompt(12345, "deploy the thing", message_id=77)
+
+        destinations = [e["destination"] for e in mesh.sent_envelopes]
+        assert destinations == ["test1"], (
+            f"the prompt did not go where the sticky target pointed: {destinations}"
+        )
+        assert any("test1" in m["text"] for m in telegram.sent_messages), (
+            "the message went to test1 and the conversation never said so — "
+            f"the operator saw only: {[m['text'] for m in telegram.sent_messages]}"
+        )
+
+
+def test_the_default_target_still_confirms_with_a_reaction_alone():
+    """The other direction, so the fix cannot be "narrate everything". When the
+    destination is the default the operator already knows it, the 👀 reaction
+    is the whole confirmation, and adding a line per message would be noise in
+    the common case."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance.target_agent = "architect"
+
+        bot_instance.handle_user_prompt(12345, "status please", message_id=77)
+
+        assert [e["destination"] for e in mesh.sent_envelopes] == ["architect"]
+        assert telegram.sent_messages == [], (
+            f"the default target added chatter: {[m['text'] for m in telegram.sent_messages]}"
+        )
+        assert telegram.reactions_set, "the reaction is the confirmation on this path"
+
+
+def test_a_typed_destination_is_not_repeated_back():
+    """An `@mention` names its destination in the text the operator just typed,
+    so repeating it is noise. The gate is "routing the operator cannot see",
+    not "anything off-default" — a distinction worth keeping, because the harm
+    is state they cannot observe, not an unusual agent."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance.target_agent = "architect"
+
+        bot_instance.handle_user_prompt(12345, "look at this", agent_override="test1", message_id=77)
+
+        assert [e["destination"] for e in mesh.sent_envelopes] == ["test1"]
+        assert telegram.sent_messages == [], (
+            "an explicitly addressed message was narrated back at the operator"
+        )
+
+
 def test_handle_user_prompt_shows_typing_before_dispatch():
     mesh = DummyMeshClient()
     mesh.presence_state = "working"
@@ -501,9 +571,14 @@ def test_handle_user_prompt_skips_the_redundant_text_confirmation_once_reacted()
 
 
 def test_unverified_delivery_notice_failure_cannot_replace_known_prompt_admission():
-    """A warning-sink failure after reaction success must leave admission known."""
+    """A routed warning-sink failure after reaction must leave admission known."""
     class RaisingNoticeTelegram(DummyTelegramClient):
+        def __init__(self):
+            super().__init__()
+            self.notice_attempts = []
+
         def send_message(self, chat_id, text, **kwargs):
+            self.notice_attempts.append(text)
             raise OSError("telegram notice unavailable")
 
     mesh = DummyMeshClient()
@@ -514,12 +589,16 @@ def test_unverified_delivery_notice_failure_cannot_replace_known_prompt_admissio
         bot_instance = TelegramBot(
             mesh, telegram, store, target_agent="architect", no_activity_push=True,
         )
+        with bot_instance.chat_txn(12345):
+            bot_instance.chat_target_agent["12345"] = "sme-2"
 
         reply = bot_instance.handle_user_prompt(12345, "fresh evidence", message_id=7)
 
-    assert mesh.sent_envelopes == [{"destination": "architect", "text": "fresh evidence"}]
+    assert mesh.sent_envelopes == [{"destination": "sme-2", "text": "fresh evidence"}]
     assert telegram.reactions_set == [{"chat_id": "12345", "message_id": 7, "emoji": "👀"}]
-    assert reply == "✅ Sent to architect. A prior delivery remains unverified; this send is fresh evidence."
+    expected = "✅ Sent to sme-2. A prior delivery remains unverified; this send is fresh evidence."
+    assert telegram.notice_attempts == [expected]
+    assert reply == expected
 
 
 def test_handle_user_prompt_confirms_by_text_when_there_is_no_message_id():
@@ -653,6 +732,193 @@ def test_chat_allowed_matches_configured_id_across_str_int():
         assert bot_instance._chat_allowed(12345) is True   # int from Telegram
         assert bot_instance._chat_allowed("12345") is True
         assert bot_instance._chat_allowed(99999) is False
+
+
+def test_every_allowed_type_is_routed_and_nothing_else_is():
+    """⚠ BEHAVIOURAL, replacing an AST derivation reviewer defeated in one
+    pass. That test scanned `_dispatch_update` for `update.get("...")` literals
+    and called the result "what dispatch routes" — but `update["poll"]`,
+    `"chat_member" in update`, `update.pop(...)`, a computed key, or a helper
+    handed the raw update all route a type the scan cannot see. Enumerating
+    spellings certifies the spellings.
+
+    `_routed_type` iterates `ALLOWED_UPDATE_TYPES`, so this asks the question
+    directly and there is no syntax to bypass: every type in the list routes,
+    and a type outside it does not."""
+    for kind in bot.ALLOWED_UPDATE_TYPES:
+        payload = {"marker": kind}
+        assert bot._routed_type({"update_id": 1, kind: payload}) == (kind, payload)
+
+    for outside in ("poll", "chat_member", "my_chat_member", "shipping_query"):
+        assert bot._routed_type({"update_id": 1, outside: {"x": 1}}) == (None, None), (
+            f"{outside} routed without being in ALLOWED_UPDATE_TYPES, so getUpdates "
+            "would never have asked Telegram for it"
+        )
+
+
+def test_a_second_types_chat_cannot_authorise_another_types_payload():
+    """⚠ AUTHORIZATION HARM, introduced by my own refactor and caught in review.
+    Routing iterated `ALLOWED_UPDATE_TYPES` (message first) while a separate
+    `_update_chat_id` re-parsed the raw update preferring callback_query. The
+    two disagreed, so one type's PAYLOAD was paired with another type's
+    IDENTITY.
+
+    Reviewer's reproduction: a `message` from unauthorised chat 99999 carrying
+    text, plus a `callback_query` whose message belongs to allowed chat 12345.
+    Routing selected the message, the identity came out as 12345, and the bot
+    ADMITTED AND SENT the unauthorised text — confirmed in the envelopes.
+
+    ⚠ On main the orders happened to agree (callback checked first in both), so
+    this could not arise. My refactor made `ALLOWED_UPDATE_TYPES` — a list
+    written to say what to REQUEST FROM TELEGRAM — load-bearing for routing
+    order, a second meaning nobody had stated. The fix is one decision:
+    `_routed_type` selects, `_chat_id_of` derives the identity from what was
+    selected, and the second parser is deleted rather than left for the next
+    person to reach for.
+
+    A multi-type update is now REFUSED rather than resolved, because picking a
+    winner leaves the pairing possible wherever priorities disagree."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance.allowed_chat_id = "12345"
+
+        hostile = {
+            "update_id": 1,
+            "message": {"chat": {"id": 99999}, "text": "REMOTE MESSAGE"},
+            "callback_query": {"id": "cb", "data": "hi",
+                               "message": {"message_id": 5, "chat": {"id": 12345}}},
+        }
+        # ⚠ Dispatched DIRECTLY, and that matters: routed through
+        # submit_update the admission happens on a worker thread, so asserting
+        # the envelopes immediately can pass while the harm is still in flight.
+        # The first version of this test did exactly that — it failed on the
+        # worker-allocation assertion and its envelope assertion passed against
+        # the broken code, which is a test that reports the wrong reason.
+        bot_instance._dispatch_update(dict(hostile))
+
+        admitted = [e for e in mesh.sent_envelopes if "REMOTE MESSAGE" in json.dumps(e)]
+        assert admitted == [], (
+            "an unauthorised chat's message was admitted using another type's chat id"
+        )
+
+        # and the gate upstream must not allocate for it either
+        bot_instance.submit_update(dict(hostile))
+        assert bot_instance._chat_workers == {}, (
+            "the hostile update allocated a worker for the allowed chat"
+        )
+        assert telegram.sent_messages == []
+
+
+def test_the_routed_type_and_the_chat_identity_come_from_one_decision():
+    """The property behind the harm above, asserted directly: whatever
+    `_routed_type` selects is what `_chat_id_of` reads, so there is no second
+    parser to disagree with. There is no `_update_chat_id` any more — a second
+    way to answer the same question is what made the disagreement possible."""
+    assert not hasattr(bot.TelegramBot, "_update_chat_id"), (
+        "the second chat-id parser is back; two answers to one question is the defect"
+    )
+
+    callback = {"id": "cb", "message": {"chat": {"id": 5}}}
+    assert bot._chat_id_of("callback_query", callback) == "5"
+    assert bot._chat_id_of("message", {"chat": {"id": 7}}) == "7"
+    assert bot._chat_id_of("edited_message", {"chat": {"id": 9}}) == "9"
+    # a missing id is None, never the string "None" — that would become a chat
+    assert bot._chat_id_of("message", {}) is None
+    assert bot._chat_id_of(None, None) is None
+
+
+def test_an_update_of_an_unrequested_type_is_dropped_and_said_so(caplog):
+    """The dispatcher's half of the same property: an update carrying only a
+    type this bot does not request is dropped with a log line rather than
+    half-handled. Silence here is what made "the button does nothing"
+    undiagnosable."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        with caplog.at_level(logging.DEBUG, logger="mesh_telegram"):
+            bot_instance._dispatch_update({"update_id": 7, "poll": {"id": "1"}})
+
+        log = "\n".join(r.getMessage() for r in caplog.records)
+        assert "nothing to dispatch" in log
+        assert telegram.sent_messages == []
+
+
+def test_a_handler_added_after_routing_cannot_read_the_raw_update():
+    """⚠ THE GUARD'S OWN GUARD — a test that fails if `del update` is removed.
+
+    The structural claim rests on one line, and a comment explaining why a line
+    exists does not survive a refactor by someone in a hurry. But deleting the
+    `del` changes NO behaviour today: nothing below it reads the update, so no
+    ordinary test can tell the two versions apart. The property is about code
+    that does not exist yet.
+
+    So this constructs that code. It takes the real dispatcher's source, appends
+    the read a future handler would naturally write — the way anyone picks up a
+    new Telegram type — compiles it, and asserts it raises NameError. With the
+    `del` present the appended read cannot run; with the `del` removed it
+    succeeds and this fails.
+
+    ⚠ The bound, honestly: this proves a handler appended AFTER routing cannot
+    reach the raw update. Code inserted ABOVE the `del` still can, which is why
+    the claim is "not without a visible edit at the boundary" rather than
+    "cannot drift"."""
+    source = textwrap.dedent(inspect.getsource(bot.TelegramBot._dispatch_update))
+    tree = ast.parse(source)
+    function = tree.body[0]
+
+    # ⚠ Placed where a handler would actually go: at the end of the prologue,
+    # immediately after routing and before the first branch. Appending to the
+    # END of the body proves nothing — every branch returns, so the line is
+    # unreachable and the test passes without exercising anything. That first
+    # version of this test was green against BOTH versions of the dispatcher,
+    # which is the failure mode it exists to catch, one level up.
+    insert_at = next(i for i, node in enumerate(function.body) if isinstance(node, ast.If))
+    probe = ast.parse('_ = update["poll"]').body[0]
+    function.body.insert(insert_at, probe)
+    ast.fix_missing_locations(tree)
+
+    namespace = dict(vars(bot))
+    exec(compile(tree, "<dispatch-with-a-future-handler>", "exec"), namespace)
+    patched = namespace["_dispatch_update"]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        # a message for the allowed chat, so control reaches the appended line
+        update = {"update_id": 1, "message": {"chat": {"id": 12345}, "text": "hello"},
+                  "poll": {"id": "unused"}}
+        with pytest.raises(NameError):
+            patched(bot_instance, update)
+
+
+def test_get_updates_sends_the_complete_allowed_updates_every_call():
+    """⚠ HARM: `allowed_updates` persists SERVER-SIDE per token, so omitting it
+    means "reuse whatever was last set for this token, by anyone" — not "send
+    everything". An old webhook configuration or another process narrowing it
+    once makes `callback_query` stop arriving forever: every button dead, this
+    client unchanged, the logs silent. It fits the intermittency an operator
+    sees, too, because the inherited value changes whenever something else
+    touches the token.
+
+    Asserted on EVERY call, including the one carrying an offset: a filter
+    inherited on the second poll is exactly as fatal as one inherited on the
+    first."""
+    client = TelegramClient("token-not-logged")
+    calls = []
+
+    def fake_request(method, params=None):
+        calls.append((method, params))
+        return {"ok": True, "result": []}
+
+    client.request = fake_request
+    client.get_updates()
+    client.get_updates(offset=42)
+
+    assert len(calls) == 2
+    for method, params in calls:
+        assert method == "getUpdates"
+        assert params.get("allowed_updates") == list(bot.ALLOWED_UPDATE_TYPES), (
+            f"getUpdates was called without the complete allowed_updates: {params}"
+        )
+    assert calls[1][1]["offset"] == 42, "the offset must still be sent"
 
 
 def test_dispatch_update_ignores_a_message_from_an_unconfigured_chat():

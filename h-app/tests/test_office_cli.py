@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import sys
@@ -15,7 +16,8 @@ H_APP = Path(__file__).resolve().parents[1]
 if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
-from core.envelope import build, encode
+from core.channels import receive
+from core.envelope import build, encode, parse
 from core.keys import prefix, receive_undeliverable_key, receive_unresolved_key
 from modules.office import cli as office_cli
 from modules.office.cli import main as office_main
@@ -167,6 +169,56 @@ def test_root_help_lists_every_command_without_environment_or_redis(capsys):
     out = capsys.readouterr().out
     for name in office_cli._COMMANDS:
         assert name in out
+
+
+def test_send_stdin_identity_reaches_recipient_on_real_redis(monkeypatch, capsys):
+    """Pin h-mesh's working boundary by what the recipient opens.
+
+    This is a negative regression for a live legacy-CLI defect, not evidence
+    that every implementation named `office` behaves the same way. The sender's
+    success line and byte count are deliberately insufficient assertions.
+    """
+    r = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"))
+    try:
+        r.ping()
+    except redis.RedisError:
+        pytest.skip("real Redis server not available at REDIS_URL")
+
+    tenant = f"stdin-recipient-{os.urandom(8).hex()}"
+    registry = prefix(POD, tenant, resource="registry")
+    egress = prefix(POD, tenant, "sender", "egress")
+    ingress = prefix(POD, tenant, "recipient", "ingress")
+    body = "recipient must open this exact stdin body"
+    r.hset(registry, mapping={"sender": "tmux", "recipient": "tmux"})
+    try:
+        with (
+            patch("modules.office.cli._context", return_value=(r, POD, tenant, "sender")),
+            patch("modules.office.cli.sys.stdin", io.StringIO(body)),
+        ):
+            office_main(["send", "-a", "recipient", "--stdin"])
+
+        reported_id = capsys.readouterr().out.rsplit("(", 1)[1].rstrip(")\n")
+        raw = r.lpop(egress)
+        assert parse(raw)["stream_id"] == reported_id
+        r.rpush(ingress, raw)
+        opened = []
+        receive(
+            r,
+            pod=POD,
+            tenant=tenant,
+            agent="recipient",
+            openers={"Message": opened.append},
+            timeout=0,
+            blocking=False,
+        )
+
+        assert len(opened) == 1
+        assert opened[0]["stream_id"] == reported_id
+        assert opened[0]["payload"]["text"] == body
+    finally:
+        keys = r.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            r.delete(*keys)
 
 
 def test_unresolved_names_exact_identity_without_consuming(monkeypatch, capsys):
@@ -329,16 +381,6 @@ def test_hire_carries_profile_provider_resume_permissions_and_tools(mock_send, m
     assert payload["resume"] is True
     assert payload["skip_permissions"] is True
     assert payload["claude_tools"] == ""
-
-
-@patch("modules.office.cli.send")
-def test_hire_can_transfer_leadership(mock_send, monkeypatch):
-    _env(monkeypatch)
-    mock_send.return_value = "stream-1"
-    r = FakeRedis()
-    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
-        office_main(["hire", "replacement", "--lead"])
-    assert mock_send.call_args.kwargs["payload"]["lead"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1265,7 +1307,7 @@ def test_clone_to_all_uses_host_workdir_fallback(monkeypatch, tmp_path):
     ):
         office_main(["clone-to-all", "git@example.com:org/repo.git"])
 
-    expected = tmp_path / "h-mesh" / "workdir" / "backend" / "repo"
+    expected = tmp_path / "h-mesh" / "backend" / "repo"
     git_clone.assert_called_once_with(
         "git@example.com:org/repo.git", expected, "git@example.com:org/repo.git"
     )

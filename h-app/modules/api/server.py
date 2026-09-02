@@ -579,13 +579,13 @@ def _render_restdoc_html(app: FastAPI) -> str:
         </tr>
         <tr>
           <td><code>StartAgent</code></td>
-          <td><code>{{"agent": "...", "cli": "claude", "lead": true}}</code></td>
-          <td>Enrols agent in registry, creates a terminal window, and starts the CLI (defaults to <code>claude</code>). Optional <code>lead: true</code> atomically transfers leadership to this tmux agent as it is enrolled.</td>
+          <td><code>{{"agent": "...", "cli": "claude"}}</code></td>
+          <td>Enrols agent in registry, creates a terminal window, and starts the CLI (defaults to <code>claude</code>). The first hire when the lead key is empty becomes lead; later hires silently preserve the incumbent. There is currently no supported lead-change operation.</td>
         </tr>
         <tr>
           <td><code>StopAgent</code></td>
           <td><code>{{"agent": "..."}}</code></td>
-          <td>Reverses all three: terminates the CLI process, kills the terminal window, and removes it from the registry. Retiring the current lead also clears the lead selection, unless leadership was already transferred.</td>
+          <td>Reverses all three: terminates the CLI process, kills the terminal window, and removes it from the registry. Retiring the current lead clears the lead key; the next tmux hire claims it.</td>
         </tr>
       </tbody>
     </table>

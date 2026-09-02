@@ -188,8 +188,9 @@ def _write_attachment(
     """Write through a temporary path then atomically rename inside sandbox.
 
     Paths are shell positional arguments, never interpolated into script text.
-    `/sandbox` is the sandbox home; h-mesh's host `/workdir` does not exist
-    there and may not be writable.
+    `/sandbox` is the sandbox home; a host-side agent workdir (see
+    lib.paths.get_agent_workdir) does not exist there and may not be
+    writable.
     """
     ref = _sandbox_before_effect(client, sbx_name)
     target_dir = f"/sandbox/attachments/{stream_id}"
