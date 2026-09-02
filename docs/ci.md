@@ -16,6 +16,30 @@ Report both the collection count and the pass count. Do not substitute
 `pytest tests/`, `unittest discover`, or another explicit subtree; those
 commands collect less than the complete suite.
 
+The complete-suite runner accepts no additional pytest arguments. Paths,
+selectors, verbosity flags, and configuration overrides are all refused because
+the harness must collect and execute one identical, reviewed node set. Use bare
+pytest directly for focused development runs, then use the argument-free command
+above for merge evidence.
+
+The reviewed node set is checked in at `h-app/tools/test_nodeids.txt`. A plugin
+inside the pytest process that actually executes the tests compares its
+collected items to that manifest before the first test runs. Collection and
+execution therefore cannot silently describe different selections.
+
+Any test addition, removal, or rename makes the harness fail with separately
+labeled `added` and `missing` node IDs. `missing` means a previously reviewed
+test would not execute; `added` means a new or renamed test has not yet been
+reviewed into the harness. Do not blindly regenerate the manifest to clear the
+error: explain every missing and added entry first. Once the test change is
+intentional and reviewed, regenerate the manifest from the repository root and
+review its diff before running the harness again:
+
+```bash
+PYTHONPATH=h-app python -m pytest --collect-only -q \
+  | sed -n '/^h-app\/.*::/p' > h-app/tools/test_nodeids.txt
+```
+
 The runner binds the suite to the h-mesh tree containing the directory from
 which it was invoked. On every run it prints that tree, the resolved runner
 module, and the directory handed to pytest. Quote those paths with the counts

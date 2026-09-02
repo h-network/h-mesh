@@ -3,26 +3,31 @@
 
 from __future__ import annotations
 
-import re
 import subprocess
 import sys
 from pathlib import Path
 
 
 RUNNER_PATH = Path(__file__).resolve()
-EXPECTED_MINIMUM_TEST_COUNT = 759
 
 
 def _find_invoked_tree(start: Path) -> Path | None:
-    """Return the repository containing the caller's cwd, if it is h-mesh."""
+    """Return the Git worktree containing the caller's cwd, if it is h-mesh."""
     resolved = start.resolve()
-    for candidate in (resolved, *resolved.parents):
-        if (
-            (candidate / "pyproject.toml").is_file()
-            and (candidate / "h-app" / "tools" / "run_tests.py").is_file()
-        ):
-            return candidate
-    return None
+    git_root = subprocess.run(
+        ["git", "-C", str(resolved), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if git_root.returncode != 0:
+        return None
+    candidate = Path(git_root.stdout.strip()).resolve()
+    if not (
+        (candidate / "pyproject.toml").is_file()
+        and (candidate / "h-app" / "tools" / "run_tests.py").is_file()
+    ):
+        return None
+    return candidate
 
 
 def _print_provenance(tree: Path | None) -> None:
@@ -53,37 +58,16 @@ def main() -> int:
         )
         return 1
 
-    collect = subprocess.run(
-        [sys.executable, "-m", "pytest", "--collect-only", "-q"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
-    if collect.returncode != 0:
-        sys.stdout.write(collect.stdout)
-        sys.stderr.write(collect.stderr)
-        return collect.returncode
-
-    summary = re.search(r"(\d+) tests? collected", collect.stdout)
-    if summary is None:
-        sys.stdout.write(collect.stdout)
-        print("error: pytest collection output did not contain a test count", file=sys.stderr)
-        return 1
-
-    collected = int(summary.group(1))
-    if collected < EXPECTED_MINIMUM_TEST_COUNT:
+    if sys.argv[1:]:
         print(
-            f"error: expected at least {EXPECTED_MINIMUM_TEST_COUNT} tests, "
-            f"but pytest collected {collected}.\n"
-            "If tests were intentionally removed, update "
-            "EXPECTED_MINIMUM_TEST_COUNT in h-app/tools/run_tests.py.",
+            "error: the complete-suite runner accepts no pytest arguments; "
+            "forwarding selectors or configuration could narrow the executed suite",
             file=sys.stderr,
         )
         return 1
 
-    print(f"collection invariant satisfied: {collected} tests")
     return subprocess.call(
-        [sys.executable, "-m", "pytest", *sys.argv[1:]],
+        [sys.executable, "-m", "pytest", "-p", "tools.manifest_plugin"],
         cwd=repo_root,
     )
 
