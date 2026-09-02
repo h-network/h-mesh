@@ -1,15 +1,21 @@
+import ast
 import contextlib
+import inspect
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
+import textwrap
 import unittest
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+
+import redis
 
 H_APP = Path(__file__).resolve().parents[1]
 if str(H_APP) not in sys.path:
@@ -224,6 +230,359 @@ def _capture(fn):
     with contextlib.redirect_stdout(buf):
         fn()
     return buf.getvalue()
+
+
+def _watchdog_records(out, destination="architect"):
+    """Parse watchdog-module log lines from captured stdout, addressed to
+    `destination`. Used to assert on the CLAIM a record makes, not on one
+    implementation's choice of event-name vocabulary for making it."""
+    records = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if event.get("module") == "watchdog" and event.get("destination") == destination:
+            records.append(event)
+    return records
+
+
+# The canonical, closed evidence-level contract (core.logging.log_record's
+# `evidence` field -- see modules/watchdog/service.py's _log_lead_alert for
+# the writer side). A CLOSED allowlist, not a denylist of overclaiming
+# words: scanning specific fields (or even every field, for specific words)
+# still lets a genuinely novel claim-shaped vocabulary slip through
+# unnoticed ("paste landed", anything nobody has enumerated yet). An
+# allowlist has the opposite failure mode: anything NOT explicitly
+# recognized is rejected, including vocabulary nobody has written yet.
+_ADMISSION_ONLY_EVIDENCE = frozenset({"admitted", "rejected", "unknown", "no_lead"})
+
+# ⚠ `evidence` alone is not sufficient -- kept as a scenario-level backstop
+# below even though `_log_lead_alert` now makes the contradiction reviewer
+# found (evidence="admitted" next to outcome="delivered"/reason="alert
+# sent") structurally unreachable through the real code path: `event`,
+# `evidence` and the `reason` template are all sourced together from one
+# entry in `Watchdog._LEAD_ALERT_TEMPLATES`, keyed by a closed `kind`
+# string, so nothing calling through the wrapper can set any of them
+# independently. `reason`'s runtime-interpolated *values* (a lead name, an
+# exception's text) are still free text, so this scan stays as defense in
+# depth against a future template whose fixed wording itself overclaims.
+_OVERCLAIM_WORD = re.compile(r"\b(sent|delivered)\b", re.IGNORECASE)
+_NEGATION_BEFORE = re.compile(r"\b(?:not|never|no)\s+(?:\w+\s+){0,2}$", re.IGNORECASE)
+
+
+def _reason_contradicts_evidence(record):
+    reason = record.get("reason")
+    if not isinstance(reason, str):
+        return False
+    for match in _OVERCLAIM_WORD.finditer(reason):
+        preceding = reason[max(0, match.start() - 24):match.start()]
+        if _NEGATION_BEFORE.search(preceding):
+            continue
+        return True
+    return False
+
+
+def _assert_admission_only_evidence(testcase, records):
+    """Assert every record's `evidence` tag is one of the admission-only
+    values -- never `delivered`/`sent`/`created`, and never silently absent
+    -- AND that `reason` (the one field _log_lead_alert cannot structurally
+    close off) does not independently contradict it. Could a system that
+    still produces the harmful output pass this check? A record with a
+    correct `evidence` tag and a contradicting `reason` must fail here, not
+    just one with a wrong `evidence` value -- that is the exact gap reviewer
+    found in the version of this helper before it checked `reason` too."""
+    testcase.assertTrue(records, "an alert attempt must leave a record, not silence")
+    for record in records:
+        testcase.assertIn(
+            record.get("evidence"), _ADMISSION_ONLY_EVIDENCE,
+            f"record {record!r} does not carry a closed, admission-only evidence tag",
+        )
+        testcase.assertFalse(
+            _reason_contradicts_evidence(record),
+            f"record {record!r} carries a correct evidence tag but its reason text overclaims",
+        )
+
+
+class AdmissionEvidenceContractTests(unittest.TestCase):
+    """Counterfixtures for _assert_admission_only_evidence itself, per
+    reviewer's finding that the earlier field-scanning version needed
+    tests exercising the HELPER's own correctness directly, not only
+    indirectly through the watchdog scenario tests that happen to call it.
+    Each of these constructs a record by hand -- no Watchdog, no FakeRedis
+    -- so the contract enforcement is pinned in isolation."""
+
+    def test_accepts_every_known_admission_only_value(self):
+        for value in _ADMISSION_ONLY_EVIDENCE:
+            _assert_admission_only_evidence(self, [{"evidence": value}])
+
+    def test_rejects_a_delivered_claim(self):
+        with self.assertRaises(AssertionError):
+            _assert_admission_only_evidence(self, [{"evidence": "delivered"}])
+
+    def test_rejects_a_sent_claim(self):
+        with self.assertRaises(AssertionError):
+            _assert_admission_only_evidence(self, [{"evidence": "sent"}])
+
+    def test_rejects_reviewers_exact_contradictory_record(self):
+        """Reviewer's literal counterexample, verbatim, with the evidence
+        tag left CORRECT: evidence="admitted" alongside outcome="delivered"
+        and reason="alert sent". A first version of this fixture changed
+        `evidence` itself to "sent" and asserted rejection -- that tested
+        the allowlist mechanism (an illegal value in the field the helper
+        reads is caught), not the actual harm reviewer demonstrated: a
+        record whose CANONICAL TAG IS TRUTHFUL can still contain a false
+        delivery claim elsewhere. This is the fixture that must fail if
+        `_assert_admission_only_evidence` only checks `evidence`."""
+        record = {
+            "event": "lead_alert_admitted",
+            "evidence": "admitted",
+            "outcome": "delivered",
+            "reason": "alert sent",
+        }
+        with self.assertRaises(AssertionError):
+            _assert_admission_only_evidence(self, [record])
+
+    def test_accepts_a_correct_evidence_tag_with_ordinary_reason_text(self):
+        """The contradiction check must not be so broad it rejects ordinary,
+        non-overclaiming reason text alongside a correct tag."""
+        _assert_admission_only_evidence(self, [{
+            "evidence": "no_lead",
+            "reason": "lead 'retired-lead' is not a registered agent",
+        }])
+
+    def test_rejects_a_missing_evidence_tag(self):
+        """A record with no `evidence` field at all is a contract
+        violation, not a free pass -- the contract requires presence, not
+        just non-overclaiming content."""
+        with self.assertRaises(AssertionError):
+            _assert_admission_only_evidence(self, [{"event": "lead_alert_admitted", "reason": "ok"}])
+
+    def test_rejects_an_unrecognized_future_value(self):
+        """A vocabulary nobody has thought of yet -- an evidence tag that
+        is neither a known-safe value nor a word this file specifically
+        bans -- must still fail. This is what makes a closed allowlist
+        different from scanning for specific overclaiming words: a NEW
+        claim-shaped value that was never enumerated anywhere still cannot
+        slip through silently, because the allowlist is closed rather than
+        the denylist being (necessarily incompletely) open."""
+        with self.assertRaises(AssertionError):
+            _assert_admission_only_evidence(self, [{"evidence": "paste_landed"}])
+
+    def test_rejects_an_empty_record_list(self):
+        """Silence is still the original defect this whole family exists to
+        fix -- no records at all must fail exactly like an overclaiming one,
+        not pass by vacuous truth."""
+        with self.assertRaises(AssertionError):
+            _assert_admission_only_evidence(self, [])
+
+    def test_accepts_multiple_records_only_if_all_are_admission_only(self):
+        _assert_admission_only_evidence(
+            self, [{"evidence": "no_lead"}, {"evidence": "admitted"}]
+        )
+        with self.assertRaises(AssertionError):
+            _assert_admission_only_evidence(
+                self, [{"evidence": "admitted"}, {"evidence": "delivered"}]
+            )
+
+
+def _log_emitting_calls(func):
+    """Every call to `log_record`/`_log_lead_alert` in `func`'s own source,
+    as raw AST nodes. Shared by the two structural checks below: one reads
+    the call target's name, the other reads its first argument -- neither
+    can be right if this collection is wrong, so it exists once."""
+    source = textwrap.dedent(inspect.getsource(func))
+    tree = ast.parse(source)
+    return [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Attribute) and node.func.attr in ("log_record", "_log_lead_alert"))
+            or (isinstance(node.func, ast.Name) and node.func.id in ("log_record", "_log_lead_alert"))
+        )
+    ]
+
+
+class LeadAlertLoggingStructureTests(unittest.TestCase):
+    """Structural pins on _log_lead_alert itself and on _notify_lead's
+    source, answering reviewer's "ninth call site" question: what
+    necessarily catches a future lead-alert log call that overclaims,
+    independent of whether any test scenario happens to exercise that
+    specific code path?
+
+    ⚠ This is the SECOND version of the AST check below. The first one
+    verified only that every log-emitting call in _notify_lead named
+    `_log_lead_alert` as its target -- it never inspected that call's
+    arguments at all. Reviewer's exact finding: "the AST test checks only
+    that calls are named `_log_lead_alert`; it does NOT check that the
+    `evidence=` keyword is present." A call missing its required argument
+    still passed this check statically and would only have failed the
+    first time that exact line executed at runtime -- a guarantee asserted
+    at a boundary (the callee name) wider than the mechanism it claimed to
+    enforce (evidence always present) is not a guarantee. Falsified by hand
+    before being trusted this time, the same discipline already proven on
+    the Lua-preflight branch: a real call site in _notify_lead was
+    temporarily edited to drop its `kind` argument entirely, the rewritten
+    test below (`test_every_log_emitting_call_in_notify_lead_goes_through_
+    the_wrapper_with_a_registered_kind`) was run and confirmed to fail with
+    exactly the missing-argument assertion, and the call site was then
+    restored -- recorded in the branch's commit message rather than kept as
+    a permanent fixture in this file, since a test asserting its own
+    assertion logic against a synthetic broken function would not actually
+    exercise this test the way mutating the real source and rerunning it
+    did.
+
+    Four guarantees now, three static (checked by parsing source, not by
+    running it) and one enforced by Python itself:
+    1. `_log_lead_alert` cannot be called without `kind` (no default) --
+       Python raises TypeError immediately, before any record is built.
+    2. An unrecognized `kind` is a KeyError inside `_log_lead_alert` itself
+       -- there is no way to reach the log_record call with a `kind` that
+       is not a real entry in `_LEAD_ALERT_TEMPLATES`.
+    3. `_log_lead_alert`'s own log_record call passes only stream_id,
+       destination, reason and evidence -- never a caller-supplied
+       `outcome`/`title`/`old_title`, regardless of what extra `**context`
+       a caller passes (those keys can only feed a reason template's named
+       placeholders, and are silently unused otherwise).
+    4. A static AST walk of _notify_lead's source confirms every
+       log-emitting call in it (a) targets `_log_lead_alert`, not
+       `log_record` directly, and (b) passes a `kind` whose literal string
+       value is an actual key in `_LEAD_ALERT_TEMPLATES` -- so neither a
+       bypass of the wrapper NOR a call through the wrapper with a
+       fabricated/unregistered kind string can ship unnoticed.
+    """
+
+    def test_log_lead_alert_requires_kind(self):
+        watchdog = service.Watchdog(object(), pod="p", tenant="t", session_name="t")
+        with self.assertRaises(TypeError):
+            watchdog._log_lead_alert()
+
+    def test_log_lead_alert_rejects_an_unregistered_kind(self):
+        watchdog = service.Watchdog(object(), pod="p", tenant="t", session_name="t")
+        with self.assertRaises(KeyError):
+            watchdog._log_lead_alert("paste_landed", "lead", "stream-1")
+
+    def test_log_lead_alert_never_forwards_outcome_title_or_old_title(self):
+        """`_log_lead_alert` accepts arbitrary **context (to fill a reason
+        template's named placeholders), so passing outcome/title/old_title
+        as context does not raise -- str.format silently ignores unused
+        keywords. The actual guarantee is that they never reach the
+        record regardless: log_record captures stdout here and the parsed
+        line must not carry any of the three keys reviewer's counterexample
+        used, no matter what a caller hands _log_lead_alert."""
+        watchdog = service.Watchdog(object(), pod="p", tenant="t", session_name="t")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            watchdog._log_lead_alert(
+                "admitted", "lead", "stream-1",
+                outcome="delivered", title="t", old_title="o",
+            )
+        record = json.loads(out.getvalue().strip())
+        for forbidden_key in ("outcome", "title", "old_title"):
+            self.assertNotIn(forbidden_key, record, f"record {record!r} leaked {forbidden_key!r}")
+
+    def test_templates_are_all_admission_only_and_free_of_overclaim_words(self):
+        """Every entry in `_LEAD_ALERT_TEMPLATES` is the whole vocabulary
+        `_log_lead_alert` can ever emit -- a closed, hardcoded table, not
+        runtime input. Checking it once here covers every record that
+        table can ever produce, forever, the same way checking a type's
+        constructor once covers every instance -- no scenario test needs
+        to independently re-earn this for each `kind`."""
+        for kind, (event, evidence, reason_template) in service.Watchdog._LEAD_ALERT_TEMPLATES.items():
+            self.assertIn(
+                evidence, _ADMISSION_ONLY_EVIDENCE,
+                f"template {kind!r} carries a non-admission-only evidence tag {evidence!r}",
+            )
+            self.assertFalse(
+                _OVERCLAIM_WORD.search(event),
+                f"template {kind!r}'s event name {event!r} overclaims",
+            )
+            if reason_template is not None:
+                self.assertFalse(
+                    _OVERCLAIM_WORD.search(reason_template),
+                    f"template {kind!r}'s reason template {reason_template!r} overclaims",
+                )
+
+    def test_every_log_emitting_call_in_notify_lead_goes_through_the_wrapper_with_a_registered_kind(self):
+        calls = _log_emitting_calls(service.Watchdog._notify_lead)
+        self.assertTrue(calls, "expected at least one lead-alert log call in _notify_lead")
+        known_kinds = set(service.Watchdog._LEAD_ALERT_TEMPLATES)
+        for call in calls:
+            name = call.func.attr if isinstance(call.func, ast.Attribute) else call.func.id
+            self.assertEqual(
+                name, "_log_lead_alert",
+                f"_notify_lead calls {name}(...) directly at line {call.lineno} "
+                "(source-relative) instead of going through _log_lead_alert -- "
+                "this bypasses every guarantee the wrapper owns entirely",
+            )
+            # `self` is the first positional arg of a bound-method AST call
+            # only when written as `self._log_lead_alert(...)`, which every
+            # call site here is -- so `args[0]` is the `kind` argument, not
+            # `self` (that's implicit in the Attribute access, not a
+            # separate call argument).
+            self.assertTrue(
+                call.args, f"_log_lead_alert call at line {call.lineno} passes no `kind` argument",
+            )
+            kind_arg = call.args[0]
+            self.assertIsInstance(
+                kind_arg, ast.Constant,
+                f"_log_lead_alert call at line {call.lineno} passes a non-literal `kind` "
+                "-- this check can only verify a literal string against the template table",
+            )
+            self.assertIn(
+                kind_arg.value, known_kinds,
+                f"_log_lead_alert call at line {call.lineno} passes kind={kind_arg.value!r}, "
+                "which is not a key in _LEAD_ALERT_TEMPLATES",
+            )
+
+
+class AdmissionErrorCategoryTests(unittest.TestCase):
+    """Counterfixtures for _admission_error_category itself -- the closed
+    mapping that replaced `detail=str(exc)` after reviewer's exact
+    reproduction (`_log_lead_alert('unknown', ..., detail='REMOTE_SECRET_
+    EXCEPTION_TEXT')` -> that text landing verbatim in the durable
+    `reason`). Pinned in isolation, no Watchdog/FakeRedis needed, the same
+    reasoning as AdmissionEvidenceContractTests above: the classifier's own
+    correctness should not depend only on which scenario tests happen to
+    exercise it."""
+
+    def test_a_redis_error_is_categorized_as_redis_error(self):
+        self.assertEqual(
+            service.Watchdog._admission_error_category(redis.exceptions.ResponseError("x")),
+            "redis_error",
+        )
+
+    def test_a_builtin_connection_error_is_categorized_as_connection_error(self):
+        self.assertEqual(
+            service.Watchdog._admission_error_category(ConnectionError("x")),
+            "connection_error",
+        )
+
+    def test_a_builtin_timeout_error_is_categorized_as_timeout(self):
+        self.assertEqual(
+            service.Watchdog._admission_error_category(TimeoutError("x")),
+            "timeout",
+        )
+
+    def test_an_unrecognized_exception_falls_back_to_unexpected_error(self):
+        """A closed mapping must fail CLOSED, not open: an exception type
+        nobody has enumerated here yet must still get a safe, generic
+        category rather than falling through to something that exposes its
+        message."""
+        self.assertEqual(
+            service.Watchdog._admission_error_category(ValueError("x")),
+            "unexpected_error",
+        )
+
+    def test_the_categorys_own_message_never_appears_in_the_category_value(self):
+        """The classifier must return a fixed literal from its own closed
+        set -- never anything derived from the exception's message, even
+        indirectly. If this ever changed to build the category FROM
+        `str(exc)` (e.g. a prefix of it), this is the fixture that would
+        catch it."""
+        secret = "REMOTE_SECRET_EXCEPTION_TEXT"
+        category = service.Watchdog._admission_error_category(ConnectionError(secret))
+        self.assertNotIn(secret, category)
+        self.assertEqual(category, "connection_error")
 
 
 def _kicks():
@@ -536,7 +895,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(len(r.lists[_key("architect", "ingress")]), 300)
         events = [json.loads(line) for line in out.splitlines()]
         self.assertTrue(any(event.get("event") == "lead_alert_capacity" for event in events))
-        self.assertFalse(any(event.get("event") == "lead_alert_admitted" for event in events))
+        _assert_admission_only_evidence(self, _watchdog_records(out))
 
     def test_notify_lead_logs_unknown_and_does_not_kick_on_a_redis_fault(self):
         r = FakeRedis(fails_on={"eval": ConnectionError})
@@ -549,7 +908,27 @@ class WatchdogTests(unittest.TestCase):
 
         events = [json.loads(line) for line in out.splitlines()]
         self.assertTrue(any(event.get("event") == "lead_alert_unknown" for event in events))
-        self.assertFalse(any(event.get("event") == "lead_alert_admitted" for event in events))
+        _assert_admission_only_evidence(self, _watchdog_records(out))
+
+    def test_notify_lead_never_logs_the_admission_exceptions_own_message(self):
+        """Reviewer's exact reproduction: an admission-time exception whose
+        MESSAGE carries content nothing here can bound (a connection
+        string, a key name, arbitrary backend text) must never reach the
+        durable record. Only a closed CATEGORY this module names may cross
+        that boundary -- not `str(exc)`, not anywhere in the record."""
+        r = FakeRedis(fails_on={"eval": ConnectionError("REMOTE_SECRET_EXCEPTION_TEXT")})
+        _doing_agent(r)
+        _lead(r)
+        self._set(service, "run_tmux", _quiet_windows())
+        self._set(service, "deliver_tmux", _no_kick())
+
+        out = _capture(lambda: _watchdog(r).poll(now=NOW))
+
+        self.assertNotIn("REMOTE_SECRET_EXCEPTION_TEXT", out)
+        events = [json.loads(line) for line in out.splitlines()]
+        unknown = [event for event in events if event.get("event") == "lead_alert_unknown"]
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual(unknown[0].get("reason"), "admission outcome UNKNOWN after a connection_error")
 
     def test_notify_lead_logs_a_record_when_the_lead_is_not_a_registered_agent(self):
         """A dangling `lead` key pointing at a retired agent must not vanish
@@ -570,7 +949,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(no_lead[0]["destination"], "retired-lead")
         self.assertIn("not a registered agent", no_lead[0]["reason"])
         self.assertTrue(no_lead[0].get("stream_id"))
-        self.assertFalse(any(e.get("event") == "lead_alert_admitted" for e in events))
+        _assert_admission_only_evidence(self, _watchdog_records(out, destination="retired-lead"))
 
     def test_notify_lead_logs_a_record_when_the_lead_is_not_a_tmux_agent(self):
         r = FakeRedis()
@@ -588,7 +967,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(len(no_lead), 1)
         self.assertEqual(no_lead[0]["destination"], "api")
         self.assertIn("port_type is not tmux", no_lead[0]["reason"])
-        self.assertFalse(any(e.get("event") == "lead_alert_admitted" for e in events))
+        _assert_admission_only_evidence(self, _watchdog_records(out, destination="api"))
 
     def test_lead_window_missing_dead_letters_with_a_real_record_not_replayed(self):
         """A registered tmux lead whose window is merely missing right now
@@ -611,17 +990,46 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(len(dead_lettered), 1)
         self.assertEqual(dead_lettered[0]["reason"], "window_missing")
         self.assertEqual(dead_lettered[0]["destination"], "architect")
-        self.assertTrue(any(e.get("event") == "lead_alert_admitted" for e in events))
+        # Something was recorded about the alert attempt (the original
+        # defect was silence, not a naming choice) -- but it must not claim
+        # delivery either, since admission is genuinely all that's known
+        # here. See test_admission_only_logs_as_admitted_never_as_sent_or_
+        # delivered below for the dedicated claim-vs-vocabulary check.
+        _assert_admission_only_evidence(self, _watchdog_records(out))
 
     def test_admission_only_logs_as_admitted_never_as_sent_or_delivered(self):
         """ALLOCATED/ADMITTED/CREATED discipline: at the point admit_ingress
         succeeds, only ADMITTED (durably queued) is known -- deliver_tmux
-        has not even been called yet, let alone confirmed. The log at that
-        site must not claim more than that, and no other event in the same
-        pass may claim delivery succeeded when it did not.
+        has not even been called yet, let alone confirmed. Something must
+        be recorded (silence was the original defect), but whatever it says
+        must not claim delivery.
+
+        Asserts the CONTRACT, not a word list. Scanning specific fields (or
+        even every field, for specific overclaiming words) still lets a
+        genuinely novel claim-shaped vocabulary slip through unnoticed --
+        an implementation could always find a new way to say "delivered"
+        that a hardcoded word list never enumerated. The actual fix: every
+        watchdog record now carries a canonical `evidence` tag
+        (core.logging.log_record's `evidence` field) drawn from a CLOSED
+        allowlist -- `_assert_admission_only_evidence` rejects anything not
+        explicitly in it, including a vocabulary nobody has thought of yet,
+        not just the two words this ticket happened to start with. See
+        AdmissionEvidenceContractTests below for direct counterfixtures
+        pinning that the allowlist itself actually rejects an overclaim
+        (in `evidence` specifically, and a missing tag entirely) rather
+        than only being exercised indirectly through this scenario.
+
+        History: an earlier version of this test asserted the literal
+        string `lead_alert_admitted` as the event name; a correct alternate
+        implementation using one event name with a `state` field would have
+        broken it. The version after that scanned "event"/"state" fields
+        for overclaiming words; reviewer's counterexample
+        (outcome="delivered", reason="alert sent") showed a fixed field
+        list has the same shape of gap with more entries. This version is
+        the third: a closed contract instead of an enumerated one.
 
         Same window-missing scenario as the dead-letter test above -- this
-        one exists specifically to pin the naming/claim discipline, not the
+        one exists specifically to pin the claim discipline, not the
         dead-letter mechanics."""
         r = FakeRedis()
         _doing_agent(r)
@@ -630,14 +1038,11 @@ class WatchdogTests(unittest.TestCase):
         with patch("modules.tmux.port.list_windows", return_value=set()):
             out = _capture(lambda: _watchdog(r).poll(now=NOW))
 
-        events = [json.loads(line).get("event") for line in out.splitlines()]
-        self.assertIn("lead_alert_admitted", events)
-        self.assertNotIn("lead_alert_sent", events)
-        self.assertNotIn("lead_alert_delivered", events)
+        _assert_admission_only_evidence(self, _watchdog_records(out))
 
-    def test_admission_is_the_only_lead_alert_event_logged_on_success(self):
-        """No second, stronger-sounding event follows a successful
-        deliver_tmux call. deliver_tmux -> core.channels.receive() catches
+    def test_no_delivery_claim_follows_a_successful_deliver_tmux_call(self):
+        """No claim stronger than ADMITTED follows a successful deliver_tmux
+        call either. deliver_tmux -> core.channels.receive() catches
         DeadLetter internally and returns normally either way, so "no
         exception raised" cannot distinguish a real delivery from an
         internal dead-letter -- there is no honest claim to make beyond
@@ -653,24 +1058,7 @@ class WatchdogTests(unittest.TestCase):
 
         out = _capture(lambda: _watchdog(r).poll(now=NOW))
 
-        events = [json.loads(line).get("event") for line in out.splitlines()]
-        self.assertEqual(
-            [e for e in events if e and e.startswith("lead_alert_")],
-            ["lead_alert_admitted"],
-        )
-
-    def test_admitted_does_not_log_when_the_lead_ingress_is_full(self):
-        r = FakeRedis()
-        _doing_agent(r)
-        _lead(r)
-        r.lists[_key("architect", "ingress")] = ["x"] * 300  # INGRESS_MAX default
-        self._set(service, "run_tmux", _quiet_windows())
-        self._set(service, "deliver_tmux", _no_kick())
-
-        out = _capture(lambda: _watchdog(r).poll(now=NOW))
-
-        events = [json.loads(line).get("event") for line in out.splitlines()]
-        self.assertNotIn("lead_alert_admitted", events)
+        _assert_admission_only_evidence(self, _watchdog_records(out))
 
     # -- ack loop -------------------------------------------------------------
 

@@ -146,6 +146,7 @@ def log_record(
     outcome: str | None = None,
     title: str | None = None,
     old_title: str | None = None,
+    evidence: str | None = None,
 ) -> None:
     """One JSON object per line on stdout. Fields absent when not known.
 
@@ -156,6 +157,16 @@ def log_record(
     ⚠ This said "four" until 2026-08-22. A delivered unicast leaves SIX —
     `sent, popped, forwarded, kick_started, received, opened` — and the count in
     this file has now been stale at four, five and six in turn.
+
+    `evidence` is the canonical claim-level tag: what a caller actually knows
+    at the point it logs, not what it hopes or expects to happen next. Free
+    text in `reason` is for a human; `evidence` is the machine-checkable
+    contract a test can assert against without parsing prose or guessing at
+    vocabulary. A caller that knows only that a write was ADMITTED (durably
+    queued, not yet confirmed delivered) must not write "delivered" here or
+    anywhere else in the record -- see `modules.watchdog.service._notify_lead`
+    for the first caller that needed this distinction enforceable, not just
+    described.
     """
     record = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
@@ -186,6 +197,7 @@ def log_record(
         ("outcome", outcome),
         ("title", title),
         ("old_title", old_title),
+        ("evidence", evidence),
     ):
         if value is not None:
             record[field] = value

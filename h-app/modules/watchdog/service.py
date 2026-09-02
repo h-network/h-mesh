@@ -312,6 +312,119 @@ class Watchdog:
     def _lead(self) -> str | None:
         return _text(self.r.get(prefix(self.pod, self.tenant, resource="lead")))
 
+    # ⚠ The COMPLETE, closed vocabulary for every lead-alert record
+    # _notify_lead can ever produce. `event`, `evidence`, and the `reason`
+    # WORDING are all owned here -- a caller never supplies any of the
+    # three as free text. This is the third narrowing of this same defect:
+    # first a caller could contradict a correct `evidence` tag via
+    # `outcome`/`title`/`old_title` (closed by not exposing those
+    # parameters); then via an arbitrary `event` string or free `reason`
+    # prose (reviewer's next counterexample: event="lead_alert_delivered"
+    # with evidence="admitted" -- a delivery claim in the field naming the
+    # record, which nothing was checking). Closing individual fields one at
+    # a time kept relocating the same overclaim into whichever field was
+    # still open. The actual fix: if a caller can pass a string that reaches
+    # the record, the caller owns the vocabulary, not this module. So no
+    # caller-supplied string reaches the record at all -- only a `kind` key
+    # into this table, and structured values to fill each template's named
+    # placeholders.
+    #
+    # ⚠ A fourth leak, found by reviewer AFTER the above closed event/
+    # evidence/reason-wording: closing the SENTENCE FRAME is not the same
+    # as closing its CONTENT. The "unknown" template used to interpolate
+    # `{detail}` from a caller-supplied `detail=str(exc)` -- a fixed
+    # template around free text is still free text reaching the record.
+    # `str(exc)` is remote-influenced BY CONSTRUCTION: a Redis/proxy
+    # exception's message can embed a connection string, a key name, or
+    # arbitrary backend text nothing here can bound, the same content-leak
+    # class the relay branch hit repeatedly the same day. The provenance
+    # question, asked of every placeholder below, not just the one that
+    # already failed it once: *could this value be influenced by anything
+    # outside this process?*
+    #   {lead}         -- a registered agent name, only ever set by an
+    #                      authenticated `office` admin action. Already
+    #                      carried by this same record's `destination`
+    #                      field regardless, so this adds no new exposure.
+    #   {category}     -- see _admission_error_category below: a small,
+    #                      closed set of literals this module hardcodes by
+    #                      isinstance, never the exception's own message or
+    #                      even its own class name (that vocabulary would
+    #                      belong to redis-py, not to this module).
+    #   {depth}        -- a plain int, admit_ingress's own ingress-length
+    #                      count. Never text.
+    #   {ingress_max}  -- a plain int, this instance's own configured
+    #                      constant. Never text.
+    _LEAD_ALERT_TEMPLATES: dict[str, tuple[str, str, str | None]] = {
+        # kind -> (event, evidence, reason template or None)
+        "no_lead_unregistered": (
+            "lead_alert_no_lead", "no_lead", "lead {lead!r} is not a registered agent",
+        ),
+        "no_lead_wrong_port_type": (
+            "lead_alert_no_lead", "no_lead", "lead {lead!r} port_type is not tmux",
+        ),
+        "unknown": (
+            "lead_alert_unknown", "unknown",
+            "admission outcome UNKNOWN after a {category}",
+        ),
+        "capacity": (
+            "lead_alert_capacity", "rejected",
+            "lead ingress full: depth {depth} has reached INGRESS_MAX {ingress_max}",
+        ),
+        "admitted": ("lead_alert_admitted", "admitted", None),
+    }
+
+    # ⚠ A CLOSED, hardcoded mapping from exception type to a category THIS
+    # MODULE names -- never `type(exc).__name__` (that name belongs to
+    # whichever library raised it, and is not a vocabulary this module has
+    # reviewed for safety to log durably) and never `str(exc)` (that
+    # message can embed arbitrary backend/remote text; see the template
+    # comment above). Checked most-specific-first; anything unrecognized
+    # -- including a non-Redis exception admit_ingress was never expected
+    # to raise -- falls through to "unexpected_error" rather than widening
+    # what gets logged to cover it.
+    _ADMISSION_ERROR_CATEGORIES: tuple[tuple[type[BaseException], str], ...] = (
+        (redis.exceptions.RedisError, "redis_error"),
+        (ConnectionError, "connection_error"),
+        (TimeoutError, "timeout"),
+    )
+
+    @classmethod
+    def _admission_error_category(cls, exc: BaseException) -> str:
+        for exc_type, category in cls._ADMISSION_ERROR_CATEGORIES:
+            if isinstance(exc, exc_type):
+                return category
+        return "unexpected_error"
+
+    # ⚠ The ONLY way _notify_lead may log anything about a lead-alert
+    # attempt. `kind` is required (no default) and must be a key in
+    # _LEAD_ALERT_TEMPLATES -- an unrecognized or omitted `kind` is a
+    # KeyError/TypeError at the call, immediately, not a malformed or
+    # untagged record reaching the log. `**context` fills the chosen
+    # template's named placeholders with structured values (a lead name, a
+    # closed error CATEGORY, a queue depth) -- never a caller-composed
+    # sentence, and never a value with unbounded provenance like an
+    # exception's own message (see the provenance audit above
+    # _LEAD_ALERT_TEMPLATES).
+    #
+    # This is checked two ways, not one, per the lesson that a guarantee
+    # asserted at a boundary wider than the mechanism enforcing it is not a
+    # guarantee: `evidence` used to be a keyword-only parameter with no
+    # default, and the claim was "an omitted tag fails at the call, which
+    # the AST test catches before it ships." The AST test only checked the
+    # CALL TARGET's name, never its arguments -- a call missing `evidence=`
+    # passed the static check and would only have raised in production, the
+    # first time that path executed. Falsified before trusting it fixed:
+    # see tests.test_watchdog's LeadAlertLoggingStructureTests, which
+    # constructs a call missing the required argument and confirms the AST
+    # check itself catches it, not just Python's own TypeError at runtime.
+    def _log_lead_alert(self, kind: str, lead: str, stream_id: str, **context: object) -> None:
+        event, evidence, reason_template = self._LEAD_ALERT_TEMPLATES[kind]
+        reason = reason_template.format(lead=lead, **context) if reason_template else None
+        log_record(
+            "watchdog", event,
+            stream_id=stream_id, destination=lead, reason=reason, evidence=evidence,
+        )
+
     def _notify_lead(self, lead: str, text: str) -> None:
         """Paste one message directly into the lead's pane.
 
@@ -383,18 +496,10 @@ class Watchdog:
             self._error("lead_alert", exc)
             return
         if not is_member(self.r, pod=self.pod, tenant=self.tenant, agent=lead):
-            log_record(
-                "watchdog", "lead_alert_no_lead",
-                stream_id=envelope["stream_id"], destination=lead,
-                reason=f"lead {lead!r} is not a registered agent",
-            )
+            self._log_lead_alert("no_lead_unregistered", lead, envelope["stream_id"])
             return
         if port_type(self.r, pod=self.pod, tenant=self.tenant, agent=lead) != "tmux":
-            log_record(
-                "watchdog", "lead_alert_no_lead",
-                stream_id=envelope["stream_id"], destination=lead,
-                reason=f"lead {lead!r} port_type is not tmux",
-            )
+            self._log_lead_alert("no_lead_wrong_port_type", lead, envelope["stream_id"])
             return
         try:
             admitted, _, depth = admit_ingress(
@@ -406,23 +511,29 @@ class Watchdog:
                 limit=self.ingress_max,
             )
         except Exception as exc:
-            log_record(
-                "watchdog", "lead_alert_unknown",
-                stream_id=envelope["stream_id"], destination=lead,
-                reason=f"admission outcome UNKNOWN after {exc}",
+            # ⚠ `exc` itself never crosses into _log_lead_alert -- only the
+            # closed category _admission_error_category derives from it.
+            # str(exc) is never a legitimate context value; see the
+            # provenance comment above _LEAD_ALERT_TEMPLATES.
+            self._log_lead_alert(
+                "unknown", lead, envelope["stream_id"],
+                category=self._admission_error_category(exc),
             )
             return
         if not admitted:
-            log_record(
-                "watchdog", "lead_alert_capacity",
-                stream_id=envelope["stream_id"], destination=lead,
-                reason=f"lead ingress full: depth {depth} has reached INGRESS_MAX {self.ingress_max}",
+            self._log_lead_alert(
+                "capacity", lead, envelope["stream_id"],
+                depth=depth, ingress_max=self.ingress_max,
             )
             return
         # ⚠ ADMITTED, not sent/delivered: this only proves the envelope was
         # durably written to the lead's ingress list. deliver_tmux has not
         # been called yet, let alone confirmed -- admission and delivery are
         # different facts, and this event must not be read as the second one.
+        # kind="admitted" resolves via _LEAD_ALERT_TEMPLATES to event=
+        # "lead_alert_admitted" and evidence="admitted" together, from one
+        # owned entry -- there is no way to reach this call with an event
+        # name that disagrees with its evidence tag.
         #
         # ⚠ No second "attempted"/"delivered" event is logged here on purpose.
         # deliver_tmux -> core.channels.receive() catches DeadLetter INSIDE
@@ -436,7 +547,7 @@ class Watchdog:
         # logged by channels.receive() itself under module="tmux", each
         # backed by an actual distinguishing fact instead of an absence of
         # exception.
-        log_record("watchdog", "lead_alert_admitted", stream_id=envelope["stream_id"], destination=lead)
+        self._log_lead_alert("admitted", lead, envelope["stream_id"])
         try:
             deliver_tmux(
                 self.r, self.pod, self.tenant, lead,
