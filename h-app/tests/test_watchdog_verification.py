@@ -278,6 +278,26 @@ class DeliveryVerifierTests(unittest.TestCase):
 
         self.assertNotIn(_key("blocked"), r.hashes)
 
+    def test_self_heal_requires_activity_strictly_after_since_not_at_it(self):
+        """Pin the safety side of the self-heal boundary: activity AT or
+        BEFORE `blocked.since` is not evidence the agent recovered -- it may
+        be exactly what caused the block, or older still. Only activity
+        strictly after `since` counts, same `>` the marker-based verified
+        check already uses."""
+        r = FakeRedis()
+        blocked = {"since": "2026-08-09T11:00:00Z", "stream_id": "stale"}
+        r.hashes[_key("blocked")] = dict(blocked)
+        # Activity exactly AT `since`, and one before it -- neither is
+        # "later" activity.
+        r.streams[_key("activity")] = [
+            _activity("tool", "2026-08-09T10:55:00Z"),
+            _activity("tool", "2026-08-09T11:00:00Z"),
+        ]
+
+        DeliveryVerifier(r, pod=POD, tenant=TENANT).poll({"sme-2"}, now=NOW)
+
+        self.assertEqual(r.hashes[_key("blocked")], blocked)
+
     def test_pending_verify_key_follows_the_dotted_resource_convention(self):
         """Resources compose with a dot, like tasks.todo and activity.offset.
 

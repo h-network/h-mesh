@@ -925,6 +925,25 @@ class WatchdogTests(unittest.TestCase):
         ))
         self.assertEqual(kicks, ["architect"])
 
+    def test_hold_duration_normalizes_embedded_whitespace_in_the_reason(self):
+        """Matches office list's own normalization of `hold_reason` -- an
+        unnormalized multi-line reason would make one alert read like
+        several separate messages."""
+        r = FakeRedis()
+        _hold_agent(r, reason="waiting on vendor\n\nconfirmation   still   pending")
+        _lead(r)
+        kicks, fake = _kicks()
+        self._set(service, "run_tmux", _quiet_windows())
+        self._set(service, "deliver_tmux", fake)
+
+        _watchdog(r).poll(now=NOW)
+
+        envelope = parse(r.lists[_key("architect", "ingress")][-1])
+        self.assertEqual(envelope["payload"]["text"], (
+            '[alert from watchdog] sme-2 has had "wait on the vendor reply" '
+            'on hold for 60 min (reason: waiting on vendor confirmation still pending)'
+        ))
+
     def test_hold_duration_still_fires_without_a_reason_on_a_legacy_entry(self):
         """A ticket held before --reason was mandatory has no `hold_reason`
         at all -- must degrade gracefully, not crash or suppress the alert."""
