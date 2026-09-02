@@ -27,6 +27,7 @@ class FakeRedis:
         self.lists = defaultdict(deque)
         self.hashes = defaultdict(dict)
         self.hget_calls = []
+        self.hgetall_calls = []
         self.hexists_calls = []
 
     def rpush(self, key, *values):
@@ -51,6 +52,10 @@ class FakeRedis:
     def hget(self, key, field):
         self.hget_calls.append((key, field))
         return self.hashes[key].get(field)
+
+    def hgetall(self, key):
+        self.hgetall_calls.append(key)
+        return dict(self.hashes[key])
 
     def hdel(self, key, field):
         return int(self.hashes[key].pop(field, None) is not None)
@@ -240,7 +245,7 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(opened[0]["ttl"], 15)
         self.assertEqual(opened[0]["hops"], 1)
 
-    def test_broadcast_keeps_membership_only_kick_path(self):
+    def test_broadcast_resolves_each_member_type_and_kicks_all(self):
         self.register(alice="tmux", bob="tmux", carol="api")
         stream_id = send(
             self.redis, pod=POD, tenant=TENANT, source="alice",
@@ -256,9 +261,12 @@ class ChannelTests(unittest.TestCase):
         )
         with patch("core.service._emit_observation"), patch("core.service._log_observation") as log:
             self.assertTrue(switch.step(timeout=0))
-        self.assertEqual(kicks, [])
+        self.assertEqual(kicks, [
+            ("bob", "tmux", stream_id),
+            ("carol", "api", stream_id),
+        ])
         deferred = [call for call in log.call_args_list if call.args == ("kick_deferred",)]
-        self.assertEqual([call.kwargs["destination"] for call in deferred], ["bob", "carol"])
+        self.assertEqual(deferred, [])
         self.assertEqual(self.redis.hget_calls[hgets_before_step:], [])
         self.assertEqual(self.redis.hexists_calls, [])
 
