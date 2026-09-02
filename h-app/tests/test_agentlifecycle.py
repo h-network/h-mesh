@@ -345,6 +345,22 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
     kill_window.assert_called_once_with("worker-1")
 
 
+def test_successful_public_stop_clears_current_lead(real_redis):
+    tenant = f"stop-lead-{uuid4().hex[:12]}"
+    registry_key = prefix(POD, tenant, resource="registry")
+    lead_key = prefix(POD, tenant, resource="lead")
+    real_redis.hset(registry_key, "lead-agent", "tmux")
+    real_redis.set(lead_key, "lead-agent")
+    try:
+        stop_agent(real_redis, pod=POD, tenant=tenant,
+                   envelope={"payload": {"agent": "lead-agent"}},
+                   kill_window=lambda _agent: None)
+        assert real_redis.get(lead_key) is None
+        assert real_redis.hget(registry_key, "lead-agent") is None
+    finally:
+        real_redis.delete(registry_key, lead_key)
+
+
 def test_stop_cleanup_cannot_erase_successor_delivery_identity(real_redis):
     tenant = f"stop-reuse-{uuid4().hex[:12]}"
     agent = "reused-worker"
