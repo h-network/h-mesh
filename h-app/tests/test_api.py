@@ -342,23 +342,26 @@ class ApiTests(unittest.TestCase):
             deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
         self.assertNotIn(marker, out2.getvalue())
 
-    def test_reply_correlation_and_dead_letter_reasons_are_always_closed_literals(self):
+    def test_known_reply_correlation_and_dead_letter_branches_use_closed_literal_reasons(self):
         """EXAMPLE-LEVEL coverage, not a module-wide guarantee -- reviewer's
         exact correction, still the accurate description after the source
-        checker's retreat (ticket 0e6cdc0f): this drives every branch that
-        exists TODAY (the ones enumerated below) with adversarial values
-        and confirms none of them currently leak. It has no mechanism to
-        discover a NEW caller added elsewhere in the file, so it cannot
-        and does not prove "any third site would fail". A prior AST-based
-        source checker attempted that stronger, module-wide claim and was
-        retired after five review rounds each found a real way past it,
-        the last being a `global` declaration moving binding ownership
-        without changing nesting depth -- a genuinely new category its own
-        documented stopping condition correctly refused to patch a sixth
-        time. Module-wide reason-argument safety in this file rests on
-        manual code review (this branch's own commit history) plus this
-        test pinning today's known branches -- not on an automated
-        certificate."""
+        checker's retreat (ticket 0e6cdc0f), and now reflected in this
+        test's own name too (reviewer's second, scoped correction on
+        d4431bd: the old name's "always" claimed the module-wide guarantee
+        this retreat withdrew, even after the docstring was fixed -- a
+        node ID is what the manifest and a reviewer see first). This drives
+        every branch that exists TODAY (the ones enumerated below) with
+        adversarial values and confirms none of them currently leak. It has
+        no mechanism to discover a NEW caller added elsewhere in the file,
+        so it cannot and does not prove "any third site would fail". A
+        prior AST-based source checker attempted that stronger, module-wide
+        claim and was retired after five review rounds each found a real
+        way past it, the last being a `global` declaration moving binding
+        ownership without changing nesting depth -- a genuinely new
+        category its own documented stopping condition correctly refused
+        to patch a sixth time. No automated module-wide guarantee remains
+        in this file -- a future or new call site requires manual review.
+        This test only pins the branches enumerated here today."""
         closed_reasons = {
             None,
             "malformed in_reply_to",
