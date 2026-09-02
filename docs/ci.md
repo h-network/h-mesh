@@ -38,20 +38,32 @@ opposite and was wrong.
 
 The real obstacle is our own workflow triggers, and it is specific:
 `.github/workflows/ci.yml` runs on `pull_request`, `merge_group`, and pushes to
-`main`. It does **not** run on pushes to topic branches. So a commit sitting on
-a topic branch has no check run attached to it at all. Turn on required status
-checks for `main` while merging by direct push, and every direct push is
-rejected forever — not because the code fails, but because the required check
-can never come into existence for a commit that has not already landed on
-`main`. Requiring a pull request has the same effect by design: it ends direct
-pushes.
+`main`. It does **not** run on pushes to topic branches. So under the current
+configuration a commit sitting on a topic branch acquires no check run
+automatically. Turn on required status checks for `main` while merging by
+direct push, and the ordinary direct-push workflow stops working — not because
+the code fails, but because nothing in the present setup produces the required
+context for a commit before it lands on `main`. Requiring a pull request has
+the same effect more directly: it ends direct pushes by design.
 
-That is the actual trade. A mechanical gate here is not weak, it is
-*load-bearing*: enabling one means adopting pull requests, or restoring CI on
-topic-branch pushes so commits can carry a check before they land. Both are
-real options and neither has been taken. Until one is, the absence of a gate is
-a standing decision to rely on process instead — made knowingly, and revisitable
-the moment someone is willing to pay for one of those two changes.
+Note the boundary of that claim. It is about *this* workflow configuration, not
+about what GitHub permits. A required context is satisfied by a check run **or
+a commit status**, and the commit-status API lets any sufficiently permitted
+user or integration create a status for an arbitrary SHA. Adding a
+`workflow_dispatch` trigger would be another route. So a topic commit *can* be
+made to carry the required context without changing `ci.yml` at all — the gate
+is not technically unreachable, and this document should not be read as
+claiming it is.
+
+That is the actual trade, and it is about which operating model we want rather
+than what is possible. The practical routes are adopting pull requests, or
+restoring CI on topic-branch pushes so commits carry a check before they land;
+a hand-posted commit status would also satisfy the rule, but a gate whose
+required evidence a human can mint on demand is a gate in name only, so it is
+not offered here as a serious option. None of these has been taken. Until one
+is, the absence of a gate is a standing decision to rely on process instead —
+made knowingly, and revisitable whenever someone is willing to pay for one of
+those changes.
 
 What gates a merge here today is procedural, not mechanical:
 
@@ -68,11 +80,19 @@ What gates a merge here today is procedural, not mechanical:
    about the suite.
 
    ⚠ State which tree the run was in. `python -m tools.run_tests` resolves its
-   own repository root from the installed module's path, so invoking it from a
-   git worktree or a second checkout runs the suite against the *install* clone
-   while you stand in the branch — exiting 0 with a believable count. Confirm
-   with `python -c "import tools.run_tests as m; print(m.REPO_ROOT)"` and check
-   the path is the tree you meant to test.
+   repository root from the *resolved module's* path, not from your working
+   directory. So invoking it from a git worktree or a second checkout **can**
+   run the suite against a different clone while you stand in the branch,
+   exiting 0 with a believable count. Whether it does depends on how import
+   resolution lands: a clone with its own editable install or `PYTHONPATH` is
+   unaffected. Do not reason about which case you are in — check:
+
+   ```bash
+   python -c "import tools.run_tests as m; print(m.REPO_ROOT)"
+   ```
+
+   The path it prints is the tree that will be tested. If it is not the tree
+   you meant, the number you get is about something else.
 
 Both steps are human discipline and can be skipped by anyone who decides to
 skip them. That is the honest cost of not having a mechanical gate, and it
