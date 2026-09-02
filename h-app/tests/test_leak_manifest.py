@@ -1158,17 +1158,18 @@ def test_a_transient_nonempty_directory_is_stuck_then_cleanly_reaped_next_sessio
         # process gets to check.
         #
         # ⚠ Reviewer's finding: `not raced_once["done"]` is NOT by itself a
-        # safe skip condition. If the tmpdir is STILL PRESENT and nobody's
-        # rmdir ever touched it (raced_once False), that is not "someone
-        # else finished the job" -- nobody did, and THIS process's own
-        # reap_all_orphans never even reached this entry's removal at all.
-        # That is a genuine regression (a reaper that stops before
-        # attempting the owned orphan), and skipping it would turn the
-        # only test for this recovery path into permanently green noise.
-        # Skip ONLY when the tmpdir is gone (someone, concurrently,
-        # finished it) -- otherwise fall through and let `raced_once`
-        # itself be asserted, which fails loudly if this process's own
-        # attempt never happened.
+        # safe skip condition. A concurrent process finishing the job
+        # requires the tmpdir to be GONE -- if it's still present, no
+        # process (this one or a concurrent one) has completed removing
+        # it, so "someone else finished the job" cannot explain this
+        # state. That state-based reasoning is what justifies failing
+        # rather than skipping here; it does not by itself say WHY this
+        # process's own attempt didn't complete (see the diagnostic
+        # below, which states what's known and doesn't guess the rest).
+        # Skip ONLY when the tmpdir is gone -- otherwise fall through and
+        # let `raced_once` itself be asserted, which fails loudly instead
+        # of turning the only test for this recovery path into
+        # permanently green noise.
         if not real_tmpdir.exists():
             pytest.skip(
                 "a concurrent process's ordinary sweep of the same shared "
@@ -1178,10 +1179,24 @@ def test_a_transient_nonempty_directory_is_stuck_then_cleanly_reaped_next_sessio
             )
         if not raced_once["done"]:
             if not own_log_lines:
+                # Reviewer's finding: absence of a matching captured line is
+                # NOT proof this entry was never reached -- only proof there
+                # is no captured evidence that it was. A matching line
+                # would positively prove reaching a logged point; the
+                # absence of one cannot positively prove the opposite (the
+                # sweep could have reached the entry and failed before its
+                # first matching log call, the wording could have stopped
+                # including this entry's name, or logging on this path
+                # could have been removed/moved). State the absence, list
+                # what it could mean, and pick none of them.
                 cause = (
-                    "reap_all_orphans never mentioned this entry at all -- it "
-                    "did not reach this entry in its sweep (misclassified, "
-                    "skipped, or never iterated to it)"
+                    "no captured log line mentions this entry at all -- this "
+                    "could mean reap_all_orphans never reached it in its "
+                    "sweep, OR that it reached it and failed/stopped before "
+                    "any matching log call, OR that a matching line exists "
+                    "but no longer mentions this entry's name/path. Absence "
+                    "of a captured line proves absence of evidence, not "
+                    "absence of the attempt."
                 )
             else:
                 cause = (
