@@ -111,6 +111,19 @@ instead of silently testing the installed clone. Run it with an environment
 installed from the tree being verified; do not treat that refusal as a reason
 to fall back to a narrower pytest command.
 
+Before collection, the runner starts a fresh child with the same sanitized
+environment that pytest and test-spawned processes will inherit. That child
+must import `services.daemons` from the named tree. A missing or cross-tree
+import fails immediately with the interpreter, module path, expected tree, and
+editable-install command instead of surfacing later as a product-test failure.
+The runner deliberately does not inject the checkout into `PYTHONPATH`: doing
+so would let source imports hide a broken installation. Install the tree with
+the command in the diagnostic, then rerun the canonical suite. A manually
+supplied `PYTHONPATH` that points at the named tree can satisfy the child-import
+check, but that only demonstrates the import property for that invocation; the
+documented production-equivalent setup remains an editable install from the
+tree under test.
+
 ## There is no enforced merge gate, and that is deliberate
 
 Nothing in the repository prevents a change from reaching `main` without
