@@ -32,6 +32,29 @@ DEFAULT_ENVELOPE_MAX_BYTES = 1_048_576
 # the cause). Module-level so a test can shrink it without waiting out a
 # real multi-second interval.
 SSE_KEEPALIVE_INTERVAL_S = 3.0
+# The idle-poll interval in _stream_response's event_generator: one Redis
+# XRANGE per open connection every SSE_POLL_INTERVAL_S, whether or not
+# anything is queued -- looks like an obvious rate to tighten on sight.
+# Measured before touching it (ticket 737c6b13, 2026-09-02, on a real
+# server against real Redis, not reasoned about): scales exactly linearly
+# at ~10 XRANGE/sec per idle stream (confirmed at 1, 20, and 100
+# concurrent streams), Redis-side execution cost sub-2-microseconds per
+# call at every scale tested, redis-py's connection pool multiplexes many
+# streams onto few actual connections (100 concurrent streams used 13,
+# not 100), and a separate client's PING round-trip latency was
+# unaffected at mean/p50 even at 100 concurrent streams (p99 tail rose to
+# ~430us from a ~170us baseline -- still sub-millisecond). Redis container
+# CPU: 0.21% baseline to 2.88% at 100 concurrent streams.
+# THE ASSUMPTION THIS RESTS ON: this office's realistic concurrent-stream
+# count is single-digit to low-tens (one telegram bot process plus
+# whatever web console tabs are open), not hundreds -- 100 was tested as
+# roughly 10x that, deliberately, to leave margin. If something changes
+# that assumption -- a stream opened per agent rather than per client, a
+# console that opens one stream per browser tab, or concurrent SSE
+# consumers for one tenant plausibly reaching the 100s -- re-run the
+# measurement in ticket 737c6b13 before assuming this is still fine;
+# linear-but-cheap does not stay cheap forever, it stays linear.
+SSE_POLL_INTERVAL_S = 0.1
 ATTACHMENT_MAX_BYTES = 10_485_760
 ATTACHMENT_BASE64_MAX_BYTES = 4 * math.ceil(ATTACHMENT_MAX_BYTES / 3)
 ATTACHMENT_FILENAME_MAX_BYTES = 255
@@ -710,7 +733,7 @@ def _stream_response(
                     # to a stream nobody is reading anymore.
                     yield ": keepalive\n\n"
                     last_sent = now
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(SSE_POLL_INTERVAL_S)
 
     return StreamingResponse(
         event_generator(),
