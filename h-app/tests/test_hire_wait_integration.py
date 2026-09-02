@@ -1,10 +1,19 @@
 """End-to-end confirmation that `office hire --wait` actually distinguishes
-confirmed/failed/unknown against a REAL switch+reconciler pair, not just the
+failed/unknown against a REAL switch+reconciler pair, not just the
 FakeRedis-backed unit tests in test_office_cli.py. Real incident: setup.sh's
 roster-hire loop printed "hired" for any exit 0 from `hire`, which only ever
 proved the StartAgent envelope was durably enqueued (ADMITTED) -- never that
-the agent actually registered (CREATED). This exercises the actual mesh
-(a real hired agent's registry row, a real dead-letter rejection) end to end.
+the agent actually registered (CREATED).
+
+⚠ --wait cannot currently report success (exit 0/"confirmed"), for a fresh
+hire or a re-hire alike -- reviewer FAILED two successive versions of that
+outcome, the second time proving that even "the registry transitioned from
+absent to tmux" isn't attributable to a specific request under concurrency
+(a different, unrelated same-name hire can be the one that actually
+registered it). See ff53e7e9 for the real fix shape. So a REAL successful
+hire below is checked by polling the registry directly with core.registry.
+port_type -- the thing --wait itself now deliberately never claims -- not
+by trusting --wait's own exit code for that half of the story.
 """
 
 import os
@@ -13,12 +22,14 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
 import redis
 
 from core.keys import prefix
+from core.registry import port_type
 from services.daemons import DAEMON_MODULES, start_daemons
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -53,7 +64,11 @@ def _office_env(tmpdir: str, pod: str, tenant: str) -> dict:
     return env
 
 
-def test_hire_wait_confirms_a_real_agent_end_to_end():
+def test_hire_wait_is_unknown_for_a_real_successful_hire_which_really_did_register():
+    # The real point of this test: --wait correctly refuses to claim
+    # "confirmed" even though the hire genuinely worked (checked
+    # independently, via the registry directly) -- proving the honesty
+    # fix, not a hang or a crash.
     _skip_unless_redis()
     tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_hire_wait_")
     run_dir = Path(tmpdir) / "run"
@@ -73,11 +88,25 @@ def test_hire_wait_confirms_a_real_agent_end_to_end():
         hire_env = dict(env)
         hire_env["AGENT_NAME"] = "host"
         res = subprocess.run(
-            [str(python), "-m", "modules.office.cli", "hire", "worker1", "--cli", "claude", "--wait"],
+            [str(python), "-m", "modules.office.cli", "hire", "worker1", "--cli", "claude", "--wait", "5"],
             env=hire_env, capture_output=True, text=True, timeout=40,
         )
-        assert res.returncode == 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
-        assert "confirmed: worker1 registered" in res.stdout
+        assert res.returncode == 2, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+        assert "confirmed" not in res.stdout
+        assert "unknown: no proof of failure" in res.stderr
+
+        # The hire genuinely worked -- proven independently of --wait's own
+        # (deliberately non-committal) exit code.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if port_type(r, pod=pod, tenant=tenant, agent="worker1") == "tmux":
+                break
+            time.sleep(0.2)
+        assert port_type(r, pod=pod, tenant=tenant, agent="worker1") == "tmux", (
+            "the hire never actually registered -- this would mean --wait's "
+            "'unknown' was masking a real failure, not honest uncertainty "
+            "about a real success"
+        )
     finally:
         for pidfile in run_dir.glob("*.pid") if run_dir.is_dir() else []:
             try:
@@ -152,10 +181,12 @@ def test_hire_wait_never_confirms_a_rejected_rehire_of_an_already_registered_age
     # reproduced against real FakeRedis-seeded state; this proves the same
     # harm is closed against the real switch/lifecycle pipeline, not just a
     # mocked one. Hire worker1 for real first (so it's genuinely
-    # registered), then re-hire the SAME agent with a malformed --profile
-    # -- a real rejection -- and confirm the second call is never told
-    # "confirmed" despite the agent still being tmux-registered throughout
-    # (from the first, successful hire).
+    # registered -- proven via the registry directly, not via --wait's own
+    # exit code, which correctly never claims success), then re-hire the
+    # SAME agent with a malformed --profile -- a real rejection -- and
+    # confirm the second call is never told "confirmed" despite the agent
+    # still being tmux-registered throughout (from the first, successful
+    # hire).
     _skip_unless_redis()
     tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_hire_wait_")
     run_dir = Path(tmpdir) / "run"
@@ -175,11 +206,21 @@ def test_hire_wait_never_confirms_a_rejected_rehire_of_an_already_registered_age
         hire_env = dict(env)
         hire_env["AGENT_NAME"] = "host"
         first = subprocess.run(
-            [str(python), "-m", "modules.office.cli", "hire", "worker1", "--cli", "claude", "--wait"],
+            [str(python), "-m", "modules.office.cli", "hire", "worker1", "--cli", "claude", "--wait", "5"],
             env=hire_env, capture_output=True, text=True, timeout=40,
         )
-        assert first.returncode == 0, f"stdout: {first.stdout}\nstderr: {first.stderr}"
-        assert "confirmed: worker1 registered" in first.stdout
+        assert first.returncode == 2, f"stdout: {first.stdout}\nstderr: {first.stderr}"
+        assert "confirmed" not in first.stdout
+
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if port_type(r, pod=pod, tenant=tenant, agent="worker1") == "tmux":
+                break
+            time.sleep(0.2)
+        assert port_type(r, pod=pod, tenant=tenant, agent="worker1") == "tmux", (
+            "the first hire never actually registered -- can't set up the "
+            "already-registered precondition this test needs"
+        )
 
         second = subprocess.run(
             [str(python), "-m", "modules.office.cli", "hire", "worker1", "--cli", "claude",

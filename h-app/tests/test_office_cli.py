@@ -267,18 +267,32 @@ def _dead_letter_envelope() -> tuple[bytes, str]:
 
 @patch("modules.office.cli.port_type")
 @patch("modules.office.cli.send")
-def test_hire_wait_confirms_a_genuinely_new_registration(mock_send, mock_port_type, monkeypatch, capsys):
-    # Attributable: the agent was NOT registered at the pre-send baseline
-    # (first port_type call), then IS registered by the time the poll loop
-    # checks (second call) -- a real transition this request could only
-    # have caused, unlike a bare pre-existing row (see the tests below).
+def test_hire_wait_is_unknown_not_confirmed_even_for_a_clean_new_registration(
+    mock_send, mock_port_type, monkeypatch, capsys,
+):
+    # Reviewer FAILED a version of this function that treated "absent, then
+    # tmux" as unambiguous for a never-before-registered agent, reasoning
+    # nothing else could cause that transition. Wrong under concurrency: a
+    # DIFFERENT, unrelated StartAgent for the same agent name -- already
+    # queued, or racing in around the same time -- can register the agent
+    # while THIS request is independently rejected, with its dead-letter
+    # simply not landed yet by the time of an early poll. Both worlds look
+    # identical: no dead-letter match (yet), port_type()=="tmux". So even
+    # a clean-looking transition -- registry absent, then present, no
+    # dead-letter ever -- must resolve to "unknown", never "confirmed".
+    # port_type is mocked and asserted un-called below to prove the
+    # function doesn't even look at it anymore, not to simulate a
+    # transition it would react to.
     _env(monkeypatch)
     mock_send.return_value = "stream-1"
-    mock_port_type.side_effect = [None, "tmux"]
     r = FakeRedis()
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
-        office_main(["hire", "worker-1", "--cli", "claude", "--wait", "1"])
-    assert "confirmed: worker-1 registered" in capsys.readouterr().out
+        with pytest.raises(SystemExit) as exc_info:
+            office_main(["hire", "worker-1", "--cli", "claude", "--wait", "0.3"])
+    out = capsys.readouterr()
+    assert "confirmed" not in out.out
+    assert exc_info.value.code == 2
+    mock_port_type.assert_not_called()
 
 
 @patch("modules.office.cli.send")
@@ -391,8 +405,8 @@ def test_hire_wait_times_out_as_unknown_not_failed_when_neither_happens(mock_sen
             office_main(["hire", "worker-1", "--cli", "claude", "--wait", "0.2"])
     assert exc_info.value.code == 2, "a timeout must be its own exit code, distinct from a real failure (1)"
     err = capsys.readouterr().err
-    assert "unknown: no confirmation" in err
-    assert "NOT a failure" in err
+    assert "unknown: no proof of failure" in err
+    assert "does NOT mean it failed" in err
 
 
 # ⚠ Reviewer FAILED this branch on exactly this: `type=float` accepted nan/
@@ -427,22 +441,24 @@ def test_hire_wait_rejects_non_finite_and_negative_values_before_any_send(mock_s
     mock_send.assert_not_called()
 
 
-@patch("modules.office.cli.port_type")
 @patch("modules.office.cli.send")
-def test_hire_wait_accepts_zero_as_an_immediate_single_check(mock_send, mock_port_type, monkeypatch, capsys):
+def test_hire_wait_accepts_zero_as_an_immediate_single_check(mock_send, monkeypatch, capsys):
     # 0 is finite and non-negative -- a legitimate "check once now, don't
     # actually wait" mode, not something the nan/inf/negative fix should
-    # also reject. Same attributable-transition shape as the genuinely-new
-    # registration test above: not registered at the pre-send baseline,
-    # registered by the single check the loop still performs at wait=0.
+    # also reject. send() still gets called (0 isn't rejected the way
+    # nan/inf/negative are), and with nothing seeded to prove a rejection,
+    # the single check correctly resolves unknown -- not confirmed, since
+    # that outcome no longer exists at all.
     _env(monkeypatch)
     mock_send.return_value = "stream-1"
-    mock_port_type.side_effect = [None, "tmux"]
     r = FakeRedis()
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
-        office_main(["hire", "worker-1", "--cli", "claude", "--wait", "0"])
+        with pytest.raises(SystemExit) as exc_info:
+            office_main(["hire", "worker-1", "--cli", "claude", "--wait", "0"])
     mock_send.assert_called_once()
-    assert "confirmed: worker-1 registered" in capsys.readouterr().out
+    out = capsys.readouterr()
+    assert "confirmed" not in out.out
+    assert exc_info.value.code == 2
 
 
 @patch("modules.office.cli.send")

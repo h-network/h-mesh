@@ -520,19 +520,39 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
         # word "hired" off nothing but this command's exit code is ADMITTED
         # (the envelope was durably enqueued) reported as CREATED (the agent
         # actually exists) -- exactly the shape of a real incident where an
-        # operator was told an agent existed when it did not. A caller that
-        # wants to print CREATED-level language must earn it, not assume it.
+        # operator was told an agent existed when it did not.
+        #
+        # ⚠ Cannot currently report success, only the ABSENCE of a proven
+        # failure -- read this before scripting against exit 0. "hire" is
+        # really two operations sharing one name: identity creation (a
+        # genuinely new agent, where CREATED could in principle be
+        # observed once an attributable signal exists) and idempotent
+        # re-hire/reconfiguration of an agent that already exists (where
+        # bare registry membership says NOTHING about whether THIS
+        # request did anything -- no amount of polling membership will
+        # ever be conclusive for it, even in principle, since a
+        # different, unrelated request for the same agent name is
+        # observationally identical). Nothing in this codebase today
+        # writes a signal tying a *successful* StartAgent back to the
+        # specific stream_id that caused it, for either case -- so
+        # neither can be safely confirmed, only proven failed or left
+        # unknown. See ticket ff53e7e9 for the attributable-completion
+        # signal (success AND failure, keyed by stream_id, covering both
+        # operations) this would need to safely report a real success.
         parser.add_argument(
             "--wait", nargs="?", const=30.0, type=_wait_seconds, default=None, metavar="SECONDS",
-            help="wait up to SECONDS (default 30) for confirmation the agent actually "
-                 "registered, instead of returning as soon as the request is merely "
-                 "accepted. Three distinct outcomes, not two: exit 0 = confirmed "
-                 "(registered); exit 1 = failed (a real rejection, seen in the "
-                 "destination's dead-letter list); exit 2 = unknown -- no confirmation "
-                 "within SECONDS, which is NOT the same as failure. A stranded request "
-                 "can still complete later once switch recovery re-kicks it (see "
-                 "switch-agent's drain/recovery fix) -- timing out here means 'don't "
-                 "know yet', never 'didn't happen'.",
+            help="wait up to SECONDS (default 30) and report what can be proven about "
+                 "this request, instead of returning as soon as it's merely accepted. "
+                 "Two outcomes today, not three: exit 1 = failed (a real, stream_id-"
+                 "matched rejection, seen in the destination's dead-letter list); "
+                 "exit 2 = unknown -- no proof of failure within SECONDS. Exit 0 is "
+                 "NOT currently reachable: bare registry membership cannot be "
+                 "attributed to this specific request under concurrency (a different "
+                 "request for the same agent name could be the one that actually "
+                 "registered it, or already had), so this never claims success -- "
+                 "only the absence of a proven failure. A timeout is not a failure: "
+                 "a stranded request can still complete later once switch recovery "
+                 "re-kicks it (see switch-agent's drain/recovery fix).",
         )
     args = parser.parse_args(argv)
     r, pod, tenant, source = _context()
@@ -562,17 +582,6 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
         if args.claude_tools is not None:
             payload["claude_tools"] = args.claude_tools
 
-    # ⚠ Captured BEFORE send(), not after -- this is the baseline
-    # _await_hire_confirmation needs to tell "this request caused the
-    # agent to register" apart from "the agent was already registered for
-    # an unrelated reason". Checking it after send() would race: the
-    # request could already have been processed by the time this line
-    # runs, making an attributable transition look like pre-existing
-    # membership.
-    already_registered = (
-        command == "hire" and args.wait is not None
-        and port_type(r, pod=pod, tenant=tenant, agent=args.agent) == "tmux"
-    )
     stream_id = send(
         r,
         pod=pod,
@@ -585,19 +594,17 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
     )
     if command == "hire" and args.wait is not None:
         outcome, detail = _await_hire_confirmation(
-            r, pod=pod, tenant=tenant, agent=args.agent, stream_id=stream_id, timeout=args.wait,
-            already_registered=already_registered,
+            r, pod=pod, tenant=tenant, stream_id=stream_id, timeout=args.wait,
         )
-        if outcome == "confirmed":
-            print(f"confirmed: {args.agent} registered")
-            return
         if outcome == "failed":
             print(f"failed: {args.agent} was not registered -- {detail}", file=sys.stderr)
             raise SystemExit(1)
         print(
-            f"unknown: no confirmation for {args.agent} within {args.wait:.0f}s -- "
-            "this is NOT a failure, it may still complete; check 'office status' or "
-            "the registry directly before assuming it didn't happen",
+            f"unknown: no proof of failure for {args.agent} within {args.wait:.0f}s -- "
+            "this does NOT mean it failed, it may well have succeeded; there is "
+            "currently no way to prove success for this request, only to disprove "
+            "it (see ticket ff53e7e9 for why). Check 'office status' or the "
+            "registry directly if you want to look for yourself.",
             file=sys.stderr,
         )
         raise SystemExit(2)
@@ -608,67 +615,44 @@ _HIRE_CONFIRMATION_POLL_INTERVAL_S = 0.5
 
 
 def _await_hire_confirmation(
-    r, *, pod: str, tenant: str, agent: str, stream_id: str, timeout: float,
-    already_registered: bool,
+    r, *, pod: str, tenant: str, stream_id: str, timeout: float,
 ) -> tuple[str, str | None]:
-    """Poll for evidence attributable to THIS request -- not just evidence
-    about the world. Reviewer FAILED an earlier version of this function on
-    exactly the gap that distinction closes: registry port_type()=="tmux"
-    was checked as confirmation with no regard for whether the agent was
-    *already* tmux before this request was ever sent. For an agent hired
-    for the first time, "absent, then tmux" is unambiguous -- nothing else
-    could have caused that transition. For an agent that already existed
-    (a re-hire / config-change request), bare membership proves nothing
-    about whether THIS request succeeded or was rejected: the row would
-    look identical either way. lib.agentlifecycle.start_agent DOES
-    sometimes produce a real, observable side effect for this case (it
-    kills the existing pane via replace_window() when the new payload's
-    cli/profile/provider/resume/skip_permissions/claude_tools actually
-    differ from what's already published -- its own `config_changed`
-    check), but that is a *window-liveness* event, not an identity one --
-    deliberately not consumed here, the same "window readiness is a
-    separate, later state" scoping switch-agent drew for the
-    never-registered-before case too. What start_agent() never does,
-    changed or not, is touch `window.cause`/any registry-adjacent marker
-    for an already-registered agent's hire ("idempotent starts do not
-    replace this marker: their envelope did not cause a new window" --
-    its own comment; not independently asserted by that module's own test
-    suite as of this writing, only relied upon here, and this function
-    does not actually depend on it staying true either way, since it
-    never reads that key at all). So an already-registered agent can only
-    ever resolve to "failed" (a real, stream_id-matched rejection) or
-    "unknown" here -- never "confirmed" -- because no request-attributable
-    *identity* signal is consumed for it. UNKNOWN staying UNKNOWN, not
-    silently becoming a false CONFIRMED, is the entire point of the
-    three-state design; a wait that cannot tell the difference must time
-    out, not lie.
+    """Poll for the only outcome this can currently prove: a real,
+    stream_id-matched rejection. Deliberately does NOT check registry
+    membership as evidence of success, in any case -- not even a
+    genuinely-first-ever hire of a brand-new agent name.
 
-    ⚠ Known, accepted residual gap, not fully closed: the caller's own
-    already_registered baseline (see _lifecycle_command) is read
-    immediately before send(), but not atomically with it -- a
-    same-name hire racing in *that* exact window (unrelated to this one)
-    could still make a genuinely-fresh request look already-registered
-    (this function then correctly stays conservative: unknown/failed,
-    never a false confirm) or, in the narrower and more concerning
-    direction, could make this function treat a transition it didn't
-    cause as if it did (a false confirm, the original defect shape at a
-    much smaller scale). Closing this fully needs an atomic read+enqueue
-    (e.g. a Lua script), which would mean changing core.channels.send()
-    itself -- out of scope here without coordinating with whoever owns
-    that function.
+    An earlier version of this function DID check bare registry
+    port_type()=="tmux" as confirmation once the target had never been
+    seen before, reasoning that "absent, then tmux" was unambiguous since
+    nothing else could cause that transition. Reviewer FAILED that
+    version too: it is not unambiguous under concurrency. A DIFFERENT,
+    unrelated StartAgent for the same agent name -- already queued, or
+    racing in around the same time -- can register the agent while THIS
+    request is independently rejected, with its dead-letter simply not
+    landed yet by the time of an early poll. Both worlds -- "this request
+    succeeded" and "a different request succeeded while this one failed"
+    -- look identical from here: no dead-letter match (yet) and
+    port_type()=="tmux". An earlier attempt to fix this by requiring the
+    agent to have been absent at a pre-send baseline (this function's own
+    previous revision) does not close it either: another same-name hire
+    can already be sitting in ingress, unprocessed, when that baseline is
+    read -- the baseline sees absence, this request is enqueued behind
+    the other one, the other one registers the agent, this one is
+    rejected, and the poll still observes tmux before the rejection lands.
 
-    Dead-letter evidence is checked every iteration BEFORE the registry, and
-    reversing that order alone was considered and rejected (per reviewer):
-    it would only convert a reliable wrong answer into an intermittent
-    race, where the poll can still resolve "confirmed" a moment before a
-    slightly-delayed rejection lands. The already_registered gate is what
-    actually closes it, not the check ordering by itself.
-
-    ⚠ Registry port_type=="tmux" is CREATED *identity* only, even in the
-    unambiguous never-before-registered case -- it does not prove the tmux
-    window/pane is actually ready to receive input. Window readiness is a
-    separate, later state and must be checked separately by a caller that
-    needs it (per switch-agent).
+    "hire" is really two operations sharing one name and this one --wait
+    flag: identity creation (a genuinely new agent -- CREATED could in
+    principle be observed once an attributable signal exists) and
+    idempotent re-hire/reconfiguration of an agent that already exists
+    (where bare membership can never be conclusive, even in principle,
+    since a different request is observationally identical). Neither
+    currently has a success signal keyed by stream_id anywhere in this
+    codebase, so neither can be safely confirmed -- only proven failed,
+    or left honestly unknown. See ticket ff53e7e9 for the real fix shape:
+    stream-id-attributable lifecycle completion, covering explicit
+    idempotent-success and reconfiguration-success signals, not just a
+    reordered or better-gated registry check.
 
     ⚠ Read-only against the dead-letter list (LRANGE, never pop) -- popping
     it here would consume evidence a human or another tool still needs to
@@ -691,8 +675,6 @@ def _await_hire_confirmation(
                 continue
             if envelope.get("stream_id") == stream_id:
                 return "failed", "rejected by host -- see host's activity log for the reason"
-        if not already_registered and port_type(r, pod=pod, tenant=tenant, agent=agent) == "tmux":
-            return "confirmed", None
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return "unknown", None
