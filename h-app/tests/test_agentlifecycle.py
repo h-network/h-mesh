@@ -142,6 +142,28 @@ def test_lead_removal_wrongtype_is_no_write(real_redis):
         )
 
 
+@patch("lib.agentlifecycle.lifecycle.log_record")
+def test_start_agent_first_claim_and_later_preserve_report_success(_log, real_redis):
+    tenant = f"public-lead-{uuid4().hex[:12]}"
+    try:
+        for agent in ("first", "second"):
+            start_agent(
+                real_redis, pod=POD, tenant=tenant,
+                envelope={"correlation_id": agent, "payload": {"agent": agent}},
+                replace_window=lambda _agent: None,
+                available_profiles=lambda *_: None,
+            )
+        assert real_redis.get(prefix(POD, tenant, resource="lead")) == b"first"
+        assert real_redis.hget(prefix(POD, tenant, resource="registry"), "first") == b"tmux"
+        assert real_redis.hget(prefix(POD, tenant, resource="registry"), "second") == b"tmux"
+        accepted = [call.kwargs for call in _log.call_args_list if call.args[1] == "start_agent_accepted"]
+        assert [item["lead_outcome"] for item in accepted] == ["lead_claimed", "lead_preserved"]
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
 @pytest.mark.parametrize(
     "wrong_index",
     [2, 3, 4, 16, 17],

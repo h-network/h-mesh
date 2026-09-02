@@ -71,6 +71,7 @@ h-app/clients/web/tests/test_web_server.py::test_the_ordering_watch_catches_a_ha
 h-app/clients/web/tests/test_web_server.py::test_the_audit_ordering_is_owned_by_the_response_helper
 h-app/tests/test_agentlifecycle.py::test_lead_publish_wrongtype_is_no_write
 h-app/tests/test_agentlifecycle.py::test_lead_removal_wrongtype_is_no_write
+h-app/tests/test_agentlifecycle.py::test_start_agent_first_claim_and_later_preserve_report_success
 h-app/tests/test_agentlifecycle.py::test_stop_custody_type_preflight_preserves_every_identity[processing]
 h-app/tests/test_agentlifecycle.py::test_stop_custody_type_preflight_preserves_every_identity[opening]
 h-app/tests/test_agentlifecycle.py::test_stop_custody_type_preflight_preserves_every_identity[ingress]
