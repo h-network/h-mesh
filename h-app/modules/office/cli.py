@@ -898,13 +898,17 @@ def _retitle_command(argv: list[str]) -> None:
         raise OfficeError("replacement title cannot be empty")
     r, pod, tenant, source = _context()
     keys = _task_keys(pod, tenant, source)
-    state, raw, ticket = _select(r, keys, ("todo", "doing", "hold"), args.id)
-    old_title = ticket["title"]
-    ticket["title"] = title
-    _rewrite_selected(r, key=keys[state], raw=raw, ticket=ticket)
+    state, raw, normalized = _select(r, keys, ("todo", "doing", "hold"), args.id)
+    # A targeted edit owns exactly one field. Unknown extensions and legacy
+    # spellings are preservation obligations, not migration opportunities, so
+    # rewrite the original object rather than normalize_ticket's projection.
+    stored = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+    old_title = stored["title"]
+    stored["title"] = title
+    _rewrite_selected(r, key=keys[state], raw=raw, ticket=stored)
     record_task_event(
         "retitle",
-        id=ticket["id"],
+        id=normalized["id"],
         title=title,
         old_title=old_title,
         agent=source,
@@ -914,11 +918,11 @@ def _retitle_command(argv: list[str]) -> None:
         "office",
         "task_retitled",
         destination=source,
-        task_id=ticket["id"],
+        task_id=normalized["id"],
         title=title,
         old_title=old_title,
     )
-    print(serialize_ticket(ticket))
+    print(serialize_ticket(stored))
 
 
 def _hold_command(argv: list[str]) -> None:

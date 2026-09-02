@@ -457,6 +457,44 @@ def test_retitle_rewrites_open_ticket_in_place_and_preserves_position(monkeypatc
     assert json.loads(r.lists[todo_key][1])["id"] == "second"
 
 
+@pytest.mark.parametrize(
+    "ticket",
+    [
+        _ticket(
+            "architect",
+            status="doing",
+            title="stale premise",
+            external_ref="must-survive",
+            future_metadata={"owner": "ops"},
+        ),
+        {
+            "v": 1,
+            "id": "legacy-id",
+            "title": "stale premise",
+            "description": "legacy shape",
+            "from": "architect",
+            "status": "doing",
+            "created_at": "2026-08-31T00:00:00.000Z",
+            "custom_legacy_flag": True,
+        },
+    ],
+)
+def test_retitle_changes_only_title_in_full_stored_object(ticket, monkeypatch):
+    _env(monkeypatch)
+    r = FakeRedis()
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    r.lists[doing_key].append(json.dumps(ticket))
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["retitle", "--title", "corrected premise"])
+
+    rewritten = json.loads(r.lists[doing_key][0])
+    assert rewritten["title"] == "corrected premise"
+    assert {key: value for key, value in rewritten.items() if key != "title"} == {
+        key: value for key, value in ticket.items() if key != "title"
+    }
+
+
 def test_retitle_records_old_and_new_title_in_both_audit_channels(monkeypatch, tmp_path):
     _env(monkeypatch)
     task_record = tmp_path / "tasks.jsonl"
