@@ -1,11 +1,9 @@
 import json
 import os
 import signal
-import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from unittest.mock import ANY, call, patch
@@ -16,7 +14,6 @@ import redis
 from core.keys import prefix
 from core.registry import port_type
 from services.daemons import (
-    ALL_DAEMON_MODULES,
     DAEMON_MODULES,
     OPTIONAL_DAEMON_MODULES,
     DaemonError,
@@ -63,85 +60,56 @@ def _skip_unless_redis() -> None:
         pytest.skip("Redis server not available at REDIS_URL")
 
 
-def _kill_and_cleanup(run_dir: Path, tmpdir: str, env: dict) -> None:
-    for name in ALL_DAEMON_MODULES:
-        pidfile = run_dir / f"{name}.pid"
-        if pidfile.exists():
-            try:
-                pid = int(pidfile.read_text().strip())
-                os.kill(pid, 9)
-            except (ValueError, OSError):
-                pass
-    socket_path = env.get("TMUX_SOCKET")
-    if socket_path:
-        try:
-            import subprocess
-            subprocess.run(["tmux", "-S", socket_path, "kill-server"],
-                            capture_output=True, timeout=5)
-        except Exception:
-            pass
-    shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def test_start_daemons_then_stop_daemons_cleanly():
+def test_start_daemons_then_stop_daemons_cleanly(managed_tmpdir):
     _skip_unless_redis()
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_daemons_")
+    tmpdir = managed_tmpdir("h_mesh_test_daemons_")
     run_dir = Path(tmpdir) / "run"
     pod = f"testpod-{os.urandom(4).hex()}"
     tenant = f"testtenant-{os.urandom(4).hex()}"
     python = Path(sys.executable)
     env = _env(pod, tenant, tmpdir)
 
-    try:
-        pids = start_daemons(python=python, run_dir=run_dir, env=env)
-        assert set(pids) == set(DAEMON_MODULES)
-        for name, pid in pids.items():
-            assert pid_alive(pid), f"{name} (pid {pid}) not alive right after start"
-            assert (run_dir / f"{name}.pid").read_text().strip() == str(pid)
-            assert (run_dir / f"{name}.pid.identity").exists()
-            assert (run_dir / f"{name}.log").exists()
+    pids = start_daemons(python=python, run_dir=run_dir, env=env)
+    assert set(pids) == set(DAEMON_MODULES)
+    for name, pid in pids.items():
+        assert pid_alive(pid), f"{name} (pid {pid}) not alive right after start"
+        assert (run_dir / f"{name}.pid").read_text().strip() == str(pid)
+        assert (run_dir / f"{name}.pid.identity").exists()
+        assert (run_dir / f"{name}.log").exists()
 
-        stop_daemons(run_dir)
-        for name, pid in pids.items():
-            assert not pid_alive(pid), f"{name} (pid {pid}) still alive after stop"
-            assert not (run_dir / f"{name}.pid").exists()
-            assert not (run_dir / f"{name}.pid.identity").exists()
+    stop_daemons(run_dir)
+    for name, pid in pids.items():
+        assert not pid_alive(pid), f"{name} (pid {pid}) still alive after stop"
+        assert not (run_dir / f"{name}.pid").exists()
+        assert not (run_dir / f"{name}.pid.identity").exists()
 
-        # Idempotent: stopping again (nothing running, no pidfiles) is a no-op.
-        stop_daemons(run_dir)
-    finally:
-        _kill_and_cleanup(run_dir, tmpdir, env)
+    # Idempotent: stopping again (nothing running, no pidfiles) is a no-op.
+    stop_daemons(run_dir)
 
 
-def test_start_daemons_is_duplicate_safe_against_an_already_running_pair():
+def test_start_daemons_is_duplicate_safe_against_an_already_running_pair(managed_tmpdir):
     _skip_unless_redis()
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_daemons_")
+    tmpdir = managed_tmpdir("h_mesh_test_daemons_")
     run_dir = Path(tmpdir) / "run"
     pod = f"testpod-{os.urandom(4).hex()}"
     tenant = f"testtenant-{os.urandom(4).hex()}"
     python = Path(sys.executable)
     env = _env(pod, tenant, tmpdir)
 
-    try:
-        first_pids = start_daemons(python=python, run_dir=run_dir, env=env)
-        second_pids = start_daemons(python=python, run_dir=run_dir, env=env)
-        assert second_pids == first_pids, "second start_daemons() call spawned new processes"
-        stop_daemons(run_dir)
-    finally:
-        _kill_and_cleanup(run_dir, tmpdir, env)
+    first_pids = start_daemons(python=python, run_dir=run_dir, env=env)
+    second_pids = start_daemons(python=python, run_dir=run_dir, env=env)
+    assert second_pids == first_pids, "second start_daemons() call spawned new processes"
+    stop_daemons(run_dir)
 
 
-def test_stop_daemons_removes_stale_pidfile_without_error():
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_daemons_")
+def test_stop_daemons_removes_stale_pidfile_without_error(managed_tmpdir):
+    tmpdir = managed_tmpdir("h_mesh_test_daemons_")
     run_dir = Path(tmpdir) / "run"
     run_dir.mkdir(parents=True)
     # A pid that is certainly not running (max pid range, unlikely to collide).
     (run_dir / "switch.pid").write_text("999999999\n")
-    try:
-        stop_daemons(run_dir)
-        assert not (run_dir / "switch.pid").exists()
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    stop_daemons(run_dir)
+    assert not (run_dir / "switch.pid").exists()
 
 
 def test_stop_daemons_does_not_signal_an_unrelated_live_process(tmp_path):
@@ -173,24 +141,20 @@ def test_stop_daemons_does_not_signal_an_unrelated_live_process(tmp_path):
         unrelated.wait(timeout=5)
 
 
-def test_legacy_daemon_is_authenticated_then_stopped_during_first_upgrade():
+def test_legacy_daemon_is_authenticated_then_stopped_during_first_upgrade(managed_tmpdir):
     _skip_unless_redis()
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_daemons_legacy_")
+    tmpdir = managed_tmpdir("h_mesh_test_daemons_legacy_")
     run_dir = Path(tmpdir) / "run"
     env = _env(f"testpod-{os.urandom(4).hex()}", f"testtenant-{os.urandom(4).hex()}", tmpdir)
-    pids = {}
-    try:
-        pids = start_daemons(
-            python=Path(sys.executable), run_dir=run_dir, env=env,
-        )
-        for name in pids:
-            (run_dir / f"{name}.pid.identity").unlink()
+    pids = start_daemons(
+        python=Path(sys.executable), run_dir=run_dir, env=env,
+    )
+    for name in pids:
+        (run_dir / f"{name}.pid.identity").unlink()
 
-        stop_daemons(run_dir, env=env)
+    stop_daemons(run_dir, env=env)
 
-        assert all(not pid_alive(pid) for pid in pids.values())
-    finally:
-        _kill_and_cleanup(run_dir, tmpdir, env)
+    assert all(not pid_alive(pid) for pid in pids.values())
 
 
 def test_stop_daemons_fails_closed_when_process_identity_cannot_be_read(tmp_path):
@@ -368,19 +332,16 @@ def test_pidfd_processlookup_cleans_up_stale_evidence_without_numeric_signal(tmp
     assert not identity_file.exists()
 
 
-def test_start_daemons_raises_daemon_error_when_module_is_broken(monkeypatch):
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_daemons_")
+def test_start_daemons_raises_daemon_error_when_module_is_broken(monkeypatch, managed_tmpdir):
+    tmpdir = managed_tmpdir("h_mesh_test_daemons_")
     run_dir = Path(tmpdir) / "run"
     python = Path(sys.executable)
     env = _env("testpod", "testtenant", tmpdir)
 
     import services.daemons as daemons_mod
     monkeypatch.setitem(daemons_mod.DAEMON_MODULES, "switch", "this.module.does.not.exist")
-    try:
-        with pytest.raises(DaemonError):
-            start_daemons(python=python, run_dir=run_dir, env=env)
-    finally:
-        _kill_and_cleanup(run_dir, tmpdir, env)
+    with pytest.raises(DaemonError):
+        start_daemons(python=python, run_dir=run_dir, env=env)
 
 
 def test_failed_start_rolls_back_only_daemons_started_by_this_call(monkeypatch, tmp_path):
@@ -565,14 +526,14 @@ def test_enabled_daemon_modules_requires_both_token_and_chat_id():
     assert set(enabled_daemon_modules({"TELEGRAM_CHAT_ID": "y"})) == set(DAEMON_MODULES)
 
 
-def test_start_daemons_starts_an_optional_daemon_when_requested_in_daemon_modules():
+def test_start_daemons_starts_an_optional_daemon_when_requested_in_daemon_modules(managed_tmpdir):
     # api is genuinely startable with no external network calls, given
     # POD/TENANT/API_TOKEN/REDIS_URL -- proves the daemon_modules override
     # actually starts a real, alive extra process end to end, and that the
     # now-broadened stop_daemons() (checking ALL_DAEMON_MODULES) stops it
     # too, not just the always-on pair.
     _skip_unless_redis()
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_daemons_")
+    tmpdir = managed_tmpdir("h_mesh_test_daemons_")
     run_dir = Path(tmpdir) / "run"
     pod = f"testpod-{os.urandom(4).hex()}"
     tenant = f"testtenant-{os.urandom(4).hex()}"
@@ -593,21 +554,18 @@ def test_start_daemons_starts_an_optional_daemon_when_requested_in_daemon_module
         env["API_PORT"] = str(probe.getsockname()[1])
 
     daemon_modules = {**DAEMON_MODULES, "api": OPTIONAL_DAEMON_MODULES["api"]}
-    try:
-        pids = start_daemons(python=python, run_dir=run_dir, env=env, daemon_modules=daemon_modules)
-        assert set(pids) == set(DAEMON_MODULES) | {"api"}
-        for pid in pids.values():
-            assert pid_alive(pid)
+    pids = start_daemons(python=python, run_dir=run_dir, env=env, daemon_modules=daemon_modules)
+    assert set(pids) == set(DAEMON_MODULES) | {"api"}
+    for pid in pids.values():
+        assert pid_alive(pid)
 
-        stop_daemons(run_dir)
-        for pid in pids.values():
-            assert not pid_alive(pid)
-        assert not (run_dir / "api.pid").exists()
-    finally:
-        _kill_and_cleanup(run_dir, tmpdir, env)
+    stop_daemons(run_dir)
+    for pid in pids.values():
+        assert not pid_alive(pid)
+    assert not (run_dir / "api.pid").exists()
 
 
-def test_watchdog_starts_by_default_and_presence_leaves_unknown_after_a_real_hire():
+def test_watchdog_starts_by_default_and_presence_leaves_unknown_after_a_real_hire(managed_tmpdir):
     # The actual bug: DAEMON_MODULES didn't include watchdog, so setup.sh/
     # h-mesh start/h-mesh upgrade never started it, nothing ever sampled
     # presence, and every agent read "unknown" forever with no ticket to
@@ -615,7 +573,7 @@ def test_watchdog_starts_by_default_and_presence_leaves_unknown_after_a_real_hir
     # notice -- modules.office.cli's own "status" command -- not just that
     # a watchdog pid happens to exist.
     _skip_unless_redis()
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_watchdog_")
+    tmpdir = managed_tmpdir("h_mesh_test_watchdog_")
     run_dir = Path(tmpdir) / "run"
     pod = f"testpod-{os.urandom(4).hex()}"
     tenant = f"testtenant-{os.urandom(4).hex()}"
@@ -634,55 +592,52 @@ def test_watchdog_starts_by_default_and_presence_leaves_unknown_after_a_real_hir
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
 
     r = redis.Redis.from_url(env["REDIS_URL"])
-    try:
-        pids = start_daemons(python=python, run_dir=run_dir, env=env)
-        assert "watchdog" in pids, "watchdog must be part of the default, always-on set"
-        assert pid_alive(pids["watchdog"])
+    pids = start_daemons(python=python, run_dir=run_dir, env=env)
+    assert "watchdog" in pids, "watchdog must be part of the default, always-on set"
+    assert pid_alive(pids["watchdog"])
 
-        registry_key = prefix(pod, tenant, resource="registry")
-        r.hset(registry_key, mapping={"host": "office"})
+    registry_key = prefix(pod, tenant, resource="registry")
+    r.hset(registry_key, mapping={"host": "office"})
 
-        hire_env = dict(env)
-        hire_env["AGENT_NAME"] = "host"
-        hire_res = subprocess.run(
-            [str(python), "-m", "modules.office.cli", "hire", "worker1", "--cli", "claude"],
-            env=hire_env, capture_output=True, text=True, timeout=15,
+    hire_env = dict(env)
+    hire_env["AGENT_NAME"] = "host"
+    hire_res = subprocess.run(
+        [str(python), "-m", "modules.office.cli", "hire", "worker1", "--cli", "claude"],
+        env=hire_env, capture_output=True, text=True, timeout=15,
+    )
+    assert hire_res.returncode == 0, f"hire failed: {hire_res.stderr}\n{hire_res.stdout}"
+
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if port_type(r, pod=pod, tenant=tenant, agent="worker1") == "tmux":
+            break
+        time.sleep(0.2)
+    assert port_type(r, pod=pod, tenant=tenant, agent="worker1") == "tmux", "worker1 never registered"
+
+    status_out = ""
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        status_res = subprocess.run(
+            [str(python), "-m", "modules.office.cli", "status", "worker1"],
+            env=hire_env, capture_output=True, text=True, timeout=10,
         )
-        assert hire_res.returncode == 0, f"hire failed: {hire_res.stderr}\n{hire_res.stdout}"
-
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
-            if port_type(r, pod=pod, tenant=tenant, agent="worker1") == "tmux":
-                break
-            time.sleep(0.2)
-        assert port_type(r, pod=pod, tenant=tenant, agent="worker1") == "tmux", "worker1 never registered"
-
-        status_out = ""
-        deadline = time.monotonic() + 15.0
-        while time.monotonic() < deadline:
-            status_res = subprocess.run(
-                [str(python), "-m", "modules.office.cli", "status", "worker1"],
-                env=hire_env, capture_output=True, text=True, timeout=10,
-            )
-            status_out = status_res.stdout
-            if "unknown" not in status_out:
-                break
-            time.sleep(0.5)
-        assert "unknown" not in status_out, (
-            f"presence stayed unknown after a real hire, status output: {status_out!r}\n"
-            f"watchdog.log:\n{(run_dir / 'watchdog.log').read_text()}"
-        )
-    finally:
-        _kill_and_cleanup(run_dir, tmpdir, env)
+        status_out = status_res.stdout
+        if "unknown" not in status_out:
+            break
+        time.sleep(0.5)
+    assert "unknown" not in status_out, (
+        f"presence stayed unknown after a real hire, status output: {status_out!r}\n"
+        f"watchdog.log:\n{(run_dir / 'watchdog.log').read_text()}"
+    )
 
 
-def test_session_daemon_starts_when_telegram_is_configured_not_otherwise():
+def test_session_daemon_starts_when_telegram_is_configured_not_otherwise(managed_tmpdir):
     # session backs the Telegram bot's "watch" command and hard-requires
     # API_TOKEN (modules.session.app.SessionSettings.from_env) -- confirms
     # it actually starts, alive, once Telegram config makes it eligible via
     # enabled_daemon_modules, and is absent when it doesn't.
     _skip_unless_redis()
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_session_")
+    tmpdir = managed_tmpdir("h_mesh_test_session_")
     run_dir = Path(tmpdir) / "run"
     pod = f"testpod-{os.urandom(4).hex()}"
     tenant = f"testtenant-{os.urandom(4).hex()}"
@@ -700,26 +655,22 @@ def test_session_daemon_starts_when_telegram_is_configured_not_otherwise():
     env["TELEGRAM_BOT_TOKEN"] = "fake-bot-token"
     env["TELEGRAM_CHAT_ID"] = "12345"
 
-    try:
-        # enabled_daemon_modules() is what setup.sh actually calls -- confirm
-        # its shape here -- but only start a subset for real (skip
-        # telegram_bot): a fake, non-functional TELEGRAM_BOT_TOKEN would make
-        # TelegramBot use the real TelegramClient, not DryRunTelegramClient,
-        # risking a real network call to Telegram's servers. This test is
-        # about session, not the bot.
-        daemon_modules = enabled_daemon_modules(env)
-        assert "session" in daemon_modules
-        start_modules = {**DAEMON_MODULES, "api": daemon_modules["api"], "session": daemon_modules["session"]}
-        pids = start_daemons(python=python, run_dir=run_dir, env=env, daemon_modules=start_modules)
-        assert "session" in pids
-        assert pid_alive(pids["session"]), (
-            f"session.log:\n{(run_dir / 'session.log').read_text()}"
-        )
+    # enabled_daemon_modules() is what setup.sh actually calls -- confirm its
+    # shape here -- but only start a subset for real (skip telegram_bot): a
+    # fake, non-functional TELEGRAM_BOT_TOKEN would make TelegramBot use the
+    # real TelegramClient, not DryRunTelegramClient, risking a real network
+    # call to Telegram's servers. This test is about session, not the bot.
+    daemon_modules = enabled_daemon_modules(env)
+    assert "session" in daemon_modules
+    start_modules = {**DAEMON_MODULES, "api": daemon_modules["api"], "session": daemon_modules["session"]}
+    pids = start_daemons(python=python, run_dir=run_dir, env=env, daemon_modules=start_modules)
+    assert "session" in pids
+    assert pid_alive(pids["session"]), (
+        f"session.log:\n{(run_dir / 'session.log').read_text()}"
+    )
 
-        stop_daemons(run_dir)
-        assert not pid_alive(pids["session"])
-    finally:
-        _kill_and_cleanup(run_dir, tmpdir, env)
+    stop_daemons(run_dir)
+    assert not pid_alive(pids["session"])
 
 
 def test_session_daemon_absent_without_telegram_config():

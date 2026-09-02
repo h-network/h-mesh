@@ -12,11 +12,9 @@ mock of it.
 
 import json
 import os
-import shutil
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -40,9 +38,9 @@ def _skip_unless_redis() -> None:
         pytest.skip("Redis server not available at REDIS_URL")
 
 
-def test_session_daemon_streams_a_real_hired_agents_pane():
+def test_session_daemon_streams_a_real_hired_agents_pane(managed_tmpdir):
     _skip_unless_redis()
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_session_watch_")
+    tmpdir = managed_tmpdir("h_mesh_test_session_watch_")
     run_dir = Path(tmpdir) / "run"
     pod = f"testpod-{os.urandom(4).hex()}"
     tenant = f"testtenant-{os.urandom(4).hex()}"
@@ -162,26 +160,19 @@ def test_session_daemon_streams_a_real_hired_agents_pane():
             "never received the real pane's marker text over a real watch stream"
         )
     finally:
+        # Daemons, the isolated tmux server, and the tmpdir itself are all
+        # handled by managed_tmpdir's own teardown (and, if this process is
+        # killed before reaching even that, by the next session's orphan
+        # reaper -- see conftest.py). Only state managed_tmpdir doesn't know
+        # about -- this websocket, these Redis keys -- needs cleaning here.
         if ws is not None:
             try:
                 ws.close()
             except Exception:
                 pass
-        for name in ("switch", "tmux_reconciler", "watchdog", "api", "session"):
-            pidfile = run_dir / f"{name}.pid"
-            if pidfile.exists():
-                try:
-                    os.kill(int(pidfile.read_text().strip()), 9)
-                except (ValueError, OSError):
-                    pass
-        try:
-            subprocess.run(["tmux", "-S", socket_path, "kill-server"], capture_output=True, timeout=5)
-        except Exception:
-            pass
         try:
             keys = r.keys(f"pod:{pod}:tenant:{tenant}:*") or []
             if keys:
                 r.delete(*keys)
         except Exception:
             pass
-        shutil.rmtree(tmpdir, ignore_errors=True)

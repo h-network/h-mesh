@@ -1,9 +1,6 @@
 import os
-import shutil
-import signal
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -42,7 +39,7 @@ def test_upgrade_rejects_empty_identity_before_resolving_or_mutating(field, monk
     assert exc.value.code == 2
 
 
-def test_upgrade_restarts_daemons_without_duplicating_and_preserves_the_tmux_session():
+def test_upgrade_restarts_daemons_without_duplicating_and_preserves_the_tmux_session(managed_tmpdir):
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
     r = redis.Redis.from_url(redis_url)
     try:
@@ -50,7 +47,7 @@ def test_upgrade_restarts_daemons_without_duplicating_and_preserves_the_tmux_ses
     except Exception:
         pytest.skip("Redis server not available at REDIS_URL")
 
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_upgrade_")
+    tmpdir = managed_tmpdir("h_mesh_test_upgrade_")
     socket_path = os.path.join(tmpdir, "isolated.sock")
     run_dir = os.path.join(tmpdir, "run")
     pod = f"testpod-{os.urandom(4).hex()}"
@@ -249,33 +246,20 @@ def test_upgrade_restarts_daemons_without_duplicating_and_preserves_the_tmux_ses
         switch_pid, reconciler_pid = switch_pid2, reconciler_pid2
 
     finally:
-        for pid in (switch_pid, reconciler_pid, old_switch_pid, old_reconciler_pid):
-            if pid:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
-        # ⚠ Also sweep any pidfile still under run_dir by name, not just the
-        # explicitly-tracked switch/reconciler pids above -- setup.sh/
-        # h-mesh upgrade start every daemon in DAEMON_MODULES (now including
-        # watchdog), and a hardcoded pid list here silently orphaned it on
-        # every run once that set grew. Measured: it did.
-        for pidfile in Path(run_dir).glob("*.pid"):
-            try:
-                os.kill(int(pidfile.read_text().strip()), signal.SIGKILL)
-            except (ValueError, OSError):
-                pass
-        try:
-            run_tmux("kill-server", socket=socket_path)
-        except Exception:
-            pass
+        # Every pidfile under run_dir (switch/reconciler/watchdog/anything
+        # DAEMON_MODULES grows to next), the isolated tmux server, and the
+        # tmpdir itself are all handled by managed_tmpdir's own teardown --
+        # by pid, not by tmux IPC alone (see _leak_manifest.py for why a
+        # bare `tmux kill-server` isn't trusted alone) -- and, if this
+        # process is killed before reaching even that, by the next
+        # session's orphan reaper (conftest.py). Only Redis state
+        # managed_tmpdir doesn't know about needs cleaning here.
         try:
             keys = r.keys(f"pod:{pod}:tenant:{tenant}:*") or []
             if keys:
                 r.delete(*keys)
         except Exception:
             pass
-        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _pid_alive(pid: int) -> bool:
