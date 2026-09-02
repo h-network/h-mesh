@@ -193,7 +193,31 @@ def test_send_builds_message_envelope(mock_send, monkeypatch, capsys):
     assert kwargs["destination"] == "backend"
     assert kwargs["payload"] == {"text": "hello there"}
     assert kwargs["kind"] == "Message"
+    assert kwargs["in_reply_to"] is None
     assert "sent to backend: 11 bytes (stream-1)" in capsys.readouterr().out
+
+
+@patch("modules.office.cli.send")
+def test_send_reply_to_threads_through_to_the_wire(mock_send, monkeypatch, capsys):
+    _env(monkeypatch)
+    mock_send.return_value = "stream-2"
+    r = FakeRedis(registry={"backend": "tmux"})
+    target = "a" * 32
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["send", "-a", "backend", "--reply-to", target, "hello there"])
+    kwargs = mock_send.call_args[1]
+    assert kwargs["in_reply_to"] == target
+
+
+@patch("modules.office.cli.send")
+def test_send_reply_to_rejects_malformed_id_before_sending(mock_send, monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis(registry={"backend": "tmux"})
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit):
+            office_main(["send", "-a", "backend", "--reply-to", "not-an-id", "hello there"])
+    assert "not a 32-character lowercase hex stream_id" in capsys.readouterr().err
+    mock_send.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

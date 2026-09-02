@@ -137,7 +137,7 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         )
 
         # Capture pane text from alice window
-        code, stdout, stderr = run_tmux("capture-pane", "-p", "-t", f"{self.session_name}:alice", socket=self.socket)
+        code, stdout, stderr = run_tmux("capture-pane", "-J", "-p", "-t", f"{self.session_name}:alice", socket=self.socket)
         self.assertEqual(code, 0)
         self.assertIn("[message from bob] hello alice from bob", stdout)
 

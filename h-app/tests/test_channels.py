@@ -141,6 +141,25 @@ class ChannelTests(unittest.TestCase):
         )
         self.assertEqual(opened[0]["payload"], payload)
 
+    def test_send_threads_in_reply_to_onto_the_wire(self):
+        self.register(alice="tmux", bob="tmux")
+        target = "c" * 32
+        send(
+            self.redis, pod=POD, tenant=TENANT, source="alice",
+            destination="bob", payload={"text": "reply"}, in_reply_to=target,
+        )
+        raw = self.redis.lpop(prefix(POD, TENANT, "alice", "egress"))
+        self.assertEqual(parse(raw)["in_reply_to"], target)
+
+    def test_send_without_in_reply_to_leaves_it_absent(self):
+        self.register(alice="tmux", bob="tmux")
+        send(
+            self.redis, pod=POD, tenant=TENANT, source="alice",
+            destination="bob", payload={"text": "hello"},
+        )
+        raw = self.redis.lpop(prefix(POD, TENANT, "alice", "egress"))
+        self.assertNotIn("in_reply_to", parse(raw))
+
     def test_unreplied_count_opens_increments_and_reply_clears(self):
         self.register(client="api", worker="tmux")
         send(
