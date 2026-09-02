@@ -1151,16 +1151,35 @@ def test_a_transient_nonempty_directory_is_stuck_then_cleanly_reaped_next_sessio
         # different concurrent sweep finishes removing it (a real,
         # unmonkeypatched rmdir has no trouble with a directory that
         # genuinely, ordinarily contains one leftover file) before this
-        # process gets to check. Either way this attempt cannot honestly
-        # claim to have exercised the race itself.
-        if not raced_once["done"] or not real_tmpdir.exists():
+        # process gets to check.
+        #
+        # ⚠ Reviewer's finding: `not raced_once["done"]` is NOT by itself a
+        # safe skip condition. If the tmpdir is STILL PRESENT and nobody's
+        # rmdir ever touched it (raced_once False), that is not "someone
+        # else finished the job" -- nobody did, and THIS process's own
+        # reap_all_orphans never even reached this entry's removal at all.
+        # That is a genuine regression (a reaper that stops before
+        # attempting the owned orphan), and skipping it would turn the
+        # only test for this recovery path into permanently green noise.
+        # Skip ONLY when the tmpdir is gone (someone, concurrently,
+        # finished it) -- otherwise fall through and let `raced_once`
+        # itself be asserted, which fails loudly if this process's own
+        # attempt never happened.
+        if not real_tmpdir.exists():
             pytest.skip(
                 "a concurrent process's ordinary sweep of the same shared "
                 "MANIFEST_DIR reaped this entry before this attempt could "
-                f"establish the stuck-then-reaped claim itself (this "
-                f"process's own race fired: {raced_once['done']}, tmpdir "
-                f"still present right after: {real_tmpdir.exists()})"
+                "establish the stuck-then-reaped claim itself (this "
+                f"process's own race fired: {raced_once['done']})"
             )
+        assert raced_once["done"], (
+            "the tmpdir is still here and NOTHING reaped it -- this "
+            "process's own reap_all_orphans never called rmdir('home') "
+            "for this entry at all, so the injected race was never "
+            "reached. That is a genuine failure to attempt the owned "
+            "orphan's removal, not a concurrent process winning a race "
+            "(nobody finished the job either)."
+        )
         assert real_tmpdir.exists(), "the tmpdir was removed despite the transient race"
         assert (subdir / "race-injected.txt").exists(), "the injected content was lost anyway"
         assert entry.exists(), "the manifest entry was cleared despite the transient race"
