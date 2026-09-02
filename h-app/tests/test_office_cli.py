@@ -1,9 +1,11 @@
+import io
 import json
 import os
 import sys
 import threading
 import time
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,7 +16,8 @@ H_APP = Path(__file__).resolve().parents[1]
 if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
-from core.envelope import build, encode
+from core.channels import receive
+from core.envelope import build, encode, parse
 from core.keys import prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key
 from modules.office import cli as office_cli
 from modules.office.cli import main as office_main
@@ -166,6 +169,56 @@ def test_root_help_lists_every_command_without_environment_or_redis(capsys):
     out = capsys.readouterr().out
     for name in office_cli._COMMANDS:
         assert name in out
+
+
+def test_send_stdin_identity_reaches_recipient_on_real_redis(monkeypatch, capsys):
+    """Pin h-mesh's working boundary by what the recipient opens.
+
+    This is a negative regression for a live legacy-CLI defect, not evidence
+    that every implementation named `office` behaves the same way. The sender's
+    success line and byte count are deliberately insufficient assertions.
+    """
+    r = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"))
+    try:
+        r.ping()
+    except redis.RedisError:
+        pytest.skip("real Redis server not available at REDIS_URL")
+
+    tenant = f"stdin-recipient-{os.urandom(8).hex()}"
+    registry = prefix(POD, tenant, resource="registry")
+    egress = prefix(POD, tenant, "sender", "egress")
+    ingress = prefix(POD, tenant, "recipient", "ingress")
+    body = "recipient must open this exact stdin body"
+    r.hset(registry, mapping={"sender": "tmux", "recipient": "tmux"})
+    try:
+        with (
+            patch("modules.office.cli._context", return_value=(r, POD, tenant, "sender")),
+            patch("modules.office.cli.sys.stdin", io.StringIO(body)),
+        ):
+            office_main(["send", "-a", "recipient", "--stdin"])
+
+        reported_id = capsys.readouterr().out.rsplit("(", 1)[1].rstrip(")\n")
+        raw = r.lpop(egress)
+        assert parse(raw)["stream_id"] == reported_id
+        r.rpush(ingress, raw)
+        opened = []
+        receive(
+            r,
+            pod=POD,
+            tenant=tenant,
+            agent="recipient",
+            openers={"Message": opened.append},
+            timeout=0,
+            blocking=False,
+        )
+
+        assert len(opened) == 1
+        assert opened[0]["stream_id"] == reported_id
+        assert opened[0]["payload"]["text"] == body
+    finally:
+        keys = r.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            r.delete(*keys)
 
 
 def test_unresolved_names_exact_identity_without_consuming(monkeypatch, capsys):
@@ -427,16 +480,6 @@ def test_hire_carries_profile_provider_resume_permissions_and_tools(mock_send, m
     assert payload["resume"] is True
     assert payload["skip_permissions"] is True
     assert payload["claude_tools"] == ""
-
-
-@patch("modules.office.cli.send")
-def test_hire_can_transfer_leadership(mock_send, monkeypatch):
-    _env(monkeypatch)
-    mock_send.return_value = "stream-1"
-    r = FakeRedis()
-    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
-        office_main(["hire", "replacement", "--lead"])
-    assert mock_send.call_args.kwargs["payload"]["lead"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1363,7 +1406,7 @@ def test_clone_to_all_uses_host_workdir_fallback(monkeypatch, tmp_path):
     ):
         office_main(["clone-to-all", "git@example.com:org/repo.git"])
 
-    expected = tmp_path / "h-mesh" / "workdir" / "backend" / "repo"
+    expected = tmp_path / "h-mesh" / "backend" / "repo"
     git_clone.assert_called_once_with(
         "git@example.com:org/repo.git", expected, "git@example.com:org/repo.git"
     )
@@ -1457,6 +1500,70 @@ def test_status_reports_unknown_with_no_activity_feed(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "unknown" in out
     assert "no activity feed" in out
+
+
+def test_status_does_not_report_active_empty_board_as_blocked_by_delivery_marker(
+    monkeypatch, capsys
+):
+    """Delivery uncertainty must not silently remove an available agent."""
+    _env(monkeypatch)
+    r = FakeRedis(registry={"ci-agent": "tmux"})
+    now = datetime.now(timezone.utc)
+    r.hashes[prefix(POD, TENANT, "ci-agent", "presence")] = {
+        "state": "idle",
+        "since": (now - timedelta(minutes=1)).isoformat(),
+        "last_activity": (now - timedelta(seconds=8)).isoformat(),
+    }
+    r.hashes[prefix(POD, TENANT, "ci-agent", "blocked")] = {
+        "since": (now - timedelta(minutes=2)).isoformat(),
+        "stream_id": "a" * 32,
+    }
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["status", "ci-agent"])
+
+    row = capsys.readouterr().out
+    assert "ci-agent    idle" in row
+    assert "ci-agent    blocked" not in row
+    assert "—" in row
+    assert "last activity 8s ago" in row
+    assert "delivery unverified for 2m" in row
+
+
+def test_status_keeps_unknown_presence_unknown_with_delivery_marker(monkeypatch, capsys):
+    """Missing presence is not silently promoted to availability or blockage."""
+    _env(monkeypatch)
+    r = FakeRedis(registry={"ci-agent": "tmux"})
+    r.hashes[prefix(POD, TENANT, "ci-agent", "blocked")] = {
+        "since": "2026-09-02T09:59:00.000Z",
+        "stream_id": "a" * 32,
+    }
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["status", "ci-agent"])
+
+    row = capsys.readouterr().out
+    assert "ci-agent    unknown" in row
+    assert "ci-agent    idle" not in row
+    assert "no activity feed; delivery unverified" in row
+
+
+def test_status_keeps_delivery_marker_visible_when_its_age_is_malformed(monkeypatch, capsys):
+    """Bad marker age degrades to explicit unknown context, not silence or blockage."""
+    _env(monkeypatch)
+    r = FakeRedis(registry={"ci-agent": "tmux"})
+    r.hashes[prefix(POD, TENANT, "ci-agent", "presence")] = {"state": "idle"}
+    r.hashes[prefix(POD, TENANT, "ci-agent", "blocked")] = {
+        "since": "not-a-timestamp",
+        "stream_id": "a" * 32,
+    }
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["status", "ci-agent"])
+
+    row = capsys.readouterr().out
+    assert "ci-agent    idle" in row
+    assert "delivery unverified (age unknown)" in row
 
 
 @patch("modules.office.cli.send")

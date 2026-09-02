@@ -89,6 +89,45 @@ def test_install_sh_clones_and_hands_off_to_setup_sh():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_install_sh_defaults_to_local_share_leaving_h_mesh_free_for_workdirs():
+    # Real regression: every OTHER test here sets H_MESH_INSTALL_DIR, so a
+    # revert of install.sh's default back to $HOME/h-mesh would leave every
+    # one of them green. This is the only test that omits the override --
+    # proves the actual default landed where the relocation ticket asked
+    # (~/.local/share/h-mesh, hidden/machine-managed) and, just as
+    # importantly, that ~/h-mesh itself is left untouched -- that's the
+    # directory agent workdirs now use, and the whole point of the
+    # relocation is that installing the app must not touch it.
+    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_install_")
+    try:
+        home_dir = os.path.join(tmpdir, "home")
+        os.makedirs(home_dir, exist_ok=True)
+        env = dict(os.environ)
+        env.pop("H_MESH_INSTALL_DIR", None)
+        env["H_MESH_CLONE_URL"] = _clone_url(tmpdir)
+        env["HOME"] = home_dir
+        env["TMUX_TMPDIR"] = tmpdir
+        env["TMUX_SESSION"] = f"sess-{os.urandom(4).hex()}"
+        env["TMUX_SOCKET"] = os.path.join(tmpdir, "isolated.sock")
+
+        res = subprocess.run(
+            ["sh", str(INSTALL_SH), "--help"],
+            env=env, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+        )
+        assert res.returncode == 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+
+        expected_checkout = Path(home_dir) / ".local" / "share" / "h-mesh"
+        assert expected_checkout.is_dir() and (expected_checkout / ".git").is_dir(), (
+            f"checkout did not land at the new default {expected_checkout}"
+        )
+        assert not (Path(home_dir) / "h-mesh").exists(), (
+            "installing the app wrote into ~/h-mesh -- that directory is "
+            "reserved for agent workdirs, not the source checkout"
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_install_sh_updates_an_existing_checkout():
     tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_install_")
     try:

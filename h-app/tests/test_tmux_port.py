@@ -7,6 +7,10 @@ import unittest
 from collections import defaultdict, deque
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
+
+import pytest
+import redis
 
 H_APP = Path(__file__).resolve().parents[1]
 if str(H_APP) not in sys.path:
@@ -293,6 +297,133 @@ class TmuxPortTests(unittest.TestCase):
         self.assertEqual(ticket["id"], "t1")
         self.assertEqual(ticket["title"], "Fix bug")
 
+    def test_add_ticket_nonpositive_write_result_routes_unresolved(self):
+        """An impossible RPUSH response is uncertainty, not proven rejection."""
+        self.register(alice="tmux", bob="tmux")
+        stream_id = send(
+            self.redis,
+            pod=POD,
+            tenant=TENANT,
+            source="alice",
+            destination="bob",
+            payload={"id": "t1", "title": "outcome unknown"},
+            kind="AddTicket",
+        )
+        raw = self.redis.lpop(prefix(POD, TENANT, "alice", "egress"))
+        self.redis.rpush(prefix(POD, TENANT, "bob", "ingress"), raw)
+        todo = prefix(POD, TENANT, agent="bob", resource="tasks.todo")
+
+        class NonpositiveBoardWrite:
+            def __getattr__(_, name):
+                return getattr(self.redis, name)
+
+            def rpush(_, key, *values):
+                if key == todo:
+                    return 0
+                return self.redis.rpush(key, *values)
+
+        deliver_tmux(
+            NonpositiveBoardWrite(),
+            pod=POD,
+            tenant=TENANT,
+            agent="bob",
+            session_name=TENANT,
+        )
+
+        self.assertEqual(list(self.redis.lists[todo]), [])
+        self.assertEqual(list(self.redis.lists[prefix(POD, TENANT, "bob", "dead")]), [])
+        records = self.redis.lists[prefix(POD, TENANT, resource="unresolved")]
+        self.assertEqual(
+            [parse(json.loads(record)["envelope"])["stream_id"] for record in records],
+            [stream_id],
+        )
+
+    def _assert_add_ticket_observer_failure_keeps_confirmed_custody(self, observer):
+        self.register(alice="tmux", bob="tmux")
+        stream_id = send(
+            self.redis,
+            pod=POD,
+            tenant=TENANT,
+            source="alice",
+            destination="bob",
+            payload={"id": "t1", "title": "confirmed board write"},
+            kind="AddTicket",
+        )
+        raw = self.redis.lpop(prefix(POD, TENANT, "alice", "egress"))
+        self.redis.rpush(prefix(POD, TENANT, "bob", "ingress"), raw)
+
+        with patch(observer, side_effect=OSError("observer unavailable")):
+            deliver_tmux(
+                self.redis,
+                pod=POD,
+                tenant=TENANT,
+                agent="bob",
+                session_name=TENANT,
+            )
+
+        todo = self.redis.lists[prefix(POD, TENANT, agent="bob", resource="tasks.todo")]
+        self.assertEqual([json.loads(value)["id"] for value in todo], ["t1"])
+        self.assertEqual(list(self.redis.lists[prefix(POD, TENANT, "bob", "dead")]), [])
+        self.assertEqual(list(self.redis.lists[prefix(POD, TENANT, resource="unresolved")]), [])
+        opened = self.redis.lists[prefix(POD, TENANT, "bob", "opened")]
+        self.assertEqual([parse(value)["stream_id"] for value in opened], [stream_id])
+
+    def test_add_ticket_success_log_failure_keeps_confirmed_custody(self):
+        """A broken success logger must not downgrade created work to unknown."""
+        self._assert_add_ticket_observer_failure_keeps_confirmed_custody(
+            "lib.board_interaction.log_record"
+        )
+
+    def test_add_ticket_task_event_failure_keeps_confirmed_custody(self):
+        """A broken audit writer must not downgrade created work to unknown."""
+        self._assert_add_ticket_observer_failure_keeps_confirmed_custody(
+            "lib.board_interaction.record_task_event"
+        )
+
+    def test_add_ticket_success_log_failure_still_attempts_task_audit(self):
+        """One broken observer must not silently suppress the sibling audit."""
+        self.register(alice="tmux", bob="tmux")
+        created_ts = "2026-09-02T08:00:00.000Z"
+        stream_id = send(
+            self.redis,
+            pod=POD,
+            tenant=TENANT,
+            source="alice",
+            destination="bob",
+            payload={
+                "v": 1,
+                "id": "t1",
+                "title": "confirmed board write",
+                "created_ts": created_ts,
+            },
+            kind="AddTicket",
+        )
+        raw = self.redis.lpop(prefix(POD, TENANT, "alice", "egress"))
+        self.redis.rpush(prefix(POD, TENANT, "bob", "ingress"), raw)
+
+        with (
+            patch("lib.board_interaction.log_record", side_effect=OSError("stdout broken")),
+            patch("lib.board_interaction.record_task_event") as task_event,
+        ):
+            deliver_tmux(
+                self.redis,
+                pod=POD,
+                tenant=TENANT,
+                agent="bob",
+                session_name=TENANT,
+            )
+
+        task_event.assert_called_once_with(
+            "add",
+            id="t1",
+            title="confirmed board write",
+            agent="bob",
+            actor="alice",
+            timestamp=created_ts,
+        )
+        opened = self.redis.lists[prefix(POD, TENANT, "bob", "opened")]
+        self.assertEqual([parse(value)["stream_id"] for value in opened], [stream_id])
+
     @patch("modules.tmux.port.submit_text")
     @patch("modules.tmux.port.list_windows", return_value={"bob"})
     def test_deliver_tmux_attachment(self, mock_list, mock_submit):
@@ -431,3 +562,69 @@ class TmuxPortTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_add_ticket_response_loss_routes_identity_unresolved_on_real_redis():
+    """A ticket that genuinely landed must not make its envelope look rejected."""
+    r = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"))
+    try:
+        r.ping()
+    except redis.RedisError:
+        pytest.skip("real Redis server not available at REDIS_URL")
+
+    tenant = f"board-write-unknown-{uuid4().hex[:12]}"
+    agent = "recipient"
+    todo = prefix(POD, tenant, agent=agent, resource="tasks.todo")
+    dead = prefix(POD, tenant, agent=agent, resource="dead")
+    unresolved = prefix(POD, tenant, resource="unresolved")
+    registry = prefix(POD, tenant, resource="registry")
+    r.hset(registry, mapping={"sender": "tmux", agent: "tmux"})
+
+    class RpushLandsThenFails:
+        def __init__(self, client, target):
+            self.client = client
+            self.target = target
+
+        def __getattr__(self, name):
+            return getattr(self.client, name)
+
+        def rpush(self, key, *values):
+            result = self.client.rpush(key, *values)
+            if key == self.target:
+                raise ConnectionError("response lost after board write")
+            return result
+
+    try:
+        stream_id = send(
+            r,
+            pod=POD,
+            tenant=tenant,
+            source="sender",
+            destination=agent,
+            payload={"id": "landed-ticket", "title": "must remain traceable"},
+            kind="AddTicket",
+        )
+        raw = r.lpop(prefix(POD, tenant, "sender", "egress"))
+        r.rpush(prefix(POD, tenant, agent, "ingress"), raw)
+
+        deliver_tmux(
+            RpushLandsThenFails(r, todo),
+            pod=POD,
+            tenant=tenant,
+            agent=agent,
+            session_name=tenant,
+        )
+
+        tickets = [json.loads(value) for value in r.lrange(todo, 0, -1)]
+        assert [ticket["id"] for ticket in tickets] == ["landed-ticket"]
+        dead_ids = [parse(value)["stream_id"] for value in r.lrange(dead, 0, -1)]
+        unresolved_ids = [
+            parse(json.loads(value)["envelope"])["stream_id"]
+            for value in r.lrange(unresolved, 0, -1)
+        ]
+        assert stream_id not in dead_ids
+        assert unresolved_ids == [stream_id]
+    finally:
+        keys = r.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            r.delete(*keys)
