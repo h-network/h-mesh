@@ -28,22 +28,36 @@ envelope's own `stream_id` -- never by count. Five scenarios:
    custody, and must not erase a *different* identity's already-recorded
    unresolved evidence (phases shape only).
 6. Retirement itself (`lib.agentlifecycle.lifecycle.stop_agent`): must not
-   turn admitted custody into absence. Seeds one distinct identity in each
-   of `ingress`, `processing`, and `opening`, plus one genuinely completed
-   `opened` receipt, then calls the real `stop_agent` and asserts each
-   identity's EXACT final location -- `ingress`/`processing` in tenant
-   `undeliverable` (proven never to have begun), `opening` in tenant
-   `unresolved` (outcome unknown), `opened` untouched -- and separately
-   asserts each is not ALSO in the wrong sink, since a known non-effect
-   landing in `unresolved` lies about it just as badly as landing nowhere.
-   Then rehires the same name and asserts the successor inherits none of it
-   and the retirement evidence is byte-identical before and after (phases
-   shape only, and only where `stop_agent`/`receive_undeliverable_key`
-   exist on the tree under test).
+   turn admitted custody into absence, AND must move each seeded identity to
+   EXACTLY ONE terminal location, never zero, never more than one. Seeds one
+   distinct identity in each of `ingress`, `processing`, and `opening`, plus
+   one genuinely completed `opened` receipt, calls the real `stop_agent`,
+   then counts every occurrence of each seeded identity across
+   undeliverable+unresolved+opened combined (see `_stream_id_occurrences`,
+   which keeps every parsed record rather than indexing by identity -- a
+   dict/set collapses two occurrences into one and cannot prove
+   "exactly once" at all, only "at least one"). Absence, more-than-one, and
+   wrong-sink-with-the-right-count all fail distinctly. Then rehires the
+   same name and asserts the successor inherits none of it and the
+   retirement evidence is byte-identical before and after (phases shape
+   only, and only where `stop_agent`/`receive_undeliverable_key` exist on
+   the tree under test).
 
 Every scenario that found loss was falsified by hand before being trusted:
 the underlying fix (or the harness's own detection logic) was deliberately
 broken, confirmed the scenario reports the failure, then restored.
+
+⚠ Scenario 6's exactly-once claim was itself falsely green once. Reviewer
+found that an earlier version built it on `_undeliverable_stream_ids`/
+`_unresolved_stream_ids` (dicts keyed by stream_id) and `_stream_ids_in` (a
+set) -- each silently collapses duplicate occurrences of the same identity
+into one, so a misattributed duplicate followed by a correctly-attributed
+one would collapse to the good record, reporting clean while hiding both
+the duplication and the bad record. Confirmed by falsifying that exact
+shape against the pre-fix code (silently clean) and the fixed code (caught,
+reported `DUPLICATED`). This is the second time this file's own detection
+logic has been the false-negative, not the thing it was pointed at -- see
+`_decode_evidence_envelope`'s docstring for the first.
 
 ## What it does NOT reach
 

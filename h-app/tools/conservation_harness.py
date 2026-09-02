@@ -208,6 +208,44 @@ def _undeliverable_stream_ids(r, pod: str, tenant: str) -> dict[str, dict]:
     return result
 
 
+def _stream_id_occurrences(raw_records: list, is_evidence_wrapper: bool) -> list[tuple[str, dict | None]]:
+    """Every occurrence of a stream_id parsed from `raw_records`, WITH
+    duplicates preserved -- never a dict/set keyed by stream_id.
+
+    Reviewer's finding against an earlier version of this file:
+    `_undeliverable_stream_ids`/`_unresolved_stream_ids` (dicts) and
+    `_stream_ids_in` (a set) each silently collapse two occurrences of the
+    same identity into one. A scenario built on those can only prove "at
+    least one parseable record exists in the expected sink" -- never
+    "exactly once" -- and a MISATTRIBUTED duplicate followed by a
+    correctly-attributed one collapses to the good record, hiding both the
+    duplication and the bad one. This is the only shape that can actually
+    support an exactly-once claim: keep every parse, one entry per raw
+    record, so counting occurrences of an identity means something.
+
+    `is_evidence_wrapper` -- True for undeliverable/unresolved (each raw is
+    a JSON evidence record whose `envelope` field, hex-or-plain, wraps the
+    real frame -- see `_decode_evidence_envelope`), False for a raw custody
+    list like `opened` (each raw IS the encoded frame directly). Returns
+    `(stream_id, record_or_none)` pairs -- `record` is the evidence dict
+    for the wrapper case, `None` otherwise. A record this harness cannot
+    parse contributes no occurrence at all (never miscounted as present).
+    """
+    occurrences = []
+    for raw in raw_records:
+        try:
+            if is_evidence_wrapper:
+                record = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                header = parse_for_switch(_decode_evidence_envelope(record))
+            else:
+                record = None
+                header = parse_for_switch(raw)
+        except Exception:
+            continue
+        occurrences.append((header["stream_id"], record))
+    return occurrences
+
+
 def _setup(r, pod: str, tenant: str, agents: list[str]) -> None:
     registry = prefix(pod, tenant, resource="registry")
     r.hset(registry, mapping={agent: "tmux" for agent in agents})
@@ -804,8 +842,30 @@ def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -
         processing_stream_id = _seed(processing_key, "retirement-processing-target")
         opening_stream_id = _seed(opening_key, "retirement-opening-target")
 
-        before_undeliverable = _undeliverable_stream_ids(r, pod, tenant)
-        before_unresolved = _unresolved_stream_ids(r, pod, tenant)
+        # Reviewer's finding against 67f42a1: a dict/set keyed by identity
+        # silently collapses two occurrences of the same identity into
+        # one, so a scenario built on that can only prove "at least one
+        # parseable record exists in the expected sink" -- never
+        # "exactly once", which is this scenario's own name and claim.
+        # `_stream_id_occurrences` keeps every parse instead, so counting
+        # actually means something.
+        def _occurrence_lists():
+            return (
+                _stream_id_occurrences(r.lrange(receive_undeliverable_key(pod, tenant), 0, -1), True),
+                _stream_id_occurrences(r.lrange(_unresolved_key(pod, tenant), 0, -1), True),
+                _stream_id_occurrences(r.lrange(_opened_key(pod, tenant, target), 0, -1), False),
+            )
+
+        before_undeliverable, before_unresolved, _before_opened = _occurrence_lists()
+        seeded_ids = {ingress_stream_id, processing_stream_id, opening_stream_id}
+        for label, occurrences in (("undeliverable", before_undeliverable), ("unresolved", before_unresolved)):
+            collision = [sid for sid, _ in occurrences if sid in seeded_ids]
+            if collision:
+                return [
+                    f"HARNESS ERROR: seeded identity {collision[0]} was already in "
+                    f"tenant {label} BEFORE stop_agent ran -- seeding collided with "
+                    "prior state, narrowing the claim"
+                ]
 
         # 3. The real stop_agent -- not a description of it, not a
         #    synthetic Lua stand-in.
@@ -816,70 +876,52 @@ def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -
             )
 
         failures: list[str] = []
-        after_undeliverable = _undeliverable_stream_ids(r, pod, tenant)
-        after_unresolved = _unresolved_stream_ids(r, pod, tenant)
-        opened_ids_after = _stream_ids_in(r.lrange(_opened_key(pod, tenant, target), 0, -1))
+        after_undeliverable, after_unresolved, after_opened = _occurrence_lists()
+        all_occurrences = (
+            [(sid, "undeliverable", rec) for sid, rec in after_undeliverable]
+            + [(sid, "unresolved", rec) for sid, rec in after_unresolved]
+            + [(sid, "opened", rec) for sid, rec in after_opened]
+        )
 
-        for stream_id, label in ((ingress_stream_id, "ingress"), (processing_stream_id, "processing")):
-            record = after_undeliverable.get(stream_id)
-            if record is None:
+        def _check_exactly_once(stream_id: str, label: str, expected_sink: str) -> None:
+            matches = [(sink, rec) for sid, sink, rec in all_occurrences if sid == stream_id]
+            if not matches:
                 failures.append(
-                    f"CUSTODY LOST: {label} identity {stream_id} is not in tenant "
-                    "undeliverable after stop_agent -- retirement must not turn "
-                    "admitted custody into absence. undeliverable now holds: "
-                    f"{sorted(after_undeliverable)!r}"
+                    f"CUSTODY LOST: {label} identity {stream_id} appears in NONE "
+                    "of undeliverable/unresolved/opened after stop_agent -- "
+                    "retirement must not turn admitted custody into absence."
                 )
-            elif record.get("agent") != target:
+                return
+            if len(matches) > 1:
+                sinks = [sink for sink, _ in matches]
                 failures.append(
-                    f"MISATTRIBUTED: {label} identity {stream_id}'s undeliverable "
-                    f"record names agent {record.get('agent')!r}, expected {target!r}"
+                    f"DUPLICATED: {label} identity {stream_id} appears "
+                    f"{len(matches)} times across undeliverable/unresolved/"
+                    f"opened ({sinks!r}) -- retirement must move each identity "
+                    "to exactly one terminal location, not duplicate it."
                 )
-            elif stream_id in before_undeliverable:
+                return
+            sink, record = matches[0]
+            if sink != expected_sink:
                 failures.append(
-                    f"HARNESS ERROR: {label} identity {stream_id} was already in "
-                    "undeliverable BEFORE stop_agent ran -- seeding collided with "
-                    "prior state, narrowing the claim"
+                    f"MISCLASSIFIED: {label} identity {stream_id} landed in "
+                    f"{sink!r}, expected {expected_sink!r} -- a record in the "
+                    "wrong sink lies about what's known just as badly as no "
+                    "record at all."
+                )
+                return
+            if record is not None and record.get("agent") != target:
+                failures.append(
+                    f"MISATTRIBUTED: {label} identity {stream_id}'s {sink} "
+                    f"record names agent {record.get('agent')!r}, expected "
+                    f"{target!r}"
                 )
 
-        record = after_unresolved.get(opening_stream_id)
-        if record is None:
-            failures.append(
-                f"CUSTODY LOST: opening identity {opening_stream_id} is not in "
-                "tenant unresolved after stop_agent -- an outcome-unknown "
-                "envelope must not become absence either. unresolved now holds: "
-                f"{sorted(after_unresolved)!r}"
-            )
-        elif record.get("agent") != target:
-            failures.append(
-                f"MISATTRIBUTED: opening identity {opening_stream_id}'s unresolved "
-                f"record names agent {record.get('agent')!r}, expected {target!r}"
-            )
-        elif opening_stream_id in before_unresolved:
-            failures.append(
-                f"HARNESS ERROR: opening identity {opening_stream_id} was already "
-                "in unresolved BEFORE stop_agent ran -- seeding collided with "
-                "prior state, narrowing the claim"
-            )
-        # A record in the wrong sink lies about what's known just as badly
-        # as no record at all: proven-not-begun must never read as
-        # outcome-unknown, and outcome-unknown must never read as proven.
-        if ingress_stream_id in after_unresolved or processing_stream_id in after_unresolved:
-            failures.append(
-                "MISCLASSIFIED: an ingress or processing identity (proven never "
-                "to have begun) landed in unresolved (outcome-unknown) instead "
-                "of undeliverable."
-            )
-        if opening_stream_id in after_undeliverable:
-            failures.append(
-                "MISCLASSIFIED: the opening identity (outcome unknown) landed in "
-                "undeliverable (proven-not-begun) instead of unresolved."
-            )
-        if opened_stream_id not in opened_ids_after:
-            failures.append(
-                f"EVIDENCE ERASED: opened identity {opened_stream_id} is gone "
-                "from the opened receipt list after stop_agent -- completed "
-                "effects must never be discarded on retirement."
-            )
+        _check_exactly_once(ingress_stream_id, "ingress", "undeliverable")
+        _check_exactly_once(processing_stream_id, "processing", "undeliverable")
+        _check_exactly_once(opening_stream_id, "opening", "unresolved")
+        _check_exactly_once(opened_stream_id, "opened (pre-existing)", "opened")
+
         for key, label in ((ingress_key, "ingress"), (processing_key, "processing"), (opening_key, "opening")):
             remaining = r.llen(key)
             if remaining:
