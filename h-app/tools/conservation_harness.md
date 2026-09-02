@@ -32,8 +32,10 @@ envelope's own `stream_id` -- never by count. Five scenarios:
    EXACTLY ONE terminal location, never zero, never more than one. Seeds one
    distinct identity in each of `ingress`, `processing`, and `opening`, plus
    one genuinely completed `opened` receipt, calls the real `stop_agent`,
-   then counts every occurrence of each seeded identity across
-   undeliverable+unresolved+opened combined (see `_stream_id_occurrences`,
+   then counts every occurrence of each seeded identity across EVERY real
+   terminal custody sink combined -- tenant `undeliverable`, tenant
+   `unresolved`, the target's own `opened`, and the target's own `dead`
+   (see `_stream_id_occurrences`,
    which keeps every parsed record rather than indexing by identity -- a
    dict/set collapses two occurrences into one and cannot prove
    "exactly once" at all, only "at least one"). Absence, more-than-one, and
@@ -55,8 +57,20 @@ into one, so a misattributed duplicate followed by a correctly-attributed
 one would collapse to the good record, reporting clean while hiding both
 the duplication and the bad record. Confirmed by falsifying that exact
 shape against the pre-fix code (silently clean) and the fixed code (caught,
-reported `DUPLICATED`). This is the second time this file's own detection
-logic has been the false-negative, not the thing it was pointed at -- see
+reported `DUPLICATED`).
+
+⚠ A second round found the fix itself incomplete: the occurrence scan only
+covered the three sinks this scenario's own happy path names (undeliverable/
+unresolved/opened), omitting the target's own `dead` list -- a real
+terminus `core.channels.py` dead-letters straight into, and one
+`stop_agent`'s own Lua never touches (not in its `KEYS` list at all), so an
+identity duplicated into `dead` was invisible. Reviewer's exact
+reproduction -- append a genuine undeliverable record's raw envelope
+directly to the target's own `dead` list after a normal retirement --
+reported clean before this fix. Added `dead` to the scan; confirmed the
+same reproduction is RED against the pre-fix code and GREEN against this
+one. This is the second time this file's own detection logic has been the
+false-negative, not the thing it was pointed at -- see
 `_decode_evidence_envelope`'s docstring for the first.
 
 ## What it does NOT reach

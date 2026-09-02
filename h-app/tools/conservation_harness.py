@@ -849,14 +849,27 @@ def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -
         # "exactly once", which is this scenario's own name and claim.
         # `_stream_id_occurrences` keeps every parse instead, so counting
         # actually means something.
+        #
+        # ⚠ Reviewer's SECOND finding, against 5442e4e: the occurrence scan
+        # must cover every REAL terminal custody sink an identity could
+        # land in, not just the three this scenario's own happy path
+        # names. `dead` (per-agent) is a real terminus -- core.channels.py
+        # dead-letters straight into it -- and stop_agent's own Lua never
+        # touches it (not in its KEYS list at all), so it is silently
+        # unwatched unless scanned explicitly. Falsified: appending a
+        # duplicate raw envelope directly to the target's own `dead` list
+        # after a normal retirement reported clean before this fix.
+        dead_key = prefix(pod, tenant, target, "dead")
+
         def _occurrence_lists():
             return (
                 _stream_id_occurrences(r.lrange(receive_undeliverable_key(pod, tenant), 0, -1), True),
                 _stream_id_occurrences(r.lrange(_unresolved_key(pod, tenant), 0, -1), True),
                 _stream_id_occurrences(r.lrange(_opened_key(pod, tenant, target), 0, -1), False),
+                _stream_id_occurrences(r.lrange(dead_key, 0, -1), False),
             )
 
-        before_undeliverable, before_unresolved, _before_opened = _occurrence_lists()
+        before_undeliverable, before_unresolved, _before_opened, _before_dead = _occurrence_lists()
         seeded_ids = {ingress_stream_id, processing_stream_id, opening_stream_id}
         for label, occurrences in (("undeliverable", before_undeliverable), ("unresolved", before_unresolved)):
             collision = [sid for sid, _ in occurrences if sid in seeded_ids]
@@ -876,11 +889,12 @@ def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -
             )
 
         failures: list[str] = []
-        after_undeliverable, after_unresolved, after_opened = _occurrence_lists()
+        after_undeliverable, after_unresolved, after_opened, after_dead = _occurrence_lists()
         all_occurrences = (
             [(sid, "undeliverable", rec) for sid, rec in after_undeliverable]
             + [(sid, "unresolved", rec) for sid, rec in after_unresolved]
             + [(sid, "opened", rec) for sid, rec in after_opened]
+            + [(sid, "dead", rec) for sid, rec in after_dead]
         )
 
         def _check_exactly_once(stream_id: str, label: str, expected_sink: str) -> None:
@@ -888,7 +902,7 @@ def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -
             if not matches:
                 failures.append(
                     f"CUSTODY LOST: {label} identity {stream_id} appears in NONE "
-                    "of undeliverable/unresolved/opened after stop_agent -- "
+                    "of undeliverable/unresolved/opened/dead after stop_agent -- "
                     "retirement must not turn admitted custody into absence."
                 )
                 return
@@ -897,8 +911,8 @@ def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -
                 failures.append(
                     f"DUPLICATED: {label} identity {stream_id} appears "
                     f"{len(matches)} times across undeliverable/unresolved/"
-                    f"opened ({sinks!r}) -- retirement must move each identity "
-                    "to exactly one terminal location, not duplicate it."
+                    f"opened/dead ({sinks!r}) -- retirement must move each "
+                    "identity to exactly one terminal location, not duplicate it."
                 )
                 return
             sink, record = matches[0]
