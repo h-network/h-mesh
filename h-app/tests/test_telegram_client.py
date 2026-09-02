@@ -500,6 +500,28 @@ def test_handle_user_prompt_skips_the_redundant_text_confirmation_once_reacted()
         assert telegram.sent_messages == []
 
 
+def test_unverified_delivery_notice_failure_cannot_replace_known_prompt_admission():
+    """A warning-sink failure after reaction success must leave admission known."""
+    class RaisingNoticeTelegram(DummyTelegramClient):
+        def send_message(self, chat_id, text, **kwargs):
+            raise OSError("telegram notice unavailable")
+
+    mesh = DummyMeshClient()
+    mesh.delivery_unverified = {"since": "2026-09-02T06:00:00Z", "stream_id": "a" * 32}
+    telegram = RaisingNoticeTelegram()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = CursorStore(str(Path(tmpdir) / "cursor.json"))
+        bot_instance = TelegramBot(
+            mesh, telegram, store, target_agent="architect", no_activity_push=True,
+        )
+
+        reply = bot_instance.handle_user_prompt(12345, "fresh evidence", message_id=7)
+
+    assert mesh.sent_envelopes == [{"destination": "architect", "text": "fresh evidence"}]
+    assert telegram.reactions_set == [{"chat_id": "12345", "message_id": 7, "emoji": "👀"}]
+    assert reply == "✅ Sent to architect. A prior delivery remains unverified; this send is fresh evidence."
+
+
 def test_handle_user_prompt_confirms_by_text_when_there_is_no_message_id():
     """The CLI's own --prompt one-shot (main()'s `bot.handle_user_prompt(chat_id,
     args.prompt)`) has no inbound Telegram message to react to at all --

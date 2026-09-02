@@ -2067,6 +2067,19 @@ class TelegramBot:
         resp = self.telegram.send_message(chat_id, text, reply_markup=markup)
         return resp.get("result", {}).get("message_id") if isinstance(resp, dict) else None
 
+    def _post_admission_notice(self, chat_id: int | str, text: str) -> None:
+        """Attempt a final notice without changing an already-known admission.
+
+        This is the terminal containment layer: a Telegram sink failure cannot
+        relabel the Mesh send, and no further observer is invoked on failure.
+        """
+        if not self.telegram:
+            return
+        try:
+            self.telegram.send_message(str(chat_id), text)
+        except Exception:
+            pass
+
     def _dispatch_menu_action(self, chat_id: int | str, code: str, message_id: int | None = None) -> str:
         """Shared by the sticky keyboard (text label tap, no message to
         edit) and any inline button still using these same short codes
@@ -2531,7 +2544,7 @@ class TelegramBot:
         reply = f"✅ {label.capitalize()} sent to {agent}."
         if delivery_unverified:
             reply += " A prior delivery remains unverified; this send is fresh evidence."
-        self.telegram.send_message(cid, reply)
+        self._post_admission_notice(cid, reply)
         return reply
 
     # ── /watch — live-tail an agent's tmux pane ─────────────────────────────
@@ -3256,7 +3269,7 @@ class TelegramBot:
         this call only, never written to `chat_target_agent`. `raw` is
         handle_run_command's "/run <agent> <text>" — sends a Command-kind
         envelope instead of a Message-kind one (see MeshClient.send_command),
-        otherwise identical: same presence/blocked gate, same activity
+        otherwise identical: same activity-derived presence check, same activity
         watcher, same one-off (never persistent) destination. `message_id` —
         the incoming prompt's own id — gets a 👀 reaction the moment the
         envelope is actually dispatched: a persistent marker on the message
@@ -3376,8 +3389,8 @@ class TelegramBot:
         reply_text = f"✅ Ran on {agent}." if raw else f"✅ Sent to {agent}."
         if delivery_unverified:
             reply_text += " A prior delivery remains unverified; this send is fresh evidence."
-        if (not reacted or delivery_unverified) and self.telegram:
-            self.telegram.send_message(cid, reply_text)
+        if not reacted or delivery_unverified:
+            self._post_admission_notice(cid, reply_text)
         return reply_text
 
     def _decline_edited_message(self, chat_id: str, update_id, edited: dict) -> None:
