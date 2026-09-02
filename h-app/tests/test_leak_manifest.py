@@ -1530,6 +1530,36 @@ def test_completed_cleanup_with_unremovable_claim_reports_stuck_and_keeps_eviden
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_public_reaper_recovers_authenticated_claim_after_tmpdir_removed():
+    import _leak_manifest
+
+    entry = MANIFEST_DIR / "h_mesh_test_post_remove.json"
+    claim = MANIFEST_DIR / f".claim.0.0.token.{entry.name}"
+    claim.write_text(json.dumps({"tmpdir": str(Path('/tmp') / entry.stem), "owner_pid": 0, "owner_start_time": "0"}))
+    try:
+        reaped, stuck = _leak_manifest.reap_all_orphans(log=lambda *_: None)
+        assert reaped >= 1
+        assert not claim.exists()
+    finally:
+        claim.unlink(missing_ok=True)
+
+
+def test_absence_not_confirmed_on_permission_error_retains_claim(monkeypatch):
+    import _leak_manifest
+
+    entry = MANIFEST_DIR / "h_mesh_test_permission_remove.json"
+    claim = MANIFEST_DIR / f".claim.0.0.token.{entry.name}"
+    claim.write_text(json.dumps({"tmpdir": str(Path('/tmp') / entry.stem), "owner_pid": 0, "owner_start_time": "0"}))
+    monkeypatch.setattr(_leak_manifest, "_tmpdir_confirmed_absent", lambda *_: False)
+    try:
+        reaped, stuck = _leak_manifest.reap_all_orphans(log=lambda *_: None)
+        assert reaped == 0 and stuck >= 1
+        assert any(MANIFEST_DIR.glob(f".claim.*.{entry.name}"))
+    finally:
+        for path in MANIFEST_DIR.glob(f".claim.*.{entry.name}"):
+            path.unlink(missing_ok=True)
+
+
 def test_failed_retry_restamp_retains_live_claim_and_reports_stuck(monkeypatch):
     import _leak_manifest
 
