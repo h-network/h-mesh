@@ -161,7 +161,18 @@ class TmuxReconciler:
                 cmd.extend(["-c", cwd])
 
             if initial_window != "__init__":
-                write_agent_guide(cwd, initial_window, self.tenant, lead=lead, profile=profile, cli=cli)
+                try:
+                    all_members = members(r, pod=self.pod, tenant=self.tenant)
+                except Exception as exc:
+                    try:
+                        log_record("tmux_reconciler", "warning", reason=f"failed to read members from registry: {exc}")
+                    except Exception:
+                        pass
+                    all_members = None
+                write_agent_guide(
+                    cwd, initial_window, self.tenant, lead=lead, profile=profile, cli=cli,
+                    enrolled_entrances=all_members,
+                )
                 if cli:
                     if resume is None:
                         should_resume = tmux_ops.has_session_history(initial_window, cli, profile=profile, cwd=cwd)
@@ -231,16 +242,31 @@ class TmuxReconciler:
         else:
             command = env_args + ["bash", "-il"]
 
+        try:
+            all_members = members(r, pod=self.pod, tenant=self.tenant)
+        except Exception as exc:
+            try:
+                log_record("tmux_reconciler", "warning", reason=f"failed to read members from registry: {exc}")
+            except Exception:
+                pass
+            all_members = None
+
         ret, stdout, stderr = tmux_ops.create_window(
             self.session_name, agent_name, command=command, cwd=cwd, socket=self.socket,
-            lead=lead, profile=profile, cli=cli,
+            lead=lead, profile=profile, cli=cli, enrolled_entrances=all_members,
         )
         if ret == 0:
-            self.log_window_created(r, agent_name)
+            try:
+                self.log_window_created(r, agent_name)
+            except Exception:
+                pass
             self._spawned_agents[agent_name] = time.monotonic()
             return True
         else:
-            log_record("tmux_reconciler", "error", destination=agent_name, reason=f"new-window failed: {stderr}")
+            try:
+                log_record("tmux_reconciler", "error", destination=agent_name, reason=f"new-window failed: {stderr}")
+            except Exception:
+                pass
             return False
 
     def kill_window(self, window_name: str) -> bool:
