@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from unittest.mock import ANY, MagicMock, call, patch
@@ -10,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.channels import receive
 from core.envelope import build, encode
-from core.keys import prefix, receive_processing_key
+from core.keys import prefix, receive_opened_key, receive_opening_key, receive_processing_key, receive_unresolved_key
 from lib.agentlifecycle.lifecycle import (
     _PUBLISH_LEAD_MEMBERSHIP_LUA,
     _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
@@ -43,7 +44,7 @@ def test_lead_publish_wrongtype_is_no_write(real_redis):
         with pytest.raises(redis.ResponseError, match="WRONGTYPE"):
             real_redis.eval(
                 _PUBLISH_LEAD_MEMBERSHIP_LUA,
-                3,
+                5,
                 lead_key,
                 registry_key,
                 cause_key,
@@ -74,6 +75,8 @@ def test_lead_removal_wrongtype_is_no_write(real_redis):
                 registry_key,
                 lead_key,
                 processing_key,
+                receive_opening_key(POD, tenant, "old-lead"),
+                receive_opened_key(POD, tenant, "old-lead"),
                 "old-lead",
             )
 
@@ -102,10 +105,12 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
     assert r.method_calls == [
         call.eval(
             ANY,
-            3,
+            5,
             prefix(POD, TENANT, resource="registry"),
             prefix(POD, TENANT, resource="lead"),
             receive_processing_key(POD, TENANT, "worker-1"),
+            receive_opening_key(POD, TENANT, "worker-1"),
+            receive_opened_key(POD, TENANT, "worker-1"),
             "worker-1",
         ),
         call.delete(prefix(POD, TENANT, agent="worker-1", resource="ingress")),
@@ -120,11 +125,18 @@ def test_stop_and_rehire_cannot_open_predecessor_processing_custody(real_redis):
     agent = "reused-worker"
     registry_key = prefix(POD, tenant, resource="registry")
     processing_key = receive_processing_key(POD, tenant, agent)
+    opening_key = receive_opening_key(POD, tenant, agent)
+    opened_key = receive_opened_key(POD, tenant, agent)
+    unresolved_key = receive_unresolved_key(POD, tenant)
     ingress_key = prefix(POD, tenant, agent=agent, resource="ingress")
     old = build("Message", "sender", agent, {"text": "predecessor"}, pod=POD, tenant=tenant)
     new = build("Message", "sender", agent, {"text": "successor"}, pod=POD, tenant=tenant)
     real_redis.hset(registry_key, agent, "tmux")
     real_redis.rpush(processing_key, encode(old))
+    real_redis.rpush(opening_key, encode(old))
+    real_redis.rpush(opened_key, encode(old))
+    unresolved_record = json.dumps({"agent": agent, "envelope": encode(old), "reason": "unknown"})
+    real_redis.rpush(unresolved_key, unresolved_record)
     try:
         stop_agent(
             real_redis,
@@ -149,6 +161,7 @@ def test_stop_and_rehire_cannot_open_predecessor_processing_custody(real_redis):
 
         assert [envelope["stream_id"] for envelope in opened] == [new["stream_id"]]
         assert old["stream_id"] not in [envelope["stream_id"] for envelope in opened]
+        assert real_redis.lrange(unresolved_key, 0, -1) == [unresolved_record.encode()]
     finally:
         keys = real_redis.keys(prefix(POD, tenant) + ":*")
         if keys:

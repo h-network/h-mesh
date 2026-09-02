@@ -34,12 +34,16 @@ records return over a dedicated validated pipe, while arbitrary stdout/stderr
 and crash tracebacks go to `ports.log` beside the daemon logs.
 For tmux, office, and openshell ports, one kick drains ingress until empty,
 atomically claiming one envelope at a time into the participant's durable
-`processing` list before opening it. Successful opening acknowledges the claim;
-rejection moves it directly from `processing` to `dead` after validating both
-Redis key types. A killed worker leaves its claimed identity in `processing`,
-and its successor recovers that identity before newer ingress. This provides
-at-least-once external opening: a death after the external effect but before
-acknowledgement may replay it, while no death can make the envelope disappear.
+`processing` list. Processing means the effect has not started and is safe for
+a successor to recover. Immediately before calling an opener, custody moves to
+`opening`; that state is never replayed because the external outcome may be
+unknown. Success moves it to a per-agent `opened` receipt list capped at 1,000;
+explicit rejection moves it to `dead`; exceptions and abandoned `opening`
+claims move to the tenant-level `unresolved` evidence list. `office unresolved`
+reads that evidence without consuming or retrying it. There is deliberately no
+automatic expiry and currently no resolution verb: future exact-identity,
+audited retry/dead/resolve actions require per-kind policy rather than silently
+choosing loss or duplication today.
 Kicks are availability hints, not
 tokens paired one-to-one with envelopes: an older entry left by a missed or
 crashed kick therefore cannot consume the only attempt for the request behind

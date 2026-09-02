@@ -165,6 +165,16 @@ class FakeRedis:
                 return 0
             self.rpush(dead, raw)
             return 1
+        if "core receive custody transfer" in script:
+            source, destination = keys
+            old, new = rest[0], rest[1]
+            if self.lrem(source, 1, old) != 1:
+                return 0
+            self.rpush(destination, new)
+            cap = int(rest[2])
+            while cap > 0 and len(self.lists[destination]) > cap:
+                self.lists[destination].pop(0)
+            return 1
         raise AssertionError(f"unexpected Lua script: {script}")
 
 

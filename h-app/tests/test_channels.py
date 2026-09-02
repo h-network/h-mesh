@@ -112,6 +112,16 @@ class FakeRedis:
                 return 0
             self.rpush(dead, raw)
             return 1
+        if "core receive custody transfer" in script:
+            source, destination = keys
+            old, new = argv[0], argv[1]
+            if self.lrem(source, 1, old) != 1:
+                return 0
+            self.rpush(destination, new)
+            cap = int(argv[2])
+            while cap > 0 and len(self.lists[destination]) > cap:
+                self.lists[destination].popleft()
+            return 1
         if "core unreplied increment" in script:
             key, client, since = keys[0], argv[0], argv[1]
             existing = self.hget(key, client)
@@ -240,6 +250,7 @@ class ChannelTests(unittest.TestCase):
         raw = self.redis.lpop(prefix(POD, TENANT, "alice", "egress"))
         ingress = prefix(POD, TENANT, "bob", "ingress")
         processing = prefix(POD, TENANT, "bob", "processing")
+        opening = prefix(POD, TENANT, "bob", "opening")
         dead = prefix(POD, TENANT, "bob", "dead")
         self.redis.rpush(ingress, raw)
 
@@ -254,7 +265,7 @@ class ChannelTests(unittest.TestCase):
 
         surviving_ids = [
             parse(candidate)["stream_id"]
-            for key in (ingress, processing, dead)
+            for key in (ingress, processing, opening, dead)
             for candidate in self.redis.lists[key]
         ]
         self.assertEqual(
@@ -270,12 +281,13 @@ class ChannelTests(unittest.TestCase):
         raw = self.redis.lpop(prefix(POD, TENANT, "alice", "egress"))
         ingress = prefix(POD, TENANT, "bob", "ingress")
         processing = prefix(POD, TENANT, "bob", "processing")
+        opening = prefix(POD, TENANT, "bob", "opening")
         dead = prefix(POD, TENANT, "bob", "dead")
         self.redis.rpush(ingress, raw)
         original_eval = self.redis.eval
 
         def fail_dead_write(script, key_count, *args):
-            if "core receive processing-to-dead" in script:
+            if "core receive custody transfer" in script and args[1] == dead:
                 raise RuntimeError("injected dead-letter write failure")
             return original_eval(script, key_count, *args)
 
@@ -289,7 +301,7 @@ class ChannelTests(unittest.TestCase):
 
         surviving_ids = [
             parse(candidate)["stream_id"]
-            for key in (ingress, processing, dead)
+            for key in (ingress, processing, opening, dead)
             for candidate in self.redis.lists[key]
         ]
         self.assertEqual(
@@ -307,9 +319,14 @@ class ChannelTests(unittest.TestCase):
         processing = prefix(POD, TENANT, "bob", "processing")
         self.redis.rpush(ingress, raw)
         opened = []
-        self.redis.lrem = lambda *args: (_ for _ in ()).throw(
-            RuntimeError("injected acknowledgement failure")
-        )
+        opening = prefix(POD, TENANT, "bob", "opening")
+        opened_key = prefix(POD, TENANT, "bob", "opened")
+        original_eval = self.redis.eval
+        def fail_ack(script, key_count, *args):
+            if "core receive custody transfer" in script and args[0] == opening and args[1] == opened_key:
+                raise RuntimeError("injected acknowledgement failure")
+            return original_eval(script, key_count, *args)
+        self.redis.eval = fail_ack
 
         with self.assertRaises(RuntimeError):
             receive(
@@ -318,11 +335,12 @@ class ChannelTests(unittest.TestCase):
             )
 
         self.assertEqual([item["stream_id"] for item in opened], [stream_id])
-        self.assertEqual(
-            [parse(candidate)["stream_id"] for candidate in self.redis.lists[processing]],
-            [stream_id],
-            "failed acknowledgement must retain the opened identity for at-least-once recovery",
-        )
+        self.redis.eval = original_eval
+        receive(self.redis, pod=POD, tenant=TENANT, agent="bob", openers={"Message": opened.append}, timeout=0, blocking=False)
+        unresolved = prefix(POD, TENANT, resource="unresolved")
+        records = [json.loads(value) for value in self.redis.lists[unresolved]]
+        self.assertEqual([parse(record["envelope"])["stream_id"] for record in records], [stream_id])
+        self.assertEqual([item["stream_id"] for item in opened], [stream_id], "unknown outcome must not be reopened")
 
     def test_receive_successor_recovers_claimed_identity_before_new_ingress(self):
         old_id = send(
