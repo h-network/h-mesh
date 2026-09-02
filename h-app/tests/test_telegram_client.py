@@ -4319,12 +4319,19 @@ def test_unauthorized_chats_never_get_a_worker():
 
 def test_updates_are_acknowledged_to_telegram_before_they_are_handled():
     """⚠ Pins a LOSS BOUNDARY, not a guarantee. `offset` advances when an
-    update is queued, so a crash with a non-empty queue loses operator actions
-    Telegram believes were delivered. The alternative -- acknowledging only
-    after processing -- makes restart redeliver, and a redelivered /run runs
-    the command twice with no dedupe anywhere in this client. A lost message
-    can be sent again; a duplicated side effect cannot be un-run. This test
-    exists so the boundary moves only on purpose."""
+    update is queued, so a crash loses operator actions Telegram believes were
+    delivered. The alternative -- acknowledging only after processing -- makes
+    restart redeliver, and a redelivered /run runs the command twice with no
+    dedupe anywhere in this client. A lost message can be sent again; a
+    duplicated side effect cannot be un-run.
+
+    ⚠ The exposure is the in-progress update PLUS anything queued behind it,
+    not just the queue: once the worker has dequeued an update, qsize reads
+    zero while the handler may still be tens of seconds inside network calls,
+    and that update is equally acknowledged and equally lost. The assertion
+    below deliberately uses unfinished_tasks rather than qsize for exactly
+    that reason, and BACKLOG_WARN never fires for a single in-flight update --
+    no warning does not mean nothing at risk."""
     with tempfile.TemporaryDirectory() as tmpdir:
         holding = threading.Event()
         offsets = []

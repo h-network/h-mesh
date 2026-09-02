@@ -1149,9 +1149,13 @@ class ChatWorker:
     ⚠ There IS something to flush, and it is lost: an earlier version of this
     docstring said otherwise and was wrong. `run_polling` acknowledges an
     update to Telegram when it queues it, so anything still queued at process
-    death is gone while Telegram considers it delivered. That boundary is
-    argued and pinned in `run_polling`'s own docstring; what matters here is
-    that the queue is not a durable buffer and must not be mistaken for one.
+    death is gone while Telegram considers it delivered — and so is the update
+    currently BEING handled, which has already left the queue. `qsize()` reads
+    zero for it. `BACKLOG_WARN` is a backlog signal only: it never fires for a
+    single in-flight update, so "no warning" does not mean "nothing at risk".
+    That boundary is argued and pinned in `run_polling`'s own docstring; what
+    matters here is that the queue is not a durable buffer and must not be
+    mistaken for one.
 
     ⚠ BACKPRESSURE. The queue is unbounded ON PURPOSE. The alternatives are
     dropping an operator's message (silent data loss, the failure this whole
@@ -3513,9 +3517,17 @@ class TelegramBot:
         dedupe: a redelivered `/run` runs the command a second time and a
         redelivered prompt is sent twice. The asymmetry is the reason for the
         choice: a lost message is one the operator can send again, while a
-        duplicated side effect cannot be un-run. The exposure is the depth of
-        one chat's queue, which is zero in steady state and announces itself
-        at `ChatWorker.BACKLOG_WARN`. Pinned by
+        duplicated side effect cannot be un-run.
+
+        ⚠ THE EXPOSURE IS "THE IN-PROGRESS UPDATE PLUS ANYTHING QUEUED BEHIND
+        IT", not "the queue". Once `ChatWorker._run` has called `get()`, that
+        update is off the queue — `qsize()` reads zero — while the handler
+        spends up to tens of seconds in network calls, and it is just as
+        acknowledged and just as lost if the process dies there. So an empty
+        queue is not zero exposure, and there is always at least one update at
+        risk while anything is being handled at all. `BACKLOG_WARN` announces
+        a BACKLOG; it says nothing about a single in-flight update and never
+        fires for one. Pinned by
         test_updates_are_acknowledged_to_telegram_before_they_are_handled so
         the boundary moves only on purpose.
         """
