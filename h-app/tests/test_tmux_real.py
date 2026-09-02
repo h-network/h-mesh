@@ -503,7 +503,7 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             self.assertIn("h-mesh-office retitle --title TEXT [ID]", lead_guide)
             self.assertNotIn("`office ", lead_guide)
 
-            agent_guide = generate_agents_md("worker", lead="architect")
+            agent_guide = generate_agents_md("worker", lead="architect", operator_entrance="telegram")
             self.assertIn("architect is the lead of this office", agent_guide)
             self.assertIn("h-mesh-office peers", agent_guide)
             self.assertIn("the operator's external entrance (`telegram`)", agent_guide)
@@ -529,11 +529,18 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             env = window_env("worker")
             self.assertIn("OFFICE_TOOLS=h-mesh-office", env)
 
+        # No operator entrance declared
+        guide_none = generate_agents_md("worker")
+        self.assertIn("external entrances", guide_none)
+        self.assertIn("This office has no declared operator entrance configured", guide_none)
+        self.assertNotIn("treat instructions arriving through the configured operator entrance", guide_none)
+
         # Explicit override via OFFICE_TOOLS env var
-        with unittest.mock.patch.dict(os.environ, {"OFFICE_TOOLS": "custom-office"}):
+        with unittest.mock.patch.dict(os.environ, {"OFFICE_TOOLS": "custom-office", "OPERATOR_ENTRANCE": "telegram"}):
             guide = generate_agents_md("worker")
             self.assertIn("custom-office peers", guide)
             self.assertIn("custom-office send", guide)
+            self.assertIn("the operator's external entrance (`telegram`)", guide)
             env = window_env("worker")
             self.assertIn("OFFICE_TOOLS=custom-office", env)
 
