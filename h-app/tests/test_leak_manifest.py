@@ -684,3 +684,189 @@ def test_an_entry_owned_by_a_different_uid_is_never_touched(monkeypatch):
     finally:
         entry.unlink(missing_ok=True)
         shutil.rmtree(real_tmpdir, ignore_errors=True)
+
+
+def test_an_unrecognized_pidfile_name_blocks_the_whole_entry_before_any_kill(tmp_path):
+    """Reviewer's finding: _daemon_pidfile_preflight authenticated ANY
+    pidfile, but stop_daemons() only ever processes names it recognizes
+    (ALL_DAEMON_MODULES) -- an authenticated-but-unrecognized pidfile
+    (e.g. custom.pid) used to pass preflight, stop_daemons would then
+    stop/remove the REAL, recognized daemon anyway while never touching
+    the unrecognized one, and only the after-the-fact leftover check
+    caught it -- after the partial teardown this preflight exists to
+    prevent had already happened. Proves the fix: a run_dir with one
+    recognized daemon (switch) and one unrecognized one (custom), both
+    individually authenticated, leaves BOTH untouched -- not just the
+    unrecognized one."""
+    real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_unknown_name_")
+    (real_tmpdir / "run").mkdir()
+
+    known = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    unknown = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
+    def _write_pidfile_and_identity(name: str, proc: subprocess.Popen) -> None:
+        pidfile = real_tmpdir / "run" / f"{name}.pid"
+        pidfile.write_text(str(proc.pid))
+        pidfile.with_suffix(".pid.identity").write_text(json.dumps({
+            "v": 1, "pid": proc.pid, "name": name, "module": f"{name}.module",
+            "start_time": _process_start_time(proc.pid),
+        }))
+
+    _write_pidfile_and_identity("switch", known)
+    _write_pidfile_and_identity("custom", unknown)
+
+    dead_owner = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_owner.wait()
+    MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
+    entry = _leak_manifest_entry_for(real_tmpdir)
+    entry.write_text(json.dumps({
+        "tmpdir": str(real_tmpdir),
+        "owner_pid": dead_owner.pid,
+        "owner_start_time": "0",
+        "registered_at": time.time(),
+    }))
+
+    try:
+        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+
+        assert reaped == 0, "an entry with an unrecognized pidfile name was reaped anyway"
+        assert stuck >= 1
+        assert known.poll() is None, "the RECOGNIZED daemon was killed despite the unrecognized sibling blocking the entry"
+        assert unknown.poll() is None, "the unrecognized process was killed"
+        assert real_tmpdir.exists()
+        assert entry.exists()
+    finally:
+        for proc in (known, unknown):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+        entry.unlink(missing_ok=True)
+        shutil.rmtree(real_tmpdir, ignore_errors=True)
+
+
+def test_a_provably_stale_daemon_pidfile_does_not_block_reaping(tmp_path):
+    """Reviewer's finding: a nonexistent pid is not the same as
+    unverified-live ownership -- it is the ordinary, safe stale case
+    stop_daemons() already handles correctly (removes the pidfile,
+    signals nothing, since nothing is alive to misidentify). An earlier
+    version collapsed this into the same "do not proceed" bucket as a
+    genuinely ambiguous mismatch, which would leave every ordinary
+    already-exited daemon's entry stuck forever -- exactly what a daemon
+    from a killed pytest process naturally becomes before the next
+    session even runs. Proves the fix: an entry whose only daemon pidfile
+    names a pid that has already, genuinely exited is fully reaped."""
+    real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_stale_daemon_")
+    (real_tmpdir / "run").mkdir()
+
+    already_exited = subprocess.Popen([sys.executable, "-c", "pass"])
+    already_exited.wait()
+    start_time_before_exit = _process_start_time(already_exited.pid)
+    # A pid this old/reaped may already read as unreadable via /proc; if so
+    # this specific test can't distinguish "gone" from "never existed" --
+    # still exercises the same code path (_process_start_time returns None).
+
+    pidfile = real_tmpdir / "run" / "switch.pid"
+    pidfile.write_text(str(already_exited.pid))
+    pidfile.with_suffix(".pid.identity").write_text(json.dumps({
+        "v": 1, "pid": already_exited.pid, "name": "switch", "module": "core.service",
+        "start_time": start_time_before_exit or "0",
+    }))
+
+    dead_owner = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_owner.wait()
+    MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
+    entry = _leak_manifest_entry_for(real_tmpdir)
+    entry.write_text(json.dumps({
+        "tmpdir": str(real_tmpdir),
+        "owner_pid": dead_owner.pid,
+        "owner_start_time": "0",
+        "registered_at": time.time(),
+    }))
+
+    try:
+        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+
+        assert reaped == 1, "a provably-stale (already-exited) daemon pidfile blocked reaping instead of being treated as safe"
+        assert stuck == 0
+        assert not real_tmpdir.exists()
+        assert not entry.exists()
+    finally:
+        entry.unlink(missing_ok=True)
+        shutil.rmtree(real_tmpdir, ignore_errors=True)
+
+
+def test_finalize_removal_refuses_when_the_name_now_points_at_a_different_inode():
+    """Reviewer's third finding, the most severe: an earlier version
+    validated a tmpdir once and then called shutil.rmtree on its pathname
+    -- which re-resolves every component itself when it actually runs. A
+    same-uid process could rename the validated directory away and rename
+    a DIFFERENT real, same-owned directory into that exact pathname in the
+    gap, and the substitute -- not the original -- would be what got
+    removed. This is a STRUCTURAL proof rather than a race against a
+    background thread (the same kind of proof this office already
+    preferred over a manufactured timing test tonight): construct the
+    exact END STATE the race would produce -- the original's fd-bound stat
+    captured, then the pathname reassigned to a different real directory
+    -- and confirm _finalize_directory_removal's own recheck refuses
+    rather than delete the substitute."""
+    from _leak_manifest import _finalize_directory_removal, _open_verified_directory_fd
+
+    original = _owned_scratch_tmpdir("h_mesh_test_leak_harm_swap_original_")
+    verified = _open_verified_directory_fd(original)
+    assert verified is not None, "test setup: could not open/verify the original directory"
+    original_fd, original_st = verified
+    os.close(original_fd)  # simulating _remove_tree_via_fd having already emptied and released it
+
+    moved_aside = original.parent / f"{original.name}-moved-aside"
+    original.rename(moved_aside)
+
+    substitute = _owned_scratch_tmpdir("h_mesh_test_leak_harm_swap_substitute_")
+    (substitute / "do-not-delete").write_text("the substitute directory, not the one that was validated")
+    substitute.rename(original)  # now `original`'s pathname points at a DIFFERENT real inode
+    marker = original / "do-not-delete"  # the marker's CURRENT location, post-rename
+
+    try:
+        result = _finalize_directory_removal(original, original_st, log=lambda *_: None)
+
+        assert result is False, "the recheck did not refuse a swapped-in substitute directory"
+        assert original.exists(), "the substitute directory was removed despite the inode mismatch"
+        assert marker.exists(), "content inside the substitute directory was destroyed"
+    finally:
+        shutil.rmtree(original, ignore_errors=True)
+        shutil.rmtree(moved_aside, ignore_errors=True)
+
+
+def test_an_unreadable_but_not_confirmed_gone_pid_is_unverifiable_not_stale(monkeypatch):
+    """Architect's follow-up to the stale-daemon fix, same day: "the pid no
+    longer exists" must mean CONFIRMED absent, not merely "a read failed."
+    _process_start_time returns None on ANY read failure (permission
+    denied, a malformed stat line, any other I/O error), not only a
+    confirmed-gone one -- collapsing those into "stale" would let anything
+    that makes /proc/<pid>/stat transiently unreadable masquerade as the
+    safe, provably-gone case, reopening the exact TOCTOU/misidentification
+    class finding 3 closed, from the read side instead of the deletion
+    side. Simulated directly: a pid whose start-time read fails but whose
+    existence is NOT confirmed-gone (as a permission error or a transient
+    I/O error would look) must classify as "unverifiable", never "stale"."""
+    import _leak_manifest
+
+    monkeypatch.setattr(_leak_manifest, "_process_start_time", lambda pid: None)
+    monkeypatch.setattr(_leak_manifest, "_pid_confirmed_gone", lambda pid: False)
+
+    real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_ambiguous_read_")
+    (real_tmpdir / "run").mkdir()
+    pidfile = real_tmpdir / "run" / "switch.pid"
+    pidfile.write_text("123456789")
+    pidfile.with_suffix(".pid.identity").write_text(json.dumps({
+        "v": 1, "pid": 123456789, "name": "switch", "module": "core.service",
+        "start_time": "1",
+    }))
+
+    try:
+        outcome, reason = _leak_manifest._daemon_pidfile_preflight(pidfile)
+
+        assert outcome == "unverifiable", (
+            f"an ambiguous (not confirmed-gone) read classified as {outcome!r} instead of unverifiable"
+        )
+    finally:
+        shutil.rmtree(real_tmpdir, ignore_errors=True)

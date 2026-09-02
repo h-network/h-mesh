@@ -90,13 +90,15 @@ pointed at. Both now count as `stuck` and stay on disk, logged, exactly like
 an unauthenticatable daemon pid does -- see `reap_all_orphans`.
 
 ⚠ Two sessions starting and reaping at once: every action taken here
-RE-AUTHENTICATES FRESH at the moment of that action -- via pidfd, not a
-value read earlier in the race -- which is what actually makes concurrent
-reaping safe. Two reapers independently authenticating the same
-genuinely-dead entry reach the same conclusion and do the same idempotent
-work twice (a pidfd opened against an already-exited pid raises
-`ProcessLookupError`, caught; `shutil.rmtree` on an already-removed tree is
-a no-op; unlinking an already-unlinked manifest entry is a no-op) -- safe. A
+RE-AUTHENTICATES FRESH at the moment of that action -- via pidfd for a
+signal, via a freshly-opened directory fd for a deletion (see
+`_fd_safe_remove_owned_tmpdir`) -- never trusting a value read earlier in
+the race, which is what actually makes concurrent reaping safe. Two
+reapers independently authenticating the same genuinely-dead entry reach
+the same conclusion and do the same idempotent work twice (a pidfd opened
+against an already-exited pid raises `ProcessLookupError`, caught; opening
+a directory fd against an already-removed tree raises `OSError`, caught;
+unlinking an already-unlinked manifest entry is a no-op) -- safe. A
 registration race (one process mid-`register()` while another reaps) cannot
 produce a corrupt read either: `register()` writes to a temp file and
 `os.replace()`s it into place, so a concurrent reader only ever sees the
@@ -109,13 +111,12 @@ from __future__ import annotations
 import json
 import os
 import select
-import shutil
 import signal
 import stat
 import time
 from pathlib import Path
 
-from services.daemons import stop_daemons
+from services.daemons import ALL_DAEMON_MODULES, stop_daemons
 
 MANIFEST_DIR = Path("/tmp/h_mesh_test_manifests")
 _OWNED_ROOT = Path("/tmp")
@@ -148,28 +149,47 @@ def _validated_tmpdir(entry: Path, tmpdir_str: str) -> Path | None:
     link itself is a TOCTOU that checking the name harder cannot close);
     and its `st_uid` must equal this process's own uid, so a directory
     planted by a different user fails. Resolution happens once, before any
-    check, and every check after runs against that SAME resolved path --
-    not re-resolved between validation and use -- so a symlinked path
-    component swapped in later cannot move the target underneath an
-    already-passed check.
+    check, and every check runs against that SAME resolved path within
+    THIS function's own lifetime.
 
-    ⚠ THE RESIDUAL, stated plainly rather than implied away: this is proof
-    of CONFORMANCE plus SAME-USER TRUST, not proof of exclusive ownership.
-    Another process running as this same uid -- another agent's test code,
-    or this scheme's own leaked code -- can still deliberately create a
-    real, correctly-named, same-owned directory and a matching manifest
-    entry; no path-level check distinguishes that from a directory this
-    scheme actually created itself, because by construction there is
-    nothing else to distinguish it by. What this closes is an ACCIDENT or
-    an OUT-OF-SCOPE target (a git checkout, a different user's files, a
-    typo'd or corrupted path) being reachable at all -- it does not, and
-    cannot from path checks alone, close a deliberate same-user forgery.
-    A narrow TOCTOU also remains between this validation returning and
-    `shutil.rmtree` actually starting to walk the tree (itself refuses to
-    operate if the top-level path is a symlink AT THAT MOMENT, which helps,
-    but does not cover every component swapped mid-walk) -- closing that
-    fully would need fd-relative (`O_NOFOLLOW`+`openat`-style) deletion
-    instead of a bare path-based `shutil.rmtree`, which this does not do.
+    ⚠ REVIEWER BLOCKING FAIL, 2026-09-02: an earlier version of this
+    docstring claimed that resolving once here meant "a symlinked path
+    component swapped in later cannot move the target underneath an
+    already-passed check" -- FALSE as a description of the whole pipeline,
+    and correctly rejected. This function returns a `Path`, a plain
+    pathname; the caller (at the time, `reap_orphan`) went on to call
+    `shutil.rmtree(path, ...)`, which is itself pathname-based and
+    RE-RESOLVES every component from scratch when it actually runs, at
+    whatever point later that happens to be -- nothing about validating
+    here bound that later, separate resolution to what was checked in this
+    function. A same-uid process could rename the validated directory away
+    and rename a different, same-owned, correctly-named directory into
+    that exact pathname in the gap between this function returning and the
+    deletion actually starting, and the replacement -- not the original --
+    is what would be removed. This function's job is now understood
+    correctly as a cheap, EARLY plausibility filter (is this claim even
+    shaped right, is it even worth acting on) -- not the thing that binds
+    the eventual destructive action to a specific inode. That binding is
+    `_fd_safe_remove_owned_tmpdir`'s job: it re-verifies fresh, at the
+    actual moment of deletion, via an opened directory fd rather than a
+    pathname, and its own docstring is where the honest residual (and what
+    actually closes the rest of the gap) belongs -- not here.
+
+    ⚠ THE RESIDUAL THIS FUNCTION ALONE LEAVES, stated plainly: this is
+    proof of CONFORMANCE plus SAME-USER TRUST, not proof of exclusive
+    ownership, and not a TOCTOU-safe binding to the eventual deletion by
+    itself. Another process running as this same uid -- another agent's
+    test code, or this scheme's own leaked code -- can still deliberately
+    create a real, correctly-named, same-owned directory and a matching
+    manifest entry; no path-level check distinguishes that from a
+    directory this scheme actually created itself, because by construction
+    there is nothing else to distinguish it by. What THIS function closes
+    is an ACCIDENT or an OUT-OF-SCOPE target (a git checkout, a different
+    user's files, a typo'd or corrupted path) being reachable at all --
+    it does not, and cannot from path checks alone, close a deliberate
+    same-user forgery, and it does not by itself close the gap between
+    validation and deletion; see `_fd_safe_remove_owned_tmpdir` for what
+    does.
     """
     try:
         tmpdir = Path(tmpdir_str)
@@ -216,6 +236,34 @@ def _process_start_time(pid: int) -> str | None:
         return None
 
 
+def _pid_confirmed_gone(pid: int) -> bool:
+    """True ONLY if `pid` is confirmed to no longer exist at all (ENOENT on
+    `/proc/<pid>`) -- never true for a read that merely failed for some
+    OTHER reason (permission denied, a malformed/unexpected stat, any other
+    I/O error).
+
+    ⚠ ARCHITECT'S FOLLOW-UP, same day: `_process_start_time` returning
+    `None` is not, by itself, proof a process is gone -- it also returns
+    `None` on a read that failed for an unrelated reason. Callers that
+    treated "current start time is None" as "confirmed dead" (both
+    `_owner_status` and `_daemon_pidfile_preflight` did) would then let
+    ANYTHING that makes `/proc/<pid>/stat` transiently unreadable
+    masquerade as the safe, provably-gone case -- reopening the exact
+    TOCTOU/misidentification class finding 3 closed, from the read side
+    instead of the deletion side. This function is the one place that
+    distinguishes "confirmed absent" from "merely unreadable," so every
+    caller asks the narrower, correct question explicitly rather than
+    inferring it from a `None`.
+    """
+    try:
+        os.stat(f"/proc/{pid}")
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False  # exists but unreadable for some other reason -- NOT confirmed gone
+    return False
+
+
 def register(tmpdir: str) -> Path:
     """Record `tmpdir` as live, owned by this process. Call before spawning
     anything under it. Returns the manifest entry's own path."""
@@ -252,15 +300,20 @@ def _owner_status(owner_pid: int, owner_start_time: str | None) -> str:
     stay VISIBLE as its own distinct case, not silently indistinguishable
     from a genuinely live entry forever (reviewer's finding: it previously
     was). Otherwise the pid's CURRENT start time must match exactly for
-    "running"; any mismatch, or the pid no longer existing at all, means the
-    original owner is provably gone ("dead") regardless of who holds that
-    pid number now.
+    "running"; a mismatch (a live pid that isn't the one we recorded) or
+    the pid being CONFIRMED gone (see `_pid_confirmed_gone` -- never merely
+    "the read failed for some other reason") means the original owner is
+    provably gone ("dead") regardless of who holds that pid number now. A
+    read that failed WITHOUT confirming absence is "unverifiable", not
+    "dead" -- collapsing those two would let anything that makes
+    `/proc/<pid>/stat` transiently unreadable masquerade as the safe,
+    provably-gone case.
     """
     if owner_start_time is None:
         return "unverifiable"
     current = _process_start_time(owner_pid)
     if current is None:
-        return "dead"
+        return "dead" if _pid_confirmed_gone(owner_pid) else "unverifiable"
     return "running" if current == owner_start_time else "dead"
 
 
@@ -395,35 +448,221 @@ def _kill_tmux_server_by_socket_path(socket_path: str, log=print) -> None:
         _pidfd_kill_if_matches(pid, verify, log=log, context=f"tmux server for {socket_path}")
 
 
-def _daemon_pidfile_preflight(pidfile: Path) -> tuple[bool, str]:
-    """Read-only: would `services.daemons` authenticate this pidfile right
-    now? Mirrors its own identity check exactly (pid + `.identity` sidecar
-    + matching `/proc` start time), but never opens a pidfd or signals
-    anything -- this is a GATE deciding whether `stop_daemons()` gets
-    called for a whole `run_dir` at all, not a replacement for its own
-    pidfd-bound authentication at the moment it actually signals."""
+def _daemon_pidfile_preflight(pidfile: Path) -> tuple[str, str]:
+    """Read-only: what would `services.daemons` do with this pidfile right
+    now? Returns `(outcome, reason)`, outcome one of:
+
+      "owned"        -- authenticates; stop_daemons will signal it.
+      "stale"        -- the pid is CONFIRMED to no longer exist at all
+                         (see `_pid_confirmed_gone` -- never merely "the
+                         read failed for some other reason"); stop_daemons
+                         will safely remove the stale pidfile, no signal
+                         sent. SAFE to proceed on -- there is nothing alive
+                         here to misidentify.
+      "unowned-name" -- the pidfile's own name isn't a key stop_daemons
+                         recognizes at all (see `reap_orphan`'s enumeration
+                         check) -- not decided here, callers must check
+                         separately; kept out of this function because it
+                         doesn't require reading the file.
+      "unverifiable" -- identity missing/corrupt/mismatched pid, OR the pid
+                         is alive but its CURRENT start time does not match
+                         what was recorded (a live, reused number) -- the
+                         one genuinely dangerous case. NOT safe to proceed.
+
+    ⚠ REVIEWER BLOCKING FAIL, 2026-09-02: an earlier version collapsed
+    "stale" (pid confirmed gone -- the safe, ordinary case a daemon from a
+    killed pytest process naturally reaches on its own before the next
+    session even runs) into the same "do not proceed" bucket as
+    "unverifiable" (genuinely ambiguous: alive, but not the process we
+    think it is). That made every ordinary already-exited daemon
+    permanently stuck -- the ENTRY never reaped, noise every session,
+    forever -- when `stop_daemons()` itself already handles a stale pidfile
+    correctly and safely (removes it, signals nothing, since there is
+    nothing alive to misidentify). Only "unverifiable" may block the whole
+    entry; "stale" is a green light exactly like "owned" is.
+
+    ⚠ ARCHITECT'S FOLLOW-UP, same day: "the pid no longer exists" must mean
+    CONFIRMED absent, not "a read failed." `_process_start_time` returns
+    `None` on any read failure, not only a confirmed-gone one (permission
+    denied, a malformed stat line, any other I/O error) -- collapsing
+    those into "stale" would let anything that makes `/proc/<pid>/stat`
+    transiently unreadable masquerade as the safe, provably-gone case,
+    reopening the exact TOCTOU/misidentification class finding 3 closed,
+    from the read side rather than the deletion side. `_pid_confirmed_gone`
+    is checked explicitly whenever `_process_start_time` returns `None`,
+    rather than treating that `None` itself as proof of absence.
+    """
     try:
         pid = int(pidfile.read_text().strip())
     except (ValueError, OSError):
-        return False, "pidfile unreadable or non-numeric"
+        return "unverifiable", "pidfile unreadable or non-numeric"
     identity_path = pidfile.with_suffix(pidfile.suffix + ".identity")
     try:
         identity = json.loads(identity_path.read_text())
     except OSError:
-        return False, f"no {identity_path.name} sidecar"
+        return "unverifiable", f"no {identity_path.name} sidecar"
     except json.JSONDecodeError:
-        return False, f"{identity_path.name} is not valid JSON"
+        return "unverifiable", f"{identity_path.name} is not valid JSON"
     if not isinstance(identity, dict) or identity.get("pid") != pid:
-        return False, f"{identity_path.name} does not name pid {pid}"
+        return "unverifiable", f"{identity_path.name} does not name pid {pid}"
     recorded = identity.get("start_time")
     if not isinstance(recorded, str):
-        return False, f"{identity_path.name} has no recorded start_time"
+        return "unverifiable", f"{identity_path.name} has no recorded start_time"
     current = _process_start_time(pid)
     if current is None:
-        return False, f"pid {pid} no longer exists"
+        if _pid_confirmed_gone(pid):
+            return "stale", f"pid {pid} confirmed no longer exists -- safe, ordinary stale pidfile"
+        return "unverifiable", f"pid {pid}'s /proc entry could not be read (not confirmed gone)"
     if current != recorded:
-        return False, f"pid {pid} start_time does not match -- number was reused"
-    return True, "ok"
+        return "unverifiable", f"pid {pid} start_time does not match -- number was reused"
+    return "owned", "ok"
+
+
+def _open_verified_directory_fd(path: Path) -> tuple[int, os.stat_result] | None:
+    """Open `path` as a directory fd with `O_NOFOLLOW`, re-verifying real
+    directory + owned-uid at the MOMENT of opening -- not trusting an
+    earlier validation to still describe reality. Returns `(fd, stat)` on
+    success (caller must close the fd); `None`, nothing left open, on any
+    failure."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        os.close(fd)
+        return None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        os.close(fd)
+        return None
+    return fd, st
+
+
+def _remove_tree_via_fd(dir_fd: int) -> None:
+    """Recursively remove everything reachable from `dir_fd`, entirely
+    through `os.*at()`-style fd-relative calls (`dir_fd=...`) -- never by
+    re-resolving a pathname from the top. Does NOT remove `dir_fd`'s own
+    directory entry; a directory cannot rmdir itself, the caller does that
+    via the PARENT's fd once this returns. Best-effort per-entry (a
+    concurrent reaper's own idempotent pass over the same genuinely-dead
+    tree is expected, per this module's own concurrency contract) -- an
+    OSError on any one entry is caught and skipped rather than aborting
+    the whole walk."""
+    try:
+        names = os.listdir(dir_fd)
+    except OSError:
+        return
+    for name in names:
+        try:
+            entry_st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISDIR(entry_st.st_mode):
+            try:
+                child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            except OSError:
+                continue
+            try:
+                _remove_tree_via_fd(child_fd)
+            finally:
+                os.close(child_fd)
+            try:
+                os.rmdir(name, dir_fd=dir_fd)
+            except OSError:
+                pass
+        else:
+            try:
+                os.unlink(name, dir_fd=dir_fd)
+            except OSError:
+                pass
+
+
+def _fd_safe_remove_owned_tmpdir(tmpdir: Path, log=print) -> bool:
+    """Remove `tmpdir` entirely through fd-relative operations bound to one
+    freshly-opened, freshly-verified inode -- never a bare pathname-based
+    `shutil.rmtree`.
+
+    ⚠ REVIEWER BLOCKING FAIL, 2026-09-02: an earlier version validated
+    `tmpdir` once (`_validated_tmpdir`) and then called
+    `shutil.rmtree(tmpdir, ...)` -- a PATHNAME-based call that re-resolves
+    every path component itself, from scratch, at the moment it actually
+    runs, regardless of what validation observed earlier. A same-uid
+    process (another agent's test code, or this scheme's own leaked code --
+    see `_validated_tmpdir`'s own residual paragraph) could rename the
+    validated directory away and rename a DIFFERENT real, same-owned
+    directory into that exact pathname in the gap between validation and
+    the rmtree call actually starting -- the replacement, not the
+    validated original, is what would get recursively removed. On an
+    automatic destructive hook running at the start of every session on a
+    shared box, same-uid concurrency is not a hypothetical, it is the
+    actual deployment model.
+
+    Fixed by binding the entire deletion to one inode: open with
+    `O_NOFOLLOW` (refuses a symlink substituted in), confirm the
+    freshly-opened fd's own `fstat` is still a real directory owned by this
+    uid, then walk and delete everything beneath it entirely through
+    `*at()`-family calls relative to that fd -- never by re-resolving a
+    name from `/tmp` downward for anything under the top level. The one
+    step that cannot be fd-relative -- removing `tmpdir`'s own directory
+    entry, since a directory cannot rmdir itself and the PARENT's fd + name
+    must be used -- re-verifies the name still refers to the SAME inode
+    immediately before that single syscall. That final gap (between the
+    re-check and the syscall) is the narrowest this can be reduced to
+    without the kernel offering an atomic "remove this exact inode,
+    wherever its name currently points" primitive; stated here rather than
+    implied closed.
+    """
+    verified = _open_verified_directory_fd(tmpdir)
+    if verified is None:
+        log(f"  • STUCK, leaving {tmpdir}: failed re-verification immediately before deletion")
+        return False
+    dir_fd, expected_st = verified
+    try:
+        _remove_tree_via_fd(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+    return _finalize_directory_removal(tmpdir, expected_st, log=log)
+
+
+def _finalize_directory_removal(tmpdir: Path, expected_st: os.stat_result, log=print) -> bool:
+    """The one step in `_fd_safe_remove_owned_tmpdir` that cannot be
+    fd-relative -- a directory cannot rmdir itself, so removing `tmpdir`'s
+    own entry requires the PARENT's fd plus `tmpdir`'s name. Split out as
+    its own function specifically so this recheck can be tested directly
+    against an already-swapped end state (a structural proof that the
+    recheck itself refuses correctly), rather than only via a real,
+    unreliable race against a background thread.
+
+    Re-verifies the name still refers to the SAME inode `expected_st`
+    describes IMMEDIATELY before the single `rmdir` syscall -- if a
+    same-uid process renamed the original away and renamed a different,
+    real directory into this exact name in the meantime, this refuses
+    rather than remove the substitute.
+    """
+    try:
+        parent_fd = os.open(str(_OWNED_ROOT), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        log(f"  • STUCK, leaving {tmpdir}: could not open {_OWNED_ROOT} to remove its own directory entry")
+        return False
+    try:
+        try:
+            current_st = os.stat(tmpdir.name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError:
+            # Already gone -- a concurrent reaper finished this same,
+            # genuinely dead entry first; idempotent, not an error.
+            return True
+        if (current_st.st_dev, current_st.st_ino) != (expected_st.st_dev, expected_st.st_ino):
+            log(f"  • STUCK, leaving {tmpdir}: the name now refers to a different inode than the one just emptied -- not removing it")
+            return False
+        try:
+            os.rmdir(tmpdir.name, dir_fd=parent_fd)
+        except OSError:
+            pass
+        return True
+    finally:
+        os.close(parent_fd)
 
 
 def reap_orphan(tmpdir: Path, log=print) -> bool:
@@ -447,27 +686,62 @@ def reap_orphan(tmpdir: Path, log=print) -> bool:
     contradicting the whole-entry preflight-before-any-kill contract this
     module promises. Restored here: every pidfile under run_dir is
     preflighted (read-only, see `_daemon_pidfile_preflight`) BEFORE
-    `stop_daemons` is ever called; if even one fails, `stop_daemons` is
-    never invoked for this run_dir at all, and NOTHING here is touched --
-    no daemon, no tmux server, no directory. This narrows the failure
-    window from "however long stop_daemons takes to process the whole set"
-    down to the brief gap between this preflight and stop_daemons' own
-    independent, per-daemon pidfd-bound re-authentication -- a genuinely
-    orphaned/unauthenticatable pidfile does not spontaneously become
-    authenticatable in that gap, so the realistic risk this preflight
-    doesn't cover is a daemon transitioning state at exactly that instant,
-    not the sequential-partial-teardown bug reviewer found. Closing that
-    residual fully would require a single atomic check-and-signal across
-    all daemons at once, which no primitive here provides.
+    `stop_daemons` is ever called; if even one is "unverifiable",
+    `stop_daemons` is never invoked for this run_dir at all, and NOTHING
+    here is touched -- no daemon, no tmux server, no directory. This
+    narrows the failure window from "however long stop_daemons takes to
+    process the whole set" down to the brief gap between this preflight and
+    stop_daemons' own independent, per-daemon pidfd-bound
+    re-authentication.
+
+    ⚠ REVIEWER BLOCKING FAIL, 2026-09-02, SAME PASS, TWO MORE GAPS in that
+    preflight, both now fixed here:
+
+    (a) It enumerated every `run/*.pid` file, but `stop_daemons()` only
+    ever processes pidfiles whose NAME is a key in `ALL_DAEMON_MODULES` --
+    it has no way to "own" or even notice a pidfile named anything else.
+    An authenticated-but-unrecognized pidfile (e.g. `custom.pid`) used to
+    pass preflight, `stop_daemons()` would then stop/remove evidence for
+    every REAL daemon it does recognize while silently never touching the
+    unrecognized one, and only the after-the-fact leftover check caught
+    it -- by which point the partial teardown this preflight exists to
+    prevent had already happened. Every pidfile's own name (its `.stem`)
+    is now checked against `ALL_DAEMON_MODULES` as part of the preflight
+    gate, not left to be discovered afterward.
+
+    (b) "Stale" (the pid provably no longer exists at all) and
+    "unverifiable" (identity missing/corrupt, or a LIVE pid whose identity
+    doesn't match -- the genuinely dangerous, possibly-reused case) were
+    collapsed into the same "do not proceed" outcome. A daemon from a
+    killed pytest process routinely exits entirely on its own before the
+    next session even runs -- `stop_daemons()` already handles that pidfile
+    correctly and safely (removes it, signals nothing, since there is
+    nothing alive to misidentify) -- so treating it as unverifiable made
+    every ordinary already-exited daemon leave its ENTIRE entry stuck
+    forever: the tmpdir and manifest entry never reaped, noise every
+    session, permanently, for the single most common and least dangerous
+    case a real orphan reaches. `_daemon_pidfile_preflight` now returns
+    three outcomes and only "unverifiable" blocks the whole entry; "stale"
+    is a green light exactly like "owned" is.
     """
     run_dir = tmpdir / "run"
     if run_dir.is_dir():
         pidfiles = sorted(run_dir.glob("*.pid"))
         for pidfile in pidfiles:
-            ok, reason = _daemon_pidfile_preflight(pidfile)
-            if not ok:
+            if pidfile.stem not in ALL_DAEMON_MODULES:
+                log(
+                    f"  • STUCK, leaving {tmpdir} entirely: {pidfile.name} is not a name "
+                    "stop_daemons recognizes -- it would never be touched, leaving it "
+                    "unowned after other daemons here are stopped"
+                )
+                return False
+            outcome, reason = _daemon_pidfile_preflight(pidfile)
+            if outcome == "unverifiable":
                 log(f"  • STUCK, leaving {tmpdir} entirely: {pidfile.name} failed preflight ({reason}) -- stop_daemons not called")
                 return False
+            # "owned" and "stale" are both safe to proceed on -- see
+            # _daemon_pidfile_preflight's own docstring for why "stale"
+            # must not be treated the same as "unverifiable".
         if pidfiles:
             stop_daemons(run_dir, log=log)
             remaining = sorted(p.name for p in run_dir.glob("*.pid"))
@@ -476,8 +750,7 @@ def reap_orphan(tmpdir: Path, log=print) -> bool:
                 return False
     socket_path = str(tmpdir / "isolated.sock")
     _kill_tmux_server_by_socket_path(socket_path, log=log)
-    shutil.rmtree(tmpdir, ignore_errors=True)
-    return True
+    return _fd_safe_remove_owned_tmpdir(tmpdir, log=log)
 
 
 def reap_all_orphans(log=print) -> tuple[int, int]:
