@@ -29,9 +29,6 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-import redis
-
-from modules.tmux.ops import refresh_agent_guides
 
 from services.claude_statusline import install_statusline
 from services.daemons import (
@@ -66,6 +63,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    # ⚠ A self-upgrade runs the code imported before ``main`` started for this
+    # entire process. ``git pull`` and an editable reinstall only affect future
+    # Python processes. A migration, cleanup, or one-time fix added here cannot
+    # run on the first upgrade that installs it; without an explicit re-exec it
+    # begins running on the second upgrade. Do not use this function as a
+    # first-transition migration hook.
     args = _build_parser().parse_args(argv)
     config = resolve_config(args)
 
@@ -99,17 +102,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(f"error: pip install failed ({exc.returncode})", file=sys.stderr)
             raise SystemExit(1) from exc
         print()
-
-    print("Refreshing instructions in existing agent workspaces...")
-    try:
-        refreshed = refresh_agent_guides(
-            redis.Redis.from_url(config.redis_url), pod=config.pod, tenant=config.tenant
-        )
-    except Exception as exc:
-        print(f"error: could not refresh agent guides: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
-    print(f"Refreshed {len(refreshed)} agent guide(s).")
-    print()
 
     print("Persisting venv bin on PATH (~/.bashrc, ~/.profile)...")
     persist_venv_on_path(config.python.parent.parent, log=print)

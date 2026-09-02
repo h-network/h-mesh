@@ -6,9 +6,7 @@ from pathlib import Path
 from typing import Set
 
 from core.config import state_path
-from core.keys import prefix
 from core.logging import log_record
-from core.registry import members, port_type
 from lib.paths import build_pane_path, get_agent_workdir, get_workdir_root, resolve_venv_bin
 from services.claude_statusline import install_statusline
 
@@ -591,37 +589,6 @@ def _seed_profile_dirs(profile: str | None) -> None:
                        reason=f"seedProfile {cli} {profile} failed: {exc}")
 
 
-def _install_guide_files(cwd: Path, content: str) -> None:
-    """Atomically replace both instruction files for an existing workspace."""
-    cwd.mkdir(parents=True, exist_ok=True)
-    for filename in ("AGENTS.md", "CLAUDE.md"):
-        destination = cwd / filename
-        temporary = cwd / f".{filename}.new"
-        temporary.write_text(content, encoding="utf-8")
-        os.replace(temporary, destination)
-
-
-def refresh_agent_guides(
-    r, *, pod: str, tenant: str, workdir_root: str | Path | None = None
-) -> list[str]:
-    """Refresh guides already deployed to every enrolled tmux workspace."""
-    raw_lead = r.get(prefix(pod, tenant, resource="lead"))
-    lead = raw_lead.decode() if isinstance(raw_lead, bytes) else raw_lead
-    root = Path(workdir_root or get_workdir_root())
-    refreshed = []
-    for agent_name in sorted(members(r, pod=pod, tenant=tenant)):
-        if port_type(r, pod=pod, tenant=tenant, agent=agent_name) != "tmux":
-            continue
-        cwd = root / agent_name
-        if not cwd.is_dir():
-            continue
-        _install_guide_files(
-            cwd, generate_agents_md(agent_name, tenant, lead=lead)
-        )
-        refreshed.append(agent_name)
-    return refreshed
-
-
 def write_agent_guide(
     cwd: str, agent_name: str, tenant: str = "default", lead: str | None = None,
     profile: str | None = None, cli: str | None = None,
@@ -630,7 +597,10 @@ def write_agent_guide(
         os.makedirs(cwd, exist_ok=True)
         content = generate_agents_md(agent_name, tenant, lead=lead)
 
-        _install_guide_files(Path(cwd), content)
+        for filename in ("AGENTS.md", "CLAUDE.md"):
+            file_path = os.path.join(cwd, filename)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(content)
 
         # ⚠ SEED THE PROFILE DIR BEFORE TRUST, AND THE ORDER IS LOAD-BEARING.
         # A CLI pointed at CLAUDE_CONFIG_DIR=~/.claude-<profile> does NOT fall

@@ -42,6 +42,11 @@ auditable state and `delete` is the explicit permanent-removal operation.
 result, so completed review work retains its verdict in `office list`.
 An interactive legacy invocation of plain `office done` prompts for that
 outcome; a non-interactive invocation fails with the exact replacement syntax.
+Already-hired agents deliberately keep their existing guides indefinitely,
+including custom content and the old plain-`done` example; upgrades do not
+rewrite workspace instructions. New hires receive the updated guide. The
+use-time prompt/error is the compatibility bridge that makes this divergence
+safe without silently destroying customized context.
 For review work, use `passed` or `failed`. Hold a QUESTIONS review while its
 answers block the verdict; use `completed` only when its questions are
 non-blocking. Returned work joins the back of a nonempty `todo` queue.

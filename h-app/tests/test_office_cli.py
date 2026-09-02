@@ -371,9 +371,15 @@ def test_done_requires_and_lists_outcome(monkeypatch, capsys):
         ["cancel"],
     ],
 )
-def test_board_moves_preserve_doing_ticket_when_atomic_move_fails(
+def test_board_moves_preserve_doing_ticket_when_transition_fails_before_execution(
     command, monkeypatch
 ):
+    """A pre-execution transport error leaves the source untouched.
+
+    This proves helper routing and preservation before Lua begins. It does not
+    claim client certainty after Redis executes but its response is lost; that
+    boundary remains outcome-unknown to the caller.
+    """
     _env(monkeypatch)
     r = FakeRedis()
     doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
@@ -382,12 +388,12 @@ def test_board_moves_preserve_doing_ticket_when_atomic_move_fails(
 
     def fail_atomic_move(*args):
         if "office atomic task transition" in args[0]:
-            raise ConnectionError("injected destination failure")
+            raise ConnectionError("injected pre-execution failure")
         raise AssertionError("unexpected script")
 
     r.eval = fail_atomic_move
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
-        with pytest.raises(ConnectionError, match="injected destination failure"):
+        with pytest.raises(ConnectionError, match="injected pre-execution failure"):
             office_main(command)
 
     assert r.lists[doing_key] == [original]
