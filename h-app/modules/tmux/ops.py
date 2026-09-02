@@ -125,6 +125,11 @@ def generate_agents_md(
                     f"in this office (enrolled: {sorted(list(enrolled_entrances))!r})"
                 )
         else:
+            log_record(
+                "tmux", "warning",
+                reason=f"Configured operator entrance {entrance!r} could not be validated "
+                       "(enrolled participants unavailable); omitting operator authority rule from guide",
+            )
             valid_entrance = None
 
     if lead and agent_name == lead:
