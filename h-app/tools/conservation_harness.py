@@ -41,6 +41,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from contextlib import redirect_stdout
 
 import redis
@@ -66,6 +67,31 @@ except ImportError:
 
 def _redis_url() -> str:
     return os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+
+
+def _default_pod_tenant() -> tuple[str, str]:
+    """A unique namespace per invocation by default -- reviewer's exact
+    finding at c2800e6: a fixed default namespace ("ci-conservation" for
+    both pod and tenant) meant two concurrent invocations against the same
+    Redis wrote, read, and cleaned up the SAME keys. The instrument's
+    result became non-attributable exactly when it mattered most --
+    concurrent, multi-agent use is the normal case in this office, not an
+    edge case. Reproduced and confirmed before this fix existed: two
+    copies running concurrently produced "receive lost ownership" and
+    "worker never reported CLAIMED" errors that were namespace collisions,
+    not custody defects.
+
+    POD/TENANT set explicitly in the environment are honored as given --
+    an acknowledged advanced option for a caller who deliberately wants a
+    fixed, inspectable namespace (comparing two runs by hand, for
+    instance) and accepts the collision risk that comes with sharing it.
+    Each dimension is independent: setting only one still gets a random
+    component on the other.
+    """
+    token = uuid.uuid4().hex[:12]
+    pod = os.environ.get("POD") or f"ci-conservation-{token}"
+    tenant = os.environ.get("TENANT") or f"ci-conservation-{token}"
+    return pod, tenant
 
 
 def _connect() -> redis.Redis:
@@ -846,6 +872,52 @@ def scenario_dead_letter_write_failure(r, pod: str, tenant: str) -> list[str]:
         _cleanup(r, pod, tenant, [sender, recipient])
 
 
+# ---------------------------------------------------------------------------
+# Scenario 6: reviewer's exact requirement at c2800e6 -- prove the namespace
+# fix works by actually running two full, independent invocations of this
+# harness concurrently and requiring BOTH to report their correct result,
+# not by reasoning about the fix in the abstract. Each child gets its own
+# default (unset POD/TENANT) namespace, so this is also the regression test
+# for the collision reviewer reproduced: before the fix, this scenario
+# would have failed the same way reviewer's manual reproduction did.
+#
+# Guarded against recursion with an env var: a spawned child harness
+# process must not itself try to spawn two more.
+# ---------------------------------------------------------------------------
+
+_CONCURRENCY_CHILD_ENV = "_CONSERVATION_HARNESS_CONCURRENCY_CHILD"
+
+
+def scenario_concurrent_invocations_do_not_collide(r, pod: str, tenant: str) -> list[str] | None:
+    if os.environ.get(_CONCURRENCY_CHILD_ENV) == "1":
+        return None  # this IS a spawned child -- do not recurse
+
+    env = dict(os.environ)
+    env.pop("POD", None)
+    env.pop("TENANT", None)
+    env[_CONCURRENCY_CHILD_ENV] = "1"
+    procs = [
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+        )
+        for _ in range(2)
+    ]
+    outputs = [proc.communicate(timeout=120)[0] for proc in procs]
+    codes = [proc.returncode for proc in procs]
+
+    failures = []
+    for index, (code, output) in enumerate(zip(codes, outputs)):
+        if code != 0:
+            tail = "\n".join(output.strip().splitlines()[-15:])
+            failures.append(
+                f"CONCURRENCY COLLISION: concurrent invocation #{index + 1} exited "
+                f"{code}, expected 0 -- two independent default-namespace runs must "
+                f"not interfere with each other. Last lines of its output:\n{tail}"
+            )
+    return failures
+
+
 SCENARIOS = [
     ("baseline conservation, 8 named envelopes, happy path", scenario_baseline),
     ("process death in receive()'s claim-then-open gap (real SIGKILL)", scenario_process_death),
@@ -854,6 +926,8 @@ SCENARIOS = [
      scenario_death_after_opening),
     ("stopped-and-rehired agent preserves unrelated unresolved evidence (phases shape only)",
      scenario_rehire_preserves_unresolved_evidence),
+    ("two concurrent default-namespace invocations do not collide",
+     scenario_concurrent_invocations_do_not_collide),
 ]
 
 
@@ -892,8 +966,7 @@ def main() -> None:
         return
 
     r = _connect()
-    pod = os.environ.get("POD", "ci-conservation")
-    tenant = os.environ.get("TENANT", "ci-conservation")
+    pod, tenant = _default_pod_tenant()
     print(f"conservation harness against {_redis_url()}, pod={pod} tenant={tenant}")
     _report_version(r)
     print("NOT A FIX -- a measuring instrument. See this file's module docstring.\n")

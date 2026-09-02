@@ -71,6 +71,21 @@ changes to the harness needed between them, because both scenarios attach
 to stable module boundaries (`deliver_office`, `deliver_openshell`,
 `add_ticket`, `message_opener`) rather than to custody internals.
 
+## Concurrent invocations are safe by default
+
+Same fix as `conservation_harness.py`, same reason: each invocation
+generates its own random pod/tenant namespace unless `POD`/`TENANT` are
+set explicitly. `--only=NAME` runs a single named scenario in isolation
+(`lifecycle`, `openshell`, `board`, `tmux`, or `concurrency`) -- the
+concurrency self-check uses this itself, spawning two separate
+`--only=lifecycle` subprocesses (not threads: an earlier in-process
+threaded version of this check was built first and failed intermittently,
+traced to `contextlib.redirect_stdout` mutating the single process-global
+`sys.stdout` across threads -- see that scenario's own comment for the
+full account) and requiring both to report clean, since `board`'s
+legitimate current failure would make "any scenario failed" useless as a
+collision signal for a full concurrent run.
+
 ## How to run
 
 ```bash

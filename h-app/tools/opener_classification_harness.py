@@ -28,11 +28,13 @@ same discipline applied there.
 Run: REDIS_URL=redis://127.0.0.1:6379/0 python tools/opener_classification_harness.py
 """
 
-import os
-import sys
-from contextlib import redirect_stdout
 import io
 import json
+import os
+import subprocess
+import sys
+import uuid
+from contextlib import redirect_stdout
 from types import SimpleNamespace
 
 import redis
@@ -52,6 +54,21 @@ except ImportError:
 
 def _redis_url() -> str:
     return os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+
+
+def _default_pod_tenant() -> tuple[str, str]:
+    """A unique namespace per invocation by default -- same fix, same
+    reasoning, as conservation_harness.py's _default_pod_tenant: reviewer
+    found both instruments defaulted to a fixed shared namespace
+    ("ci-opener-classification" for both pod and tenant here), so two
+    concurrent invocations against the same Redis collided. POD/TENANT set
+    explicitly in the environment are honored as given -- an acknowledged
+    advanced option, not the default path.
+    """
+    token = uuid.uuid4().hex[:12]
+    pod = os.environ.get("POD") or f"ci-opener-classification-{token}"
+    tenant = os.environ.get("TENANT") or f"ci-opener-classification-{token}"
+    return pod, tenant
 
 
 def _connect() -> redis.Redis:
@@ -506,22 +523,77 @@ def scenario_tmux_post_paste_failure_not_misclassified(r, pod: str, tenant: str)
     return []
 
 
+# ---------------------------------------------------------------------------
+# Scenario 5: reviewer's exact requirement at c2800e6 -- prove the namespace
+# fix works by actually running a scenario twice CONCURRENTLY under two
+# independently generated default namespaces, not by reasoning about it.
+#
+# ⚠ SEPARATE SUBPROCESSES, not threads sharing one interpreter -- found the
+# hard way, not assumed safe. An in-process thread version of this check
+# (calling the scenario function directly from two threading.Thread
+# workers) was built first and passed most of the time, then died silently
+# on some runs with no traceback and no further output. Root cause: this
+# file's scenarios use contextlib.redirect_stdout, which mutates the
+# single process-global sys.stdout -- not thread-local -- so two threads
+# entering/exiting redirect_stdout blocks concurrently can restore each
+# other's saved state onto a live object, corrupting stdout out from under
+# whichever thread still expects to be inside its own block. Confirmed by
+# retrying the SAME threaded reproduction repeatedly: it succeeded on some
+# runs and died on others, which is the signature of a race, not a
+# deterministic bug. Separate subprocesses have no shared sys.stdout to
+# race over -- each has its own interpreter, own globals, own everything.
+#
+# Not a full recursive re-invocation of this file either: this file's
+# "board" scenario legitimately exits nonzero on an unfixed base, which
+# would make "child process exited nonzero" useless as a collision signal.
+# --only=lifecycle runs just the one scenario known to be reliably clean
+# right now, in its own process, so a nonzero exit here is unambiguous.
+# ---------------------------------------------------------------------------
+
+def scenario_concurrent_invocations_do_not_collide(r, pod: str, tenant: str) -> list[str]:
+    env = dict(os.environ)
+    env.pop("POD", None)
+    env.pop("TENANT", None)
+    procs = [
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--only=lifecycle"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+        )
+        for _ in range(2)
+    ]
+    outputs = [proc.communicate(timeout=60)[0] for proc in procs]
+    codes = [proc.returncode for proc in procs]
+
+    failures = []
+    for index, (code, output) in enumerate(zip(codes, outputs)):
+        if code != 0:
+            tail = "\n".join(output.strip().splitlines()[-15:])
+            failures.append(
+                f"CONCURRENCY COLLISION: concurrent invocation #{index + 1} "
+                f"(--only=lifecycle, its own default namespace) exited {code}, "
+                f"expected 0 -- two independent invocations must not interfere. "
+                f"Last lines of its output:\n{tail}"
+            )
+    return failures
+
+
 SCENARIOS = [
-    ("lifecycle StartAgent: outcome-unknown write misclassified as proven rejection",
+    ("lifecycle", "lifecycle StartAgent: outcome-unknown write misclassified as proven rejection",
      scenario_lifecycle_outcome_unknown_misclassified),
-    ("openshell: response-loss after real execution misclassified as proven rejection",
+    ("openshell", "openshell: response-loss after real execution misclassified as proven rejection",
      scenario_openshell_response_loss_misclassified),
-    ("board: RPUSH landed, response lost, misclassified as proven rejection",
+    ("board", "board: RPUSH landed, response lost, misclassified as proven rejection",
      scenario_board_write_lands_then_response_lost),
-    ("tmux: paste landed, send-keys failed, must not be misclassified",
+    ("tmux", "tmux: paste landed, send-keys failed, must not be misclassified",
      scenario_tmux_post_paste_failure_not_misclassified),
+    ("concurrency", "two concurrent default-namespace invocations do not collide",
+     scenario_concurrent_invocations_do_not_collide),
 ]
 
 
 def _report_version() -> None:
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     try:
-        import subprocess
         head = subprocess.run(
             ["git", "-C", repo_root, "rev-parse", "HEAD"],
             capture_output=True, text=True, timeout=5,
@@ -538,15 +610,24 @@ def _report_version() -> None:
 
 
 def main() -> None:
+    only = None
+    for arg in sys.argv[1:]:
+        if arg.startswith("--only="):
+            only = arg.split("=", 1)[1]
+
     r = _connect()
-    pod = os.environ.get("POD", "ci-opener-classification")
-    tenant = os.environ.get("TENANT", "ci-opener-classification")
+    pod, tenant = _default_pod_tenant()
     print(f"opener classification harness against {_redis_url()}, pod={pod} tenant={tenant}")
     _report_version()
     print("NOT A FIX -- a verifier. See this file's module docstring.\n")
 
+    scenarios = SCENARIOS if only is None else [s for s in SCENARIOS if s[0] == only]
+    if only is not None and not scenarios:
+        print(f"error: no scenario named {only!r}", file=sys.stderr)
+        sys.exit(2)
+
     overall_ok = True
-    for name, fn in SCENARIOS:
+    for _id, name, fn in scenarios:
         print(f"--- {name} ---")
         failures = fn(r, pod, tenant)
         if failures is None:

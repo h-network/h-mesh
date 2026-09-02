@@ -63,6 +63,26 @@ a scenario that stops matching reality will report a `HARNESS ERROR`
 ("never reported the expected sync line" or similar) rather than a false
 result, by design.
 
+## Concurrent invocations are safe by default
+
+Each invocation generates its own random pod/tenant namespace unless `POD`/
+`TENANT` are set explicitly in the environment -- so two colleagues (or the
+same person, twice) can run this against the same Redis at the same time
+without their keys colliding. This was a real defect, not a theoretical
+one: reviewer ran two copies of the documented command concurrently and
+got loud, non-attributable failures (`RuntimeError: receive lost
+ownership...`, `HARNESS ERROR: worker never reported CLAIMED`) from
+namespace collision, not from the custody implementation. The last
+scenario in the list runs this exact reproduction on every invocation --
+two full concurrent copies of this harness under two independently
+generated namespaces -- and requires both to report clean.
+
+Setting `POD`/`TENANT` explicitly is still supported (an acknowledged
+advanced option -- comparing two runs by hand against a known, inspectable
+namespace, for instance) but two invocations sharing an explicit namespace
+concurrently will collide exactly as before; that risk is now opt-in, not
+the default.
+
 ## How to run
 
 ```bash
