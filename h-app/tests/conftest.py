@@ -79,7 +79,7 @@ def managed_tmpdir(tmp_path_factory):
     above is what closes that gap, on the next session."""
     import tempfile
 
-    from _leak_manifest import clear, reap_orphan, register
+    from _leak_manifest import _validated_tmpdir, clear, reap_orphan, register
 
     created: list[tuple[str, object]] = []
 
@@ -92,7 +92,16 @@ def managed_tmpdir(tmp_path_factory):
     yield make
 
     for tmpdir, entry in created:
-        if reap_orphan(tmpdir):
+        # Same validation reap_all_orphans applies to an untrusted manifest
+        # read, applied here to a tmpdir this fixture itself just created --
+        # should always pass; if it somehow doesn't (e.g. something else on
+        # this shared box already replaced it), treat it exactly like the
+        # crash path: leave it, leave the manifest entry, say why.
+        validated = _validated_tmpdir(entry, tmpdir)
+        if validated is None:
+            print(f"managed_tmpdir: {tmpdir!r} failed ownership validation at teardown -- leaving it")
+            continue
+        if reap_orphan(validated):
             clear(entry)
         # else: left in place on purpose, same as the crash path -- an
         # unauthenticatable daemon under this tmpdir means nothing was

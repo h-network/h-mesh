@@ -16,15 +16,28 @@ practice: at the start of the NEXT pytest session, not the one that died.
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 from _leak_manifest import MANIFEST_DIR, _process_start_time, reap_all_orphans, register
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _owned_scratch_tmpdir(prefix: str) -> Path:
+    """A REAL direct child of /tmp with the expected prefix, matching what
+    `managed_tmpdir` actually creates via `tempfile.mkdtemp` -- not a
+    nested path under pytest's own `tmp_path` fixture, which
+    `_validated_tmpdir`'s ownership check correctly refuses (not a direct
+    child of the owned root) and would make these tests fail for the wrong
+    reason if used here instead."""
+    return Path(tempfile.mkdtemp(prefix=prefix))
+
 
 _VICTIM_SCRIPT = """
 import json
@@ -83,8 +96,7 @@ def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_pa
     script_path = tmp_path / "victim.py"
     script_path.write_text(_VICTIM_SCRIPT.format(tests_dir=str(REPO_ROOT / "h-app" / "tests")))
 
-    victim_tmpdir = tmp_path / "h_mesh_test_leak_harm_victim"
-    victim_tmpdir.mkdir()
+    victim_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_victim_")
 
     proc = subprocess.Popen(
         [sys.executable, str(script_path), str(victim_tmpdir)],
@@ -149,9 +161,7 @@ def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_pa
             except OSError:
                 pass
         manifest_entry.unlink(missing_ok=True)
-        if victim_tmpdir.exists():
-            import shutil
-            shutil.rmtree(victim_tmpdir, ignore_errors=True)
+        shutil.rmtree(victim_tmpdir, ignore_errors=True)
 
 
 def test_reaper_does_not_touch_a_tmpdir_whose_owner_is_genuinely_still_running(tmp_path):
@@ -163,8 +173,7 @@ def test_reaper_does_not_touch_a_tmpdir_whose_owner_is_genuinely_still_running(t
     proves a manifest entry whose registering process is still alive and
     still the SAME process (authenticated by start time, not bare pid
     liveness) is left completely untouched."""
-    real_tmpdir = tmp_path / "h_mesh_test_leak_harm_still_running"
-    real_tmpdir.mkdir()
+    real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_still_running_")
     (real_tmpdir / "run").mkdir()
     (real_tmpdir / "run" / "dummy.pid").write_text(str(os.getpid()))
     marker = real_tmpdir / "still-here"
@@ -183,6 +192,7 @@ def test_reaper_does_not_touch_a_tmpdir_whose_owner_is_genuinely_still_running(t
         assert entry.exists(), "reaper deleted a live entry's manifest record"
     finally:
         entry.unlink(missing_ok=True)
+        shutil.rmtree(real_tmpdir, ignore_errors=True)
 
 
 def test_reaper_ignores_bare_pid_reuse_and_requires_start_time_to_match(tmp_path):
@@ -194,26 +204,27 @@ def test_reaper_ignores_bare_pid_reuse_and_requires_start_time_to_match(tmp_path
     real process, the same shape a genuine pid-reuse produces. The reaper
     must treat this as dead and reap it -- proving liveness alone, without
     authentication, would have wrongly skipped it forever."""
-    real_tmpdir = tmp_path / "h_mesh_test_leak_harm_pid_reuse"
-    real_tmpdir.mkdir()
+    real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_pid_reuse_")
+    try:
+        entry = register(str(real_tmpdir))
+        data = json.loads(entry.read_text())
+        assert data["owner_pid"] == os.getpid()
+        assert data["owner_start_time"] == _process_start_time(os.getpid())
 
-    entry = register(str(real_tmpdir))
-    data = json.loads(entry.read_text())
-    assert data["owner_pid"] == os.getpid()
-    assert data["owner_start_time"] == _process_start_time(os.getpid())
+        # Simulate reuse: same pid (still very much alive, this test's own
+        # process), but a start_time that cannot belong to it -- exactly the
+        # shape a genuinely different process now holding this pid would have.
+        data["owner_start_time"] = "0"
+        entry.write_text(json.dumps(data))
 
-    # Simulate reuse: same pid (still very much alive, this test's own
-    # process), but a start_time that cannot belong to it -- exactly the
-    # shape a genuinely different process now holding this pid would have.
-    data["owner_start_time"] = "0"
-    entry.write_text(json.dumps(data))
+        reaped, stuck = reap_all_orphans(log=lambda *_: None)
 
-    reaped, stuck = reap_all_orphans(log=lambda *_: None)
-
-    assert reaped == 1, "reaper trusted bare pid liveness instead of the authenticated start time"
-    assert stuck == 0
-    assert not real_tmpdir.exists()
-    assert not entry.exists()
+        assert reaped == 1, "reaper trusted bare pid liveness instead of the authenticated start time"
+        assert stuck == 0
+        assert not real_tmpdir.exists()
+        assert not entry.exists()
+    finally:
+        shutil.rmtree(real_tmpdir, ignore_errors=True)
 
 
 def test_reaper_leaves_an_unauthenticatable_daemon_pid_running_and_retries_forever(tmp_path):
@@ -230,8 +241,8 @@ def test_reaper_leaves_an_unauthenticatable_daemon_pid_running_and_retries_forev
     quietly expiring after some number of attempts. A stuck entry is meant
     to accumulate visibly (see conftest.py's own per-session log line for
     the count), not resolve itself."""
-    real_tmpdir = tmp_path / "h_mesh_test_leak_harm_unauth_daemon"
-    (real_tmpdir / "run").mkdir(parents=True)
+    real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_unauth_daemon_")
+    (real_tmpdir / "run").mkdir()
     unrelated = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"],
         start_new_session=True,
@@ -266,7 +277,6 @@ def test_reaper_leaves_an_unauthenticatable_daemon_pid_running_and_retries_forev
             unrelated.kill()
         unrelated.wait(timeout=5)
         entry.unlink(missing_ok=True)
-        import shutil
         shutil.rmtree(real_tmpdir, ignore_errors=True)
 
 
@@ -284,8 +294,7 @@ def test_unverifiable_owner_at_registration_is_stuck_not_silently_running(tmp_pa
     counted as `stuck`, not silently treated as running, and stays on disk
     (never reaped -- correct, since it genuinely cannot tell if the owner
     is alive) across repeated attempts."""
-    real_tmpdir = tmp_path / "h_mesh_test_leak_harm_unverifiable_owner"
-    real_tmpdir.mkdir()
+    real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_unverifiable_owner_")
     entry = _leak_manifest_entry_for(real_tmpdir)
     entry.write_text(json.dumps({
         "tmpdir": str(real_tmpdir),
@@ -303,6 +312,7 @@ def test_unverifiable_owner_at_registration_is_stuck_not_silently_running(tmp_pa
             assert entry.exists(), f"attempt {attempt}: manifest entry cleared despite unverifiable owner"
     finally:
         entry.unlink(missing_ok=True)
+        shutil.rmtree(real_tmpdir, ignore_errors=True)
 
 
 def test_malformed_manifest_entry_is_left_visible_not_deleted(tmp_path):
@@ -370,6 +380,50 @@ def test_tmux_kill_does_not_match_a_socket_path_that_is_only_a_prefix(tmp_path):
         )
     finally:
         subprocess.run(["tmux", "-S", prefix_colliding_socket, "kill-server"], capture_output=True, timeout=5)
+
+
+def test_tmux_kill_does_not_match_a_program_whose_name_merely_contains_tmux(tmp_path):
+    """Reviewer's fourth finding, same shape one field over: a REAL,
+    unrelated executable named `notmux`, invoked with the EXACT `-S
+    <socket>` argument pair a genuine tmux server would use, must not be
+    killed just because its name contains the substring "tmux". A pidfd
+    proves an action is delivered to one specific process lifetime; it
+    proves nothing about what program that lifetime is running -- program
+    identity has to be an exact comparison, checked separately."""
+    from _leak_manifest import _kill_tmux_server_by_socket_path
+
+    target_socket = str(tmp_path / "isolated.sock")
+    fake_tmux = tmp_path / "notmux"
+    fake_tmux.write_text("#!/usr/bin/env bash\nsleep 60\n")
+    fake_tmux.chmod(0o755)
+
+    impostor = subprocess.Popen([str(fake_tmux), "-S", target_socket, "new-session", "-d", "-s", "sess"])
+    try:
+        deadline = time.monotonic() + 5.0
+        found = False
+        while time.monotonic() < deadline and not found:
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    argv = (entry / "cmdline").read_bytes().split(b"\0")
+                except OSError:
+                    continue
+                if target_socket.encode() in argv and int(entry.name) == impostor.pid:
+                    found = True
+                    break
+            time.sleep(0.05)
+        assert found, "test setup: impostor process never showed up in /proc with the expected argv"
+
+        _kill_tmux_server_by_socket_path(target_socket, log=lambda *_: None)
+
+        assert impostor.poll() is None, (
+            "a program whose name merely CONTAINS 'tmux' was killed for an exact -S argument match"
+        )
+    finally:
+        if impostor.poll() is None:
+            impostor.kill()
+        impostor.wait(timeout=5)
 
 
 def _alive2(pid: int) -> bool:
@@ -447,3 +501,186 @@ def test_pidfd_kill_detects_a_process_that_exits_between_open_and_signal_as_stal
         if victim.poll() is None:
             victim.kill()
             victim.wait(timeout=5)
+
+
+def test_forged_entry_pointing_outside_tmp_is_never_touched(tmp_path):
+    """Reviewer's most severe finding, 2026-09-02: reap_all_orphans() used
+    to trust ANY string read from a manifest JSON file as a shutil.rmtree
+    target -- MANIFEST_DIR is world-writable, so a stale, corrupt, or
+    forged entry could name a git checkout or any other writable tree, and
+    every pytest session on the box would delete it. Proves the target
+    directly: a manifest entry with a dead owner naming a REAL, existing
+    directory outside /tmp entirely (standing in for "a git checkout") is
+    left completely untouched -- confirmed to still exist, with its own
+    content intact, and the entry counted as stuck rather than acted on."""
+    victim = tmp_path / "not_ours" / "important_work"
+    victim.mkdir(parents=True)
+    marker = victim / "do-not-delete"
+    marker.write_text("this is not h-mesh's to touch")
+
+    dead_owner = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_owner.wait()
+
+    entry = MANIFEST_DIR / "forged_out_of_scope.json"
+    entry.write_text(json.dumps({
+        "tmpdir": str(victim),
+        "owner_pid": dead_owner.pid,
+        "owner_start_time": "0",
+        "registered_at": time.time(),
+    }))
+
+    try:
+        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+
+        assert reaped == 0, "a forged entry naming a directory outside /tmp was reaped"
+        assert stuck >= 1
+        assert victim.exists(), "the out-of-scope directory was deleted"
+        assert marker.exists(), "content inside the out-of-scope directory was destroyed"
+        assert entry.exists(), "the forged entry itself was silently deleted rather than left stuck"
+    finally:
+        entry.unlink(missing_ok=True)
+
+
+def test_forged_entry_with_wrong_prefix_under_tmp_is_never_touched():
+    """Same finding, narrower case: a real directory that IS a direct child
+    of /tmp but does not carry the h_mesh_test_ prefix this whole scheme
+    uses -- must not be reachable either, even though it satisfies the
+    "direct child of /tmp" check alone."""
+    victim = Path(tempfile.mkdtemp(prefix="not_h_mesh_related_"))
+    marker = victim / "do-not-delete"
+    marker.write_text("unrelated tmp directory")
+
+    dead_owner = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_owner.wait()
+
+    entry = MANIFEST_DIR / "forged_wrong_prefix.json"
+    entry.write_text(json.dumps({
+        "tmpdir": str(victim),
+        "owner_pid": dead_owner.pid,
+        "owner_start_time": "0",
+        "registered_at": time.time(),
+    }))
+
+    try:
+        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+
+        assert reaped == 0
+        assert stuck >= 1
+        assert victim.exists()
+        assert marker.exists()
+    finally:
+        entry.unlink(missing_ok=True)
+        shutil.rmtree(victim, ignore_errors=True)
+
+
+def test_forged_entry_whose_tmpdir_does_not_match_its_own_filename_is_never_touched():
+    """Same finding, another narrow case: a manifest file NAMED after one
+    tmpdir but whose JSON content CLAIMS a different one -- register()
+    itself never produces this shape (it always names the file after the
+    tmpdir it's registering), so an entry like this is either corruption or
+    a forgery, and either way must not be trusted to redirect the target."""
+    real = _owned_scratch_tmpdir("h_mesh_test_leak_harm_real_")
+    decoy = _owned_scratch_tmpdir("h_mesh_test_leak_harm_decoy_")
+    marker = decoy / "do-not-delete"
+    marker.write_text("this is the decoy, not the entry's own name")
+
+    dead_owner = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_owner.wait()
+
+    # Named after `real`, but claims `decoy` as its tmpdir -- a mismatch
+    # that could never come from a genuine register() call.
+    entry = MANIFEST_DIR / f"{real.name}.json"
+    entry.write_text(json.dumps({
+        "tmpdir": str(decoy),
+        "owner_pid": dead_owner.pid,
+        "owner_start_time": "0",
+        "registered_at": time.time(),
+    }))
+
+    try:
+        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+
+        assert reaped == 0
+        assert stuck >= 1
+        assert decoy.exists(), "the mismatched tmpdir was deleted despite not matching its own entry's filename"
+        assert marker.exists()
+    finally:
+        entry.unlink(missing_ok=True)
+        shutil.rmtree(real, ignore_errors=True)
+        shutil.rmtree(decoy, ignore_errors=True)
+
+
+def test_a_symlink_standing_in_for_the_tmpdir_is_never_touched():
+    """Architect's follow-up, same day: naming checks alone are not
+    ownership checks. A symlink at the expected, correctly-prefixed,
+    correctly-named path -- pointing anywhere -- would pass every naming
+    check. Proves it's rejected anyway: lstat must show a real directory,
+    not a symlink, however correctly it's named."""
+    real_target = Path(tempfile.mkdtemp(prefix="h_mesh_test_symlink_target_"))
+    marker = real_target / "do-not-delete"
+    marker.write_text("pointed to via a symlink standing in for the manifest's claimed tmpdir")
+
+    link_name = f"h_mesh_test_leak_harm_symlink_{os.getpid()}"
+    link_path = Path("/tmp") / link_name
+    link_path.symlink_to(real_target)
+
+    dead_owner = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_owner.wait()
+
+    entry = MANIFEST_DIR / f"{link_name}.json"
+    entry.write_text(json.dumps({
+        "tmpdir": str(link_path),
+        "owner_pid": dead_owner.pid,
+        "owner_start_time": "0",
+        "registered_at": time.time(),
+    }))
+
+    try:
+        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+
+        assert reaped == 0, "a symlink standing in for the tmpdir was followed and reaped"
+        assert stuck >= 1
+        assert link_path.is_symlink(), "the symlink itself was removed"
+        assert real_target.exists(), "the symlink's real target was deleted"
+        assert marker.exists()
+    finally:
+        entry.unlink(missing_ok=True)
+        link_path.unlink(missing_ok=True)
+        shutil.rmtree(real_target, ignore_errors=True)
+
+
+def test_an_entry_owned_by_a_different_uid_is_never_touched(monkeypatch):
+    """Same finding: naming and real-directory checks alone are still not
+    OWNERSHIP -- a conforming, real, correctly-named /tmp directory planted
+    by a different user must also be rejected. Simulated by making this
+    process's own reported uid differ from the real directory's owner
+    (rather than requiring an actual second system user, impractical to
+    set up in this environment) -- from _validated_tmpdir's point of view
+    this is indistinguishable from a genuine cross-user directory."""
+    real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_wrong_uid_")
+    marker = real_tmpdir / "do-not-delete"
+    marker.write_text("owned by 'someone else' as far as this test can simulate")
+
+    dead_owner = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_owner.wait()
+
+    entry = register(str(real_tmpdir))
+    data = json.loads(entry.read_text())
+    data["owner_pid"] = dead_owner.pid
+    data["owner_start_time"] = "0"
+    entry.write_text(json.dumps(data))
+
+    import _leak_manifest
+    real_uid = os.getuid()
+    monkeypatch.setattr(_leak_manifest.os, "getuid", lambda: real_uid + 1)
+
+    try:
+        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+
+        assert reaped == 0, "an entry was reaped despite failing the (simulated) uid check"
+        assert stuck >= 1
+        assert real_tmpdir.exists()
+        assert marker.exists()
+    finally:
+        entry.unlink(missing_ok=True)
+        shutil.rmtree(real_tmpdir, ignore_errors=True)
