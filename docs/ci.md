@@ -34,11 +34,12 @@ evidence.
 
 The evidence is the pair of runner exit status zero **and** its post-validation
 certificate line. Pytest and the tests share stdout with the runner, so child
-code can print identical text; line presence alone is never evidence. An
-unenumerated termination that prevents the outer runner from completing its
-check—such as an external timeout, supervisor kill, signal, or native
-crash—cannot produce that success pair. The harness does not need to predict
-every way either process can die in order for those paths to fail safe.
+code can print identical text; line presence alone is never evidence. Every
+human verifier, script, and CI job consuming this result must check the runner
+process's exit status. Grepping stdout for the certificate sentence is not
+verification. An unenumerated termination that prevents the outer runner from
+completing its check cannot produce the success pair, although the harness does
+not diagnose why the process ended.
 
 The runner removes external `PYTEST_ADDOPTS` and `PYTEST_PLUGINS`, disables
 ambient plugin autoloading, overrides repository `addopts`, and rejects parsed
