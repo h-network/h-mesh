@@ -53,9 +53,19 @@ def _scrub_ambient_telegram_and_api_env(monkeypatch):
 def pytest_sessionstart(session: pytest.Session) -> None:
     reporter = session.config.pluginmanager.get_plugin("terminalreporter")
     log = reporter.write_line if reporter is not None else print
-    reaped = reap_all_orphans(log=log)
+    reaped, stuck = reap_all_orphans(log=log)
     if reaped:
         log(f"conftest: reaped {reaped} orphaned test tmpdir(s) from a previously killed run")
+    if stuck:
+        # Deliberately permanent, not aged out -- see reap_all_orphans's own
+        # docstring for why an unauthenticatable entry is retried forever
+        # rather than silently expired. Said here, once per session, so
+        # accumulation is countable rather than indistinguishable from the
+        # mechanism working.
+        log(
+            f"conftest: {stuck} orphaned test tmpdir(s) COULD NOT be authenticated and were "
+            "left untouched (see the per-entry reason above) -- will be retried next session"
+        )
 
 
 @pytest.fixture
@@ -82,5 +92,8 @@ def managed_tmpdir(tmp_path_factory):
     yield make
 
     for tmpdir, entry in created:
-        reap_orphan(tmpdir)
-        clear(entry)
+        if reap_orphan(tmpdir):
+            clear(entry)
+        # else: left in place on purpose, same as the crash path -- an
+        # unauthenticatable daemon under this tmpdir means nothing was
+        # touched, so the manifest entry must survive to say so.

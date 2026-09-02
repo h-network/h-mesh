@@ -27,21 +27,30 @@ from _leak_manifest import MANIFEST_DIR, _process_start_time, reap_all_orphans, 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _VICTIM_SCRIPT = """
+import json
 import os
 import subprocess
 import sys
 import time
 
 sys.path.insert(0, {tests_dir!r})
-from _leak_manifest import register
+from _leak_manifest import _process_start_time, register
 
 tmpdir = sys.argv[1]
 os.makedirs(os.path.join(tmpdir, "run"), exist_ok=True)
 
-# A real dummy daemon this reaper must kill.
+# A real dummy daemon this reaper must kill -- with a real .pid.identity
+# sidecar, the same shape services.daemons.start_daemons() writes, so this
+# proves the AUTHENTICATED kill path, not an artificially-unauthenticated one.
 daemon = subprocess.Popen(["sleep", "300"])
-with open(os.path.join(tmpdir, "run", "dummy.pid"), "w") as f:
+pidfile = os.path.join(tmpdir, "run", "dummy.pid")
+with open(pidfile, "w") as f:
     f.write(str(daemon.pid))
+with open(pidfile + ".identity", "w") as f:
+    json.dump({{
+        "v": 1, "pid": daemon.pid, "name": "dummy", "module": "dummy.module",
+        "start_time": _process_start_time(daemon.pid),
+    }}, f)
 
 # A real tmux server this reaper must kill, exactly like the session-watch
 # tests use, including a socket file inside the tmpdir being reaped.
@@ -115,8 +124,9 @@ def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_pa
         # THE GUARD: this is what pytest_sessionstart runs automatically at
         # the start of the next session. Called directly here so this test
         # doesn't depend on spawning a whole second pytest process.
-        reaped = reap_all_orphans(log=lambda *_: None)
+        reaped, stuck = reap_all_orphans(log=lambda *_: None)
         assert reaped >= 1
+        assert stuck == 0
 
         deadline = time.monotonic() + 5.0
         while _alive(daemon_pid) and time.monotonic() < deadline:
@@ -162,9 +172,10 @@ def test_reaper_does_not_touch_a_tmpdir_whose_owner_is_genuinely_still_running(t
     try:
         assert entry.exists()
 
-        reaped = reap_all_orphans(log=lambda *_: None)
+        reaped, stuck = reap_all_orphans(log=lambda *_: None)
 
         assert reaped == 0, "reaper touched a tmpdir whose owner is this live test process"
+        assert stuck == 0
         assert real_tmpdir.exists()
         assert marker.exists()
         assert entry.exists(), "reaper deleted a live entry's manifest record"
@@ -195,8 +206,67 @@ def test_reaper_ignores_bare_pid_reuse_and_requires_start_time_to_match(tmp_path
     data["owner_start_time"] = "0"
     entry.write_text(json.dumps(data))
 
-    reaped = reap_all_orphans(log=lambda *_: None)
+    reaped, stuck = reap_all_orphans(log=lambda *_: None)
 
     assert reaped == 1, "reaper trusted bare pid liveness instead of the authenticated start time"
+    assert stuck == 0
     assert not real_tmpdir.exists()
     assert not entry.exists()
+
+
+def test_reaper_leaves_an_unauthenticatable_daemon_pid_running_and_retries_forever(tmp_path):
+    """The daemon-pid mirror of the pid-reuse test above, and the more
+    dangerous case: a manifest entry whose owner is genuinely dead, but
+    whose recorded DAEMON pid has no (or a mismatched) `.identity` sidecar.
+    A daemon pid recorded hours or days ago has had a far larger window for
+    its number to be recycled than the owner does -- the exposure this
+    guards against is real, not theoretical.
+
+    Proves the deliberate design: nothing is killed, the tmpdir is NOT
+    removed, the manifest entry is NOT cleared -- and calling the reaper
+    again reaches the exact same outcome, forever, rather than the entry
+    quietly expiring after some number of attempts. A stuck entry is meant
+    to accumulate visibly (see conftest.py's own per-session log line for
+    the count), not resolve itself."""
+    real_tmpdir = tmp_path / "h_mesh_test_leak_harm_unauth_daemon"
+    (real_tmpdir / "run").mkdir(parents=True)
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+    pidfile = real_tmpdir / "run" / "switch.pid"
+    pidfile.write_text(str(unrelated.pid))
+    # Deliberately no .switch.pid.identity sidecar at all -- the shape of a
+    # legacy daemon pidfile, or one whose identity file was lost/truncated.
+
+    # A dead, non-running owner so the reaper actually reaches the daemon
+    # authentication step rather than skipping this entry as still-live.
+    dead_owner = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_owner.wait()
+    entry = _leak_manifest_entry_for(real_tmpdir)
+    entry.write_text(json.dumps({
+        "tmpdir": str(real_tmpdir),
+        "owner_pid": dead_owner.pid,
+        "owner_start_time": "0",  # cannot match any current process
+        "registered_at": time.time(),
+    }))
+
+    try:
+        for attempt in range(2):
+            reaped, stuck = reap_all_orphans(log=lambda *_: None)
+            assert reaped == 0, f"attempt {attempt}: reaper killed/removed an unauthenticatable entry"
+            assert stuck == 1, f"attempt {attempt}: entry was not reported as stuck"
+            assert unrelated.poll() is None, f"attempt {attempt}: an unauthenticated pid was signalled"
+            assert real_tmpdir.exists(), f"attempt {attempt}: tmpdir removed despite unauthenticated daemon"
+            assert entry.exists(), f"attempt {attempt}: manifest entry cleared despite unauthenticated daemon"
+    finally:
+        if unrelated.poll() is None:
+            unrelated.kill()
+        unrelated.wait(timeout=5)
+        entry.unlink(missing_ok=True)
+        import shutil
+        shutil.rmtree(real_tmpdir, ignore_errors=True)
+
+
+def _leak_manifest_entry_for(tmpdir: Path) -> Path:
+    return MANIFEST_DIR / f"{tmpdir.name}.json"
