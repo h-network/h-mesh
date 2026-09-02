@@ -60,6 +60,11 @@ end
 return 0
 """
 
+# tools/conservation_harness.py's retirement-conservation scenario assumes
+# this is one of exactly two scripts (the other is core/channels.py's
+# _TRANSFER_RECEIVE_CUSTODY) that ever move a raw envelope out of
+# processing/opening custody -- a new destination added here needs that
+# instrument's sink list updated too (see tools/conservation_harness.md).
 _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA = """
 -- Atomic through deterministic preflight, not because EVAL rolls back (it
 -- does not). Validate every type-sensitive source and destination, snapshot

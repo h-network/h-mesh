@@ -178,7 +178,15 @@ result it couldn't support.
 
 Before merging any change to `core.channels`' custody transfer logic
 (`receive`, `_open_received`, `send`, the switch's egress-to-ingress
-forwarding), or when verifying such a change is being reviewed. Nothing
-runs it automatically; it stays deliberate on purpose (see the module
-docstring) so a scenario finding a real defect doesn't train anyone to
-ignore a red suite.
+forwarding), **or to `lib.agentlifecycle.lifecycle`'s retirement custody
+handling** (`stop_agent`, `_REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA`) -- or when
+verifying either kind of change is being reviewed. Reviewer's finding: an
+earlier version of this section named only `core.channels`, so a
+lifecycle-side maintainer adding a new custody destination could reasonably
+never encounter this instrument's sink-list assumption at all. Both
+`_TRANSFER_RECEIVE_CUSTODY` and `_REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA` also
+carry a short comment pointing back here, so a maintainer editing either
+script directly (not just this doc) hits the warning too. Nothing runs it
+automatically; it stays deliberate on purpose (see the module docstring) so
+a scenario finding a real defect doesn't train anyone to ignore a red
+suite.
