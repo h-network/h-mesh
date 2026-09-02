@@ -368,6 +368,50 @@ class TmuxPortTests(unittest.TestCase):
             "lib.board_interaction.record_task_event"
         )
 
+    def test_add_ticket_success_log_failure_still_attempts_task_audit(self):
+        """One broken observer must not silently suppress the sibling audit."""
+        self.register(alice="tmux", bob="tmux")
+        created_ts = "2026-09-02T08:00:00.000Z"
+        stream_id = send(
+            self.redis,
+            pod=POD,
+            tenant=TENANT,
+            source="alice",
+            destination="bob",
+            payload={
+                "v": 1,
+                "id": "t1",
+                "title": "confirmed board write",
+                "created_ts": created_ts,
+            },
+            kind="AddTicket",
+        )
+        raw = self.redis.lpop(prefix(POD, TENANT, "alice", "egress"))
+        self.redis.rpush(prefix(POD, TENANT, "bob", "ingress"), raw)
+
+        with (
+            patch("lib.board_interaction.log_record", side_effect=OSError("stdout broken")),
+            patch("lib.board_interaction.record_task_event") as task_event,
+        ):
+            deliver_tmux(
+                self.redis,
+                pod=POD,
+                tenant=TENANT,
+                agent="bob",
+                session_name=TENANT,
+            )
+
+        task_event.assert_called_once_with(
+            "add",
+            id="t1",
+            title="confirmed board write",
+            agent="bob",
+            actor="alice",
+            timestamp=created_ts,
+        )
+        opened = self.redis.lists[prefix(POD, TENANT, "bob", "opened")]
+        self.assertEqual([parse(value)["stream_id"] for value in opened], [stream_id])
+
     @patch("modules.tmux.port.submit_text")
     @patch("modules.tmux.port.list_windows", return_value={"bob"})
     def test_deliver_tmux_attachment(self, mock_list, mock_submit):

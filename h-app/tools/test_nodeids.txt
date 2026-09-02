@@ -744,6 +744,7 @@ h-app/tests/test_tmux_port.py::TmuxPortTests::test_a_failed_paste_never_counts_a
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_deliver_tmux_add_ticket
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_add_ticket_nonpositive_write_result_routes_unresolved
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_add_ticket_success_log_failure_keeps_confirmed_custody
+h-app/tests/test_tmux_port.py::TmuxPortTests::test_add_ticket_success_log_failure_still_attempts_task_audit
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_add_ticket_task_event_failure_keeps_confirmed_custody
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_deliver_tmux_attachment
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_deliver_tmux_command
