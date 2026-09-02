@@ -239,6 +239,28 @@ own (narrower) argparse surface, per office-sme:
   is dynamic** — it shows the chat's current target and updates the moment it
   changes, the one part of the keyboard that isn't a fixed constant (see
   `TelegramBot._sticky_keyboard`).
+  ⚠ **And every prompt it routes says where it went.** A plain prompt to a
+  non-default target is confirmed in words ("✅ Sent to `test1`.") rather than
+  by the silent 👀 reaction the default target gets. Traced live: after using
+  this button, three prompts reached `test1` and nothing in the conversation
+  said so, and three delivery failures were attributed to an agent the
+  operator never meant to send to.
+
+  ⚠ **Two silences met, and neither was a bug alone.** The dynamic label above
+  is a real indicator — but Telegram lets the reply keyboard be collapsed and
+  this bot offers **🙈 Hide menu**, so it is exactly as visible as the
+  operator's last UI gesture. Meanwhile the acknowledgement that names the
+  destination was suppressed *precisely when the send succeeded*: a reaction
+  confirms "dispatched" and names nothing. **An acknowledgement should not
+  become less informative because things went well** — that is how a system
+  stops being able to tell you what it just did.
+
+  The gate is routing the operator **cannot see**, not merely "not the
+  default": `@agent` and `/run <agent>` name their destination in the text
+  just typed, so repeating it would be noise. Sticky targeting is the case
+  where the destination lives only in state, and it self-limits — pick the
+  default agent again and the extra line stops.
+
 - **`@agent message text`** — a one-off override, not a persistent-target
   change: `@sme-2 can you check this?` reaches `sme-2` for that one message
   only, and the very next plain message still goes to whatever 🎯 Message
