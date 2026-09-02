@@ -440,6 +440,19 @@ def _claimed_evidence_exists(entry: Path) -> bool:
     return any(entry.parent.glob(f".claim.*.{entry.name}"))
 
 
+def _different_live_claim_exists(entry: Path) -> bool:
+    """Evidence of a claim held by a different, authenticated live process."""
+    import _leak_manifest
+
+    for claim in entry.parent.glob(f".claim.*.{entry.name}"):
+        identity = _leak_manifest._claim_identity(claim)
+        if identity is None or identity[0] == os.getpid():
+            continue
+        if _leak_manifest._owner_status(identity[0], identity[1]) == "running":
+            return True
+    return False
+
+
 def _manifest_evidence_eventually_exists(entry: Path, timeout: float = 1.0) -> bool:
     """Tolerate a directory scan concurrent with an atomic claim rename."""
     deadline = time.monotonic() + timeout
@@ -1255,9 +1268,9 @@ def test_a_transient_nonempty_directory_is_stuck_then_cleanly_reaped_next_sessio
                 f"process's own race fired: {raced_once['done']})"
             )
         if not raced_once["done"]:
-            if _claimed_evidence_exists(entry):
+            if _different_live_claim_exists(entry):
                 pytest.skip(
-                    "a concurrent process owns this entry's stamped claim; "
+                    "a different live process owns this entry's stamped claim; "
                     "this process did not establish the injected-rmdir path"
                 )
             if not own_log_lines:

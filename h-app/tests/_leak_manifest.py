@@ -134,6 +134,37 @@ _OWNED_ROOT = Path("/tmp")
 _OWNED_PREFIX = "h_mesh_test_"
 
 
+def _plausible_tmpdir_path(entry: Path, tmpdir_str: str) -> Path | None:
+    """Return the normalized path when the manifest's naming facts hold.
+
+    This is deliberately not ownership proof. It exists separately so a
+    claimed entry can distinguish a valid target that is confirmed absent
+    (cleanup already completed) from malformed or unsafe evidence, without
+    weakening the lstat ownership checks in ``_validated_tmpdir``.
+    """
+    try:
+        tmpdir = Path(tmpdir_str)
+    except (TypeError, ValueError):
+        return None
+    if not tmpdir.is_absolute():
+        return None
+    try:
+        resolved = tmpdir.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    try:
+        relative = resolved.relative_to(_OWNED_ROOT)
+    except ValueError:
+        return None
+    if len(relative.parts) != 1:
+        return None
+    if not relative.parts[0].startswith(_OWNED_PREFIX):
+        return None
+    if resolved.name != entry.stem:
+        return None
+    return resolved
+
+
 def _validated_tmpdir(entry: Path, tmpdir_str: str) -> Path | None:
     """`tmpdir_str`, as an owned `Path`, ONLY if it names-and-is-proven-to-be
     a directory this scheme could plausibly have created -- otherwise
@@ -202,26 +233,9 @@ def _validated_tmpdir(entry: Path, tmpdir_str: str) -> Path | None:
     validation and deletion; see `_fd_safe_remove_owned_tmpdir` for what
     does.
     """
-    try:
-        tmpdir = Path(tmpdir_str)
-    except (TypeError, ValueError):
+    resolved = _plausible_tmpdir_path(entry, tmpdir_str)
+    if resolved is None:
         return None
-    if not tmpdir.is_absolute():
-        return None
-    try:
-        resolved = tmpdir.resolve(strict=False)
-    except (OSError, RuntimeError):
-        return None
-    try:
-        relative = resolved.relative_to(_OWNED_ROOT)
-    except ValueError:
-        return None
-    if len(relative.parts) != 1:
-        return None  # not a DIRECT child of _OWNED_ROOT -- e.g. a nested escape
-    if not relative.parts[0].startswith(_OWNED_PREFIX):
-        return None
-    if resolved.name != entry.stem:
-        return None  # claimed tmpdir doesn't match the manifest file that named it
     try:
         st = os.lstat(resolved)
     except OSError:
@@ -231,6 +245,20 @@ def _validated_tmpdir(entry: Path, tmpdir_str: str) -> Path | None:
     if st.st_uid != os.getuid():
         return None  # conforms in name only; owned by a different user
     return resolved
+
+
+def _tmpdir_confirmed_absent(entry: Path, tmpdir_str: str) -> bool:
+    """True only for a safely-shaped target whose directory is now absent."""
+    target = _plausible_tmpdir_path(entry, tmpdir_str)
+    if target is None:
+        return False
+    try:
+        os.lstat(target)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 def _process_start_time(pid: int) -> str | None:
@@ -987,6 +1015,21 @@ def _reap_claimed_entry(claim: Path, entry: Path, log=print) -> tuple[int, int]:
         return 0, 1
     validated = _validated_tmpdir(entry, tmpdir)
     if validated is None:
+        if _tmpdir_confirmed_absent(entry, tmpdir):
+            # The authenticated claimant may have died after removing the
+            # directory, or its final evidence unlink may have failed. The
+            # valid target's confirmed absence proves there is no destructive
+            # work left; completing evidence removal is recovery, not a reason
+            # to retain an otherwise permanent claim.
+            try:
+                claim.unlink(missing_ok=True)
+            except OSError as exc:
+                log(
+                    f"  • STUCK, retaining completed claim {claim}: "
+                    f"cannot remove it ({exc})"
+                )
+                return 0, 1
+            return 1, 0
         log(
             f"  • STUCK, leaving {claim}: claimed tmpdir {tmpdir!r} "
             "failed ownership validation -- not touching it"
