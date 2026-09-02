@@ -1293,7 +1293,28 @@ def test_a_transient_nonempty_directory_is_stuck_then_cleanly_reaped_next_sessio
                 f"genuine failure to complete the owned orphan's removal: {cause}"
             )
         assert real_tmpdir.exists(), "the tmpdir was removed despite the transient race"
-        assert (subdir / "race-injected.txt").exists(), "the injected content was lost anyway"
+        injected = subdir / "race-injected.txt"
+        if not injected.exists():
+            # This process established the transient ENOTEMPTY state, then
+            # published a retryable claim.  A concurrent session is allowed
+            # to win that NEXT claim immediately.  Once the injected file is
+            # gone, wait for the observable outcome of that later ownership:
+            # complete removal is recovery, while a surviving tmpdir is lost
+            # content and remains a failure.  The wait does not decide when a
+            # claim is stale; it only avoids sampling another reaper halfway
+            # through its already-authorised removal.
+            deadline = time.monotonic() + 5.0
+            while real_tmpdir.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not real_tmpdir.exists(), (
+                "the injected content vanished but the orphan survived the "
+                "concurrent retry that removed it"
+            )
+            assert not _manifest_evidence_exists(entry), (
+                "the orphan was removed but its manifest evidence survived"
+            )
+            return
+        assert injected.exists(), "the injected content was lost anyway"
         assert _manifest_evidence_eventually_exists(entry), "the manifest evidence vanished despite the transient race"
 
         # Second attempt, later "session" -- nothing races this time.
@@ -1494,6 +1515,31 @@ def test_completed_cleanup_with_unremovable_claim_reports_stuck_and_keeps_eviden
         claim.unlink(missing_ok=True)
         entry.unlink(missing_ok=True)
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_failed_retry_restamp_retains_live_claim_and_reports_stuck(monkeypatch):
+    import _leak_manifest
+
+    entry = MANIFEST_DIR / "retry-restamp.json"
+    claim = MANIFEST_DIR / f".claim.{os.getpid()}.1.token.{entry.name}"
+    claim.write_text("evidence")
+    real_rename = Path.rename
+    logs = []
+
+    def refuse_claim_rename(path, target):
+        if path == claim:
+            raise PermissionError("denied")
+        return real_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", refuse_claim_rename)
+    try:
+        assert _leak_manifest._retire_claim(claim, entry, log=logs.append) is None
+        assert claim.read_text() == "evidence"
+        assert any("cannot mark it retryable" in line and "STUCK" in line for line in logs)
+    finally:
+        monkeypatch.setattr(Path, "rename", real_rename)
+        claim.unlink(missing_ok=True)
+        entry.unlink(missing_ok=True)
 
 
 def test_entry_claimed_after_glob_snapshot_is_not_reported_stuck(

@@ -102,7 +102,9 @@ atomically renames the public entry to a unique claim stamped with its PID
 and `/proc` start time. Only the rename winner acts. This is a claim rather
 than a lock: there is no separate lock object or acquisition window, and a
 claim whose authenticated owner died can itself be atomically reclaimed by
-a later process without a guessed timeout. A live claimant is left alone;
+a later process without a guessed timeout. An attempt that returns incomplete
+atomically restamps its one claim with confirmed-absent PID 0, making the next
+invocation retry it without creating a second name. A live claimant is left alone;
 unverifiable identity fails closed and stays visible as a hidden `.claim.*`
 entry in the manifest directory. A
 registration race (one process mid-`register()` while another reaps) cannot
@@ -121,7 +123,6 @@ import select
 import secrets
 import signal
 import stat
-import threading
 import time
 from pathlib import Path
 
@@ -131,8 +132,6 @@ MANIFEST_DIR = Path("/tmp/h_mesh_test_manifests")
 CLAIM_DIR = MANIFEST_DIR
 _OWNED_ROOT = Path("/tmp")
 _OWNED_PREFIX = "h_mesh_test_"
-_ACTIVE_CLAIMS: set[Path] = set()
-_ACTIVE_CLAIMS_LOCK = threading.Lock()
 
 
 def _validated_tmpdir(entry: Path, tmpdir_str: str) -> Path | None:
@@ -344,25 +343,26 @@ def _take_claim(source: Path, original_entry: Path, log=print) -> Path | None:
     except OSError as exc:
         log(f"  • STUCK, leaving {source}: cannot claim manifest entry ({exc})")
         return None
-    with _ACTIVE_CLAIMS_LOCK:
-        _ACTIVE_CLAIMS.add(claim)
     return claim
 
 
-def _release_active_claim(claim: Path) -> None:
-    with _ACTIVE_CLAIMS_LOCK:
-        _ACTIVE_CLAIMS.discard(claim)
+def _retire_claim(claim: Path, entry: Path, log=print) -> Path | None:
+    """Atomically mark a finished-but-incomplete attempt retryable now.
 
-
-def _claim_is_active_here(claim: Path) -> bool:
-    identity = _claim_identity(claim)
-    if identity is None:
-        return False
-    claimant_pid, claimant_start_time, _entry_name = identity
-    if claimant_pid != os.getpid() or claimant_start_time != _process_start_time(os.getpid()):
-        return False
-    with _ACTIVE_CLAIMS_LOCK:
-        return claim in _ACTIVE_CLAIMS
+    PID 0 is outside the process namespace and `/proc/0` is confirmed absent,
+    so the ordinary claimant authentication classifies the new stamp dead
+    without a timeout. A crash before this rename leaves the real live stamp;
+    later recovery waits until that claimant is authentically dead instead.
+    """
+    retired = CLAIM_DIR / f".claim.0.0.{secrets.token_hex(8)}.{entry.name}"
+    try:
+        claim.rename(retired)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        log(f"  • STUCK, leaving live claim {claim}: cannot mark it retryable ({exc})")
+        return None
+    return retired
 
 
 def _owner_status(owner_pid: int, owner_start_time: str | None) -> str:
@@ -1040,7 +1040,7 @@ def reap_all_orphans(log=print) -> tuple[int, int]:
 
     # Recover claims whose previous owner provably died. A live claimant is
     # still legitimately working; an unverifiable claimant fails closed.
-    for abandoned in CLAIM_DIR.glob(".claim.*"):
+    for abandoned in list(CLAIM_DIR.glob(".claim.*")):
         identity = _claim_identity(abandoned)
         if identity is None:
             log(f"  • STUCK, leaving {abandoned}: malformed claim identity")
@@ -1048,12 +1048,7 @@ def reap_all_orphans(log=print) -> tuple[int, int]:
             continue
         claimant_pid, claimant_start_time, entry_name = identity
         claim_status = _owner_status(claimant_pid, claimant_start_time)
-        if _claim_is_active_here(abandoned):
-            continue
-        if claim_status == "running" and not (
-            claimant_pid == os.getpid()
-            and claimant_start_time == _process_start_time(os.getpid())
-        ):
+        if claim_status == "running":
             continue
         if claim_status == "unverifiable":
             log(
@@ -1066,14 +1061,13 @@ def reap_all_orphans(log=print) -> tuple[int, int]:
         claim = _take_claim(abandoned, entry, log=log)
         if claim is None:
             continue
-        try:
-            claimed_reaped, claimed_stuck = _reap_claimed_entry(claim, entry, log=log)
-        finally:
-            _release_active_claim(claim)
+        claimed_reaped, claimed_stuck = _reap_claimed_entry(claim, entry, log=log)
+        if claim.exists():
+            _retire_claim(claim, entry, log=log)
         reaped += claimed_reaped
         stuck += claimed_stuck
 
-    for entry in MANIFEST_DIR.glob("*.json"):
+    for entry in list(MANIFEST_DIR.glob("*.json")):
         if entry.name.startswith("."):
             continue  # a register() temp file mid-write, not a real entry
         try:
@@ -1106,10 +1100,9 @@ def reap_all_orphans(log=print) -> tuple[int, int]:
         claim = _take_claim(entry, entry, log=log)
         if claim is None:
             continue
-        try:
-            claimed_reaped, claimed_stuck = _reap_claimed_entry(claim, entry, log=log)
-        finally:
-            _release_active_claim(claim)
+        claimed_reaped, claimed_stuck = _reap_claimed_entry(claim, entry, log=log)
+        if claim.exists():
+            _retire_claim(claim, entry, log=log)
         reaped += claimed_reaped
         stuck += claimed_stuck
     return reaped, stuck

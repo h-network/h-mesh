@@ -307,6 +307,7 @@ h-app/tests/test_leak_manifest.py::test_dead_claimant_is_recovered_without_a_tim
 h-app/tests/test_leak_manifest.py::test_live_claimant_is_not_stolen
 h-app/tests/test_leak_manifest.py::test_incomplete_cleanup_retains_one_recoverable_claim
 h-app/tests/test_leak_manifest.py::test_completed_cleanup_with_unremovable_claim_reports_stuck_and_keeps_evidence
+h-app/tests/test_leak_manifest.py::test_failed_retry_restamp_retains_live_claim_and_reports_stuck
 h-app/tests/test_leak_manifest.py::test_entry_claimed_after_glob_snapshot_is_not_reported_stuck
 h-app/tests/test_office_cli.py::test_dispatch_table_has_no_duplicate_names_and_matches_derived_maps
 h-app/tests/test_office_cli.py::test_profiles_is_not_a_command_yet
