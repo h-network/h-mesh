@@ -841,6 +841,47 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         except Exception:
             pass
 
+    def test_concurrent_submit_text_with_shared_stream_id_does_not_collide_paste_buffer(self):
+        import concurrent.futures
+        from modules.tmux.ops import run_tmux, submit_text
+
+        run_tmux("new-session", "-d", "-s", self.session_name, "-n", "agent1", "bash", socket=self.socket)
+        run_tmux("new-window", "-t", f"{self.session_name}:", "-n", "agent2", "bash", socket=self.socket)
+
+        stream_id = "82605b8b1234567890abcdef12345678"
+
+        def assert_pane_contains(agent: str, marker: str, timeout: float = 3.0) -> None:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                code, stdout, _ = run_tmux(
+                    "capture-pane", "-J", "-p", "-t", f"{self.session_name}:{agent}", socket=self.socket
+                )
+                if code == 0 and marker in stdout:
+                    return
+                time.sleep(0.05)
+            code, stdout, _ = run_tmux(
+                "capture-pane", "-J", "-p", "-t", f"{self.session_name}:{agent}", socket=self.socket
+            )
+            self.assertEqual(code, 0)
+            self.assertIn(marker, stdout, f"Marker {marker!r} missing from {agent} pane output: {stdout!r}")
+
+        # 20 trials of concurrent submissions with the same stream_id across different agents
+        for trial in range(20):
+            marker1 = f"MARKER_A1_{trial}_{os.urandom(4).hex()}"
+            marker2 = f"MARKER_A2_{trial}_{os.urandom(4).hex()}"
+
+            def deliver(agent: str, text: str) -> None:
+                submit_text(self.session_name, agent, text, stream_id=stream_id, socket=self.socket)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                f1 = executor.submit(deliver, "agent1", f"echo {marker1}")
+                f2 = executor.submit(deliver, "agent2", f"echo {marker2}")
+                f1.result()
+                f2.result()
+
+            assert_pane_contains("agent1", marker1)
+            assert_pane_contains("agent2", marker2)
+
 
 if __name__ == "__main__":
     unittest.main()

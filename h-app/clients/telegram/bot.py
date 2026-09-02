@@ -3465,7 +3465,24 @@ class TelegramBot:
                 )
 
         reply_text = f"✅ Ran on {agent}." if raw else f"✅ Sent to {agent}."
-        if not reacted and self.telegram:
+        # ⚠ THE HAPPY PATH MUST NOT TELL THE OPERATOR LESS THAN THE FAILURE
+        # PATH. A 👀 reaction confirms "dispatched" and names nothing, so when
+        # the destination came from STATE THE OPERATOR CANNOT SEE, the reaction
+        # alone leaves the conversation silent about where the message went.
+        #
+        # Traced live: after "🎯 Message agent", three plain prompts reached
+        # `test1` and nothing in the chat said so. The sticky keyboard does
+        # carry a "🎯 Message: <target>" button — but Telegram lets that
+        # keyboard be collapsed and this bot offers "🙈 Hide menu", so the one
+        # persistent indicator is exactly as visible as the operator's last UI
+        # gesture. Two silences meeting, neither a bug alone.
+        #
+        # ⚠ Gated on ROUTING THE OPERATOR CANNOT SEE, not merely "not the
+        # default": an `@mention` or `/run <agent>` names its destination in
+        # the text the operator just typed, so repeating it is noise. Sticky
+        # targeting is the case where the destination lives only in state.
+        routed_by_invisible_state = agent_override is None and agent != self.target_agent
+        if (not reacted or routed_by_invisible_state) and self.telegram:
             self.telegram.send_message(cid, reply_text)
         return reply_text
 

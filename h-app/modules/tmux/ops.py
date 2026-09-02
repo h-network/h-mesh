@@ -726,7 +726,9 @@ def submit_text(
     socket: str | None = None,
 ) -> None:
     target = f"{session_name}:{agent_name}"
-    buf_name = f"hmesh_{stream_id[:8]}" if stream_id else f"hmesh_{os.urandom(4).hex()}"
+    nonce = os.urandom(8).hex()
+    sid_part = f"_{stream_id}" if stream_id else ""
+    buf_name = f"hmesh_{agent_name}{sid_part}_{nonce}"
 
     def checked(command: str, result: tuple[int, str, str]) -> None:
         code, _, stderr = result

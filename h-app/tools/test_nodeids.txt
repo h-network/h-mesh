@@ -308,6 +308,7 @@ h-app/tests/test_leak_manifest.py::test_a_transient_nonempty_directory_is_stuck_
 h-app/tests/test_office_cli.py::test_dispatch_table_has_no_duplicate_names_and_matches_derived_maps
 h-app/tests/test_office_cli.py::test_profiles_is_not_a_command_yet
 h-app/tests/test_office_cli.py::test_root_help_lists_every_command_without_environment_or_redis
+h-app/tests/test_office_cli.py::test_send_stdin_identity_reaches_recipient_on_real_redis
 h-app/tests/test_office_cli.py::test_unresolved_names_exact_identity_without_consuming
 h-app/tests/test_office_cli.py::test_undeliverable_names_terminal_identity_without_consuming
 h-app/tests/test_office_cli.py::test_undeliverable_malformed_record_is_reported_without_consuming
@@ -526,6 +527,9 @@ h-app/tests/test_telegram_client.py::test_cursor_store_save_creates_missing_pare
 h-app/tests/test_telegram_client.py::test_status_command
 h-app/tests/test_telegram_client.py::test_handle_user_prompt_when_blocked
 h-app/tests/test_telegram_client.py::test_handle_user_prompt_success
+h-app/tests/test_telegram_client.py::test_a_sticky_target_names_itself_on_every_prompt_it_routes
+h-app/tests/test_telegram_client.py::test_the_default_target_still_confirms_with_a_reaction_alone
+h-app/tests/test_telegram_client.py::test_a_typed_destination_is_not_repeated_back
 h-app/tests/test_telegram_client.py::test_handle_user_prompt_shows_typing_before_dispatch
 h-app/tests/test_telegram_client.py::test_dispatching_flows_all_show_typing_before_their_network_call
 h-app/tests/test_telegram_client.py::test_door_context_none_for_plain_http
@@ -775,6 +779,10 @@ h-app/tests/test_tmux_conf.py::test_install_tmux_conf_leaves_a_foreign_symlink_a
 h-app/tests/test_tmux_conf.py::test_shipped_tmux_conf_exists_and_is_reachable_from_the_module
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_a_failed_paste_never_counts_as_delivered
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_deliver_tmux_add_ticket
+h-app/tests/test_tmux_port.py::TmuxPortTests::test_add_ticket_nonpositive_write_result_routes_unresolved
+h-app/tests/test_tmux_port.py::TmuxPortTests::test_add_ticket_success_log_failure_keeps_confirmed_custody
+h-app/tests/test_tmux_port.py::TmuxPortTests::test_add_ticket_success_log_failure_still_attempts_task_audit
+h-app/tests/test_tmux_port.py::TmuxPortTests::test_add_ticket_task_event_failure_keeps_confirmed_custody
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_deliver_tmux_attachment
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_deliver_tmux_command
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_deliver_tmux_drains_queued_envelopes_in_one_call
@@ -785,7 +793,9 @@ h-app/tests/test_tmux_port.py::TmuxPortTests::test_main_entrypoint
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_main_entrypoint_missing_arg_exits
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_main_entrypoint_skips_when_paused
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_mark_delivery_pending
+h-app/tests/test_tmux_port.py::test_add_ticket_response_loss_routes_identity_unresolved_on_real_redis
 h-app/tests/test_tmux_real.py::RealTmuxIntegrationTests::test_ambient_tmux_refusal
+h-app/tests/test_tmux_real.py::RealTmuxIntegrationTests::test_concurrent_submit_text_with_shared_stream_id_does_not_collide_paste_buffer
 h-app/tests/test_tmux_real.py::RealTmuxIntegrationTests::test_empty_roster_refusal_and_override
 h-app/tests/test_tmux_real.py::RealTmuxIntegrationTests::test_generate_agents_md_command_derivation
 h-app/tests/test_tmux_real.py::RealTmuxIntegrationTests::test_hired_agent_pane_process_has_venv_bin_on_path_in_proc_environ

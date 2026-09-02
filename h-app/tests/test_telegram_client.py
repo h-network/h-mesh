@@ -406,6 +406,74 @@ def test_handle_user_prompt_success():
         assert telegram.sent_messages[0]["text"] == "✅ Sent to architect."
 
 
+def test_a_sticky_target_names_itself_on_every_prompt_it_routes():
+    """⚠ HARM, traced live: after "🎯 Message agent", three plain prompts
+    reached `test1` and NOTHING in the conversation said so. Three delivery
+    failures were attributed to an agent the operator never meant to send to.
+
+    Two silences meeting, neither a bug alone. The sticky keyboard does carry a
+    "🎯 Message: <target>" button — but Telegram lets that keyboard be
+    collapsed and this bot offers "🙈 Hide menu", so the one persistent
+    indicator is as visible as the operator's last UI gesture. And the
+    acknowledgement that names the destination is SUPPRESSED PRECISELY WHEN
+    THE SEND WORKS: a 👀 reaction replaces "✅ Sent to X" and names nothing.
+
+    ⚠ Asserted on WHERE THE MESSAGE LANDED and what the operator was told —
+    never on `chat_target_agent`, which is the mechanism rather than the harm."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance.target_agent = "architect"
+
+        bot_instance.handle_message_agent_pick(12345, "test1")
+        telegram.sent_messages.clear()
+
+        bot_instance.handle_user_prompt(12345, "deploy the thing", message_id=77)
+
+        destinations = [e["destination"] for e in mesh.sent_envelopes]
+        assert destinations == ["test1"], (
+            f"the prompt did not go where the sticky target pointed: {destinations}"
+        )
+        assert any("test1" in m["text"] for m in telegram.sent_messages), (
+            "the message went to test1 and the conversation never said so — "
+            f"the operator saw only: {[m['text'] for m in telegram.sent_messages]}"
+        )
+
+
+def test_the_default_target_still_confirms_with_a_reaction_alone():
+    """The other direction, so the fix cannot be "narrate everything". When the
+    destination is the default the operator already knows it, the 👀 reaction
+    is the whole confirmation, and adding a line per message would be noise in
+    the common case."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance.target_agent = "architect"
+
+        bot_instance.handle_user_prompt(12345, "status please", message_id=77)
+
+        assert [e["destination"] for e in mesh.sent_envelopes] == ["architect"]
+        assert telegram.sent_messages == [], (
+            f"the default target added chatter: {[m['text'] for m in telegram.sent_messages]}"
+        )
+        assert telegram.reactions_set, "the reaction is the confirmation on this path"
+
+
+def test_a_typed_destination_is_not_repeated_back():
+    """An `@mention` names its destination in the text the operator just typed,
+    so repeating it is noise. The gate is "routing the operator cannot see",
+    not "anything off-default" — a distinction worth keeping, because the harm
+    is state they cannot observe, not an unusual agent."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        bot_instance.target_agent = "architect"
+
+        bot_instance.handle_user_prompt(12345, "look at this", agent_override="test1", message_id=77)
+
+        assert [e["destination"] for e in mesh.sent_envelopes] == ["test1"]
+        assert telegram.sent_messages == [], (
+            "an explicitly addressed message was narrated back at the operator"
+        )
+
+
 def test_handle_user_prompt_shows_typing_before_dispatch():
     mesh = DummyMeshClient()
     mesh.presence_state = "working"
