@@ -44,6 +44,17 @@ reads that evidence without consuming or retrying it. There is deliberately no
 automatic expiry and currently no resolution verb: future exact-identity,
 audited retry/dead/resolve actions require per-kind policy rather than silently
 choosing loss or duplication today.
+Retirement classifies the same phases without erasing custody: queued
+`ingress` and claimed `processing` envelopes are known not to have begun, so
+they move to the tenant-level `undeliverable` evidence list; `opening` moves to
+`unresolved`; bounded `opened` receipts remain intact. `office undeliverable`
+is read-only. Like `unresolved`, it has no replay/delete verb and no expiry;
+those missing operator actions are a deliberate gap, not an implied cleanup.
+Operators therefore have three truthful terminal surfaces: `dead` for an
+explicit rejection, `unresolved` when an effect may have happened, and
+`undeliverable` when the destination retired before the effect began. Keeping
+them separate avoids changing dead's raw-envelope contract or calling a known
+non-effect unknown.
 Kicks are availability hints, not
 tokens paired one-to-one with envelopes: an older entry left by a missed or
 crashed kick therefore cannot consume the only attempt for the request behind

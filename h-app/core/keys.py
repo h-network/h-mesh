@@ -88,3 +88,8 @@ def receive_opened_key(pod: str, tenant: str, agent: str) -> str:
 
 def receive_unresolved_key(pod: str, tenant: str) -> str:
     return prefix(pod, tenant, resource="unresolved")
+
+
+def receive_undeliverable_key(pod: str, tenant: str) -> str:
+    """Tenant evidence for envelopes whose destination retired before opening."""
+    return prefix(pod, tenant, resource="undeliverable")
