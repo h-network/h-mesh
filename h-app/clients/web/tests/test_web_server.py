@@ -1455,242 +1455,125 @@ def test_a_json_response_cannot_be_given_conflicting_or_split_headers():
         handler._json(200, {"ok": True}, set_cookie="s=1\r\nX-Injected: yes")
 
 
-_RESPONSE_WRITES = {"send_response", "end_headers", "send_error", "_json"}
-# the events whose call sites this guard must find. Keyed on EVENT NAMES from
-# the discovered calls, not on file text: if `_audit_log` is renamed and the
-# walk finds nothing, an assertion about text would still pass against
-# orphaned literals, and this fails instead.
-_EXPECTED_AUDIT_EVENTS = {"login_success", "login_failure", "telegram_auth_success",
-                          "telegram_auth_failure", "logout", "operator_action"}
+class _OrderingWatch:
+    """Records, per request, whether an audit followed the response.
+
+    ⚠ THE FOURTH VERSION OF THIS GUARD, AND THE FIRST THAT MODELS NOTHING.
+    Three AST walkers came before it and each was falsified by a construct the
+    previous one did not model: branches, then compound statements, then
+    `break` and `continue` — which the last version treated as leaving the
+    handler when they leave only the loop, so `while True: ... _json(); break`
+    followed by an audit came back clean. Writing a small interpreter for
+    Python's control flow means the failures arrive one construct at a time.
+
+    This watches what actually happened instead. It cannot certify a path the
+    tests never take — a real limit, stated in the test below — but everything
+    it does say is about executed code rather than about my reading of the
+    grammar.
+    """
+
+    def __init__(self):
+        self.violations = []
+
+    def response_started(self, handler):
+        handler._ordering_responded = True
+
+    def audited(self, handler, event):
+        if getattr(handler, "_ordering_responded", False):
+            self.violations.append(event)
 
 
-def _terminates(statements) -> bool:
-    """Does this block always leave, so nothing after it on this path runs?"""
-    if not statements:
-        return False
-    last = statements[-1]
-    if isinstance(last, (ast.Return, ast.Raise, ast.Continue, ast.Break)):
-        return True
-    if isinstance(last, ast.If):
-        return _terminates(last.body) and _terminates(last.orelse)
-    return False
+@pytest.fixture(autouse=True)
+def audit_ordering(monkeypatch):
+    """⚠ AUTOUSE: every request any test in this file makes is checked.
+
+    The ordering is owned by `_json(audit=...)` now — a caller handing over its
+    record cannot place it after the body, because `_json` writes it before
+    `send_response`. This fixture is what notices a future handler going back
+    to writing its own response and its own audit call.
+    """
+    watch = _OrderingWatch()
+    real_audit = OfficeHandler._audit_log
+    real_send_response = OfficeHandler.send_response
+    real_handle_one = OfficeHandler.handle_one_request
+
+    def audit(self, event, details, session_id=None):
+        watch.audited(self, event)
+        return real_audit(self, event, details, session_id)
+
+    def send_response(self, code, message=None):
+        watch.response_started(self)
+        return real_send_response(self, code, message)
+
+    def handle_one_request(self):
+        # a kept-alive connection reuses the handler instance, and a stale flag
+        # would report the NEXT request's audit as late
+        self._ordering_responded = False
+        return real_handle_one(self)
+
+    monkeypatch.setattr(OfficeHandler, "_audit_log", audit)
+    monkeypatch.setattr(OfficeHandler, "send_response", send_response)
+    monkeypatch.setattr(OfficeHandler, "handle_one_request", handle_one_request)
+    yield watch
+    assert not watch.violations, (
+        f"these audit records were written after their response: {watch.violations}"
+    )
 
 
-def _audit_calls_after_a_response(tree):
-    """Audit calls that follow a response write on a path that reaches them.
+def test_the_ordering_watch_catches_a_handler_that_audits_after_responding(audit_ordering):
+    """⚠ THE WATCH'S OWN FALSIFICATION, end to end through a real request.
+    Without it, a fixture that silently stopped matching would look exactly
+    like a codebase with no violations — the vacuous pass this office has
+    deleted three times tonight.
 
-    ⚠ TWO GRANULARITY ERRORS ARE ENCODED HERE, both caught by someone else.
-    First: comparing each audit call against the first response write anywhere
-    in the function flagged four sites, two of them on branches that had
-    written nothing — `login_failure` audits and THEN responds, and reading
-    that as a violation would have meant "fixing" correct code. Second, and
-    reviewer's: walking compound statements with a COPY of the responded flag
-    and discarding the result, so `_json` in a try body followed by
-    `_audit_log` in the finally — or after the try, or after a `with`, or
-    after a loop — came back clean while the harm was fully present.
+    ⚠ AND THE LIMIT, stated rather than implied: this covers the paths the
+    suite executes. A handler nothing calls is not covered, and no runtime
+    watch can cover it. The guard it replaces claimed every path by reading the
+    source, and was wrong three times about what the source meant; this claims
+    less and is true."""
+    class LateAuditHandler(OfficeHandler):
+        def do_GET(self):
+            self._json(200, {"ok": True})
+            self._audit_log("deliberately_late", {})
 
-    So each block returns the state it leaves behind, and that state flows to
-    the following siblings unless the block always leaves via return, raise,
-    continue or break. Where the answer is uncertain the code assumes a
-    response HAPPENED: an over-report here is a reviewer looking at a handler,
-    while an under-report is the bug shipping green."""
-    found, events = [], set()
-
-    def direct_calls(stmt):
-        nested = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try,
-                  ast.With, ast.AsyncWith, ast.FunctionDef, ast.AsyncFunctionDef)
-        out = []
-
-        def rec(node, top=False):
-            if isinstance(node, nested) and not top:
-                return
-            for child in ast.iter_child_nodes(node):
-                if isinstance(child, ast.Call):
-                    func = child.func
-                    name = (func.attr if isinstance(func, ast.Attribute)
-                            else func.id if isinstance(func, ast.Name) else None)
-                    out.append((child, name))
-                rec(child)
-
-        if isinstance(stmt, nested):
-            # only the header — test, iterable, context manager — because the
-            # body is walked separately and must carry its own state
-            for field in ("test", "iter", "items", "value"):
-                value = getattr(stmt, field, None)
-                for node in (value if isinstance(value, list) else [value]) if value else []:
-                    rec(node)
-        else:
-            rec(stmt, top=True)
-        return out
-
-    def note_audits(stmt, responded):
-        for call, name in direct_calls(stmt):
-            if name != "_audit_log":
-                continue
-            event = (call.args[0].value if call.args and isinstance(call.args[0], ast.Constant)
-                     else "<not a literal>")
-            events.add(event)
-            if responded:
-                found.append((call.lineno, event))
-
-    def walk(statements, responded):
-        """Returns the responded state this block leaves to what follows it."""
-        for stmt in statements:
-            note_audits(stmt, responded)
-            if isinstance(stmt, (ast.If, ast.Try, ast.With, ast.AsyncWith,
-                                 ast.For, ast.AsyncFor, ast.While)):
-                responded = walk_compound(stmt, responded)
-            elif any(name in _RESPONSE_WRITES for _, name in direct_calls(stmt)):
-                responded = True
-            if _terminates([stmt]):
-                return responded
-        return responded
-
-    def walk_compound(stmt, responded):
-        if isinstance(stmt, ast.If):
-            outcomes = []
-            for block in (stmt.body, stmt.orelse):
-                if not block:
-                    outcomes.append(responded)      # the branch not taken
-                elif _terminates(block):
-                    walk(block, responded)          # walked for its audits only
-                else:
-                    outcomes.append(walk(block, responded))
-            return any(outcomes) if outcomes else responded
-        if isinstance(stmt, (ast.With, ast.AsyncWith)):
-            return walk(stmt.body, responded)
-        if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
-            # the body may run or not; either way a response inside it counts
-            after_body = walk(stmt.body, responded)
-            after_else = walk(stmt.orelse, after_body) if stmt.orelse else after_body
-            return after_else
-        # Try: the body may have written a response before raising, so the
-        # handlers, else and finally all inherit that possibility
-        after_body = walk(stmt.body, responded)
-        after_else = walk(stmt.orelse, after_body) if stmt.orelse else after_body
-        state = after_else
-        for handler in stmt.handlers:
-            handler_state = walk(handler.body, after_body)
-            if not _terminates(handler.body):
-                state = state or handler_state
-        if stmt.finalbody:
-            state = walk(stmt.finalbody, state)
-        return state
-
-    for func in [n for n in ast.walk(tree)
-                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
-        walk(func.body, False)
-    return found, events
-
-
-# ⚠ REVIEWER'S FALSE-CLEAN SHAPES, kept as the guard's own falsification. Each
-# returned (late=[], events={'x'}) against the previous walker while the harm —
-# a success response written before its audit record — was fully present.
-_MUST_BE_FLAGGED = {
-    "audit in a finally after a response in the try body": """
-def handler(self):
+    web_server = ThreadingHTTPServer(("127.0.0.1", 0), LateAuditHandler)
+    web_server.audit_log = None          # writing the record is not the point
+    web_server.api_base = "http://127.0.0.1:8080"
+    web_port = web_server.server_address[1]
+    threading.Thread(target=web_server.serve_forever, daemon=True).start()
     try:
-        self._json(200, {"ok": True})
+        with urllib.request.urlopen(f"http://127.0.0.1:{web_port}/anything") as resp:
+            assert resp.status == 200
     finally:
-        self._audit_log("x", {})
-""",
-    "audit after a with whose body responded": """
-def handler(self):
-    with self.lock:
-        self._json(200, {"ok": True})
-    self._audit_log("x", {})
-""",
-    "audit after a try whose body responded": """
-def handler(self):
-    try:
-        self._json(200, {"ok": True})
-    except Exception:
-        pass
-    self._audit_log("x", {})
-""",
-    "audit after a loop whose body responded": """
-def handler(self):
-    for item in items:
-        self._json(200, {"ok": True})
-    self._audit_log("x", {})
-""",
-    "audit after an if branch that responded and fell through": """
-def handler(self):
-    if ready:
-        self._json(200, {"ok": True})
-    self._audit_log("x", {})
-""",
-}
+        web_server.shutdown()
+        web_server.server_close()
 
-# and the shapes that must NOT be flagged, or the guard would push handlers
-# into rearranging correct code
-_MUST_NOT_BE_FLAGGED = {
-    "audit before the response": """
-def handler(self):
-    self._audit_log("x", {})
-    self._json(200, {"ok": True})
-""",
-    "an earlier branch that responded and returned": """
-def handler(self):
-    if too_many:
-        self._json(429, {"detail": "slow down"})
-        return
-    self._audit_log("x", {})
-    self._json(200, {"ok": True})
-""",
-    "audit inside a with, before the response": """
-def handler(self):
-    with self.lock:
-        self._audit_log("x", {})
-    self._json(200, {"ok": True})
-""",
-}
+    assert audit_ordering.violations == ["deliberately_late"], (
+        "the watch did not notice an audit written after its response"
+    )
+    # consumed deliberately, so the fixture's own teardown assertion passes
+    audit_ordering.violations.clear()
 
 
-def test_the_ordering_guard_detects_a_response_before_an_audit():
-    """⚠ THE GUARD'S OWN FALSIFICATION, and it is the whole reason to trust the
-    guard on code nobody has written yet. Checking only today's call sites is
-    evidence about today's call sites; these shapes are the ones a future
-    handler will actually produce, and three of them were reported clean by
-    the previous version of this walk."""
-    for description, source in _MUST_BE_FLAGGED.items():
-        late, events = _audit_calls_after_a_response(ast.parse(source))
-        assert events, f"the walk found no audit call at all in: {description}"
-        assert late, f"the walk reports this as clean: {description}"
+def test_the_audit_ordering_is_owned_by_the_response_helper():
+    """⚠ STRUCTURAL, and the reason the walkers are gone. `_json` writes the
+    record before `send_response`, so a caller that hands one over cannot put
+    it after the body: the wrong order is not expressible rather than
+    detectable. Both authentication success paths hand theirs over.
 
-    for description, source in _MUST_NOT_BE_FLAGGED.items():
-        late, events = _audit_calls_after_a_response(ast.parse(source))
-        assert events, f"the walk found no audit call at all in: {description}"
-        assert late == [], (
-            f"the walk flags correct code, which would push a handler into "
-            f"rearranging it: {description} -> {late}"
+    Reviewer's counterexamples that defeated the AST versions —
+    `while True: ... _json(); break` then an audit, `continue` in a loop, an
+    audit in a `finally` after a response in the try — are all still writable
+    Python. What changed is that neither site this ticket is about writes its
+    own response any more, and the runtime watch sees any handler that does."""
+    source = inspect.getsource(server.OfficeHandler._json)
+    assert source.index("self._audit_log(*audit)") < source.index("self.send_response("), (
+        "the audit record is no longer written before the response starts"
+    )
+
+    handler_source = inspect.getsource(server.OfficeHandler)
+    for site in ("login_success", "telegram_auth_success"):
+        assert f'audit=("{site}"' in handler_source, (
+            f"{site} no longer hands its record to _json, so nothing orders it"
         )
 
-
-def test_no_audit_record_is_written_after_its_response():
-    """⚠ THE PROPERTY, not the two sites. Both authentication success paths
-    had it, and both had it for the same reason: they needed a Set-Cookie
-    header, `_json` did not take headers, so they hand-rolled the response and
-    the audit call ended up on the far side of it. Anything that reaches past
-    `_json` again can land in the same place.
-
-    The vacuity check is keyed on the EVENT NAMES this walk discovers. Renaming
-    `_audit_log` makes the walk find nothing, which a check on file text would
-    survive by reading orphaned literals — verified by renaming the method in a
-    scratch copy of server.py, where this fails with `discovered no audit call
-    sites at all` rather than passing."""
-    source = inspect.getsource(server)
-    tree = ast.parse(source)
-    late, events = _audit_calls_after_a_response(tree)
-
-    assert events, (
-        "discovered no audit call sites at all — has _audit_log been renamed? "
-        "this guard is reading nothing and would pass regardless of the code"
-    )
-    missing = _EXPECTED_AUDIT_EVENTS - events
-    assert not missing, f"the walk no longer reaches these audit sites: {sorted(missing)}"
-
-    assert late == [], (
-        "these write an audit record after the response that reports the action, "
-        f"so a caller reading the log back can see nothing: {late}"
-    )
