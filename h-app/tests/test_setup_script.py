@@ -45,8 +45,18 @@ def _fake_h_agent_installer(tmpdir: str, *, behavior: str) -> str:
       "fail_differently"   -- exits 1 on the first invocation, 42 on the
                               second, neither placing h-agent -- a
                               deliberately NON-identical pair of failures,
-                              so the "both attempts failed identically"
-                              reporting only fires when it's actually true.
+                              so the equal-exit-status reporting only fires
+                              when the codes actually match.
+      "fail_same_code_different_cause" -- exits 1 BOTH times, neither
+                              placing h-agent, but prints different stderr
+                              text each time (h-agent's real installer
+                              exits 1 for multiple distinct causes --
+                              claude/codex/agy each have their own
+                              verification-failed path). The counterexample
+                              that breaks a message claiming equal exit
+                              codes mean an identical, deterministic
+                              failure: two different real failures can
+                              produce this exact pair of codes.
     """
     script_path = os.path.join(tmpdir, "fake_h_agent_install.sh")
     counter_path = os.path.join(tmpdir, "h_agent_install_attempts")
@@ -64,6 +74,14 @@ exit 0
         body = f'if [ "$count" -eq 1 ]; then exit 1; fi\n{place_binary}'
     elif behavior == "fail_differently":
         body = 'if [ "$count" -eq 1 ]; then exit 1; fi\nexit 42\n'
+    elif behavior == "fail_same_code_different_cause":
+        body = (
+            'if [ "$count" -eq 1 ]; then '
+            'echo "simulated: claude 2.1.251 verification could not be confirmed" >&2; exit 1; '
+            'fi\n'
+            'echo "simulated: agy 1.1.24 does not match the pinned 1.1.23" >&2\n'
+            'exit 1\n'
+        )
     else:
         raise ValueError(behavior)
 
@@ -120,11 +138,14 @@ def test_setup_fails_loudly_when_h_agent_installer_fails_twice():
         )
         assert res.returncode != 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
         assert "h-agent installer failed twice" in res.stderr, res.stderr
-        # Both attempts here exit 1, identically -- a repeated, deterministic
-        # refusal (e.g. an exact upstream version pin), not a fluke. The
-        # report must say so explicitly rather than leave "attempt 2/2"
-        # reading as possibly-flaky on its own.
-        assert "Both attempts failed identically (exit 1 both times)" in res.stderr, res.stderr
+        # Both attempts here exit 1 -- reviewer FAILED an earlier version of
+        # this report for calling that "identical" and "non-transient",
+        # which the exit status alone can't prove (h-agent's installer
+        # exits 1 for multiple distinct causes -- see the same-code/
+        # different-cause test below). Report the OBSERVATION and the
+        # limit, not a conclusion.
+        assert "Both attempts exited with status 1" in res.stderr, res.stderr
+        assert "cannot tell from the exit status alone whether both attempts failed for the same reason" in res.stderr, res.stderr
         assert "✓ h-agent installed" not in res.stdout
         assert "✓ Daemons are healthy" not in res.stdout, (
             "setup.sh must not proceed past a failed h-agent install:\n" + res.stdout
@@ -135,11 +156,11 @@ def test_setup_fails_loudly_when_h_agent_installer_fails_twice():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_setup_does_not_claim_identical_failure_when_attempts_actually_differ():
-    # The identical-failure line is only honest when both attempts really did
-    # fail the same way -- assert it's absent when they didn't, so the
-    # reporting can't be implemented as "always say this on the second
-    # failure" and still pass the identical-failure test above.
+def test_setup_does_not_report_equal_exit_status_when_attempts_actually_differ():
+    # The equal-exit-status line is only accurate when both attempts really
+    # did exit the same way -- assert it's absent when the codes differ, so
+    # the reporting can't be implemented as "always say this on the second
+    # failure" and still pass the matching-codes tests.
     tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_setup_h_agent_")
     try:
         h_agent_url, counter_path = _fake_h_agent_installer(tmpdir, behavior="fail_differently")
@@ -152,7 +173,46 @@ def test_setup_does_not_claim_identical_failure_when_attempts_actually_differ():
         )
         assert res.returncode != 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
         assert "h-agent installer failed twice (last exit 42)" in res.stderr, res.stderr
-        assert "Both attempts failed identically" not in res.stderr, res.stderr
+        assert "Both attempts exited with status" not in res.stderr, res.stderr
+        assert open(counter_path).read().strip() == "2", "expected exactly 2 attempts"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_setup_never_overclaims_when_matching_exit_codes_have_different_causes():
+    # Reviewer's exact counterexample: h-agent's real installer exits 1 for
+    # MULTIPLE distinct causes (claude/codex/agy each have their own
+    # verification-failed path), so two attempts returning the same code
+    # does not mean they failed for the same reason, that either was
+    # deterministic, or that a third attempt or an upstream/host change is
+    # what's needed. Two DIFFERENT simulated failures here both exit 1 --
+    # the report must state the observation (both exited 1) and the limit
+    # (cannot tell whether the causes matched), and must never claim
+    # "identical", "deterministic", "non-transient", or promise that
+    # retrying can't help.
+    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_setup_h_agent_")
+    try:
+        h_agent_url, counter_path = _fake_h_agent_installer(
+            tmpdir, behavior="fail_same_code_different_cause"
+        )
+        run_dir = os.path.join(tmpdir, "run")
+        env = _dep_check_env(tmpdir, h_agent_url=h_agent_url)
+        env["H_MESH_RUN_DIR"] = run_dir
+        res = subprocess.run(
+            [str(SETUP_SH), "--pod", "p", "--tenant", "t", "--non-interactive"],
+            env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+        assert res.returncode != 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+        assert "h-agent installer failed twice (last exit 1)" in res.stderr, res.stderr
+        assert "Both attempts exited with status 1" in res.stderr, res.stderr
+        assert "cannot tell from the exit status alone whether both attempts failed for the same reason" in res.stderr, res.stderr
+
+        combined = res.stdout + res.stderr
+        for overclaim in ("identical", "identically", "deterministic", "non-transient", "will not help", "cannot help"):
+            assert overclaim not in combined.lower(), (
+                f"report overclaimed {overclaim!r} from two exit codes that happen to "
+                f"match but had different real causes:\n{combined}"
+            )
         assert open(counter_path).read().strip() == "2", "expected exactly 2 attempts"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
