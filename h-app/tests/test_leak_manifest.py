@@ -1550,7 +1550,15 @@ def test_absence_not_confirmed_on_permission_error_retains_claim(monkeypatch):
     entry = MANIFEST_DIR / "h_mesh_test_permission_remove.json"
     claim = MANIFEST_DIR / f".claim.0.0.token.{entry.name}"
     claim.write_text(json.dumps({"tmpdir": str(Path('/tmp') / entry.stem), "owner_pid": 0, "owner_start_time": "0"}))
-    monkeypatch.setattr(_leak_manifest, "_tmpdir_confirmed_absent", lambda *_: False)
+    real_lstat = _leak_manifest.os.lstat
+    target = Path("/tmp") / entry.stem
+
+    def deny_target(path, *args, **kwargs):
+        if Path(path) == target:
+            raise PermissionError("denied")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(_leak_manifest.os, "lstat", deny_target)
     try:
         reaped, stuck = _leak_manifest.reap_all_orphans(log=lambda *_: None)
         assert reaped == 0 and stuck >= 1
