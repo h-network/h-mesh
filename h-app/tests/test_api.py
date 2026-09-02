@@ -27,22 +27,47 @@ from modules.api.server import ApiSettings, create_app
 def _reason_argument_violations(source: str) -> list[str]:
     """Syntactic invariant, not a runtime one: every `reason` argument at
     every call to `_record(...)` in `source` must be a string/None
-    constant, a reference to a module-level name that is ONLY EVER
-    assigned string/None constants anywhere in the module, or a call to a
-    same-module function whose every `return` is itself one of those two
-    things. Deliberately no control-flow modelling (no branch, loop, or
-    exception reasoning) -- a name or function is "safe" only if EVERY
-    assignment or return anywhere in the module qualifies, independent of
-    which branch actually runs. That conservatism is the point: it can
-    only be too strict, never miss a dynamic value by assuming a branch
-    won't be taken.
+    constant, a reference to a name that is ONLY EVER bound to string/None
+    constants by EVERY binding form REACHABLE FROM THAT CALL SITE'S OWN
+    LEXICAL SCOPE (its enclosing function, else module level), or a call
+    to a same-module function whose every definition sharing that name has
+    every `return` be one of those two things. Deliberately no
+    control-flow modelling (no branch, loop, or exception reasoning) --
+    a name or function is "safe" only if every occurrence *in scope*
+    qualifies, independent of which branch actually runs.
+
+    LEXICAL SCOPING, not just flat name-matching, is required for
+    soundness: `_record`'s own `reason` parameter and an unrelated
+    caller's local variable also named `reason` are different bindings
+    and must not be conflated -- a first version of this checker did
+    exactly that and produced a false positive against the real,
+    correctly-written production file the moment function-parameter
+    bindings were tracked at all. Resolution is local-scope-first, then
+    module scope, matching ordinary Python name resolution (no closures
+    over intermediate nested-function scopes, since none exist in this
+    file; a future one would need this extended).
+
+    "Every binding form" is exhaustive, not just `Assign`: `AnnAssign`,
+    `AugAssign` (always dynamic -- a mutation is never trusted regardless
+    of what it mutates), the walrus operator, loop and comprehension
+    targets, `except ... as`, `with ... as`, imports, class names, and
+    function/lambda parameters all count. A single dynamic binding
+    anywhere in the relevant scope disqualifies the name there, including
+    a same-named function defined twice where only one definition is safe
+    -- the later definition is the one that actually binds at call time,
+    so every definition sharing a name must independently qualify. A
+    `_record` call using `**kwargs`/`*args` expansion is rejected outright:
+    its keyword contents cannot be verified by this analysis at all.
     """
     tree = ast.parse(source)
 
     def is_literal(node: ast.AST) -> bool:
         return isinstance(node, ast.Constant) and (node.value is None or isinstance(node.value, str))
 
-    def returns_of(func_node: ast.FunctionDef) -> list[ast.AST]:
+    def names_in(target: ast.AST) -> list[str]:
+        return [n.id for n in ast.walk(target) if isinstance(n, ast.Name)]
+
+    def returns_of(func_node) -> list[ast.AST]:
         found: list[ast.AST] = []
 
         class _ReturnCollector(ast.NodeVisitor):
@@ -64,44 +89,187 @@ def _reason_argument_violations(source: str) -> list[str]:
             collector.visit(stmt)
         return found
 
-    literal_only_functions = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef)
-        and (rets := returns_of(node))
-        and all(is_literal(r) for r in rets)
-    }
+    def params_of(func_or_lambda) -> list[str]:
+        a = func_or_lambda.args
+        names = [arg.arg for arg in a.posonlyargs + a.args + a.kwonlyargs]
+        if a.vararg:
+            names.append(a.vararg.arg)
+        if a.kwarg:
+            names.append(a.kwarg.arg)
+        return names
 
-    literal_only_names: set[str] = set()
-    dynamic_names: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    (literal_only_names if is_literal(node.value) else dynamic_names).add(target.id)
-    literal_only_names -= dynamic_names
+    functions_by_name: dict[str, list] = {}
+    # scope_of[id(call_node)] -> enclosing FunctionDef/AsyncFunctionDef, or
+    # None for module level.
+    scope_of: dict[int, object] = {}
+    # bindings[scope_key] -> (literal_only_names, dynamic_names) owned
+    # DIRECTLY by that scope -- module level uses key None.
+    bindings: dict[object, tuple[set, set]] = {}
+    record_calls: list[ast.Call] = []
 
-    def is_safe(node: ast.AST) -> bool:
+    def scope_key(scope_node) -> object:
+        return None if scope_node is None else id(scope_node)
+
+    def collect(scope_node, stmts, seed_dynamic: list[str] = ()) -> None:
+        """Populate bindings[scope_key(scope_node)] from the statements
+        directly in this scope's own body (not descending into nested
+        function/lambda scopes, which get their own `collect` call).
+        `seed_dynamic` pre-marks this scope's own parameters dynamic
+        before any body statement is examined, so a parameter's identity
+        is fixed at scope creation, never inferred from an outer scope."""
+        literal_only: set[str] = set()
+        dynamic: set[str] = set(seed_dynamic)
+        bindings[scope_key(scope_node)] = (literal_only, dynamic)
+
+        def literal_candidate(name: str, value_node) -> None:
+            (literal_only if is_literal(value_node) else dynamic).add(name)
+
+        def mark_dynamic(name: str) -> None:
+            dynamic.add(name)
+
+        class _Binder(ast.NodeVisitor):
+            def visit_FunctionDef(self, node):
+                functions_by_name.setdefault(node.name, []).append(node)
+                collect(node, node.body, params_of(node))
+
+            def visit_AsyncFunctionDef(self, node):
+                self.visit_FunctionDef(node)
+
+            def visit_Lambda(self, node):
+                collect(node, [], params_of(node))
+                self.visit(node.body)  # a lambda body is one expression, may hold a call
+
+            def visit_ClassDef(self, node):
+                mark_dynamic(node.name)
+                self.generic_visit(node)
+
+            def visit_Assign(self, node):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        literal_candidate(target.id, node.value)
+                    else:
+                        for name in names_in(target):
+                            mark_dynamic(name)
+                self.generic_visit(node)
+
+            def visit_AnnAssign(self, node):
+                if isinstance(node.target, ast.Name):
+                    if node.value is not None:
+                        literal_candidate(node.target.id, node.value)
+                    else:
+                        mark_dynamic(node.target.id)
+                self.generic_visit(node)
+
+            def visit_AugAssign(self, node):
+                if isinstance(node.target, ast.Name):
+                    mark_dynamic(node.target.id)
+                self.generic_visit(node)
+
+            def visit_NamedExpr(self, node):
+                if isinstance(node.target, ast.Name):
+                    literal_candidate(node.target.id, node.value)
+                self.generic_visit(node)
+
+            def visit_For(self, node):
+                for name in names_in(node.target):
+                    mark_dynamic(name)
+                self.generic_visit(node)
+
+            visit_AsyncFor = visit_For
+
+            def visit_comprehension(self, node):
+                for name in names_in(node.target):
+                    mark_dynamic(name)
+                self.generic_visit(node)
+
+            def visit_ExceptHandler(self, node):
+                if node.name:
+                    mark_dynamic(node.name)
+                self.generic_visit(node)
+
+            def visit_withitem(self, node):
+                if node.optional_vars is not None:
+                    for name in names_in(node.optional_vars):
+                        mark_dynamic(name)
+                self.generic_visit(node)
+
+            def visit_Import(self, node):
+                for alias in node.names:
+                    mark_dynamic(alias.asname or alias.name.split(".")[0])
+
+            def visit_ImportFrom(self, node):
+                for alias in node.names:
+                    mark_dynamic(alias.asname or alias.name.split(".")[0])
+
+            def visit_Call(self, node):
+                if isinstance(node.func, ast.Name) and node.func.id == "_record":
+                    scope_of[id(node)] = scope_node
+                    record_calls.append(node)
+                self.generic_visit(node)
+
+        binder = _Binder()
+        for stmt in stmts:
+            binder.visit(stmt)
+        literal_only -= dynamic
+
+    collect(None, tree.body)
+
+    literal_only_functions: set[str] = set()
+    for name, defs in functions_by_name.items():
+        # EVERY definition sharing this name must independently qualify --
+        # a later redefinition is the one that actually binds at call
+        # time, so one safe definition cannot license the name (reviewer's
+        # exact counterexample: two `def helper` with the same name).
+        if all(returns_of(d) and all(is_literal(r) for r in returns_of(d)) for d in defs):
+            literal_only_functions.add(name)
+    # A name also rebound dynamically anywhere at module level (e.g.
+    # `helper = lambda ...` after `def helper(): ...`) is not trustworthy.
+    module_literal, module_dynamic = bindings[None]
+    literal_only_functions -= module_dynamic
+
+    def resolve(name: str, scope_node) -> bool | None:
+        """True/False if this scope (or module, as a fallback) has an
+        opinion on `name`; None if truly never bound anywhere reachable."""
+        local_literal, local_dynamic = bindings.get(scope_key(scope_node), (set(), set()))
+        if name in local_dynamic:
+            return False
+        if name in local_literal:
+            return True
+        if scope_node is not None:
+            if name in module_dynamic:
+                return False
+            if name in module_literal:
+                return True
+        return None
+
+    def is_safe(node: ast.AST, scope_node) -> bool:
         if is_literal(node):
             return True
         if isinstance(node, ast.Name):
-            return node.id in literal_only_names
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            return resolve(node.id, scope_node) is True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and not any(isinstance(a, ast.Starred) for a in node.args)
+            and not any(kw.arg is None for kw in node.keywords)
+        ):
             return node.func.id in literal_only_functions
         if isinstance(node, ast.IfExp):
-            return is_safe(node.body) and is_safe(node.orelse)
+            return is_safe(node.body, scope_node) and is_safe(node.orelse, scope_node)
         return False
 
     violations = []
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_record"):
+    for node in record_calls:
+        scope_node = scope_of[id(node)]
+        if any(kw.arg is None for kw in node.keywords) or any(isinstance(a, ast.Starred) for a in node.args):
+            violations.append(f"line {node.lineno}: unverifiable *args/**kwargs expansion in _record call")
             continue
         reason_node = next((kw.value for kw in node.keywords if kw.arg == "reason"), None)
         if reason_node is None and len(node.args) >= 4:
             reason_node = node.args[3]
         if reason_node is None:
             continue  # not provided -- defaults to None, safe
-        if not is_safe(reason_node):
+        if not is_safe(reason_node, scope_node):
             violations.append(f"line {node.lineno}: {ast.dump(reason_node)}")
     return violations
 
@@ -546,6 +714,50 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(
             hostile_violations,
             "the checker must flag reviewer's exact counterexample -- it did not",
+        )
+
+    def test_reason_argument_checker_rejects_reviewers_three_binding_shape_counterexamples(self):
+        """Reviewer's second blocker, verbatim: the first version of the
+        checker returned `[]` (no violations) for all three of these --
+        allow-by-default wearing a deny-by-default docstring. Each is
+        committed here exactly as reviewer supplied it, per their explicit
+        instruction ("they are the test suite"), so a regression in any of
+        these three binding shapes is caught by name, not by re-deriving
+        the counterexample from a changelog."""
+        preamble = "def _record(event, envelope, agent, reason=None):\n    pass\n\n"
+
+        expanded_kwargs = preamble + (
+            "def f(remote):\n"
+            '    _record("x", {}, "a", **{"reason": f"leak {remote}"})\n'
+        )
+        self.assertTrue(
+            _reason_argument_violations(expanded_kwargs),
+            "expanded **kwargs reaching _record must be rejected, not silently unseen",
+        )
+
+        augmented_assignment = preamble + (
+            'reason = "safe"\n'
+            "def f(remote):\n"
+            "    global reason\n"
+            "    reason += remote\n"
+            '    _record("x", {}, "a", reason=reason)\n'
+        )
+        self.assertTrue(
+            _reason_argument_violations(augmented_assignment),
+            "AugAssign must invalidate a name even after a prior literal Assign",
+        )
+
+        redefined_function = preamble + (
+            "def helper():\n"
+            '    return "safe"\n'
+            "def helper(remote):\n"
+            '    return f"leak {remote}"\n'
+            "def f(remote):\n"
+            '    _record("x", {}, "a", reason=helper(remote))\n'
+        )
+        self.assertTrue(
+            _reason_argument_violations(redefined_function),
+            "one unsafe definition among same-named functions must fail the whole name, not be unioned away",
         )
 
     def _tamper_in_reply_to(self, envelope, value):
