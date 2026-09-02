@@ -306,6 +306,42 @@ class ApiTests(unittest.TestCase):
         dead = prefix("test", "office", "telegram", "dead")
         self.assertEqual(self.redis.lists[dead], [tampered])
 
+    def test_deliver_api_never_logs_the_in_reply_to_value_or_reply_source_it_drops(self):
+        """Reviewer's exact finding against 301ae87 (ticket 51caad5f):
+        is_valid_reply_id restricts SHAPE (32 lowercase hex characters), not
+        provenance -- a remote sender chooses the bytes freely within that
+        shape, so a syntactically valid in_reply_to is still remote data by
+        origin, same predicate as a malformed one. The prior fix closed
+        EnvelopeError's str(exc) but left _drop_untrustworthy_reply_correlation
+        interpolating in_reply_to, reply_source and agent directly into the
+        free-text `reason` -- redundant with the dedicated source/destination
+        fields _record already populates, and a second instance of the same
+        leak class. Covers both branches that interpolated a value: verdict
+        False ("was never delivered") and verdict None ("provenance
+        unavailable")."""
+        marker = "deadbeefdeadbeefdeadbeefdeadbeef"
+        ingress = prefix("test", "office", "telegram", "ingress")
+        envelope = build(
+            "Message", "alice", "telegram", {"text": "hi"},
+            pod="test", tenant="office", in_reply_to=marker,
+        )
+        self.redis.lists[ingress] = [encode(envelope)]
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+        self.assertNotIn(marker, out.getvalue())
+
+        self.redis.lists[ingress] = [encode(envelope)]
+
+        def broken_get(key):
+            raise ConnectionError("redis unavailable")
+
+        out2 = io.StringIO()
+        with patch.object(self.redis, "get", side_effect=broken_get), redirect_stdout(out2):
+            deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+        self.assertNotIn(marker, out2.getvalue())
+
     def _tamper_in_reply_to(self, envelope, value):
         """Bypass build()/encode()'s strict validation to simulate an
         already-parsed, permissive frame carrying whatever the wire said --

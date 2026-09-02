@@ -106,10 +106,19 @@ def _drop_untrustworthy_reply_correlation(r, *, pod: str, tenant: str, agent: st
     if verdict is True:
         return
     envelope.pop("in_reply_to", None)
+    # Closed literals only -- never the id or either agent name interpolated
+    # into free text. is_valid_reply_id bounds SHAPE (32 lowercase hex), not
+    # provenance: a remote sender picks the bytes freely within that shape,
+    # so a syntactically valid in_reply_to is still remote data by origin,
+    # same predicate as a malformed one (reviewer's finding against the
+    # first version of this fix). reply_source and agent are already in
+    # _record's dedicated source/destination fields below -- repeating them
+    # in `reason` adds no diagnostic value, only a second copy of the same
+    # remote-content-in-free-text problem this ticket exists to close.
     if verdict is None:
-        reason = f"in_reply_to {in_reply_to!r} provenance unavailable (storage unreachable)"
+        reason = "in_reply_to provenance unavailable (storage unreachable)"
     else:
-        reason = f"in_reply_to {in_reply_to!r} was never delivered to {reply_source!r} from {agent!r}"
+        reason = "in_reply_to was never delivered to the claimed source"
     _record("reply_correlation_dropped", envelope, agent, reason=reason)
 
 
