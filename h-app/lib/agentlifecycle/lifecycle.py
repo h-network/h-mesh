@@ -31,12 +31,21 @@ _MIN_HMAC_SECRET_LEN = 16
 _TARGET_ONLY_KEYS = frozenset({"agent"})
 
 _PUBLISH_WINDOW_CAUSE_LUA = """
+-- Atomic, not merely isolated: the only type-sensitive write is HSET, and it
+-- is the first mutation. HEXISTS performs the same hash-type check before any
+-- write; the following SET accepts and replaces a key of every Redis type.
+redis.call('HEXISTS', KEYS[2], ARGV[2])
 redis.call('HSET', KEYS[2], ARGV[2], ARGV[3])
 redis.call('SET', KEYS[1], ARGV[1])
 return 1
 """
 
 _PUBLISH_LEAD_MEMBERSHIP_LUA = """
+-- Atomic through preflight, not because EVAL rolls back (it does not).
+-- Registry is the only key whose command can fail with WRONGTYPE; validate it
+-- as a hash before the optional cause SET becomes the first mutation. Both SET
+-- writes accept and replace keys of every Redis type.
+redis.call('HEXISTS', KEYS[2], ARGV[1])
 if ARGV[3] ~= '' then
     redis.call('SET', KEYS[3], ARGV[3])
 end
@@ -46,8 +55,13 @@ return 1
 """
 
 _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA = """
+-- Atomic through preflight, not because EVAL rolls back (it does not). Check
+-- both type-sensitive reads before HDEL becomes the first mutation; otherwise
+-- a WRONGTYPE from GET would leave membership removed but the lead untouched.
+redis.call('HEXISTS', KEYS[1], ARGV[1])
+local current_lead = redis.call('GET', KEYS[2])
 redis.call('HDEL', KEYS[1], ARGV[1])
-if redis.call('GET', KEYS[2]) == ARGV[1] then
+if current_lead == ARGV[1] then
     redis.call('DEL', KEYS[2])
 end
 return 1

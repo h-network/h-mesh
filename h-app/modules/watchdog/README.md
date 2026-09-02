@@ -44,6 +44,23 @@ The watchdog exists to report reality, so a false positive here is worse
 than in most modules -- the whole point is trust. A few decisions, made
 deliberately rather than by accident (2026-09-02):
 
+- **Log events claim only what's actually known: ALLOCATED / ADMITTED /
+  CREATED.** `_notify_lead`'s admission-succeeded log is `lead_alert_admitted`,
+  not `lead_alert_sent` -- at that point only ADMITTED (durably queued onto
+  the lead's ingress) is known, `deliver_tmux` hasn't been called yet, let
+  alone confirmed. Deliberately no second, stronger-sounding event follows a
+  successful `deliver_tmux` call either: `deliver_tmux` -> `core.channels.
+  receive()` catches `DeadLetter` (window missing, unknown kind, opener
+  failure) *inside itself* and returns normally either way, so "no exception
+  raised" cannot honestly distinguish a real delivery from an internal
+  dead-letter -- there is no claim available beyond ADMITTED at this call
+  site. What actually happened during delivery is already recorded by
+  `channels.receive()` itself (`received`/`dead_lettered`/`opened`, under
+  `module="tmux"`) -- read those, not an inferred "it probably worked."
+  `DeliveryVerifier`'s `delivery_unverified` reason text already modeled this
+  discipline correctly before it had a name: "not confirmed... cannot
+  distinguish loss from a landed paste."
+
 - **`blocked` self-heals.** `DeliveryVerifier` used to only ever CLEAR
   `blocked` in response to a NEW delivery marker verifying -- an agent
   nobody messaged again after one unverified paste stayed `blocked` in
