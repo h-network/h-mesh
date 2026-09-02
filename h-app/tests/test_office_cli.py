@@ -1265,7 +1265,7 @@ def test_clone_to_all_uses_host_workdir_fallback(monkeypatch, tmp_path):
     ):
         office_main(["clone-to-all", "git@example.com:org/repo.git"])
 
-    expected = tmp_path / "h-mesh" / "workdir" / "backend" / "repo"
+    expected = tmp_path / "h-mesh" / "backend" / "repo"
     git_clone.assert_called_once_with(
         "git@example.com:org/repo.git", expected, "git@example.com:org/repo.git"
     )

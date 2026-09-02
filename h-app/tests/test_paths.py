@@ -35,10 +35,11 @@ class PathsTests(unittest.TestCase):
     def test_non_writable_workdir_falls_back_to_home(self):
         with tempfile.TemporaryDirectory() as fake_home:
             # Mock /workdir as not existing or not writable
-            with patch("os.path.isdir", side_effect=lambda p: False if p == "/workdir" else os.path.isdir(p)), \
+            _real_isdir = os.path.isdir
+            with patch("os.path.isdir", side_effect=lambda p: False if p == "/workdir" else _real_isdir(p)), \
                  patch.dict(os.environ, {"HOME": fake_home}, clear=True):
-                self.assertEqual(get_workdir_root(), os.path.join(fake_home, "h-mesh", "workdir"))
-                self.assertEqual(get_agent_workdir("dave"), os.path.join(fake_home, "h-mesh", "workdir", "dave"))
+                self.assertEqual(get_workdir_root(), os.path.join(fake_home, "h-mesh"))
+                self.assertEqual(get_agent_workdir("dave"), os.path.join(fake_home, "h-mesh", "dave"))
 
     def test_get_agent_workdir_explicit_cwd(self):
         self.assertEqual(get_agent_workdir("eve", cwd="/custom/dir"), "/custom/dir")

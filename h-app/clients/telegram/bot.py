@@ -2454,8 +2454,9 @@ class TelegramBot:
         Sends a real `Attachment` envelope (`docs/CONTRACTS.md`) — file
         bytes on the bus, `content_base64`, not a path shared out of band.
         The tmux opener owns writing it to
-        `/workdir/<recipient>/attachments/<stream_id>/` and everything about
-        that directory's lifecycle (confirmed with tmux directly); this
+        `<recipient's workdir>/attachments/<stream_id>/` (see
+        `lib.paths.get_agent_workdir`) and everything about that
+        directory's lifecycle (confirmed with tmux directly); this
         method never touches a filesystem at all.
         """
         cid = str(chat_id)

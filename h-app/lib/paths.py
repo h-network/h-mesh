@@ -11,8 +11,21 @@ def get_workdir_root() -> str:
     Resolution hierarchy:
     1. H_MESH_WORKDIR environment variable if explicitly set.
     2. $H_MESH_STATE_DIR/workdir if H_MESH_STATE_DIR is set.
-    3. /workdir if it exists and is writable (container environment).
-    4. ~/h-mesh/workdir (host/non-root fallback).
+    3. /workdir if it exists and is writable (container environment --
+       unaffected by the ~/h-mesh relocation below; a real container mount
+       is a different concept from a host install's fallback location).
+    4. ~/h-mesh (host/non-root fallback) -- VISIBLE, the operator's own
+       directory, on purpose: this is where an operator would look for an
+       agent's actual working files. Not to be confused with the h-mesh
+       SOURCE checkout itself, which installs to ~/.local/share/h-mesh
+       (see install.sh) precisely so the two don't collide -- code and
+       state (and now workdirs) are kept apart on purpose; an app
+       reinstall must not touch a live workdir, and vice versa.
+
+    ⚠ No migration or collision handling for a pre-existing ~/h-mesh
+    checkout from before this default moved -- operator's explicit call:
+    we are the only people running h-mesh, there are no third-party
+    installs to protect, and our own boxes get reinstalled, not migrated.
     """
     if "H_MESH_WORKDIR" in os.environ:
         return os.environ["H_MESH_WORKDIR"]
@@ -21,7 +34,7 @@ def get_workdir_root() -> str:
     if os.path.isdir("/workdir") and os.access("/workdir", os.W_OK):
         return "/workdir"
     home = os.environ.get("HOME", os.path.expanduser("~"))
-    return os.path.join(home, "h-mesh", "workdir")
+    return os.path.join(home, "h-mesh")
 
 
 def get_agent_workdir(agent_name: str, cwd: str | None = None) -> str:
