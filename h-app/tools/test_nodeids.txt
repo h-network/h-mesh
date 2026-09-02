@@ -342,6 +342,8 @@ h-app/tests/test_run_tests.py::test_runner_refuses_to_report_success_for_a_diffe
 h-app/tests/test_run_tests.py::test_runner_refuses_to_certify_full_collection_then_run_a_narrow_suite
 h-app/tests/test_run_tests.py::test_invoked_tree_identity_supports_a_linked_git_worktree
 h-app/tests/test_run_tests.py::test_manifest_difference_distinguishes_missing_from_added
+h-app/tests/test_run_tests.py::test_runner_cannot_certify_zero_execution_as_a_passing_suite
+h-app/tests/test_run_tests.py::test_setup_phase_skip_cannot_satisfy_execution_invariant
 h-app/tests/test_session.py::SessionTests::test_bad_token_is_closed_before_accept
 h-app/tests/test_session.py::SessionTests::test_bearer_auth_is_exact_and_constant_scheme_insensitive
 h-app/tests/test_session.py::SessionTests::test_keystrokes_are_hex_encoded_for_control_protocol

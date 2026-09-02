@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import os
 from pathlib import Path
 
 
@@ -66,9 +67,22 @@ def main() -> int:
         )
         return 1
 
+    pytest_env = os.environ.copy()
+    pytest_env.pop("PYTEST_ADDOPTS", None)
+    pytest_env.pop("PYTEST_PLUGINS", None)
+    pytest_env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     return subprocess.call(
-        [sys.executable, "-m", "pytest", "-p", "tools.manifest_plugin"],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-o",
+            "addopts=",
+            "-p",
+            "tools.manifest_plugin",
+        ],
         cwd=repo_root,
+        env=pytest_env,
     )
 
 

@@ -23,22 +23,35 @@ pytest directly for focused development runs, then use the argument-free command
 above for merge evidence.
 
 The reviewed node set is checked in at `h-app/tools/test_nodeids.txt`. A plugin
-inside the pytest process that actually executes the tests compares its
-collected items to that manifest before the first test runs. Collection and
-execution therefore cannot silently describe different selections.
+inside the pytest process compares its selected items to that manifest before
+the first test runs, then records actual runtest reports. It issues the suite
+certificate only at successful session completion, after every expected node
+has reached a terminal test outcome. Selection alone is not execution evidence.
+
+The runner removes external `PYTEST_ADDOPTS` and `PYTEST_PLUGINS`, disables
+ambient plugin autoloading, overrides repository `addopts`, and rejects parsed
+zero-runtest modes. This prevents a collect-only or setup-only invocation from
+being reported as a successful suite.
 
 Any test addition, removal, or rename makes the harness fail with separately
 labeled `added` and `missing` node IDs. `missing` means a previously reviewed
 test would not execute; `added` means a new or renamed test has not yet been
-reviewed into the harness. Do not blindly regenerate the manifest to clear the
-error: explain every missing and added entry first. Once the test change is
-intentional and reviewed, regenerate the manifest from the repository root and
-review its diff before running the harness again:
+accounted for in the manifest. Regenerating the file mechanically clears the
+mismatch whether or not anyone reviewed it. The team procedure is therefore to
+explain every missing and added entry in independent review, then regenerate the
+manifest from the repository root and review its diff before running the
+harness again:
 
 ```bash
 PYTHONPATH=h-app python -m pytest --collect-only -q \
   | sed -n '/^h-app\/.*::/p' > h-app/tools/test_nodeids.txt
 ```
+
+The harness makes node-set drift visible; it cannot prove that a branch author
+reviewed or honestly accounted for a regenerated manifest. In this repository,
+independent review of the manifest diff is a procedural trust boundary because
+there is no protected review or signing mechanism that the branch author cannot
+also change.
 
 The runner binds the suite to the h-mesh tree containing the directory from
 which it was invoked. On every run it prints that tree, the resolved runner

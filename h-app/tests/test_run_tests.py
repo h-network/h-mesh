@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,27 @@ from tools import manifest_plugin, run_tests
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 H_APP = REPO_ROOT / "h-app"
+
+
+def _make_isolated_harness_tree(tmp_path: Path, test_source: str) -> Path:
+    target = tmp_path / "isolated-tree"
+    tools = target / "h-app" / "tools"
+    tests = target / "h-app" / "tests"
+    tools.mkdir(parents=True)
+    tests.mkdir()
+    shutil.copy(H_APP / "tools" / "run_tests.py", tools / "run_tests.py")
+    shutil.copy(H_APP / "tools" / "manifest_plugin.py", tools / "manifest_plugin.py")
+    (tools / "test_nodeids.txt").write_text(
+        "h-app/tests/test_target.py::test_target_tree_marker\n"
+    )
+    (tests / "test_target.py").write_text(test_source)
+    (target / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\n"
+        "testpaths = ['h-app']\n"
+        "addopts = '--collect-only'\n"
+    )
+    subprocess.run(["git", "init", "-q", str(target)], check=True)
+    return target
 
 
 def test_runner_refuses_to_report_success_for_a_different_tree(tmp_path: Path) -> None:
@@ -129,3 +151,59 @@ def test_manifest_difference_distinguishes_missing_from_added(
 
     assert missing == ["tests/test_example.py::test_missing"]
     assert added == ["tests/test_example.py::test_added"]
+
+
+def test_runner_cannot_certify_zero_execution_as_a_passing_suite(tmp_path: Path) -> None:
+    target = _make_isolated_harness_tree(
+        tmp_path, "def test_target_tree_marker():\n    assert True\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(target / "h-app")
+    env["PYTEST_ADDOPTS"] = "--collect-only"
+    env["PYTEST_PLUGINS"] = "plugin_that_must_not_be_loaded"
+    result = subprocess.run(
+        [sys.executable, "-m", "tools.run_tests"],
+        cwd=target,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    output = result.stdout + result.stderr
+    false_success = (
+        result.returncode == 0
+        and "collection invariant satisfied" in output
+        and "passed" not in output
+    )
+    assert not false_success, (
+        "the suite certificate must not describe collection when zero tests executed"
+    )
+    assert result.returncode == 0
+    assert "1 passed" in output
+    assert "suite execution invariant satisfied: 1 terminal outcomes" in output
+
+
+def test_setup_phase_skip_cannot_satisfy_execution_invariant(tmp_path: Path) -> None:
+    target = _make_isolated_harness_tree(
+        tmp_path,
+        "import pytest\n"
+        "@pytest.mark.skip(reason='setup-only terminal state')\n"
+        "def test_target_tree_marker():\n"
+        "    raise AssertionError('call phase must not run')\n",
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(target / "h-app")
+    result = subprocess.run(
+        [sys.executable, "-m", "tools.run_tests"],
+        cwd=target,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, (
+        "a setup-phase skip must not be certified as an executed test call"
+    )
+    assert "not executed: h-app/tests/test_target.py::test_target_tree_marker" in output
+    assert "suite execution invariant satisfied" not in output
