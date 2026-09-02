@@ -52,6 +52,97 @@ def _fields(raw: dict) -> dict[str, str]:
     return {_text(key): _text(value) for key, value in raw.items()}
 
 
+# ⚠ MODULE LEVEL, not class attributes, and _error_category is a bare
+# function, not a Watchdog classmethod -- deliberately, even though it
+# reads like it belongs on the class. `_error` is a @staticmethod that
+# several tests borrow directly (`_error = staticmethod(Watchdog._error)`
+# on a double that is NOT a Watchdog) after monkeypatching the module-
+# level `Watchdog` name itself (`self._set(service, "Watchdog", Double)`).
+# A reference to `Watchdog._error_category` inside `_error`'s own body
+# would resolve through that same monkeypatched global at call time and
+# raise AttributeError on the double, not on the real class -- found by
+# running the existing suite, not by inspection. A bare module-level name
+# has no such dependency: it always means this file's own function,
+# regardless of what `service.Watchdog` currently points to.
+
+# Watchdog's OWN coding mistakes -- Python's vocabulary, and by identity
+# ours, never remote-caused. Deliberately excludes ValueError/RuntimeError
+# even though both are builtins: libraries raise them constantly for
+# malformed/remote-caused input (a JSON decode failure is a ValueError
+# subclass; a Redis protocol failure can surface as RuntimeError), so
+# treating either as "ours" would send an operator hunting a defect in
+# this module's own code for someone else's bad data -- worse than not
+# classifying it at all.
+_INTERNAL_ERROR_TYPES: tuple[type[BaseException], ...] = (
+    NameError, AttributeError, TypeError, KeyError, IndexError,
+    UnboundLocalError, ZeroDivisionError, AssertionError, ImportError,
+)
+
+# Known-safe categories for exceptions that are NOT ours -- a small,
+# closed, hardcoded set of literals this module owns, exactly like
+# Watchdog._admission_error_category. A separate table from that one (not
+# a shared function) because the two sinks see genuinely different
+# exception surfaces: this one covers all 14 _error() call sites --
+# Redis, subprocess/tmux, envelope building, JSON parsing -- not just one
+# Lua-eval admission path. Forcing one classifier to cover both would
+# mean either admission's categories leaking into unrelated jobs or this
+# table's broader categories diluting admission's precise ones.
+_EXTERNAL_ERROR_CATEGORIES: tuple[tuple[type[BaseException], str], ...] = (
+    (redis.exceptions.RedisError, "redis-error"),
+    (ConnectionError, "connection-error"),
+    (TimeoutError, "timeout"),
+    (OSError, "os-error"),  # covers subprocess.run failures (e.g. tmux binary missing)
+)
+
+
+def _error_category(exc: BaseException) -> str:
+    """A wrapper-owned CATEGORY for _error()'s durable `reason` -- never
+    str(exc), and never the exception's own class name unless its EXACT
+    type (not merely isinstance) is one of ours.
+
+    isinstance decides the BRANCH: a subclass of one of our own bug types
+    is still our bug, so it still routes to the internal-error case. Exact
+    type identity decides the NAME: a dynamically constructed subclass
+    (`type(sentinel, (NameError,), {})`) is an instance of NameError and
+    would pass isinstance, but its `__class__.__name__` can carry
+    attacker-chosen text -- so the name is only emitted when `type(exc)`
+    IS one of the hardcoded literals above, never merely `isinstance`.
+    Anything merely derived reports "internal-error (derived)" instead of
+    trusting that name. This loses one identifier in a rare case (a real
+    subclass of our own bug types) and closes the whole class of attack.
+
+    ⚠ "Exact type identity" means `is`, not `in`/`==`. A first version of
+    this used `type(exc) in _INTERNAL_ERROR_TYPES` -- `in` on a tuple
+    compares with `==`, and `type(exc) == some_builtin_type` invokes
+    `type(exc)`'s own METACLASS `__eq__` (the metaclass of a CLASS object
+    is what defines how that class compares, the same way an instance's
+    class defines how the instance compares). A custom exception whose
+    metaclass overrides `__eq__` to raise crashed this function entirely
+    -- reviewer's exact finding. `is` performs no method dispatch at all
+    (a pointer comparison at the interpreter level), so it cannot be
+    hijacked by any override on either side, hostile or not. `isinstance`
+    below is unaffected by this specific attack: it dispatches on the
+    METACLASS OF THE TYPES BEING CHECKED AGAINST (our own hardcoded
+    builtins, always plain `type`), not on `type(exc)`'s metaclass, so a
+    hostile metaclass on `exc`'s own class has no hook to reach through it.
+
+    Diagnostic value after this fix: `job` (already on every _error()
+    record) says WHERE; this category says roughly WHAT KIND. That pair
+    is deliberately all that's promised -- no free text, no exception
+    args, no traceback. This is a logging-only distinction: it does not
+    change retry/scheduling, every _error() call site's caller reruns on
+    its own next scheduled cycle regardless of category.
+    """
+    if any(type(exc) is internal_type for internal_type in _INTERNAL_ERROR_TYPES):
+        return f"internal-error ({type(exc).__name__})"
+    if isinstance(exc, _INTERNAL_ERROR_TYPES):
+        return "internal-error (derived)"
+    for exc_type, category in _EXTERNAL_ERROR_CATEGORIES:
+        if isinstance(exc, exc_type):
+            return category
+    return "external-error"
+
+
 class Watchdog:
     def __init__(
         self,
@@ -136,19 +227,42 @@ class Watchdog:
         mirror(raw)
 
     @staticmethod
-    def _error(job: str, exc: Exception) -> None:
-        raw = json.dumps(
-            {
-                "module": "watchdog",
-                "event": "error",
-                "writer": "watchdog",
-                "job": job,
-                "reason": f"{type(exc).__name__}: {exc}",
-            },
-            separators=(",", ":"),
-        )
-        print(raw, flush=True)
-        mirror(raw)
+    def _error(job: str, exc: BaseException) -> None:
+        # ⚠ This is the LAST layer: every one of _error()'s 14 call sites is
+        # itself inside a try/except reporting a failure THROUGH this
+        # function, including main()'s own outermost per-phase catches --
+        # nothing downstream catches a failure of the failure-reporter
+        # itself. A rule adopted the same day this function was touched:
+        # the last layer in a chain must be allowed to fail silently, or it
+        # becomes the new hole. `except Exception`, deliberately not a
+        # truly bare `except:` -- SystemExit/KeyboardInterrupt/
+        # GeneratorExit are BaseException, not Exception, and must still
+        # propagate rather than be swallowed by a failure-reporting sink.
+        #
+        # _error_category is total by construction (type()-identity via
+        # `is` and isinstance, never equality/hashing on the exception's
+        # own class -- see its own docstring for the metaclass-`__eq__`
+        # crash reviewer found in an earlier version that used `in`,
+        # proven fixed in test_error_category_never_raises_on_hostile_input,
+        # not just claimed), so THIS guard is defense against something
+        # outside _error_category's own control -- a full disk, a closed
+        # stdout, a future change to this function that adds a real
+        # failure mode.
+        try:
+            raw = json.dumps(
+                {
+                    "module": "watchdog",
+                    "event": "error",
+                    "writer": "watchdog",
+                    "job": job,
+                    "reason": _error_category(exc),
+                },
+                separators=(",", ":"),
+            )
+            print(raw, flush=True)
+            mirror(raw)
+        except Exception:
+            pass
 
     def _ticket(self, agent: str) -> dict | None:
         raw = self.r.lindex(prefix(self.pod, self.tenant, agent, "tasks.doing"), 0)

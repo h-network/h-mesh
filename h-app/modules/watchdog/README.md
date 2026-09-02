@@ -163,6 +163,68 @@ deliberately rather than by accident (2026-09-02):
   instead of silently returning; a systemic problem here (e.g. something
   elsewhere writing the wrong type to one of these keys) used to be able to
   stop all usage tracking for an agent forever with no trace of why.
+- **`_error()` classifies instead of quoting.** Every one of its 14 call
+  sites (poll()'s ten per-check catches, run_observers's per-job catch, and
+  main()'s three outer per-phase catches) used to log
+  `f"{type(exc).__name__}: {exc}"` -- BOTH the exception's own message and
+  its class name, durably. Both halves are remote-influenced by
+  construction: a Redis/subprocess/proxy error's message can embed
+  arbitrary backend text, and a dynamically constructed exception type
+  (`type(sentinel, (NameError,), {})`) can put attacker-chosen text in its
+  own `__class__.__name__` too -- so neither half was safe to trust as-is.
+  `_error_category` (module level, not a `Watchdog` method -- see its own
+  comment for why) replaces both with one of a small, closed set of
+  literals this module owns:
+  - `internal-error (ExactTypeName)` -- only when the exception's EXACT
+    type (not merely `isinstance`) is one of `_INTERNAL_ERROR_TYPES`, a
+    closed tuple of builtins that are near-certainly OUR coding mistakes
+    and essentially never remote-caused (`NameError`, `AttributeError`,
+    `TypeError`, `KeyError`, `IndexError`, `UnboundLocalError`,
+    `ZeroDivisionError`, `AssertionError`, `ImportError`). Deliberately
+    excludes `ValueError`/`RuntimeError` even though both are builtins:
+    libraries raise them constantly for malformed/remote-caused input (a
+    JSON decode failure is a `ValueError` subclass), so treating either as
+    "ours" would send an operator hunting a defect in this module's code
+    for someone else's bad data.
+  - `internal-error (derived)` -- `isinstance` matched one of the above but
+    the exact type didn't. `isinstance` decides the BRANCH (a subclass of
+    our own bug type is still our bug); exact identity decides the NAME
+    (a subclass's own `__class__.__name__` cannot be trusted the way a
+    literal type from this module's own tuple can).
+  - `redis-error` / `connection-error` / `timeout` / `os-error` -- known-
+    safe categories for common infra failures, a separate closed table
+    from `_admission_error_category`'s (that one is specific to one
+    Lua-eval admission path; this one covers a much broader surface --
+    Redis, subprocess/tmux, envelope building, JSON parsing -- so sharing
+    one table would either leak admission's narrow categories into
+    unrelated jobs or dilute its precise ones).
+  - `external-error` -- the fallback for anything not explicitly
+    recognized, including `ValueError`/`RuntimeError` on purpose.
+
+  Diagnostic value after this fix, stated explicitly rather than left
+  implied: `job` (unchanged, already on every record) says WHERE; the
+  category says roughly WHAT KIND. That pair is deliberately all that's
+  promised -- no free text, no exception args, no traceback. This is a
+  logging-only distinction: it does not change retry or scheduling --
+  every `_error()` call site's caller reruns on its own next scheduled
+  cycle regardless of category, the same as before this fix.
+
+  `_error()` itself is now wrapped in `try/except Exception: pass` around
+  its whole body -- deliberately `except Exception`, not a truly bare
+  `except:`, so `SystemExit`/`KeyboardInterrupt`/`GeneratorExit` (which
+  are `BaseException`, not `Exception`) still propagate rather than being
+  swallowed by a failure-reporting sink. It is the LAST layer in this
+  chain (all 14 call sites,
+  including `main()`'s own outermost per-phase catches, report a failure
+  *through* it, and nothing downstream catches a failure of the failure-
+  reporter itself), and a rule adopted the same day this function was
+  touched: the last layer in a chain must be allowed to fail silently, or
+  it becomes the new hole. `_error_category` is proven total by its own
+  test (`test_error_category_never_raises_on_hostile_input` -- a hostile
+  `__eq__`/`__hash__`, `None`, a plain non-exception object), not just
+  argued to be one; the guard around `_error`'s body is defense against
+  something outside that function's control instead (a full disk, closed
+  stdout), proven the same way by forcing `json.dumps` itself to fail.
 
 ## Imports from core
 
