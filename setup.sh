@@ -875,15 +875,34 @@ print("1" if pt == "tmux" else "0")
             EP_FOR_A=""
             for pair in ${PROVIDER_MAP_EXISTING//,/ }; do [ "${pair%%=*}" = "$a" ] && EP_FOR_A="${pair#*=}"; done
 
-            HIRE_ARGS=("$a" --cli "$CLI_FOR_A")
+            # ⚠ --wait, not a bare exit-code check -- hire's own exit 0 without
+            # it only proves the StartAgent envelope was durably enqueued
+            # (ADMITTED), not that the agent actually registered (CREATED).
+            # Printing "hired" off that alone told an operator their office
+            # came up when it knew only that a request was accepted -- a real
+            # incident, in this exact summary. --wait distinguishes three
+            # outcomes, not two: confirmed (0), failed (1, a real rejection),
+            # and unknown (2, no confirmation within the wait window -- NOT a
+            # failure, a stranded request can still complete once switch
+            # recovery re-kicks it; see modules/office/cli.py's own --wait
+            # help text).
+            HIRE_ARGS=("$a" --cli "$CLI_FOR_A" --wait)
             [ "$PROF_FOR_A" != "default" ] && HIRE_ARGS+=(--profile "$PROF_FOR_A")
             [ -n "$EP_FOR_A" ] && HIRE_ARGS+=(--provider "$EP_FOR_A")
-            if AGENT_NAME=host POD="$POD" TENANT="$TENANT" REDIS_URL="$REDIS_URL" \
-                "$PYTHON" -m modules.office.cli hire "${HIRE_ARGS[@]}" >/dev/null; then
-                echo "  • $a: hired ($CLI_FOR_A${PROF_FOR_A:+, account=$PROF_FOR_A}${EP_FOR_A:+, provider=$EP_FOR_A})"
-            else
-                echo "  • $a: hire failed -- check switch.log/tmux_reconciler.log" >&2
-            fi
+            HIRE_OUTPUT="$(AGENT_NAME=host POD="$POD" TENANT="$TENANT" REDIS_URL="$REDIS_URL" \
+                "$PYTHON" -m modules.office.cli hire "${HIRE_ARGS[@]}" 2>&1)"
+            HIRE_STATUS=$?
+            case "$HIRE_STATUS" in
+                0)
+                    echo "  • $a: hired ($CLI_FOR_A${PROF_FOR_A:+, account=$PROF_FOR_A}${EP_FOR_A:+, provider=$EP_FOR_A})"
+                    ;;
+                2)
+                    echo "  • $a: not yet confirmed -- may still complete; check 'office status' shortly ($HIRE_OUTPUT)" >&2
+                    ;;
+                *)
+                    echo "  • $a: hire failed -- $HIRE_OUTPUT" >&2
+                    ;;
+            esac
         done
         echo
     else

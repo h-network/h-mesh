@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ from pathlib import Path
 import redis
 
 from core.channels import send
+from core.envelope import EnvelopeError, parse
 from core.keys import prefix
 from core.logging import log_record, record_task_event
 from core.registry import is_member, members, port_type
@@ -484,6 +486,26 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
             help="claude's --tools list, space-separated (default: Bash Read Write Edit "
                  "Glob Grep); '' means unrestricted. claude only, ignored by codex/agy",
         )
+        # ⚠ Opt-in, not the default -- a StartAgent envelope is fire-and-forget
+        # by design (see core.channels.send's own docstring), and a caller that
+        # wants that stays fire-and-forget. This exists because printing the
+        # word "hired" off nothing but this command's exit code is ADMITTED
+        # (the envelope was durably enqueued) reported as CREATED (the agent
+        # actually exists) -- exactly the shape of a real incident where an
+        # operator was told an agent existed when it did not. A caller that
+        # wants to print CREATED-level language must earn it, not assume it.
+        parser.add_argument(
+            "--wait", nargs="?", const=30.0, type=float, default=None, metavar="SECONDS",
+            help="wait up to SECONDS (default 30) for confirmation the agent actually "
+                 "registered, instead of returning as soon as the request is merely "
+                 "accepted. Three distinct outcomes, not two: exit 0 = confirmed "
+                 "(registered); exit 1 = failed (a real rejection, seen in the "
+                 "destination's dead-letter list); exit 2 = unknown -- no confirmation "
+                 "within SECONDS, which is NOT the same as failure. A stranded request "
+                 "can still complete later once switch recovery re-kicks it (see "
+                 "switch-agent's drain/recovery fix) -- timing out here means 'don't "
+                 "know yet', never 'didn't happen'.",
+        )
     args = parser.parse_args(argv)
     r, pod, tenant, source = _context()
     # ⚠ No client-side --profile validation here. `available_profiles()` (an
@@ -522,7 +544,70 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
         kind=kinds[command],
         module="office",
     )
+    if command == "hire" and args.wait is not None:
+        outcome, detail = _await_hire_confirmation(
+            r, pod=pod, tenant=tenant, agent=args.agent, stream_id=stream_id, timeout=args.wait,
+        )
+        if outcome == "confirmed":
+            print(f"confirmed: {args.agent} registered")
+            return
+        if outcome == "failed":
+            print(f"failed: {args.agent} was not registered -- {detail}", file=sys.stderr)
+            raise SystemExit(1)
+        print(
+            f"unknown: no confirmation for {args.agent} within {args.wait:.0f}s -- "
+            "this is NOT a failure, it may still complete; check 'office status' or "
+            "the registry directly before assuming it didn't happen",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     print(stream_id)
+
+
+_HIRE_CONFIRMATION_POLL_INTERVAL_S = 0.5
+
+
+def _await_hire_confirmation(
+    r, *, pod: str, tenant: str, agent: str, stream_id: str, timeout: float,
+) -> tuple[str, str | None]:
+    """Poll for the two states this CLI can actually observe -- CREATED
+    (registry membership) or FAILED (dead-lettered by the recipient) -- and
+    return "unknown" if neither happens before timeout. Never "failed" on a
+    bare timeout: see the --wait help text and switch-agent's drain/recovery
+    fix for why a stranded request can still complete after this returns.
+
+    ⚠ Registry port_type=="tmux" is CREATED *identity* only -- it does not
+    prove the tmux window/pane is actually ready to receive input. Window
+    readiness is a separate, later state and must be checked separately by
+    a caller that needs it (per switch-agent).
+
+    ⚠ Read-only against the dead-letter list (LRANGE, never pop) -- popping
+    it here would consume evidence a human or another tool still needs to
+    see, for a check this command has no ownership over.
+
+    ⚠ Only the destination ("host") ever dead-letters a StartAgent it
+    itself rejected -- the tmux-source-only feedback path
+    (_notify_dead_letter_sender in core.channels) never reaches a caller
+    like this one (source is usually "host" itself, not a tmux agent), so
+    this reads the recipient's dead list directly instead of waiting for a
+    reply message that would never arrive.
+    """
+    dead_key = prefix(pod, tenant, agent="host", resource="dead")
+    deadline = time.monotonic() + timeout
+    while True:
+        if port_type(r, pod=pod, tenant=tenant, agent=agent) == "tmux":
+            return "confirmed", None
+        for raw in r.lrange(dead_key, 0, -1):
+            try:
+                envelope = parse(raw)
+            except EnvelopeError:
+                continue
+            if envelope.get("stream_id") == stream_id:
+                return "failed", "rejected by host -- see host's activity log for the reason"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "unknown", None
+        time.sleep(min(_HIRE_CONFIRMATION_POLL_INTERVAL_S, remaining))
 
 
 # ---------------------------------------------------------------------------

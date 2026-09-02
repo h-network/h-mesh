@@ -240,6 +240,84 @@ def test_hire_can_transfer_leadership(mock_send, monkeypatch):
     assert mock_send.call_args.kwargs["payload"]["lead"] is True
 
 
+# ---------------------------------------------------------------------------
+# hire --wait: distinguish confirmed (CREATED)/failed/unknown, not just that
+# the request was accepted. Real incident: setup.sh's own roster-hire loop
+# printed "hired" off nothing but this command's exit code, which only ever
+# proved the StartAgent envelope was durably enqueued (ADMITTED) -- never
+# that the agent actually registered (CREATED). Same shape as a 202 telling
+# an operator an agent existed when it did not, in the highest-traffic path.
+# ---------------------------------------------------------------------------
+
+
+def _dead_letter_envelope() -> tuple[bytes, str]:
+    """A realistic raw dead-letter entry, built the same way core.channels
+    itself would encode one -- not a hand-rolled string that happens to
+    parse. Source and destination match a real hire's own shape: sent by
+    "host" (setup.sh's AGENT_NAME), addressed to "host" (every StartAgent's
+    real destination)."""
+    from core.envelope import build, encode
+
+    envelope = build(
+        "StartAgent", "host", "host", {"agent": "worker-1", "cli": "claude"}, pod=POD, tenant=TENANT,
+    )
+    return encode(envelope).encode(), envelope["stream_id"]
+
+
+@patch("modules.office.cli.send")
+def test_hire_wait_confirms_once_the_registry_shows_the_agent_as_tmux(mock_send, monkeypatch, capsys):
+    _env(monkeypatch)
+    mock_send.return_value = "stream-1"
+    r = FakeRedis()
+    _member(r, "worker-1", "tmux")  # already registered -- simulates a fast, real confirmation
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["hire", "worker-1", "--cli", "claude", "--wait", "1"])
+    assert "confirmed: worker-1 registered" in capsys.readouterr().out
+
+
+@patch("modules.office.cli.send")
+def test_hire_wait_fails_on_a_matching_dead_letter_not_on_a_bare_timeout(mock_send, monkeypatch, capsys):
+    raw, real_stream_id = _dead_letter_envelope()
+    mock_send.return_value = real_stream_id  # what send() would really return for this envelope
+    r = FakeRedis()
+    dead_key = prefix(POD, TENANT, agent="host", resource="dead")
+    r.lists[dead_key].append(raw)
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit) as exc_info:
+            office_main(["hire", "worker-1", "--cli", "claude", "--wait", "1"])
+    assert exc_info.value.code == 1, "a real rejection must be a distinct exit code from a timeout"
+    err = capsys.readouterr().err
+    assert "failed: worker-1 was not registered" in err
+    # Read-only: the evidence must still be there for a human or another
+    # tool to see afterward, not consumed by this check.
+    assert r.lists[dead_key] == [raw]
+
+
+@patch("modules.office.cli.send")
+def test_hire_wait_times_out_as_unknown_not_failed_when_neither_happens(mock_send, monkeypatch, capsys):
+    mock_send.return_value = "stream-1"
+    r = FakeRedis()  # no registry entry, no dead letter -- genuinely unresolved
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit) as exc_info:
+            office_main(["hire", "worker-1", "--cli", "claude", "--wait", "0.2"])
+    assert exc_info.value.code == 2, "a timeout must be its own exit code, distinct from a real failure (1)"
+    err = capsys.readouterr().err
+    assert "unknown: no confirmation" in err
+    assert "NOT a failure" in err
+
+
+@patch("modules.office.cli.send")
+def test_hire_without_wait_stays_fire_and_forget(mock_send, monkeypatch, capsys):
+    # The default, unflagged path must be unchanged -- callers that want
+    # fire-and-forget still get it.
+    _env(monkeypatch)
+    mock_send.return_value = "stream-1"
+    r = FakeRedis()
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["hire", "worker-1", "--cli", "claude"])
+    assert capsys.readouterr().out.strip() == "stream-1"
+
+
 def test_peers_warns_when_configured_lead_is_not_enrolled(monkeypatch, capsys):
     _env(monkeypatch)
     r = FakeRedis(registry={"architect": "tmux", "worker": "tmux"})
