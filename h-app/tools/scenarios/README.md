@@ -219,7 +219,7 @@ TENANT=my-throwaway-tenant ./lead-replacement.sh
 Same real-hire requirements as `tmux-concurrent-hire.sh` (a provider-backed
 `claude`).
 
-**This scenario is retired.** Dynamic leadership transfer and the `--lead`
+**This scenario is retired.** Dynamic leadership transfer is no longer supported;
 hire flag were removed; the first tmux hire now claims an empty lead and later
 hires preserve it. Use the lifecycle tests for that behavior. The first run
 (2026-09-01) found two real bugs: the `lead`
