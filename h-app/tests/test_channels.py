@@ -265,10 +265,34 @@ class ChannelTests(unittest.TestCase):
             ("bob", "tmux", stream_id),
             ("carol", "api", stream_id),
         ])
-        deferred = [call for call in log.call_args_list if call.args == ("kick_deferred",)]
-        self.assertEqual(deferred, [])
+        skipped = [call for call in log.call_args_list if call.args == ("kick_skipped",)]
+        self.assertEqual(skipped, [])
         self.assertEqual(self.redis.hget_calls[hgets_before_step:], [])
+        self.assertEqual(self.redis.hgetall_calls, [self.registry])
         self.assertEqual(self.redis.hexists_calls, [])
+
+    def test_broadcast_kicks_resolved_members_and_records_unresolved_member(self):
+        self.register(alice="tmux", bob="tmux", unresolved="")
+        stream_id = send(
+            self.redis, pod=POD, tenant=TENANT, source="alice",
+            destination="all", payload={"text": "broadcast"},
+        )
+        kicks = []
+        switch = Switch(
+            self.redis, pod=POD, tenant=TENANT,
+            kick=lambda agent, port_type, envelope: kicks.append(
+                (agent, port_type, envelope["stream_id"])
+            ),
+        )
+
+        with patch("core.service._emit_observation"), patch("core.service._log_observation") as log:
+            self.assertTrue(switch.step(timeout=0))
+
+        self.assertEqual(kicks, [("bob", "tmux", stream_id)])
+        skipped = [call for call in log.call_args_list if call.args == ("kick_skipped",)]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0].kwargs["destination"], "unresolved")
+        self.assertIn("no delivery attempt started", skipped[0].kwargs["reason"])
 
     def test_unicast_missing_hget_value_dead_letters_without_kick(self):
         self.register(alice="tmux")

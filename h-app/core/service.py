@@ -15,7 +15,7 @@ from .envelope import EnvelopeError, advance_hop, header_record_fields, parse_fo
 from .keys import prefix
 from .logging import configure_logging, emit, log_record, publish
 from .queues import admit_ingress
-from .registry import members, port_type
+from .registry import member_types, members, port_type
 from .retention import RetentionTrimmer
 from .windowlog import WindowLogTailer
 
@@ -187,17 +187,17 @@ class Switch:
     def _kick(self, agent: str, port_type_name: str | None, envelope: dict) -> None:
         if port_type_name is None:
             _log_observation(
-                "kick_deferred",
+                "kick_skipped",
                 stream_id=envelope.get("stream_id"),
                 correlation_id=envelope.get("correlation_id"),
                 source=envelope.get("l2", {}).get("source"),
                 destination=agent,
-                reason="broadcast port_type is unresolved; delivery kick deferred",
+                reason="port_type is unresolved; no delivery attempt started",
             )
             return
         if self.kick is None:
             _log_observation(
-                "kick_deferred",
+                "kick_skipped",
                 stream_id=envelope.get("stream_id"),
                 correlation_id=envelope.get("correlation_id"),
                 source=envelope.get("l2", {}).get("source"),
@@ -280,7 +280,9 @@ class Switch:
             return True
         destination = envelope["l2"]["destination"]
         if destination == "all":
-            recipients = sorted(self._agents() - {sender})
+            recipient_types = member_types(self.r, pod=self.pod, tenant=self.tenant)
+            recipient_types.pop(sender, None)
+            recipients = sorted(recipient_types)
             if not recipients:
                 _emit_observation("forwarded", envelope, count=0)
                 return True
@@ -297,9 +299,7 @@ class Switch:
                 return True
             _emit_observation("forwarded", envelope, count=len(recipients))
             for agent in recipients:
-                # Broadcast enumeration remains membership-only until its own
-                # HGETALL-vs-per-recipient-HGET design is decided.
-                self._kick(agent, None, envelope)
+                self._kick(agent, recipient_types[agent] or None, envelope)
             return True
         destination_type = port_type(
             self.r, pod=self.pod, tenant=self.tenant, agent=destination
