@@ -91,3 +91,15 @@ is a courtesy, not the trust boundary -- the recipient's door
 against real delivery provenance and silently drops it if it doesn't hold,
 same as if `--reply-to` had never been passed. See `lib/reply_correlation.py`
 and `modules/api/README.md` for the full mechanism.
+
+Operational compatibility warning: the h-flock `office` CLI deployed in the
+office where this module was developed silently loses messages submitted with
+`office send --stdin`. It still reports success and prints the submitted byte
+count, but the recipient never receives the message; four review verdicts were
+lost before the discrepancy was detected. Do not treat that byte count as
+recipient-side delivery evidence. On that deployment, use `--file /dev/stdin`
+or a real file instead. The defect did not reproduce through h-mesh: a real
+PTY/Redis check followed one stdin envelope by identity through recipient
+opening, and the committed regression asserts the recipient opens the exact
+reported identity and body. This does not make a general promise about another
+CLI implementation or deployment.
