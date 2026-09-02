@@ -133,6 +133,14 @@ CLAIM_DIR = MANIFEST_DIR
 _OWNED_ROOT = Path("/tmp")
 _OWNED_PREFIX = "h_mesh_test_"
 
+# A STUCK claim whose target cannot be proven to be an owned test directory is
+# deliberate fail-closed retention, not a reaper bug: its evidence is kept
+# because the target's identity is unknown. Operators may clear one manually
+# only after inspecting the claim JSON, verifying that the target is invalid or
+# unowned, then removing the claim file and any corresponding malformed public
+# entry. Automatic deletion is refused because it would destroy the evidence
+# this module is designed to preserve and silently reopen arbitrary-tree risk.
+
 
 def _plausible_tmpdir_path(entry: Path, tmpdir_str: str) -> Path | None:
     """Return the normalized path when the manifest's naming facts hold.
