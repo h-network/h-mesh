@@ -1429,6 +1429,32 @@ def test_a_telegram_auth_record_is_durable_before_the_caller_is_told(tmp_path, m
         web_server.server_close()
 
 
+def test_a_json_response_cannot_be_given_conflicting_or_split_headers():
+    """⚠ HARM for the abstraction itself, added with it. The first version of
+    the header support took `headers=[(name, value)]` and appended them after
+    this method's own Content-Type, Content-Length and Cache-Control, so a
+    caller could send a second, conflicting Content-Length —
+    BaseHTTPRequestHandler does not resolve that, and the framing of the
+    response becomes whatever the recipient decides. Reviewer caught it: an
+    abstraction added to prevent one hand-rolled response should not hand the
+    next handler a response-splitting footgun.
+
+    The fix is that the conflict is UNREPRESENTABLE — there is no general
+    headers argument to pass one through, only `set_cookie`. This test states
+    both halves: the general parameter is gone, and the narrow one refuses a
+    value carrying CR or LF."""
+    signature = inspect.signature(OfficeHandler._json)
+    assert "headers" not in signature.parameters, (
+        "a general headers argument is back, and with it a caller's ability to "
+        "send a second Content-Length"
+    )
+    assert "set_cookie" in signature.parameters
+
+    handler = OfficeHandler.__new__(OfficeHandler)
+    with pytest.raises(ValueError):
+        handler._json(200, {"ok": True}, set_cookie="s=1\r\nX-Injected: yes")
+
+
 _RESPONSE_WRITES = {"send_response", "end_headers", "send_error", "_json"}
 # the events whose call sites this guard must find. Keyed on EVENT NAMES from
 # the discovered calls, not on file text: if `_audit_log` is renamed and the
@@ -1438,19 +1464,41 @@ _EXPECTED_AUDIT_EVENTS = {"login_success", "login_failure", "telegram_auth_succe
                           "telegram_auth_failure", "logout", "operator_action"}
 
 
-def _audit_calls_after_a_response(tree):
-    """Audit calls that follow a response write ON THE SAME PATH.
+def _terminates(statements) -> bool:
+    """Does this block always leave, so nothing after it on this path runs?"""
+    if not statements:
+        return False
+    last = statements[-1]
+    if isinstance(last, (ast.Return, ast.Raise, ast.Continue, ast.Break)):
+        return True
+    if isinstance(last, ast.If):
+        return _terminates(last.body) and _terminates(last.orelse)
+    return False
 
-    ⚠ Per path, not per function, and the difference is not cosmetic: a
-    line-order scan comparing every audit call against the first response
-    write anywhere in the function flags four sites here, two of them on
-    branches that never ran a response — `login_failure` audits and THEN
-    responds, and reading it as a violation would have had me 'fix' correct
-    code. Sibling statements carry the flag; branches get a copy of it."""
+
+def _audit_calls_after_a_response(tree):
+    """Audit calls that follow a response write on a path that reaches them.
+
+    ⚠ TWO GRANULARITY ERRORS ARE ENCODED HERE, both caught by someone else.
+    First: comparing each audit call against the first response write anywhere
+    in the function flagged four sites, two of them on branches that had
+    written nothing — `login_failure` audits and THEN responds, and reading
+    that as a violation would have meant "fixing" correct code. Second, and
+    reviewer's: walking compound statements with a COPY of the responded flag
+    and discarding the result, so `_json` in a try body followed by
+    `_audit_log` in the finally — or after the try, or after a `with`, or
+    after a loop — came back clean while the harm was fully present.
+
+    So each block returns the state it leaves behind, and that state flows to
+    the following siblings unless the block always leaves via return, raise,
+    continue or break. Where the answer is uncertain the code assumes a
+    response HAPPENED: an over-report here is a reviewer looking at a handler,
+    while an under-report is the bug shipping green."""
     found, events = [], set()
 
     def direct_calls(stmt):
-        nested = (ast.If, ast.For, ast.While, ast.Try, ast.With, ast.FunctionDef)
+        nested = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try,
+                  ast.With, ast.AsyncWith, ast.FunctionDef, ast.AsyncFunctionDef)
         out = []
 
         def rec(node, top=False):
@@ -1465,6 +1513,8 @@ def _audit_calls_after_a_response(tree):
                 rec(child)
 
         if isinstance(stmt, nested):
+            # only the header — test, iterable, context manager — because the
+            # body is walked separately and must carry its own state
             for field in ("test", "iter", "items", "value"):
                 value = getattr(stmt, field, None)
                 for node in (value if isinstance(value, list) else [value]) if value else []:
@@ -1473,32 +1523,148 @@ def _audit_calls_after_a_response(tree):
             rec(stmt, top=True)
         return out
 
-    def blocks(stmt):
-        for field in ("body", "orelse", "finalbody"):
-            block = getattr(stmt, field, None)
-            if block:
-                yield block
-        for handler in getattr(stmt, "handlers", []) or []:
-            yield handler.body
+    def note_audits(stmt, responded):
+        for call, name in direct_calls(stmt):
+            if name != "_audit_log":
+                continue
+            event = (call.args[0].value if call.args and isinstance(call.args[0], ast.Constant)
+                     else "<not a literal>")
+            events.add(event)
+            if responded:
+                found.append((call.lineno, event))
 
     def walk(statements, responded):
+        """Returns the responded state this block leaves to what follows it."""
         for stmt in statements:
-            for call, name in direct_calls(stmt):
-                if name != "_audit_log":
-                    continue
-                event = (call.args[0].value if call.args and isinstance(call.args[0], ast.Constant)
-                         else "<not a literal>")
-                events.add(event)
-                if responded:
-                    found.append((call.lineno, event))
-            for block in blocks(stmt):
-                walk(block, responded)
-            if any(name in _RESPONSE_WRITES for _, name in direct_calls(stmt)):
+            note_audits(stmt, responded)
+            if isinstance(stmt, (ast.If, ast.Try, ast.With, ast.AsyncWith,
+                                 ast.For, ast.AsyncFor, ast.While)):
+                responded = walk_compound(stmt, responded)
+            elif any(name in _RESPONSE_WRITES for _, name in direct_calls(stmt)):
                 responded = True
+            if _terminates([stmt]):
+                return responded
+        return responded
 
-    for func in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+    def walk_compound(stmt, responded):
+        if isinstance(stmt, ast.If):
+            outcomes = []
+            for block in (stmt.body, stmt.orelse):
+                if not block:
+                    outcomes.append(responded)      # the branch not taken
+                elif _terminates(block):
+                    walk(block, responded)          # walked for its audits only
+                else:
+                    outcomes.append(walk(block, responded))
+            return any(outcomes) if outcomes else responded
+        if isinstance(stmt, (ast.With, ast.AsyncWith)):
+            return walk(stmt.body, responded)
+        if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
+            # the body may run or not; either way a response inside it counts
+            after_body = walk(stmt.body, responded)
+            after_else = walk(stmt.orelse, after_body) if stmt.orelse else after_body
+            return after_else
+        # Try: the body may have written a response before raising, so the
+        # handlers, else and finally all inherit that possibility
+        after_body = walk(stmt.body, responded)
+        after_else = walk(stmt.orelse, after_body) if stmt.orelse else after_body
+        state = after_else
+        for handler in stmt.handlers:
+            handler_state = walk(handler.body, after_body)
+            if not _terminates(handler.body):
+                state = state or handler_state
+        if stmt.finalbody:
+            state = walk(stmt.finalbody, state)
+        return state
+
+    for func in [n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
         walk(func.body, False)
     return found, events
+
+
+# ⚠ REVIEWER'S FALSE-CLEAN SHAPES, kept as the guard's own falsification. Each
+# returned (late=[], events={'x'}) against the previous walker while the harm —
+# a success response written before its audit record — was fully present.
+_MUST_BE_FLAGGED = {
+    "audit in a finally after a response in the try body": """
+def handler(self):
+    try:
+        self._json(200, {"ok": True})
+    finally:
+        self._audit_log("x", {})
+""",
+    "audit after a with whose body responded": """
+def handler(self):
+    with self.lock:
+        self._json(200, {"ok": True})
+    self._audit_log("x", {})
+""",
+    "audit after a try whose body responded": """
+def handler(self):
+    try:
+        self._json(200, {"ok": True})
+    except Exception:
+        pass
+    self._audit_log("x", {})
+""",
+    "audit after a loop whose body responded": """
+def handler(self):
+    for item in items:
+        self._json(200, {"ok": True})
+    self._audit_log("x", {})
+""",
+    "audit after an if branch that responded and fell through": """
+def handler(self):
+    if ready:
+        self._json(200, {"ok": True})
+    self._audit_log("x", {})
+""",
+}
+
+# and the shapes that must NOT be flagged, or the guard would push handlers
+# into rearranging correct code
+_MUST_NOT_BE_FLAGGED = {
+    "audit before the response": """
+def handler(self):
+    self._audit_log("x", {})
+    self._json(200, {"ok": True})
+""",
+    "an earlier branch that responded and returned": """
+def handler(self):
+    if too_many:
+        self._json(429, {"detail": "slow down"})
+        return
+    self._audit_log("x", {})
+    self._json(200, {"ok": True})
+""",
+    "audit inside a with, before the response": """
+def handler(self):
+    with self.lock:
+        self._audit_log("x", {})
+    self._json(200, {"ok": True})
+""",
+}
+
+
+def test_the_ordering_guard_detects_a_response_before_an_audit():
+    """⚠ THE GUARD'S OWN FALSIFICATION, and it is the whole reason to trust the
+    guard on code nobody has written yet. Checking only today's call sites is
+    evidence about today's call sites; these shapes are the ones a future
+    handler will actually produce, and three of them were reported clean by
+    the previous version of this walk."""
+    for description, source in _MUST_BE_FLAGGED.items():
+        late, events = _audit_calls_after_a_response(ast.parse(source))
+        assert events, f"the walk found no audit call at all in: {description}"
+        assert late, f"the walk reports this as clean: {description}"
+
+    for description, source in _MUST_NOT_BE_FLAGGED.items():
+        late, events = _audit_calls_after_a_response(ast.parse(source))
+        assert events, f"the walk found no audit call at all in: {description}"
+        assert late == [], (
+            f"the walk flags correct code, which would push a handler into "
+            f"rearranging it: {description} -> {late}"
+        )
 
 
 def test_no_audit_record_is_written_after_its_response():

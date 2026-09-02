@@ -66,6 +66,8 @@ h-app/clients/web/tests/test_web_server.py::test_conversation_audit_prompts_and_
 h-app/clients/web/tests/test_web_server.py::test_proxy_422_policy_refusal
 h-app/clients/web/tests/test_web_server.py::test_a_login_record_is_readable_by_the_caller_that_just_logged_in
 h-app/clients/web/tests/test_web_server.py::test_a_telegram_auth_record_is_durable_before_the_caller_is_told
+h-app/clients/web/tests/test_web_server.py::test_a_json_response_cannot_be_given_conflicting_or_split_headers
+h-app/clients/web/tests/test_web_server.py::test_the_ordering_guard_detects_a_response_before_an_audit
 h-app/clients/web/tests/test_web_server.py::test_no_audit_record_is_written_after_its_response
 h-app/tests/test_agentlifecycle.py::test_lead_publish_wrongtype_is_no_write
 h-app/tests/test_agentlifecycle.py::test_lead_removal_wrongtype_is_no_write

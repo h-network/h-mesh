@@ -796,8 +796,7 @@ class OfficeHandler(SimpleHTTPRequestHandler):
             # serves that next request, so nothing made it wait.
             session_id_str = token[:12] + "..."
             self._audit_log("login_success", {}, session_id=session_id_str)
-            self._json(200, {"authenticated": True},
-                       headers=[("Set-Cookie", cookie_header)])
+            self._json(200, {"authenticated": True}, set_cookie=cookie_header)
         else:
             if lock is not None:
                 with lock:
@@ -900,7 +899,7 @@ class OfficeHandler(SimpleHTTPRequestHandler):
         # its record was on the wrong side of the body in the same way.
         self._audit_log("telegram_auth_success", {"user_id": user_id}, session_id=f"{token[:12]}...")
         self._json(200, {"authenticated": True, "read_only": True},
-                   headers=[("Set-Cookie", cookie_header)])
+                   set_cookie=cookie_header)
 
     def _handle_logout(self) -> None:
         self._audit_log("logout", {})
@@ -1429,25 +1428,38 @@ class OfficeHandler(SimpleHTTPRequestHandler):
         except Exception:
             pass
 
-    def _json(self, status: int, value: object,
-              headers: list[tuple[str, str]] | None = None) -> None:
-        """A JSON response, optionally with extra headers.
+    def _json(self, status: int, value: object, set_cookie: str | None = None) -> None:
+        """A JSON response, optionally setting one session cookie.
 
-        ⚠ `headers` exists so that a handler needing `Set-Cookie` does not have
-        to hand-roll the response. Both authentication SUCCESS paths did, and
-        both then wrote their audit record AFTER the body — so an operator who
-        logged in and immediately read the log back could legitimately see
-        nothing. Reaching past this helper is what put the audit call on the
-        wrong side of the response, so the helper now covers the case that
-        made someone reach past it.
+        ⚠ `set_cookie` — not a general `headers` argument. It exists because
+        both authentication SUCCESS paths needed `Set-Cookie`, this helper
+        could not do it, so both hand-rolled the whole response and both then
+        wrote their audit record AFTER the body: an operator could log in, be
+        told it worked, read the log back and see nothing. Covering the case
+        that made someone reach past the helper is the fix.
+
+        ⚠ A general `headers=[(name, value)]` was the first version of that,
+        and reviewer was right to reject it. It appended caller pairs after
+        this method's own `Content-Type`, `Content-Length` and `Cache-Control`,
+        so a caller could send a second, conflicting `Content-Length` —
+        `BaseHTTPRequestHandler` does not resolve that, and the framing of the
+        response is then whatever the recipient decides it is. An abstraction
+        added to prevent one hand-rolled response should not hand the next
+        handler a response-splitting footgun. One named parameter for the one
+        header that is actually needed cannot express the conflict at all.
         """
+        if set_cookie is not None and ("\r" in set_cookie or "\n" in set_cookie):
+            # Server-constructed today, so this is about the edit that puts a
+            # remote value in it: a bare CR or LF ends the header and starts
+            # whatever follows as a new one.
+            raise ValueError("cookie value must not contain CR or LF")
         body = json.dumps(value).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        for name, header_value in headers or []:
-            self.send_header(name, header_value)
+        if set_cookie is not None:
+            self.send_header("Set-Cookie", set_cookie)
         self.end_headers()
         self.wfile.write(body)
 
