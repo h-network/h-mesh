@@ -43,7 +43,9 @@ to catch a third instance before a user does.
 """
 
 import argparse
+import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -157,36 +159,199 @@ def _read_pid(pidfile: Path) -> int | None:
         return None
 
 
-def _stop_one(name: str, pidfile: Path, *, log: Callable[[str], None]) -> None:
+def _identity_path(pidfile: Path) -> Path:
+    return pidfile.with_suffix(pidfile.suffix + ".identity")
+
+
+def _process_start_time(pid: int) -> str | None:
+    """Read Linux /proc starttime (field 22), unique for one use of a PID."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        # comm is parenthesized and may itself contain spaces or ')'. Fields
+        # after its final ')' begin at field 3; starttime is field 22.
+        return stat[stat.rfind(")") + 2:].split()[19]
+    except (IndexError, OSError):
+        return None
+
+
+def _legacy_start_time(pid: int, name: str, env: dict | None) -> str | None:
+    """Authenticate a pre-identity-file daemon for one safe upgrade.
+
+    A numeric legacy pidfile alone proves nothing. The live process must name
+    the expected ``python -m`` module and carry the expected POD/TENANT. If any
+    evidence is absent, callers fail closed and do not signal it.
+    """
+    if env is None:
+        return None
+    expected_module = ALL_DAEMON_MODULES[name]
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        environ = dict(
+            item.split(b"=", 1)
+            for item in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+            if b"=" in item
+        )
+    except OSError:
+        return None
+    module_matches = any(
+        argv[index:index + 2] == [b"-m", expected_module.encode()]
+        for index in range(max(0, len(argv) - 1))
+    )
+    namespace_matches = (
+        environ.get(b"POD") == str(env.get("POD", "")).encode()
+        and environ.get(b"TENANT") == str(env.get("TENANT", "")).encode()
+    )
+    return _process_start_time(pid) if module_matches and namespace_matches else None
+
+
+def _owned_start_time(
+    pid: int, name: str, pidfile: Path, env: dict | None,
+) -> tuple[str | None, str]:
+    """Return (starttime, status), never guessing ownership from PID alone."""
+    identity_path = _identity_path(pidfile)
+    if not identity_path.exists():
+        start_time = _legacy_start_time(pid, name, env)
+        return (start_time, "owned" if start_time is not None else "unverified")
+    try:
+        identity = json.loads(identity_path.read_text())
+    except (OSError, ValueError, TypeError):
+        return None, "unverified"
+    if not isinstance(identity, dict) or (
+        identity.get("v") != 1
+        or identity.get("pid") != pid
+        or identity.get("name") != name
+        or not isinstance(identity.get("module"), str)
+        or not identity.get("module")
+        or not isinstance(identity.get("start_time"), str)
+    ):
+        return None, "mismatch"
+    current_start_time = _process_start_time(pid)
+    if current_start_time is None:
+        return None, "unverified"
+    if current_start_time != identity["start_time"]:
+        return None, "mismatch"
+    return current_start_time, "owned"
+
+
+def _open_owned_pidfd(
+    pid: int, name: str, pidfile: Path, env: dict | None,
+) -> tuple[int | None, str]:
+    """Bind ownership evidence to one process lifetime and return its pidfd.
+
+    Opening the pidfd first prevents later signals from following a reused
+    numeric PID.  Authentication reads still use ``/proc/<pid>``, so the final
+    pidfd liveness check is essential: if the bound process exited and the PID
+    was reused during those reads, the old pidfd is readable and the evidence
+    is rejected.  Every acquisition/read/parse failure fails closed.
+    """
+    try:
+        pidfd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return None, "stale"
+    except (AttributeError, OSError):
+        return None, "unverified"
+    try:
+        _start_time, status = _owned_start_time(pid, name, pidfile, env)
+        if status != "owned":
+            os.close(pidfd)
+            return None, status
+        readable, _, _ = select.select([pidfd], [], [], 0)
+        if readable:
+            os.close(pidfd)
+            return None, "stale"
+        return pidfd, "owned"
+    except Exception:
+        os.close(pidfd)
+        return None, "unverified"
+
+
+def _remove_pidfiles(pidfile: Path) -> None:
+    pidfile.unlink(missing_ok=True)
+    _identity_path(pidfile).unlink(missing_ok=True)
+
+
+def _reap_if_child(pid: int) -> None:
+    """Reap a stopped daemon when this invocation is still its parent."""
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except ChildProcessError:
+        pass
+
+
+def _stop_one(
+    name: str,
+    pidfile: Path,
+    *,
+    log: Callable[[str], None],
+    env: dict | None = None,
+) -> None:
     pid = _read_pid(pidfile)
     if pid is None:
         if pidfile.exists():
             log(f"  • {name}: pidfile {pidfile} did not contain a pid, removing")
-            pidfile.unlink(missing_ok=True)
+            _remove_pidfiles(pidfile)
         else:
             log(f"  • {name}: not running (no pidfile)")
         return
-    if not pid_alive(pid):
+    pidfd, identity_status = _open_owned_pidfd(pid, name, pidfile, env)
+    if identity_status == "stale":
         log(f"  • {name}: pidfile stale (pid {pid} not running), removing")
-        pidfile.unlink(missing_ok=True)
+        _remove_pidfiles(pidfile)
         return
-    log(f"  • {name}: stopping pid {pid}...")
-    os.kill(pid, signal.SIGTERM)
-    deadline = time.monotonic() + STOP_TIMEOUT_SECONDS
-    while time.monotonic() < deadline:
-        if not pid_alive(pid):
-            break
-        time.sleep(0.2)
-    else:
-        log(f"  • {name}: pid {pid} did not exit after {STOP_TIMEOUT_SECONDS}s, sending SIGKILL")
+    if identity_status == "mismatch":
+        log(
+            f"  • {name}: not running (stale pid {pid} belongs to another process), removing"
+        )
+        _remove_pidfiles(pidfile)
+        return
+    if identity_status != "owned" or pidfd is None:
+        log(f"  • {name}: cannot verify pid {pid} is this daemon; refusing to signal")
+        return
+    try:
+        log(f"  • {name}: stopping pid {pid}...")
         try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
-    pidfile.unlink(missing_ok=True)
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        except ProcessLookupError:
+            _reap_if_child(pid)
+            _remove_pidfiles(pidfile)
+            return
+        except (AttributeError, OSError):
+            log(f"  • {name}: cannot safely signal pid {pid}; leaving it running")
+            return
+        deadline = time.monotonic() + STOP_TIMEOUT_SECONDS
+        exited = False
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([pidfd], [], [], 0.2)
+            if readable:
+                exited = True
+                break
+        if not exited:
+            log(f"  • {name}: pid {pid} did not exit after {STOP_TIMEOUT_SECONDS}s, sending SIGKILL")
+            try:
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            except ProcessLookupError:
+                exited = True
+            except (AttributeError, OSError):
+                log(f"  • {name}: cannot safely send SIGKILL to pid {pid}; leaving it running")
+                return
+            if not exited:
+                readable, _, _ = select.select([pidfd], [], [], STOP_TIMEOUT_SECONDS)
+                exited = bool(readable)
+            if not exited:
+                log(f"  • {name}: cannot verify pid {pid} exited after SIGKILL")
+                return
+        _reap_if_child(pid)
+        _remove_pidfiles(pidfile)
+    finally:
+        os.close(pidfd)
 
 
-def stop_daemons(run_dir: Path, *, log: Callable[[str], None] = print) -> None:
+def stop_daemons(
+    run_dir: Path,
+    *,
+    log: Callable[[str], None] = print,
+    env: dict | None = None,
+) -> None:
     """Stop every known daemon found via a live pidfile under run_dir.
 
     Checks ALL_DAEMON_MODULES, not just the always-on set -- an optional
@@ -195,10 +360,13 @@ def stop_daemons(run_dir: Path, *, log: Callable[[str], None] = print) -> None:
 
     Idempotent: a daemon that isn't running (no pidfile, or a stale one left
     behind by a crash) is left alone, not an error -- safe to call whether or
-    not anything is actually up.
+    not anything is actually up. Every signal is sent through a pidfd opened
+    before authentication, binding evidence and signalling to one process
+    lifetime even if its numeric PID is reused. Missing, unreadable, malformed,
+    or mismatched identity fails closed: an unproven process is never signalled.
     """
     for name in ALL_DAEMON_MODULES:
-        _stop_one(name, run_dir / f"{name}.pid", log=log)
+        _stop_one(name, run_dir / f"{name}.pid", log=log, env=env)
 
 
 def _start_one(name: str, module: str, python: Path, run_dir: Path, env: dict) -> int:
@@ -213,7 +381,27 @@ def _start_one(name: str, module: str, python: Path, run_dir: Path, env: dict) -
             cwd=str(REPO_ROOT),
             start_new_session=True,
         )
-    pid_path.write_text(f"{proc.pid}\n")
+    start_time = _process_start_time(proc.pid)
+    if start_time is None:
+        proc.terminate()
+        proc.wait(timeout=5)
+        raise DaemonError(f"{name} started but its process identity could not be read")
+    try:
+        pid_path.write_text(f"{proc.pid}\n")
+        _identity_path(pid_path).write_text(json.dumps({
+            "v": 1,
+            "pid": proc.pid,
+            "name": name,
+            "module": module,
+            "start_time": start_time,
+        }, separators=(",", ":")) + "\n")
+    except Exception:
+        # The Popen handle itself proves ownership even when durable identity
+        # publication failed. Do not orphan a process no later stop may trust.
+        proc.terminate()
+        proc.wait(timeout=5)
+        _remove_pidfiles(pid_path)
+        raise
     return proc.pid
 
 
@@ -260,7 +448,9 @@ def start_daemons(
         log("  • startup failed; stopping daemons started by this invocation")
         for started_name in started:
             try:
-                _stop_one(started_name, run_dir / f"{started_name}.pid", log=log)
+                _stop_one(
+                    started_name, run_dir / f"{started_name}.pid", log=log, env=env
+                )
             except Exception as exc:
                 # Preserve the startup failure that triggered rollback, but
                 # keep attempting the rest: one bad cleanup must not orphan
@@ -271,10 +461,29 @@ def start_daemons(
         for name, module in daemon_modules.items():
             pidfile = run_dir / f"{name}.pid"
             existing_pid = _read_pid(pidfile)
-            if existing_pid is not None and pid_alive(existing_pid):
-                log(f"  • {name}: already running (pid: {existing_pid}), skipping")
-                pids[name] = existing_pid
-                continue
+            if existing_pid is not None:
+                existing_pidfd, identity_status = _open_owned_pidfd(
+                    existing_pid, name, pidfile, env
+                )
+                if identity_status == "owned":
+                    assert existing_pidfd is not None
+                    os.close(existing_pidfd)
+                    log(f"  • {name}: already running (pid: {existing_pid}), skipping")
+                    pids[name] = existing_pid
+                    continue
+                if identity_status == "unverified":
+                    raise DaemonError(
+                        f"cannot verify pid {existing_pid} from {pidfile} is {name}; "
+                        "refusing to signal or replace it"
+                    )
+                if identity_status == "stale":
+                    log(f"  • {name}: pidfile stale (pid {existing_pid} not running)")
+                else:
+                    log(
+                        f"  • {name}: not running "
+                        f"(stale pid {existing_pid} belongs to another process)"
+                    )
+                _remove_pidfiles(pidfile)
             pid = _start_one(name, module, python, run_dir, env)
             pids[name] = pid
             started[name] = pid
