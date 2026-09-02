@@ -17,6 +17,32 @@ as the manifest's owner, and delete the manifest entry as the last step of
 normal cleanup. A manifest entry that survives to the start of the NEXT
 pytest session is proof its owner died before finishing -- reap it there,
 regardless of which test or which agent created it.
+
+⚠ "Owner died" is decided by more than a numeric pid. A pid recorded at
+registration time can be reused by an unrelated process by the time a later
+session checks it -- exactly the bug lifecycle-agent's `services/daemons.py`
+authenticated-pidfile work removed from `stop_daemons` (reviewer's fail-first
+there killed a real unrelated sleeper on a real box). Bare `kill(pid, 0)`
+cannot tell "the same process that registered this" from "a different process
+that happens to hold this pid number now." So this module authenticates the
+same way: record the registering process's `/proc/<pid>/stat` start time
+alongside its pid, and at reap time require an EXACT match before treating
+the pid as still the same process. A mismatch (or the pid simply being gone)
+is proof the original owner exited -- reaping is then correct regardless of
+who or what holds that pid number today. If start-time authentication itself
+is unavailable at registration (e.g. `/proc` unreadable), this fails CLOSED:
+never reap an entry it could not authenticate, rather than guess.
+
+⚠ Two sessions starting and reaping at once: every reap action here is
+idempotent against a resource that's already gone -- killing an already-dead
+pid raises and is caught, `shutil.rmtree` on an already-removed tree is a
+no-op (`ignore_errors=True`), unlinking an already-unlinked manifest entry is
+a no-op (`missing_ok=True`). A genuinely orphaned entry reaped redundantly by
+two concurrent sessions does the same idempotent work twice, safely. A
+registration race (one process mid-`register()` while another reaps) cannot
+produce a corrupt read: `register()` writes to a temp file and `os.replace()`s
+it into place, so a concurrent reader only ever sees the manifest directory
+either without the entry yet, or with it fully written -- never partial.
 """
 
 from __future__ import annotations
@@ -30,16 +56,35 @@ from pathlib import Path
 MANIFEST_DIR = Path("/tmp/h_mesh_test_manifests")
 
 
+def _process_start_time(pid: int) -> str | None:
+    """Read Linux /proc starttime (field 22), unique to one use of a pid --
+    same field, same reasoning as services/daemons.py's authenticated
+    pidfile identity (reused here rather than imported: this module has no
+    other reason to depend on production daemon-lifecycle code)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        # comm is parenthesized and may itself contain spaces or ')'. Fields
+        # after its final ')' begin at field 3; starttime is field 22.
+        return stat[stat.rfind(")") + 2:].split()[19]
+    except (IndexError, OSError):
+        return None
+
+
 def register(tmpdir: str) -> Path:
     """Record `tmpdir` as live, owned by this process. Call before spawning
     anything under it. Returns the manifest entry's own path."""
     MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
+    pid = os.getpid()
     entry = MANIFEST_DIR / f"{os.path.basename(tmpdir)}.json"
-    entry.write_text(json.dumps({
+    payload = json.dumps({
         "tmpdir": tmpdir,
-        "owner_pid": os.getpid(),
+        "owner_pid": pid,
+        "owner_start_time": _process_start_time(pid),
         "registered_at": time.time(),
-    }))
+    })
+    temporary = entry.with_name(f".{entry.name}.{pid}.tmp")
+    temporary.write_text(payload)
+    os.replace(temporary, entry)
     return entry
 
 
@@ -50,12 +95,22 @@ def clear(entry: Path) -> None:
     entry.unlink(missing_ok=True)
 
 
-def _owner_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
+def _owner_still_running(owner_pid: int, owner_start_time: str | None) -> bool:
+    """True only if `owner_pid` is authenticated as the SAME process that
+    registered this entry -- never true from pid liveness alone.
+
+    `owner_start_time` being `None` means registration itself could not
+    authenticate (fails closed: treated as still running, never reaped on
+    that basis). Otherwise the pid's CURRENT start time must match exactly;
+    any mismatch, or the pid no longer existing at all, means the original
+    owner is provably gone regardless of who holds that pid number now.
+    """
+    if owner_start_time is None:
+        return True
+    current = _process_start_time(owner_pid)
+    if current is None:
         return False
-    return True
+    return current == owner_start_time
 
 
 def _kill_tmux_server_by_socket_path(socket_path: str) -> None:
@@ -110,29 +165,32 @@ def reap_orphan(tmpdir: str) -> None:
 
 
 def reap_all_orphans(log=print) -> int:
-    """Reap every manifest entry whose owner process is no longer alive.
-
-    An entry whose owner IS alive belongs to a test genuinely still running
-    -- on this shared sandbox that may be a different agent's concurrent
-    pytest invocation, not this one, so it is left alone regardless of age.
-    Returns the number of orphans reaped."""
+    """Reap every manifest entry whose registering process is authenticated
+    as no longer running (see `_owner_still_running` -- never bare pid
+    liveness). An entry whose owner IS still the same running process
+    belongs to a test genuinely in progress -- on this shared sandbox that
+    may be a different agent's concurrent pytest invocation, not this one --
+    so it is left alone regardless of age. Returns the number reaped."""
     if not MANIFEST_DIR.is_dir():
         return 0
     reaped = 0
     for entry in MANIFEST_DIR.glob("*.json"):
+        if entry.name.startswith("."):
+            continue  # a register() temp file mid-write, not a real entry
         try:
             data = json.loads(entry.read_text())
         except (OSError, json.JSONDecodeError):
             entry.unlink(missing_ok=True)
             continue
         owner_pid = data.get("owner_pid")
+        owner_start_time = data.get("owner_start_time")
         tmpdir = data.get("tmpdir")
         if not isinstance(owner_pid, int) or not isinstance(tmpdir, str):
             entry.unlink(missing_ok=True)
             continue
-        if _owner_alive(owner_pid):
+        if _owner_still_running(owner_pid, owner_start_time):
             continue
-        log(f"  • reaping orphaned test tmpdir {tmpdir} (owner pid {owner_pid} is dead)")
+        log(f"  • reaping orphaned test tmpdir {tmpdir} (owner pid {owner_pid} authenticated dead)")
         reap_orphan(tmpdir)
         entry.unlink(missing_ok=True)
         reaped += 1

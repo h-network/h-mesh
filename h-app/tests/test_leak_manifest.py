@@ -14,6 +14,7 @@ DIFFERENT process (this test's own), matching how it actually runs in
 practice: at the start of the NEXT pytest session, not the one that died.
 """
 
+import json
 import os
 import signal
 import subprocess
@@ -21,7 +22,7 @@ import sys
 import time
 from pathlib import Path
 
-from _leak_manifest import MANIFEST_DIR, reap_all_orphans
+from _leak_manifest import MANIFEST_DIR, _process_start_time, reap_all_orphans, register
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -139,3 +140,63 @@ def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_pa
         if victim_tmpdir.exists():
             import shutil
             shutil.rmtree(victim_tmpdir, ignore_errors=True)
+
+
+def test_reaper_does_not_touch_a_tmpdir_whose_owner_is_genuinely_still_running(tmp_path):
+    """The mirror of the harm test above, and the one that matters most: a
+    reaper that reaps too eagerly is worse than one that reaps too little.
+    On a shared sandbox where several agents run this suite concurrently, an
+    over-eager reaper means one agent's session start kills another agent's
+    LIVE test -- indistinguishable from a flaky test to the victim. This
+    proves a manifest entry whose registering process is still alive and
+    still the SAME process (authenticated by start time, not bare pid
+    liveness) is left completely untouched."""
+    real_tmpdir = tmp_path / "h_mesh_test_leak_harm_still_running"
+    real_tmpdir.mkdir()
+    (real_tmpdir / "run").mkdir()
+    (real_tmpdir / "run" / "dummy.pid").write_text(str(os.getpid()))
+    marker = real_tmpdir / "still-here"
+    marker.write_text("do not touch")
+
+    entry = register(str(real_tmpdir))
+    try:
+        assert entry.exists()
+
+        reaped = reap_all_orphans(log=lambda *_: None)
+
+        assert reaped == 0, "reaper touched a tmpdir whose owner is this live test process"
+        assert real_tmpdir.exists()
+        assert marker.exists()
+        assert entry.exists(), "reaper deleted a live entry's manifest record"
+    finally:
+        entry.unlink(missing_ok=True)
+
+
+def test_reaper_ignores_bare_pid_reuse_and_requires_start_time_to_match(tmp_path):
+    """The specific regression this guards against: a manifest entry whose
+    recorded pid is (coincidentally) still in use by SOME live process today
+    must not be mistaken for "the same process still running" just because
+    that pid answers `kill(pid, 0)`. Simulated directly: register normally,
+    then corrupt the recorded start_time to a value that cannot match any
+    real process, the same shape a genuine pid-reuse produces. The reaper
+    must treat this as dead and reap it -- proving liveness alone, without
+    authentication, would have wrongly skipped it forever."""
+    real_tmpdir = tmp_path / "h_mesh_test_leak_harm_pid_reuse"
+    real_tmpdir.mkdir()
+
+    entry = register(str(real_tmpdir))
+    data = json.loads(entry.read_text())
+    assert data["owner_pid"] == os.getpid()
+    assert data["owner_start_time"] == _process_start_time(os.getpid())
+
+    # Simulate reuse: same pid (still very much alive, this test's own
+    # process), but a start_time that cannot belong to it -- exactly the
+    # shape a genuinely different process now holding this pid would have.
+    data["owner_start_time"] = "0"
+    entry.write_text(json.dumps(data))
+
+    reaped = reap_all_orphans(log=lambda *_: None)
+
+    assert reaped == 1, "reaper trusted bare pid liveness instead of the authenticated start time"
+    assert not real_tmpdir.exists()
+    assert not entry.exists()
