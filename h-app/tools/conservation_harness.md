@@ -47,6 +47,14 @@ envelope's own `stream_id` -- never by count. Five scenarios:
    retirement evidence is byte-identical before and after (phases shape
    only, and only where `stop_agent`/`receive_undeliverable_key` exist on
    the tree under test).
+7. `retired_inbox`'s own record schema: NOT driven through a real
+   `stop_agent` (manufacturing malformed shapes through the real Lua isn't
+   possible -- it only ever produces the correct one). Directly exercises
+   `_retired_inbox_occurrences`'s schema validation against reviewer's
+   exact malformed-lookalike reproductions plus a genuine valid record, so
+   the "recognized inbox-conservation shape" check is proved neither
+   permissive (accepts a lookalike) nor noisy (rejects real data) on every
+   run, not just the one hand-verification round that found the gap.
 
 Every scenario that found loss was falsified by hand before being trusted:
 the underlying fix (or the harness's own detection logic) was deliberately
@@ -146,6 +154,33 @@ neither recognized shape at all. If a FUTURE destination ever carries a
 condition that invalidates this trace -- but "arrives in a sink this file
 already reads" is a smaller, checked failure mode now, not a repeat of
 "never looked."
+
+⚠ THE FIFTH FALSE-CLEAN: reading the key was not the same as validating what
+was in it. "Recognized inbox-conservation shape" meant only that `entry_id`
+and `fields` keys were PRESENT and `envelope` was not -- reviewer produced
+two records with exactly the right keys and completely wrong values
+(`entry_id` a list, `fields` a string; separately, a non-hex `encoding`, a
+non-string `agent`, a `null` `reason`) that both passed as "recognized" and
+were silently accepted, contributing zero occurrences either way. Presence
+of a key name is not validation of the schema it names.
+`_matches_recognized_inbox_shape` now checks the CLOSED schema
+`_REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA` actually produces: the top-level key
+set is exactly `{agent, reason, entry_id, encoding, fields}`; `agent`,
+`reason`, `entry_id` are strings; `encoding` is the literal `"hex"`;
+`fields` is a list of two-element hex-string pairs. Confirmed RED against
+the pre-fix hash on reviewer's exact two reproductions, GREEN against this
+one, and committed permanently as Scenario 7 rather than verified once and
+left out of the diff -- the mistake that made this round necessary in the
+first place. Both halves of the mechanism are exercised on every run: the
+malformed lookalikes (permissive-in-the-wrong-direction) and a genuine
+valid record (noisy-in-the-wrong-direction).
+
+Five rounds, all in the detection logic rather than in what it detects, all
+in the direction that makes a broken system look healthy: plain-text-only
+parsing, a dict/set collapsing duplicates, a missing sink, an unread key,
+and a recognition test looser than the schema it claimed to recognize.
+Every one was invisible until somebody read the instrument itself, not just
+its results -- see `_decode_evidence_envelope`'s docstring for the first.
 
 ## What it does NOT reach
 

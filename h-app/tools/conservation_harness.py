@@ -251,39 +251,88 @@ def _stream_id_occurrences(raw_records: list, is_evidence_wrapper: bool) -> list
     return occurrences
 
 
+def _is_hex_string(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return False
+    return True
+
+
+_RETIRED_INBOX_RECOGNIZED_KEYS = frozenset({"agent", "reason", "entry_id", "encoding", "fields"})
+
+
+def _matches_recognized_inbox_shape(record: dict) -> bool:
+    """True ONLY if `record` matches the EXACT closed schema
+    `_REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA`'s inbox-conservation branch
+    actually produces -- reviewer's finding, the fifth false-clean in this
+    instrument: checking key PRESENCE (`entry_id` and `fields` exist,
+    `envelope` doesn't) is not the same as validating the schema those
+    keys claim. Both of reviewer's reproductions have the right KEYS and
+    would have passed a presence-only check; neither has the right
+    VALUES, and this function rejects both:
+        {"entry_id": [], "fields": "not-pairs"}
+        {"entry_id": "1-0", "fields": [], "encoding": "plain",
+         "agent": 7, "reason": null}
+    Requires: the top-level key set is EXACTLY {agent, reason, entry_id,
+    encoding, fields} (no more, no fewer); `agent`, `reason`, `entry_id`
+    are strings; `encoding` is the literal string `"hex"`; `fields` is a
+    list where every element is a two-element list of hex strings (the
+    `[field_hex, value_hex]` pairs the Lua's `hex()` helper produces).
+    """
+    if set(record.keys()) != _RETIRED_INBOX_RECOGNIZED_KEYS:
+        return False
+    if not isinstance(record["agent"], str):
+        return False
+    if not isinstance(record["reason"], str):
+        return False
+    if not isinstance(record["entry_id"], str):
+        return False
+    if record["encoding"] != "hex":
+        return False
+    fields = record["fields"]
+    if not isinstance(fields, list):
+        return False
+    for pair in fields:
+        if not (isinstance(pair, list) and len(pair) == 2):
+            return False
+        if not (_is_hex_string(pair[0]) and _is_hex_string(pair[1])):
+            return False
+    return True
+
+
 def _retired_inbox_occurrences(raw_records: list) -> tuple[list[tuple[str, dict]], list[str]]:
     """Read, classify, and validate every record in the tenant retired-inbox
-    sink -- never left unread.
+    sink -- never left unread, and never recognized by key presence alone.
 
-    Reviewer's finding, twice: an earlier version reasoned that
-    retired-inbox records can never carry a `stream_id` (they're
-    `{agent, reason, entry_id, encoding, fields}`, not
-    `{agent, reason, encoding, envelope}`) and used that as grounds to
-    SKIP READING THE KEY ENTIRELY. That is not a parser rejecting an
-    unparseable shape -- it is a sink this scenario never looked at, so a
-    genuine envelope record duplicated (by a real bug, or reviewer's
-    injection) into retired-inbox was invisible: not miscounted, simply
-    never seen. "We do not read it" and "we read it and deliberately
-    treat this recognized shape as contributing no identity" are
-    different claims, and only the second is an enforced boundary.
+    Reviewer's findings, in order, each closing the gap the previous one
+    left: (1) an earlier version reasoned retired-inbox records can never
+    carry a `stream_id` and used that to justify SKIPPING THE KEY
+    ENTIRELY -- "we do not read it" is not an enforced boundary. (2) once
+    the key was read, "recognized" meant only `entry_id` and `fields`
+    keys were PRESENT, `envelope` was not -- a record with the right keys
+    and completely wrong values (`entry_id` a list, `fields` a string, a
+    non-hex `encoding`, a non-string `agent`/`reason`) passed as
+    recognized anyway. `_matches_recognized_inbox_shape` now validates
+    the actual closed schema, not just its key names.
 
     Every record here is now read and classified into exactly one of
     three outcomes:
-    - RECOGNIZED inbox-conservation shape (has `entry_id` AND `fields`,
-      no `envelope`): contributes no stream_id occurrence -- correct,
-      not assumed.
+    - RECOGNIZED inbox-conservation shape (the exact closed schema
+      `_matches_recognized_inbox_shape` validates): contributes no
+      stream_id occurrence -- correct, not assumed.
     - ENVELOPE-BEARING (has `envelope`): decoded and its stream_id IS
       returned as a real occurrence, exactly like undeliverable/
       unresolved -- a genuine envelope duplicated into this sink, by any
       cause, is now counted and can trigger DUPLICATED like anywhere
       else.
-    - ANYTHING ELSE (fails to parse as JSON, or matches neither
-      recognized shape) is a SCHEMA ANOMALY -- returned separately and
-      always reported as a failure by the caller, never silently
-      skipped. A record this harness cannot classify is not evidence of
-      absence; the sink's own documented "no fifth destination for
-      envelopes" claim depends on nothing showing up here that isn't one
-      of the two shapes above.
+    - ANYTHING ELSE (fails to parse as JSON, isn't a JSON object, or
+      matches neither recognized shape -- including a lookalike with the
+      right keys and wrong values) is a SCHEMA ANOMALY -- returned
+      separately and always reported as a failure by the caller, never
+      silently skipped.
 
     Returns `(occurrences, anomalies)` -- `occurrences` matches
     `_stream_id_occurrences`'s shape; `anomalies` is a list of
@@ -302,12 +351,17 @@ def _retired_inbox_occurrences(raw_records: list) -> tuple[list[tuple[str, dict]
             anomalies.append(f"retired_inbox record is not a JSON object: {record!r}")
             continue
         has_envelope = "envelope" in record
-        has_inbox_shape = "entry_id" in record and "fields" in record
-        if has_envelope and has_inbox_shape:
+        is_recognized_inbox_shape = _matches_recognized_inbox_shape(record)
+        if has_envelope and is_recognized_inbox_shape:
+            # Structurally unreachable given the two shapes' disjoint key
+            # sets (an exact-match on the 5 non-envelope keys cannot also
+            # contain "envelope") -- kept as a defensive check rather
+            # than assumed impossible, matching this whole file's own
+            # rule against trusting reasoning it hasn't verified.
             anomalies.append(
-                f"retired_inbox record has BOTH an 'envelope' key and the "
-                f"recognized entry_id/fields shape -- ambiguous, not "
-                f"trusted either way: {record!r}"
+                f"retired_inbox record matches BOTH the recognized "
+                f"inbox-conservation schema and has an 'envelope' key -- "
+                f"ambiguous, not trusted either way: {record!r}"
             )
             continue
         if has_envelope:
@@ -321,12 +375,15 @@ def _retired_inbox_occurrences(raw_records: list) -> tuple[list[tuple[str, dict]
                 continue
             occurrences.append((header["stream_id"], record))
             continue
-        if has_inbox_shape:
+        if is_recognized_inbox_shape:
             continue  # recognized non-envelope inbox-conservation shape
         anomalies.append(
             f"retired_inbox record matches neither the recognized "
-            f"inbox-conservation shape (entry_id + fields) nor an envelope "
-            f"shape -- schema drift, not silently accepted: {record!r}"
+            f"inbox-conservation schema (exact keys agent/reason/"
+            f"entry_id/encoding/fields, string agent/reason/entry_id, "
+            f"encoding=='hex', fields as ordered two-element hex-string "
+            f"pairs) nor an envelope shape -- schema drift, not silently "
+            f"accepted: {record!r}"
         )
     return occurrences, anomalies
 
@@ -1174,6 +1231,63 @@ def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -
 
 
 # ---------------------------------------------------------------------------
+# Scenario 6b: NOT driven through a real stop_agent -- manufacturing these
+# exact malformed shapes through the real Lua isn't possible (it only ever
+# produces the correct one). Directly exercises _retired_inbox_occurrences'
+# own schema validation instead, against reviewer's exact reproductions
+# (the fifth false-clean this instrument has had) plus a genuine valid
+# control, so the anomaly mechanism is proved neither permissive (accepts
+# a malformed lookalike) nor noisy (rejects real production data) on every
+# run, not just the one hand-verification round that found the gap.
+# ---------------------------------------------------------------------------
+
+def scenario_retired_inbox_schema_validation(r, pod: str, tenant: str) -> list[str] | None:
+    if retired_inbox_key is None:
+        return None  # not applicable -- this tree has no inbox-conservation shape yet
+
+    malformed_lookalikes = [
+        # Reviewer's exact reproductions: right KEYS, wrong VALUES. A
+        # presence-only check ("entry_id and fields exist") passed both.
+        {"entry_id": [], "fields": "not-pairs"},
+        {"entry_id": "1-0", "fields": [], "encoding": "plain", "agent": 7, "reason": None},
+        # A few more shapes in the same direction, checked rather than
+        # assumed covered by the two reviewer named.
+        {"agent": "x", "reason": "y", "entry_id": "1-0", "encoding": "hex", "fields": "not-a-list"},
+        {"agent": "x", "reason": "y", "entry_id": "1-0", "encoding": "hex", "fields": [["not-hex", "62"]]},
+        {"agent": "x", "reason": "y", "entry_id": "1-0", "encoding": "hex", "fields": [["61", "62", "63"]]},
+        {"agent": "x", "reason": "y", "entry_id": "1-0", "encoding": "hex", "fields": [], "extra": "key"},
+    ]
+    failures: list[str] = []
+    for lookalike in malformed_lookalikes:
+        occurrences, anomalies = _retired_inbox_occurrences([json.dumps(lookalike)])
+        if occurrences or not anomalies:
+            failures.append(
+                f"MALFORMED LOOKALIKE ACCEPTED: {lookalike!r} was not flagged "
+                f"as a schema anomaly (occurrences={occurrences!r}, "
+                f"anomalies={anomalies!r}) -- a record with the right KEYS "
+                "but wrong types/values must not be silently treated as the "
+                "recognized inbox-conservation shape."
+            )
+
+    # The other half reviewer named: the mechanism must not be noisy on
+    # real production data either -- a genuinely valid record must pass.
+    valid_record = {
+        "agent": "harness-recipient-6", "reason": "destination retired with unread inbox content",
+        "entry_id": "1758012345678-0", "encoding": "hex", "fields": [["7061796c6f6164", "68656c6c6f"]],
+    }
+    occurrences, anomalies = _retired_inbox_occurrences([json.dumps(valid_record)])
+    if occurrences or anomalies:
+        failures.append(
+            f"FALSE POSITIVE: a genuinely valid recognized-shape record was "
+            f"rejected or misclassified (occurrences={occurrences!r}, "
+            f"anomalies={anomalies!r}) -- narrowing the claim on the "
+            "malformed-lookalike checks above."
+        )
+
+    return failures
+
+
+# ---------------------------------------------------------------------------
 # Scenario 3 (legacy shape): a durable write failing -- the dead-letter
 # RPUSH itself, for an envelope whose body fails to parse. _open_received's
 # malformed-frame path is not wrapped in any try/except on main, so this
@@ -1410,6 +1524,8 @@ SCENARIOS = [
      scenario_rehire_preserves_unresolved_evidence),
     ("retirement conserves admitted envelopes by phase, exactly-once by identity (phases shape only)",
      scenario_retirement_conserves_admitted_envelopes),
+    ("retired-inbox schema validation rejects malformed lookalikes, accepts genuine records",
+     scenario_retired_inbox_schema_validation),
     ("two concurrent default-namespace invocations do not collide",
      scenario_concurrent_invocations_do_not_collide),
 ]
