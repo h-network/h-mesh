@@ -849,6 +849,22 @@ except DaemonError as exc:
     # 7. Hire any agent from the wizard's roster that isn't already running.
     # Only runs at all if a roster was ever persisted -- a flags-only host
     # that never used the wizard keeps today's behavior: hire manually.
+    #
+    # ⚠ HIRE_HAD_ERROR/HIRE_ERROR_SUMMARY, checked after this whole section
+    # (including the no-roster branch below and the "attach to tmux" lines)
+    # -- an honest per-agent dispatch is worthless if the script's own exit
+    # code still says success. Reviewer FAILED an earlier version of this
+    # branch for exactly that: every "•" line below could say "hire setup
+    # error" or "hire failed" and the script still exited 0, so an
+    # unattended caller (CI, an installer) saw a clean setup while a
+    # requested roster hire was never admitted. A proven rejection (exit 1)
+    # counts as an error here too, not just an unenumerated exit -- the
+    # operator asked for a roster and did not get it, and that must be
+    # detectable without parsing stderr (architect's explicit call: prefer
+    # a human occasionally re-running a setup that mostly worked over CI
+    # recording a partial roster as success).
+    HIRE_HAD_ERROR=0
+    HIRE_ERROR_SUMMARY=()
     ROSTER_CSV="$("$PYTHON" -m services.tenant_config get "$TENANT" AGENTS "")"
     if [ -n "$ROSTER_CSV" ]; then
         echo "Hiring agents from the roster (skipping any already running)..."
@@ -909,6 +925,8 @@ print("1" if pt == "tmux" else "0")
             HIRE_STATUS=$?
             if [ "$HIRE_STATUS" -eq 1 ]; then
                 echo "  • $a: hire failed -- $HIRE_OUTPUT" >&2
+                HIRE_HAD_ERROR=1
+                HIRE_ERROR_SUMMARY+=("$a: hire failed (rejected -- see the line above for detail)")
             elif [ "$HIRE_STATUS" -eq 2 ]; then
                 echo "  • $a: requested ($CLI_FOR_A${PROF_FOR_A:+, account=$PROF_FOR_A}${EP_FOR_A:+, provider=$EP_FOR_A}) -- no rejection seen; run 'office status' if you want to confirm it came up"
             elif [ "$HIRE_STATUS" -eq 0 ]; then
@@ -920,6 +938,8 @@ print("1" if pt == "tmux" else "0")
                 echo "  • $a: hired ($CLI_FOR_A${PROF_FOR_A:+, account=$PROF_FOR_A}${EP_FOR_A:+, provider=$EP_FOR_A})"
             else
                 echo "  • $a: hire setup error (unexpected exit $HIRE_STATUS, not admitted or rejected -- treat as not sent) -- $HIRE_OUTPUT" >&2
+                HIRE_HAD_ERROR=1
+                HIRE_ERROR_SUMMARY+=("$a: hire setup error (unexpected exit $HIRE_STATUS -- see the line above for detail)")
             fi
         done
         echo
@@ -932,4 +952,21 @@ print("1" if pt == "tmux" else "0")
 
     echo "To attach to the tmux session:"
     echo "  TMUX_TMPDIR=$TMUX_TMPDIR tmux attach -t $TMUX_SESSION"
+
+    # ⚠ Checked last, after every summary and instruction above has already
+    # printed -- the roster loop never aborts early on an individual
+    # failure (a later agent's hire is still attempted), but the script's
+    # OWN exit code must not say success when the roster it was asked to
+    # produce is incomplete. See the HIRE_HAD_ERROR comment above the
+    # roster loop for why both a proven rejection and an unenumerated exit
+    # count here.
+    if [ "$HIRE_HAD_ERROR" -eq 1 ]; then
+        echo >&2
+        echo "One or more roster hires did not succeed:" >&2
+        for line in "${HIRE_ERROR_SUMMARY[@]}"; do
+            echo "  • $line" >&2
+        done
+        echo "Re-run setup.sh, or hire the missing agent(s) manually, once you've resolved the cause above." >&2
+        exit 1
+    fi
 fi
