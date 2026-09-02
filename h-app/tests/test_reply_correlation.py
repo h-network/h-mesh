@@ -81,6 +81,30 @@ class ReplyCorrelationTests(unittest.TestCase):
         self.assertFalse(was_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=ids[0]))
         self.assertTrue(was_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=ids[-1]))
 
+    def test_record_delivered_swallows_redis_errors(self):
+        # Same policy as mark_delivery_pending and _record elsewhere: a
+        # bookkeeping write failure must never propagate and fail the
+        # delivery it's recording. Callers (tmux's message_opener,
+        # openshell's _reply) call this inline in the delivery path itself.
+        class BrokenRedis(FakeRedis):
+            def sadd(self, key, *values):
+                raise ConnectionError("redis unavailable")
+
+        broken = BrokenRedis()
+        record_delivered(broken, pod="p", tenant="t", agent="bob", stream_id=VALID_ID)  # must not raise
+        self.assertFalse(was_delivered(broken, pod="p", tenant="t", agent="bob", stream_id=VALID_ID))
+
+    def test_was_delivered_fails_toward_false_on_redis_error(self):
+        class BrokenRedis(FakeRedis):
+            def sismember(self, key, value):
+                raise ConnectionError("redis unavailable")
+
+        broken = BrokenRedis()
+        # Must not raise -- the caller (deliver_api) is in a per-envelope
+        # loop and a Redis hiccup here must degrade to "don't trust it",
+        # not abort the rest of the batch.
+        self.assertFalse(was_delivered(broken, pod="p", tenant="t", agent="bob", stream_id=VALID_ID))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ from core.envelope import EnvelopeError, parse, parse_for_switch
 from core.keys import prefix
 from core.logging import configure_logging, log_record
 from lib.ingress_snapshot import snapshot_ingress
+from lib.reply_correlation import is_valid_reply_id, was_delivered
 
 MAILBOX_MAXLEN = 1000
 
@@ -32,6 +33,38 @@ def _record(event: str, envelope: dict, agent: str, reason: str | None = None) -
         pass
 
 
+def _drop_untrustworthy_reply_correlation(r, *, pod: str, tenant: str, agent: str, envelope: dict) -> None:
+    """Strip an in_reply_to that doesn't validate, before this envelope is
+    ever stored in a client's mailbox.
+
+    This is THE trust boundary for the field: core/envelope.py's parse()
+    deliberately carries whatever the wire said, malformed or not (see the
+    comment on its _validate_body) -- an optional field on the wire is not
+    a reason to dead-letter an otherwise-good message. Here, it is a reason
+    to drop just the field. Failing toward absent rather than toward wrong
+    is the point: a client that reads no correlation behaves exactly as it
+    did before this feature existed; a client that reads a wrong one would
+    confidently mislabel a turn, which is worse than the bug this replaces.
+    Format and provenance are logged as distinct reasons -- they are
+    different failures, and only provenance means an agent claimed to
+    answer something that was never actually delivered to it.
+    """
+    in_reply_to = envelope.get("in_reply_to")
+    if in_reply_to is None:
+        return
+    if not is_valid_reply_id(in_reply_to):
+        envelope.pop("in_reply_to", None)
+        _record("reply_correlation_dropped", envelope, agent, reason="malformed in_reply_to")
+        return
+    source = envelope.get("l2", {}).get("source")
+    if not source or not was_delivered(r, pod=pod, tenant=tenant, agent=source, stream_id=in_reply_to):
+        envelope.pop("in_reply_to", None)
+        _record(
+            "reply_correlation_dropped", envelope, agent,
+            reason=f"in_reply_to {in_reply_to!r} was never delivered to {source!r}",
+        )
+
+
 def deliver_api(*, r, pod: str, tenant: str, agent: str) -> None:
     """Deliver the current ingress snapshot to one API participant's inbox."""
     ingress_key = prefix(pod, tenant, agent=agent, resource="ingress")
@@ -50,6 +83,7 @@ def deliver_api(*, r, pod: str, tenant: str, agent: str) -> None:
             _record("dead_lettered", header, agent, str(exc))
             continue
 
+        _drop_untrustworthy_reply_correlation(r, pod=pod, tenant=tenant, agent=agent, envelope=envelope)
         _record("received", envelope, agent)
         r.xadd(
             inbox_key,

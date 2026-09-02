@@ -27,6 +27,17 @@ class FakeRedis:
         self.hashes = {}
         self.lists = {}
         self.streams = {}
+        self.sets = {}
+
+    def sadd(self, key, *values):
+        self.sets.setdefault(key, set()).update(values)
+
+    def srem(self, key, *values):
+        for value in values:
+            self.sets.get(key, set()).discard(value)
+
+    def sismember(self, key, value):
+        return value in self.sets.get(key, set())
 
     def hkeys(self, key):
         if key.endswith(":registry"):
@@ -208,6 +219,72 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(self.redis.streams[inbox]), 1)
         self.assertEqual(json.loads(self.redis.streams[inbox][0][1]["envelope"])["payload"], {"text": "reply"})
         self.assertEqual(self.redis.lists[dead], ["not an envelope"])
+
+    def test_deliver_api_keeps_in_reply_to_when_delivered_to_the_replying_agent(self):
+        from lib.reply_correlation import record_delivered
+
+        target = "a" * 32
+        record_delivered(self.redis, pod="test", tenant="office", agent="alice", stream_id=target)
+        ingress = prefix("test", "office", "telegram", "ingress")
+        envelope = build(
+            "Message", "alice", "telegram", {"text": "reply"},
+            pod="test", tenant="office", in_reply_to=target,
+        )
+        self.redis.lists[ingress] = [encode(envelope)]
+
+        deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+
+        inbox = prefix("test", "office", "telegram", "inbox")
+        stored = json.loads(self.redis.streams[inbox][0][1]["envelope"])
+        self.assertEqual(stored["in_reply_to"], target)
+
+    def test_deliver_api_drops_in_reply_to_that_was_never_delivered(self):
+        # Well-formed, but this agent never received it -- the confident-lie
+        # case, not the format-error case. Must be dropped just like a
+        # malformed id, and must not be surfaced to the client at all.
+        target = "b" * 32
+        ingress = prefix("test", "office", "telegram", "ingress")
+        envelope = build(
+            "Message", "alice", "telegram", {"text": "reply"},
+            pod="test", tenant="office", in_reply_to=target,
+        )
+        self.redis.lists[ingress] = [encode(envelope)]
+
+        deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+
+        inbox = prefix("test", "office", "telegram", "inbox")
+        stored = json.loads(self.redis.streams[inbox][0][1]["envelope"])
+        self.assertNotIn("in_reply_to", stored)
+
+    def test_deliver_api_drops_malformed_in_reply_to(self):
+        ingress = prefix("test", "office", "telegram", "ingress")
+        envelope = build("Message", "alice", "telegram", {"text": "reply"}, pod="test", tenant="office")
+        raw = encode(envelope)
+        # Tamper the wire body directly -- build()/encode() would refuse a
+        # malformed value outright (that's the strict outgoing side); this
+        # simulates what an already-parsed, permissive frame can carry.
+        header, body = raw[:256], raw[256:]
+        body_dict = json.loads(body)
+        body_dict["in_reply_to"] = "not-a-valid-id"
+        tampered = header + json.dumps(body_dict, separators=(",", ":"))
+        self.redis.lists[ingress] = [tampered]
+
+        deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+
+        inbox = prefix("test", "office", "telegram", "inbox")
+        stored = json.loads(self.redis.streams[inbox][0][1]["envelope"])
+        self.assertNotIn("in_reply_to", stored)
+
+    def test_deliver_api_leaves_absent_in_reply_to_untouched(self):
+        ingress = prefix("test", "office", "telegram", "ingress")
+        envelope = build("Message", "alice", "telegram", {"text": "reply"}, pod="test", tenant="office")
+        self.redis.lists[ingress] = [encode(envelope)]
+
+        deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+
+        inbox = prefix("test", "office", "telegram", "inbox")
+        stored = json.loads(self.redis.streams[inbox][0][1]["envelope"])
+        self.assertNotIn("in_reply_to", stored)
 
     def test_idle_sse_stream_emits_keepalive_without_new_entries(self):
         """No existing test opened an SSE stream and left it idle -- every

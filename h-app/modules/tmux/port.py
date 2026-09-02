@@ -105,16 +105,20 @@ def message_opener(
     payload = envelope.get("payload", {})
     text = payload.get("text", "") if isinstance(payload, dict) else str(payload)
     stream_id = envelope.get("stream_id", "")
-    # Exposed so a reply can opt into `office send --reply-to` -- see
-    # lib/reply_correlation.py. Nothing downstream requires it; a reply that
-    # never names it stays valid, same as before this existed.
-    blocks = [f"[message {stream_id} from {source}] {text}\n"]
+    blocks = [f"[message from {source}] {text}\n"]
     try:
         pt = port_type(r, pod=pod, tenant=tenant, agent=source)
     except Exception:
         pt = None
     if pt == "api":
-        blocks.append(f"[reply to {source}]\n")
+        # The id only goes here, not on the primary line above: in_reply_to
+        # is only ever validated by modules/api/port.py's deliver_api, which
+        # only ever runs for an api-type destination -- exactly the
+        # condition that already gates this hint line. Exposing it on every
+        # message (tmux-to-tmux included, where nothing would ever read it)
+        # would be a permanent width tax on the line every agent actually
+        # reads, for a benefit that only exists here. See lib/reply_correlation.py.
+        blocks.append(f"[reply to {source}: office send -a {source} --reply-to {stream_id} \"...\"]\n")
 
     msg = "".join(blocks)
     corr_id = envelope.get("correlation_id")

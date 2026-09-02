@@ -155,7 +155,7 @@ class TmuxPortTests(unittest.TestCase):
         deliver_tmux(self.redis, pod=POD, tenant=TENANT, agent="bob", session_name="testtenant")
 
         mock_submit.assert_called_once_with(
-            "testtenant", "bob", f"[message {stream_id} from alice] hello bob\n",
+            "testtenant", "bob", "[message from alice] hello bob\n",
             stream_id=stream_id, socket=None,
         )
 
@@ -172,7 +172,10 @@ class TmuxPortTests(unittest.TestCase):
 
         deliver_tmux(self.redis, pod=POD, tenant=TENANT, agent="bob", session_name="testtenant")
 
-        expected_msg = f"[message {stream_id} from telegram] ping\n[reply to telegram]\n"
+        expected_msg = (
+            f"[message from telegram] ping\n"
+            f'[reply to telegram: office send -a telegram --reply-to {stream_id} "..."]\n'
+        )
         mock_submit.assert_called_once_with(
             "testtenant", "bob", expected_msg,
             stream_id=stream_id, socket=None,
@@ -284,12 +287,12 @@ class TmuxPortTests(unittest.TestCase):
         # First call pops msg 1
         deliver_tmux(self.redis, pod=POD, tenant=TENANT, agent="bob", session_name="testtenant")
         self.assertEqual(mock_submit.call_count, 1)
-        mock_submit.assert_called_with("testtenant", "bob", f"[message {id1} from alice] msg 1\n", stream_id=id1, socket=None)
+        mock_submit.assert_called_with("testtenant", "bob", "[message from alice] msg 1\n", stream_id=id1, socket=None)
 
         # Second call pops msg 2
         deliver_tmux(self.redis, pod=POD, tenant=TENANT, agent="bob", session_name="testtenant")
         self.assertEqual(mock_submit.call_count, 2)
-        mock_submit.assert_called_with("testtenant", "bob", f"[message {id2} from alice] msg 2\n", stream_id=id2, socket=None)
+        mock_submit.assert_called_with("testtenant", "bob", "[message from alice] msg 2\n", stream_id=id2, socket=None)
 
         # Ingress is now empty
         self.assertIsNone(self.redis.lpop(prefix(POD, TENANT, "bob", "ingress")))

@@ -80,6 +80,21 @@ class OpenShellPortTests(unittest.TestCase):
         reply = parse(raw)
         self.assertEqual(reply["payload"], {"text": "reply"})
         self.assertEqual(reply["correlation_id"], stream_id)
+        # Openshell replies are generated mechanically in the same call that
+        # received the envelope, so correlation is automatic and exact --
+        # no --reply-to, no agent cooperation, unlike tmux.
+        self.assertEqual(reply["in_reply_to"], stream_id)
+
+    def test_reply_correlation_records_delivery_for_validation(self):
+        from lib.reply_correlation import was_delivered
+
+        stream_id = self.queue()
+        self.assertFalse(was_delivered(self.redis, pod=POD, tenant=TENANT, agent="bob", stream_id=stream_id))
+        deliver_openshell(self.redis, pod=POD, tenant=TENANT, agent="bob", client=self.client)
+        # deliver_api validates in_reply_to against real provenance
+        # regardless of how it was produced -- this confirms an openshell
+        # reply's automatic in_reply_to would actually pass that check.
+        self.assertTrue(was_delivered(self.redis, pod=POD, tenant=TENANT, agent="bob", stream_id=stream_id))
 
     def test_command_has_no_message_prefix(self):
         self.queue("Command", {"text": "git status"})

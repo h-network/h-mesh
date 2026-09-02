@@ -139,7 +139,7 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         # Capture pane text from alice window
         code, stdout, stderr = run_tmux("capture-pane", "-J", "-p", "-t", f"{self.session_name}:alice", socket=self.socket)
         self.assertEqual(code, 0)
-        self.assertIn(f"[message {stream_id} from bob] hello alice from bob", stdout)
+        self.assertIn("[message from bob] hello alice from bob", stdout)
 
         # 3. Test Attachment delivery
         content = b"Binary attachment payload data"
@@ -248,7 +248,7 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         code, stdout, stderr = run_tmux("capture-pane", "-J", "-p", "-t", f"{self.session_name}:charlie", socket=self.socket)
         self.assertEqual(code, 0)
         for i in range(3):
-            self.assertIn(f"[message {stream_ids[i]} from dave] burst message #{i+1}", stdout)
+            self.assertIn(f"[message from dave] burst message #{i+1}", stdout)
 
     def test_real_tmux_module_subprocess_invocation(self):
         import signal
@@ -304,7 +304,7 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         # Check pane output
         code, stdout, stderr = run_tmux("capture-pane", "-J", "-p", "-t", f"{self.session_name}:grace", socket=self.socket)
         self.assertEqual(code, 0)
-        self.assertIn(f"[message {sid} from frank] invoked via python -m modules.tmux.port", stdout)
+        self.assertIn("[message from frank] invoked via python -m modules.tmux.port", stdout)
 
         # Delivering lock released
         delivering_key = prefix(self.pod, self.tenant, agent="grace", resource="delivering")

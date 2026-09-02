@@ -21,6 +21,7 @@ from core.keys import prefix
 from core.logging import configure_logging
 from lib.attachment_schema import validate_attachment_payload
 from lib.board_interaction import add_ticket
+from lib.reply_correlation import record_delivered
 
 from .client import OpenShellClient, OpenShellUnavailable
 from .headless import headless_command
@@ -117,6 +118,16 @@ def _exec_headless(
 def _reply(
     r, pod: str, tenant: str, agent: str, destination: str, envelope: dict, result
 ) -> None:
+    # Unlike a tmux agent, this reply is generated mechanically in the same
+    # call that received the envelope -- no human or CLI chooses to
+    # correlate it, so in_reply_to is set directly from what was just
+    # delivered rather than exposed for an agent to name back. record_delivered
+    # still runs first: deliver_api validates every in_reply_to against real
+    # provenance regardless of how it was produced, and this path is no
+    # exception.
+    stream_id = envelope.get("stream_id")
+    if stream_id:
+        record_delivered(r, pod=pod, tenant=tenant, agent=agent, stream_id=stream_id)
     text = result.stdout if result.exit_code == 0 else result.stdout + result.stderr
     if not text.strip():
         return
@@ -130,6 +141,7 @@ def _reply(
         kind="Message",
         correlation_id=envelope.get("stream_id"),
         module="openshell",
+        in_reply_to=stream_id,
     )
 
 
