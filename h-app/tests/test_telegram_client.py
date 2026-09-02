@@ -4101,40 +4101,56 @@ def test_a_nested_transaction_is_refused_rather_than_deadlocking():
 
 def test_updates_for_one_chat_are_applied_in_arrival_order():
     """Mutual exclusion is not ordering. Lock acquisition is not FIFO, so with
-    a lock alone the answers "sme-9" then "-" could be applied "-" first --
+    a lock alone the answers "sme-9" then "-" can be applied "-" first --
     rejected against stage=name -- leaving the flow at profile instead of
-    provider, with nothing crashed and a normal-looking log. The per-chat
-    worker keeps Telegram's own order.
+    provider, with nothing crashed and a normal-looking log.
 
-    Falsify by replacing submit_update's body with
-    `threading.Thread(target=self._dispatch_update, args=(update,)).start()`:
-    the first answer is held inside its handler, the second overtakes it, and
-    the final stage is profile."""
+    ⚠ The barrier here is DISPATCH COMPLETION, not any wait helper of the
+    bot's. An earlier version waited on chat_worker(...).wait_idle(), which
+    under a thread-per-update implementation creates an unrelated empty worker
+    and returns immediately: the test then failed at stage `name` because the
+    dispatches were still running, never at the reversed-order `profile` it
+    claimed to catch. It failed for the wrong reason, which is the same thing
+    as not testing what it says.
+
+    FALSIFICATION, observed: replace submit_update's body with
+    `threading.Thread(target=self._dispatch_update, args=(update,), daemon=True).start()`
+    and this fails on `assert state["stage"] == "provider"` with the actual
+    value 'profile' -- the second answer applied first, rejected at the name
+    stage, and the first answer then advancing only one step."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        holding = threading.Event()
-
-        class SlowFirstTelegram(DummyTelegramClient):
-            seen = 0
-
-            def send_message(self, chat_id, text, **kwargs):
-                SlowFirstTelegram.seen += 1
-                if SlowFirstTelegram.seen == 1:
-                    holding.wait(timeout=2)
-                return super().send_message(chat_id, text, **kwargs)
-
-        bot_instance, mesh, telegram = _make_bot(telegram=SlowFirstTelegram(), tmpdir=tmpdir,
-                                                 allowed_chat_id=12345)
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=12345)
         with bot_instance.chat_txn(12345):
             bot_instance.pending[12345] = {"flow": "hire", "stage": "name", "message_id": 1}
+
+        second_entered = threading.Event()
+        finished = threading.Semaphore(0)
+        real_dispatch = bot_instance._dispatch_update
+
+        def instrumented(update):
+            uid = update["update_id"]
+            if uid == 2:
+                second_entered.set()
+            if uid == 1:
+                # Give a mis-ordered implementation every chance to run the
+                # later update first. Under the worker this simply times out,
+                # because update 2 cannot start until update 1 returns.
+                second_entered.wait(timeout=0.3)
+            try:
+                real_dispatch(update)
+            finally:
+                finished.release()
+
+        # patched before the first submit, so the worker captures this handler
+        bot_instance._dispatch_update = instrumented
 
         def update(uid, text):
             return {"update_id": uid, "message": {"chat": {"id": 12345}, "message_id": uid, "text": text}}
 
         bot_instance.submit_update(update(1, "sme-9"))
         bot_instance.submit_update(update(2, "-"))
-        time.sleep(0.1)  # give a mis-ordered implementation every chance to run second first
-        holding.set()
-        assert bot_instance.chat_worker(12345).wait_idle(timeout=5)
+        assert finished.acquire(timeout=5), "first dispatch never completed"
+        assert finished.acquire(timeout=5), "second dispatch never completed"
 
         state = bot_instance.pending.get("12345")
         assert state is not None, "the flow should still be open at the provider stage"
@@ -4163,13 +4179,16 @@ def test_a_handler_that_raises_does_not_kill_the_chat_worker():
 
 
 def test_an_overlapping_reply_finalizes_the_wrong_turns_render():
-    """⚠ Pins a KNOWN LIMIT rather than correct behaviour. ReplyPusher has no
-    render handle because a reply carries no link back to its prompt -- the
-    api mints a fresh correlation_id per envelope and an agent's reply is its
-    own envelope. So with two overlapping prompts to one agent, the first
-    reply ends whichever render is installed. This test exists so that limit
-    is documented and would be noticed if the wire ever gains turn
-    correlation and someone fixes it."""
+    """⚠ Pins ACCEPTED BEHAVIOUR, not correct behaviour, and the difference
+    is a decision rather than a hope. ReplyPusher has no render handle because
+    a reply carries no link back to its prompt: the api mints a fresh
+    correlation_id per envelope and an agent's reply is its own envelope. With
+    two overlapping prompts to one agent, the first reply ends whichever
+    render is installed. api-agent declined the wire change (783f2634) --
+    nothing populates an in_reply_to without agent cooperation, and the
+    no-cooperation fallback assumes in-order replies, which is exactly false
+    here. This test exists so the behaviour is deliberate and would be
+    noticed if a cross-module correlation change ever lands."""
     with tempfile.TemporaryDirectory() as tmpdir:
         bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
         key = "12345:architect"
@@ -4267,3 +4286,85 @@ def test_nested_state_is_frozen_too():
             bot_instance.pane_watches[777] = {"agent": "sme-2", "stop_event": event}
         bot_instance.pane_watches.get("777")["stop_event"].set()
         assert event.is_set()
+
+
+def test_unauthorized_chats_never_get_a_worker():
+    """⚠ Resource exhaustion, not tidiness: a worker is a permanent thread and
+    a permanent queue. Measured before the fix, 30 updates from 30 unauthorised
+    chats left 30 live daemon threads behind, every one of those updates having
+    been correctly rejected. Authorisation has to happen before allocation."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=12345)
+        before = threading.active_count()
+
+        for i in range(30):
+            bot_instance.submit_update(
+                {"update_id": i, "message": {"chat": {"id": 900000 + i}, "message_id": i, "text": "hello"}}
+            )
+        # malformed updates must not become a chat named "None" either
+        bot_instance.submit_update({"update_id": 99, "message": {"text": "no chat at all"}})
+        bot_instance.submit_update({"update_id": 100})
+
+        assert bot_instance._chat_workers == {}
+        assert threading.active_count() == before
+        assert telegram.sent_messages == []
+
+        # the allowed chat still gets exactly one
+        bot_instance.submit_update(
+            {"update_id": 200, "message": {"chat": {"id": 12345}, "message_id": 200, "text": "/menu"}}
+        )
+        assert bot_instance.chat_worker(12345).wait_idle(timeout=5)
+        assert list(bot_instance._chat_workers) == ["12345"]
+
+
+def test_updates_are_acknowledged_to_telegram_before_they_are_handled():
+    """⚠ Pins a LOSS BOUNDARY, not a guarantee. `offset` advances when an
+    update is queued, so a crash with a non-empty queue loses operator actions
+    Telegram believes were delivered. The alternative -- acknowledging only
+    after processing -- makes restart redeliver, and a redelivered /run runs
+    the command twice with no dedupe anywhere in this client. A lost message
+    can be sent again; a duplicated side effect cannot be un-run. This test
+    exists so the boundary moves only on purpose."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        holding = threading.Event()
+        offsets = []
+        polls = threading.Semaphore(0)
+
+        class RecordingTelegram(DummyTelegramClient):
+            def get_updates(self, offset=None, timeout=20):
+                offsets.append(offset)
+                polls.release()
+                if len(offsets) == 1:
+                    return [{"update_id": 7,
+                             "message": {"chat": {"id": 12345}, "message_id": 1, "text": "hello"}}]
+                if len(offsets) > 3:
+                    raise SystemExit("stop the loop")  # not caught by run_polling's except Exception
+                return []
+
+        telegram = RecordingTelegram()
+        bot_instance, mesh, _ = _make_bot(telegram=telegram, tmpdir=tmpdir, allowed_chat_id=12345)
+
+        real_dispatch = bot_instance._dispatch_update
+        bot_instance._dispatch_update = lambda update: (holding.wait(timeout=5), real_dispatch(update))
+
+        def poll():
+            try:
+                bot_instance.run_polling()
+            except SystemExit:
+                pass  # the fake client's way of ending the loop
+
+        loop = threading.Thread(target=poll, daemon=True)
+        loop.start()
+        try:
+            assert polls.acquire(timeout=5), "the loop never polled at all"
+            assert polls.acquire(timeout=5), (
+                "no second poll while the update was still queued — acknowledgement "
+                "now waits for handling, which moves the loss boundary"
+            )
+            # the update is still sitting in the worker, unhandled...
+            assert bot_instance.chat_worker(12345)._queue.unfinished_tasks == 1
+            # ...and Telegram has already been told not to send it again
+            assert offsets[1] == 8
+        finally:
+            holding.set()
+            loop.join(timeout=5)

@@ -393,16 +393,29 @@ before the prompt it answers is visible. Claim-and-release would be safe only
 with an explicit in-progress state that queues or rejects input arriving
 mid-step. The transaction is released on exceptions.
 
-⚠ **Known limit — a reply cannot say which turn it answers.** `ReplyPusher`
-finalizes a chat+agent's activity render with no render handle, because the
-api door mints a fresh `correlation_id` per envelope and an agent's reply is
-its own envelope: nothing on the wire links it to the prompt. With two
-overlapping prompts to one agent, the first reply ends whichever render is
-installed, which may belong to the second, still-running turn. The display
-stops early; no state is corrupted. Fixing it needs turn correlation on the
-wire — an api change, not this client's to make — and
-`test_an_overlapping_reply_finalizes_the_wrong_turns_render` pins it as a
-documented limit rather than a surprise.
+⚠ **Accepted behaviour, by decision — a reply cannot say which turn it
+answers.** `ReplyPusher` finalizes a chat+agent's activity render with no
+render handle, because the api door mints a fresh `correlation_id` per
+envelope and an agent's reply is its own envelope: nothing on the wire links
+it to the prompt. With two overlapping prompts to one agent, the first reply
+ends whichever render is installed, which may belong to the second,
+still-running turn. The display stops early; no state is corrupted.
+
+Raised with api-agent, who declined the wire change: an optional
+`in_reply_to` field is nearly free, but nothing populates it without the
+agent cooperating, and the only no-cooperation mechanism available (FIFO
+oldest-delivered-first, mirroring tmux's delivery markers) assumes replies
+return in order — exactly what is false in the overlapping case. It would
+narrow the single-turn case and leave this one. A cross-module version is
+architect's to route if they want it.
+
+It is also an ORDERING dependency, not only a missing correlation:
+ReplyPusher's thread and the polling worker are excluded from each other by
+the transaction, not ordered. Dropping the reply-triggered finalize would
+remove the dependency, at the cost of every turn's display lingering until
+the watcher notices — up to its 300s timeout — which was ruled against as a
+certain cost traded for a rare one.
+`test_an_overlapping_reply_finalizes_the_wrong_turns_render` pins it.
 
 Try it without a bot token: `python3 clients/telegram/bot.py --api-token "$H_MESH_API_TOKEN" --menu`.
 

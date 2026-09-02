@@ -1141,13 +1141,17 @@ class ChatWorker:
     deliberately not caught: KeyboardInterrupt and SystemExit are the process
     ending, and a worker that swallowed them would keep a dying bot alive.
 
-    ⚠ LIFECYCLE. Workers are created on a chat's first update and never
-    stopped. They are daemon threads, so the process exits without joining
-    them; there is no shutdown handshake because there is nothing to flush —
-    an update half-handled at exit was going to be lost either way, and
-    Telegram redelivers anything not acknowledged by the cursor. The map of
-    workers is bounded in practice by the chats the bot answers, which
-    `_chat_allowed` already restricts to one.
+    ⚠ LIFECYCLE. Workers are created on a chat's first AUTHORISED update
+    (`submit_update` rejects before allocating, so unauthenticated traffic
+    cannot spawn threads) and are never stopped. They are daemon threads, so
+    the process exits without joining them.
+
+    ⚠ There IS something to flush, and it is lost: an earlier version of this
+    docstring said otherwise and was wrong. `run_polling` acknowledges an
+    update to Telegram when it queues it, so anything still queued at process
+    death is gone while Telegram considers it delivered. That boundary is
+    argued and pinned in `run_polling`'s own docstring; what matters here is
+    that the queue is not a durable buffer and must not be mistaken for one.
 
     ⚠ BACKPRESSURE. The queue is unbounded ON PURPOSE. The alternatives are
     dropping an operator's message (silent data loss, the failure this whole
@@ -3139,19 +3143,32 @@ class TelegramBot:
         completed and nothing tracking it. A caller that installed a render
         passes it here and only its own is taken.
 
-        ⚠ KNOWN LIMIT, not a claim of correctness: `ReplyPusher` calls this
-        with no render handle, because a reply carries no link back to the
-        prompt that caused it. The api door mints a fresh `correlation_id` for
-        every envelope (`modules/api/server.py`), and an agent's reply is its
-        own envelope, so there is nothing in a mailbox message that says which
-        turn it answers. With two overlapping prompts to the same agent, the
-        first reply therefore finalizes whatever render is installed — which
-        may belong to the second, still-running turn. The display ends early;
-        no state is corrupted and the second render is correctly untracked
-        afterwards. Fixing it properly needs turn correlation on the wire,
-        which is an api change and not this client's to make. Pinned by
-        test_an_overlapping_reply_finalizes_the_wrong_turns_render so it is a
-        documented limit rather than a surprise.
+        ⚠ ACCEPTED BEHAVIOUR, BY DECISION — not a limit awaiting a fix.
+        `ReplyPusher` calls this with no render handle, because a reply
+        carries no link back to the prompt that caused it: the api door mints
+        a fresh `correlation_id` per envelope and an agent's reply is its own
+        envelope, so nothing in a mailbox message says which turn it answers.
+        With two overlapping prompts to one agent, the first reply therefore
+        ends whichever render is installed — possibly the second,
+        still-running turn's. The display stops early; no state is corrupted.
+
+        api-agent considered and declined the wire change (their ticket
+        783f2634, raised from here): an optional `in_reply_to` is nearly free
+        on the wire, but nothing populates it without the agent cooperating,
+        and the only no-cooperation mechanism available — FIFO
+        oldest-delivered-first, mirroring tmux's delivery markers — assumes
+        replies come back in order, which is exactly what is false in the
+        overlapping case. It would narrow the single-turn case and leave this
+        one. A cross-module version remains architect's to route.
+
+        This ALSO is not only a correlation gap: it is an ordering dependency
+        between ReplyPusher's thread and the polling worker, which the chat
+        transaction excludes but does not order. Dropping the reply-triggered
+        finalize would remove the dependency at the cost of every turn's
+        display lingering until the watcher notices (up to its 300s timeout),
+        which architect ruled against: a certain cost on every turn against a
+        rare one. Pinned by
+        test_an_overlapping_reply_finalizes_the_wrong_turns_render.
         """
         cid = str(chat_id)
         key = f"{cid}:{agent}"
@@ -3343,14 +3360,18 @@ class TelegramBot:
     @staticmethod
     def _update_chat_id(update: dict) -> str | None:
         """The chat an update belongs to, for routing only — `_dispatch_update`
-        does its own extraction and its own authorisation check."""
+        does its own extraction and its own authorisation check.
+
+        ⚠ Returns None rather than the string "None" when the id is missing:
+        a malformed update must not become a chat named None with a thread of
+        its own."""
         callback = update.get("callback_query")
         if callback:
-            return str(callback.get("message", {}).get("chat", {}).get("id"))
-        msg = update.get("message") or update.get("edited_message")
-        if msg:
-            return str(msg.get("chat", {}).get("id"))
-        return None
+            chat_id = callback.get("message", {}).get("chat", {}).get("id")
+        else:
+            msg = update.get("message") or update.get("edited_message")
+            chat_id = msg.get("chat", {}).get("id") if msg else None
+        return None if chat_id is None else str(chat_id)
 
     def chat_worker(self, chat_id: int | str) -> ChatWorker:
         """That chat's serial worker, created under the same guard as its
@@ -3366,11 +3387,20 @@ class TelegramBot:
 
     def submit_update(self, update: dict) -> None:
         """Hand one update to its chat's worker. The polling loop never blocks
-        here; ordering within a chat is the worker's job."""
+        here; ordering within a chat is the worker's job.
+
+        ⚠ AUTHORISE BEFORE ALLOCATING. A worker is a permanent thread and a
+        permanent queue, so creating one for any chat id that arrives makes
+        unauthenticated traffic a resource-exhaustion vector: measured, 30
+        updates from 30 unauthorised chats left 30 live daemon threads behind
+        after every one of those updates had been correctly rejected. The
+        rejection has to happen before anything is allocated, not after.
+        `_dispatch_update` still re-checks — this is a gate, not a
+        replacement for the authorisation it does."""
         cid = self._update_chat_id(update)
-        if cid is None:
-            # Nothing to order it against and nothing to authorise it as —
-            # _dispatch_update logs and drops it.
+        if cid is None or not self._chat_allowed(cid):
+            # Handled inline: logging and dropping costs nothing and needs no
+            # thread of its own, and an unauthorised chat must never get one.
             self._dispatch_update(update)
             return
         self.chat_worker(cid).submit(update)
@@ -3383,7 +3413,13 @@ class TelegramBot:
         update_id = update.get("update_id")
         callback = update.get("callback_query")
         if callback:
-            chat_id = str(callback["message"]["chat"]["id"])
+            # ⚠ .get, not [...]: a malformed update must be dropped with a log
+            # line, not raise out of the dispatcher. Found by the test that
+            # feeds it an update with no chat at all.
+            chat_id = self._update_chat_id(update)
+            if chat_id is None:
+                logger.debug(f"update {update_id}: callback with no chat id, dropped")
+                return
             logger.debug(
                 f"update {update_id}: callback data={callback.get('data', '')!r} "
                 f"chat={chat_id} msg={callback['message'].get('message_id')}"
@@ -3406,7 +3442,10 @@ class TelegramBot:
             logger.debug(f"update {update_id}: no message or callback in it, nothing to dispatch")
             return
 
-        chat_id = str(msg["chat"]["id"])
+        chat_id = self._update_chat_id(update)
+        if chat_id is None:
+            logger.debug(f"update {update_id}: message with no chat id, dropped")
+            return
         logger.debug(
             f"update {update_id}: message chat={chat_id} msg={msg.get('message_id')} "
             f"edited={edited is not None} "
@@ -3448,15 +3487,32 @@ class TelegramBot:
         `main()`). Enrolling here too would just be a second, redundant call
         with its own 60s retry budget stacked on top of the caller's.
 
-        ⚠ Each update is dispatched to its own thread rather than handled
-        inline. `handle_user_prompt` blocks — unboundedly, by design — until
-        target_agent replies. Handled inline, that means ONE unanswered
-        prompt stops this loop from ever calling `get_updates()` again,
-        freezing the bot for every chat, not just the stuck one: measured
-        live — a user's "hi" outlived architect's reply-via-office-send, and
-        every message the user sent afterward went unread by Telegram's
-        getUpdates until the first exchange finally resolved and unblocked
-        the loop. They looked lost; they were just never fetched.
+        ⚠ Updates are handed to a per-chat worker (`submit_update`), not
+        handled inline and no longer one thread per update. Inline handling
+        froze the bot for EVERY chat behind one slow turn — measured live: a
+        user's "hi" outlived architect's reply, and every later message went
+        unfetched until that exchange resolved. They looked lost; they were
+        never fetched. (`handle_user_prompt` no longer waits for a reply —
+        that is `ReplyPusher`'s job — but a turn still makes several network
+        calls, which is enough to freeze a shared loop.) Thread-per-update
+        fixed the freeze and lost the ORDER: lock acquisition is not FIFO, so
+        two answers could be applied back to front. One worker per chat keeps
+        both properties — ordered within a chat, concurrent across chats.
+
+        ⚠ AN UPDATE IS ACKNOWLEDGED TO TELEGRAM BEFORE IT IS HANDLED, and
+        that is a deliberate loss boundary rather than an oversight. `offset`
+        advances as soon as an update is queued, so a crash with a non-empty
+        queue loses operator actions Telegram believes were delivered. The
+        alternative — advancing `offset` only after processing — makes
+        restart REDELIVER anything unacknowledged, and this client has no
+        dedupe: a redelivered `/run` runs the command a second time and a
+        redelivered prompt is sent twice. The asymmetry is the reason for the
+        choice: a lost message is one the operator can send again, while a
+        duplicated side effect cannot be un-run. The exposure is the depth of
+        one chat's queue, which is zero in steady state and announces itself
+        at `ChatWorker.BACKLOG_WARN`. Pinned by
+        test_updates_are_acknowledged_to_telegram_before_they_are_handled so
+        the boundary moves only on purpose.
         """
         if not self.telegram:
             logger.error("No Telegram token provided; long-polling loop disabled.")
