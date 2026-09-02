@@ -1138,8 +1138,12 @@ def test_a_transient_nonempty_directory_is_stuck_then_cleanly_reaped_next_sessio
         # Not `assert reaped_N == ...` / `assert stuck_N == ...`: whole-
         # shared-directory aggregates, not scoped to this entry (see the
         # ticket). The existence checks below are the correctly-scoped
-        # equivalent for each attempt.
-        reap_all_orphans(log=lambda *_: None)
+        # equivalent for each attempt. Log lines are captured (not
+        # discarded) so a failure below can show real evidence of what
+        # reap_all_orphans actually did with THIS entry, not just infer it.
+        captured_log: list[str] = []
+        reap_all_orphans(log=captured_log.append)
+        own_log_lines = [line for line in captured_log if real_tmpdir.name in line]
         # Two distinct windows where a DIFFERENT concurrent process's own,
         # entirely ordinary (non-monkeypatched) sweep of the same shared
         # MANIFEST_DIR can finish this entry's job before -- or right after
@@ -1172,14 +1176,25 @@ def test_a_transient_nonempty_directory_is_stuck_then_cleanly_reaped_next_sessio
                 "establish the stuck-then-reaped claim itself (this "
                 f"process's own race fired: {raced_once['done']})"
             )
-        assert raced_once["done"], (
-            "the tmpdir is still here and NOTHING reaped it -- this "
-            "process's own reap_all_orphans never called rmdir('home') "
-            "for this entry at all, so the injected race was never "
-            "reached. That is a genuine failure to attempt the owned "
-            "orphan's removal, not a concurrent process winning a race "
-            "(nobody finished the job either)."
-        )
+        if not raced_once["done"]:
+            if not own_log_lines:
+                cause = (
+                    "reap_all_orphans never mentioned this entry at all -- it "
+                    "did not reach this entry in its sweep (misclassified, "
+                    "skipped, or never iterated to it)"
+                )
+            else:
+                cause = (
+                    "reap_all_orphans reached this entry (log line(s) below) "
+                    "but never called rmdir('home') for it -- it failed or "
+                    "stopped somewhere on the way to the injected race, not "
+                    f"at it: {own_log_lines!r}"
+                )
+            raise AssertionError(
+                "the tmpdir is still here and nothing reaped it, with no "
+                "concurrent process having touched it either -- this is a "
+                f"genuine failure to complete the owned orphan's removal: {cause}"
+            )
         assert real_tmpdir.exists(), "the tmpdir was removed despite the transient race"
         assert (subdir / "race-injected.txt").exists(), "the injected content was lost anyway"
         assert entry.exists(), "the manifest entry was cleared despite the transient race"
