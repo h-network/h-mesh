@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1358,6 +1359,70 @@ def test_status_reports_unknown_with_no_activity_feed(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "unknown" in out
     assert "no activity feed" in out
+
+
+def test_status_does_not_report_active_empty_board_as_blocked_by_delivery_marker(
+    monkeypatch, capsys
+):
+    """Delivery uncertainty must not silently remove an available agent."""
+    _env(monkeypatch)
+    r = FakeRedis(registry={"ci-agent": "tmux"})
+    now = datetime.now(timezone.utc)
+    r.hashes[prefix(POD, TENANT, "ci-agent", "presence")] = {
+        "state": "idle",
+        "since": (now - timedelta(minutes=1)).isoformat(),
+        "last_activity": (now - timedelta(seconds=8)).isoformat(),
+    }
+    r.hashes[prefix(POD, TENANT, "ci-agent", "blocked")] = {
+        "since": (now - timedelta(minutes=2)).isoformat(),
+        "stream_id": "a" * 32,
+    }
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["status", "ci-agent"])
+
+    row = capsys.readouterr().out
+    assert "ci-agent    idle" in row
+    assert "ci-agent    blocked" not in row
+    assert "—" in row
+    assert "last activity 8s ago" in row
+    assert "delivery unverified for 2m" in row
+
+
+def test_status_keeps_unknown_presence_unknown_with_delivery_marker(monkeypatch, capsys):
+    """Missing presence is not silently promoted to availability or blockage."""
+    _env(monkeypatch)
+    r = FakeRedis(registry={"ci-agent": "tmux"})
+    r.hashes[prefix(POD, TENANT, "ci-agent", "blocked")] = {
+        "since": "2026-09-02T09:59:00.000Z",
+        "stream_id": "a" * 32,
+    }
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["status", "ci-agent"])
+
+    row = capsys.readouterr().out
+    assert "ci-agent    unknown" in row
+    assert "ci-agent    idle" not in row
+    assert "no activity feed; delivery unverified" in row
+
+
+def test_status_keeps_delivery_marker_visible_when_its_age_is_malformed(monkeypatch, capsys):
+    """Bad marker age degrades to explicit unknown context, not silence or blockage."""
+    _env(monkeypatch)
+    r = FakeRedis(registry={"ci-agent": "tmux"})
+    r.hashes[prefix(POD, TENANT, "ci-agent", "presence")] = {"state": "idle"}
+    r.hashes[prefix(POD, TENANT, "ci-agent", "blocked")] = {
+        "since": "not-a-timestamp",
+        "stream_id": "a" * 32,
+    }
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["status", "ci-agent"])
+
+    row = capsys.readouterr().out
+    assert "ci-agent    idle" in row
+    assert "delivery unverified (age unknown)" in row
 
 
 @patch("modules.office.cli.send")
