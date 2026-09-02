@@ -1,5 +1,6 @@
 """Unit tests for the Telegram bot client (clients/telegram/bot.py)."""
 
+import ast
 import base64
 import inspect
 import json
@@ -7,6 +8,7 @@ import logging
 import os
 import ssl
 import tempfile
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -628,6 +630,82 @@ def test_chat_allowed_matches_configured_id_across_str_int():
         assert bot_instance._chat_allowed(12345) is True   # int from Telegram
         assert bot_instance._chat_allowed("12345") is True
         assert bot_instance._chat_allowed(99999) is False
+
+
+def _update_types_dispatch_routes():
+    """The update TYPES `_dispatch_update` actually reads, from its own source.
+
+    ⚠ Derived rather than listed, because a hardcoded list that drifts from the
+    handlers is the same defect one step along: the point of asserting
+    `allowed_updates` is to stop a filter arriving from OUTSIDE, and a stale
+    list would reintroduce one from inside.
+
+    `update_id` is excluded — it is the envelope's id, not a type. Anything
+    else new that dispatch reads off an update counts as a type and fails the
+    comparison; that is a false failure in the odd case, which is the safe
+    direction and forces someone to look."""
+    # textwrap.dedent: a method's source is indented, and ast.parse wants a module
+    tree = ast.parse(textwrap.dedent(inspect.getsource(bot._dispatch_update_source_owner())))
+    return {
+        call.args[0].value
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "get" and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "update" and call.args
+        and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)
+    } - {"update_id"}
+
+
+def test_allowed_updates_matches_what_dispatch_routes():
+    """⚠ THE OBJECTION THE OLD COMMENT RAISED, ANSWERED. Narrowing at
+    getUpdates drops types silently and at a distance, so a later handler fails
+    by never being called. Sending the COMPLETE set narrows nothing — but only
+    while the set matches what dispatch routes, so this derives the routed
+    types from `_dispatch_update`'s own source and fails when they diverge.
+
+    Add a handler for a new update type without adding it to
+    `ALLOWED_UPDATE_TYPES` and this fails loudly. That is the difference
+    between a list that drifts and one that cannot."""
+    routed = _update_types_dispatch_routes()
+    assert routed, "the derivation found no update types at all — is it still reading dispatch?"
+    assert routed == set(bot.ALLOWED_UPDATE_TYPES), (
+        f"dispatch routes {sorted(routed)} but getUpdates asks for "
+        f"{sorted(bot.ALLOWED_UPDATE_TYPES)}; a type dispatch handles and the list "
+        "omits would silently never arrive"
+    )
+    assert {"message", "edited_message", "callback_query"} <= routed
+
+
+def test_get_updates_sends_the_complete_allowed_updates_every_call():
+    """⚠ HARM: `allowed_updates` persists SERVER-SIDE per token, so omitting it
+    means "reuse whatever was last set for this token, by anyone" — not "send
+    everything". An old webhook configuration or another process narrowing it
+    once makes `callback_query` stop arriving forever: every button dead, this
+    client unchanged, the logs silent. It fits the intermittency an operator
+    sees, too, because the inherited value changes whenever something else
+    touches the token.
+
+    Asserted on EVERY call, including the one carrying an offset: a filter
+    inherited on the second poll is exactly as fatal as one inherited on the
+    first."""
+    client = TelegramClient("token-not-logged")
+    calls = []
+
+    def fake_request(method, params=None):
+        calls.append((method, params))
+        return {"ok": True, "result": []}
+
+    client.request = fake_request
+    client.get_updates()
+    client.get_updates(offset=42)
+
+    assert len(calls) == 2
+    for method, params in calls:
+        assert method == "getUpdates"
+        assert params.get("allowed_updates") == list(bot.ALLOWED_UPDATE_TYPES), (
+            f"getUpdates was called without the complete allowed_updates: {params}"
+        )
+    assert calls[1][1]["offset"] == 42, "the offset must still be sent"
 
 
 def test_dispatch_update_ignores_a_message_from_an_unconfigured_chat():

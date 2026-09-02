@@ -43,6 +43,32 @@ A Telegram bot client that talks to an **h-mesh** tenant over HTTP, allowing a u
 | `RUN_ALLOWED_COMMANDS` | unset (unrestricted) | `/run` (§2h): comma-separated exact-match allowlist of native CLI slash commands, only enforced when set — global, not per-CLI/per-agent, see §2h |
 | `H_MESH_LOG_LEVEL` | `INFO` | Logging threshold for this client — see "Log Verbosity" below |
 
+### `allowed_updates` is asserted, not omitted
+
+⚠ **`allowed_updates` PERSISTS SERVER-SIDE PER TOKEN.** Omitting it does not
+mean "send everything" — it means "reuse whatever was last set for this token,
+by anyone". An old webhook configuration, another process, or a previous
+experiment that ever set a narrower list leaves this bot inheriting that filter
+forever: `callback_query` stops arriving, every button dies, this client is
+unchanged and the logs say nothing. It also explains intermittency, since the
+inherited value changes whenever something else touches the token.
+
+So `get_updates` sends the complete set on every call, including the polls that
+carry an offset.
+
+⚠ **This is not the narrowing the edited-message handler argues against.** That
+reasoning — filtering here drops types silently and at a distance, so the next
+handler added would fail by never being called — is sound, and it is about
+removing types from the list. This adds none and removes none; it asserts the
+full set so it cannot drift from outside.
+
+⚠ **And a hardcoded list that drifts from the handlers is the same defect one
+step along**, so `test_allowed_updates_matches_what_dispatch_routes` derives
+the routed types from `_dispatch_update`'s own source and fails when they
+diverge. Add a handler for a new update type without adding it to
+`ALLOWED_UPDATE_TYPES` and the suite fails loudly rather than the type silently
+never arriving.
+
 ### Log Verbosity
 
 `H_MESH_LOG_LEVEL` sets the threshold `logging.basicConfig` is called with, at

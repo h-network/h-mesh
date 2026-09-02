@@ -833,6 +833,36 @@ class ReplyPusher:
             )
 
 
+# ⚠ THE COMPLETE SET THIS BOT DISPATCHES, asserted on every getUpdates call.
+#
+# `allowed_updates` PERSISTS SERVER-SIDE PER TOKEN. Omitting it does not mean
+# "send everything" — it means "reuse whatever was last set for this token, by
+# anyone". So if any other process, an old webhook configuration, or a previous
+# experiment ever set a narrower list, this bot inherits that filter forever:
+# `callback_query` stops arriving, every button dies, our code is unchanged and
+# our logs say nothing. It also produces exactly the intermittency an operator
+# sees when something else touches the token between attempts.
+#
+# ⚠ THIS IS NOT THE FILTERING `_handle_edited_message` ARGUES AGAINST, and that
+# argument is sound: narrowing here would drop update types silently and at a
+# distance, so a later handler would fail by never being called. This does the
+# opposite — it ASSERTS the full set so it cannot drift from outside. The two
+# only agree while this list matches what dispatch actually routes, which is
+# why `test_allowed_updates_matches_what_dispatch_routes` derives the routed
+# types from `_dispatch_update` itself and fails if they diverge.
+ALLOWED_UPDATE_TYPES = ("message", "edited_message", "callback_query")
+
+
+def _dispatch_update_source_owner():
+    """The function whose source defines which update types are routed.
+
+    Exists so the drift test reads the real dispatcher rather than re-deriving
+    a path to it — if `_dispatch_update` moves or is renamed, this fails to
+    resolve instead of the test silently deriving nothing.
+    """
+    return TelegramBot._dispatch_update
+
+
 class TelegramClient:
     """Wrapper for Telegram Bot HTTP API."""
 
@@ -1071,8 +1101,14 @@ class TelegramClient:
         takes roughly half the updates — so running this against a token another
         bot is already using makes that bot drop messages, silently, for as long
         as this runs. Keep the window short, or use a token of your own.
+
+        ⚠ `allowed_updates` IS SENT ON EVERY CALL, and that is the point of it
+        rather than tidiness: the value persists server-side per token, so
+        omitting it inherits whatever was last set by anything that ever held
+        this token. Asserting the complete set makes the filter ours instead of
+        something we can silently inherit.
         """
-        params = {"timeout": timeout}
+        params = {"timeout": timeout, "allowed_updates": list(ALLOWED_UPDATE_TYPES)}
         if offset is not None:
             params["offset"] = offset
         res = self.request("getUpdates", params)
@@ -3398,11 +3434,20 @@ class TelegramBot:
         whether a flow happens to be open, which is precisely the invisible
         state-dependence that made be9cbedd undiagnosable.
 
-        ⚠ Not filtered at `getUpdates` with `allowed_updates` instead, which
-        would be tidier and is deliberately not done: that drops update types
-        silently and at a distance, so the next handler someone adds would
-        fail by never being called. Declining here is one visible line in the
-        log for every edit.
+        ⚠ Not NARROWED at `getUpdates` with `allowed_updates`, which would be
+        tidier and is deliberately not done: that drops update types silently
+        and at a distance, so the next handler someone adds would fail by never
+        being called. Declining here is one visible line in the log for every
+        edit.
+
+        ⚠ That is not the same as SENDING the parameter, which this client now
+        does on every call with the complete set (`ALLOWED_UPDATE_TYPES`). The
+        value persists server-side per token, so omitting it inherits whatever
+        another process last set — the failure this reasoning was protecting
+        against, arriving from outside instead. The objection above still
+        holds and is answered by deriving the routed types from this
+        dispatcher in the test, so a handler added without the list is a
+        failure rather than a silence.
 
         The operator is told ONLY when a flow is open, because that is the
         case where saying nothing leaves them waiting on an answer the bot has
