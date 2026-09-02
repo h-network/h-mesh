@@ -150,13 +150,47 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
-def _read_pid(pidfile: Path) -> int | None:
-    if not pidfile.exists():
-        return None
+@dataclass(frozen=True)
+class PidRead:
+    """Result of one atomic attempt to read a pidfile.
+
+    ``pid`` is None for two different facts a caller may need to tell
+    apart: no pidfile was found (never existed, or another process
+    reaped it -- these two are indistinguishable and mean the same thing
+    to every caller: there is no usable pid on disk right now), and a
+    pidfile that exists but whose content isn't a parseable pid.
+    ``corrupt`` is True only for the second case. Most callers only need
+    "is there a usable pid" (``.pid``); _stop_one uses ``.corrupt`` to
+    decide whether there is a bad file worth actively removing and
+    logging about, versus simply nothing to do.
+    """
+
+    pid: int | None
+    corrupt: bool = False
+
+
+def _read_pid(pidfile: Path) -> PidRead:
+    """One atomic read, not check-then-read.
+
+    A prior version called ``pidfile.exists()`` before ``read_text()`` --
+    a real TOCTOU: a concurrent reaper (another process finishing the
+    same pidfile's cleanup) can delete the file in the window between the
+    two calls, turning a normal "not running" case into an unhandled
+    FileNotFoundError that propagated out of stop_daemons() and aborted a
+    teardown part-way through. Reproduced live under concurrent stress,
+    not theorised (see the ticket for the traceback). ``read_text()``
+    already has to handle "file absent" on its own (it always could,
+    race or not), so the separate exists() guard added a TOCTOU window
+    without buying any actual guarantee -- deleted rather than repaired.
+    """
     try:
-        return int(pidfile.read_text().strip())
+        text = pidfile.read_text()
+    except FileNotFoundError:
+        return PidRead(pid=None)
+    try:
+        return PidRead(pid=int(text.strip()))
     except ValueError:
-        return None
+        return PidRead(pid=None, corrupt=True)
 
 
 def _identity_path(pidfile: Path) -> Path:
@@ -285,14 +319,18 @@ def _stop_one(
     log: Callable[[str], None],
     env: dict | None = None,
 ) -> None:
-    pid = _read_pid(pidfile)
-    if pid is None:
-        if pidfile.exists():
+    pid_read = _read_pid(pidfile)
+    if pid_read.pid is None:
+        # Decided from pid_read.corrupt, not a second pidfile.exists() call
+        # -- re-checking existence here would reopen the exact TOCTOU
+        # window _read_pid's own atomic read exists to close.
+        if pid_read.corrupt:
             log(f"  • {name}: pidfile {pidfile} did not contain a pid, removing")
             _remove_pidfiles(pidfile)
         else:
             log(f"  • {name}: not running (no pidfile)")
         return
+    pid = pid_read.pid
     pidfd, identity_status = _open_owned_pidfd(pid, name, pidfile, env)
     if identity_status == "stale":
         log(f"  • {name}: pidfile stale (pid {pid} not running), removing")
@@ -460,7 +498,10 @@ def start_daemons(
     try:
         for name, module in daemon_modules.items():
             pidfile = run_dir / f"{name}.pid"
-            existing_pid = _read_pid(pidfile)
+            # A corrupt pidfile and an absent one are treated alike here
+            # (start fresh either way) -- only _stop_one's log/cleanup
+            # decision needs the distinction PidRead.corrupt carries.
+            existing_pid = _read_pid(pidfile).pid
             if existing_pid is not None:
                 existing_pidfd, identity_status = _open_owned_pidfd(
                     existing_pid, name, pidfile, env
