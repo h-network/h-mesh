@@ -111,6 +111,21 @@ def _error_category(exc: BaseException) -> str:
     trusting that name. This loses one identifier in a rare case (a real
     subclass of our own bug types) and closes the whole class of attack.
 
+    ⚠ "Exact type identity" means `is`, not `in`/`==`. A first version of
+    this used `type(exc) in _INTERNAL_ERROR_TYPES` -- `in` on a tuple
+    compares with `==`, and `type(exc) == some_builtin_type` invokes
+    `type(exc)`'s own METACLASS `__eq__` (the metaclass of a CLASS object
+    is what defines how that class compares, the same way an instance's
+    class defines how the instance compares). A custom exception whose
+    metaclass overrides `__eq__` to raise crashed this function entirely
+    -- reviewer's exact finding. `is` performs no method dispatch at all
+    (a pointer comparison at the interpreter level), so it cannot be
+    hijacked by any override on either side, hostile or not. `isinstance`
+    below is unaffected by this specific attack: it dispatches on the
+    METACLASS OF THE TYPES BEING CHECKED AGAINST (our own hardcoded
+    builtins, always plain `type`), not on `type(exc)`'s metaclass, so a
+    hostile metaclass on `exc`'s own class has no hook to reach through it.
+
     Diagnostic value after this fix: `job` (already on every _error()
     record) says WHERE; this category says roughly WHAT KIND. That pair
     is deliberately all that's promised -- no free text, no exception
@@ -118,7 +133,7 @@ def _error_category(exc: BaseException) -> str:
     change retry/scheduling, every _error() call site's caller reruns on
     its own next scheduled cycle regardless of category.
     """
-    if type(exc) in _INTERNAL_ERROR_TYPES:
+    if any(type(exc) is internal_type for internal_type in _INTERNAL_ERROR_TYPES):
         return f"internal-error ({type(exc).__name__})"
     if isinstance(exc, _INTERNAL_ERROR_TYPES):
         return "internal-error (derived)"
@@ -219,13 +234,20 @@ class Watchdog:
         # nothing downstream catches a failure of the failure-reporter
         # itself. A rule adopted the same day this function was touched:
         # the last layer in a chain must be allowed to fail silently, or it
-        # becomes the new hole. _error_category is total by construction
-        # (isinstance/tuple membership, never a dict/set lookup that could
-        # raise on unhashable input -- proven in
-        # test_error_category_never_raises_on_hostile_input, not just
-        # claimed), so this guard is defense against something outside
-        # _error_category's own control -- a full disk, a closed stdout, a
-        # future change to this function that adds a real failure mode.
+        # becomes the new hole. `except Exception`, deliberately not a
+        # truly bare `except:` -- SystemExit/KeyboardInterrupt/
+        # GeneratorExit are BaseException, not Exception, and must still
+        # propagate rather than be swallowed by a failure-reporting sink.
+        #
+        # _error_category is total by construction (type()-identity via
+        # `is` and isinstance, never equality/hashing on the exception's
+        # own class -- see its own docstring for the metaclass-`__eq__`
+        # crash reviewer found in an earlier version that used `in`,
+        # proven fixed in test_error_category_never_raises_on_hostile_input,
+        # not just claimed), so THIS guard is defense against something
+        # outside _error_category's own control -- a full disk, a closed
+        # stdout, a future change to this function that adds a real
+        # failure mode.
         try:
             raw = json.dumps(
                 {

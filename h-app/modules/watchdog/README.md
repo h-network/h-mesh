@@ -209,8 +209,12 @@ deliberately rather than by accident (2026-09-02):
   every `_error()` call site's caller reruns on its own next scheduled
   cycle regardless of category, the same as before this fix.
 
-  `_error()` itself is now wrapped in a bare `try/except: pass` around its
-  whole body -- it is the LAST layer in this chain (all 14 call sites,
+  `_error()` itself is now wrapped in `try/except Exception: pass` around
+  its whole body -- deliberately `except Exception`, not a truly bare
+  `except:`, so `SystemExit`/`KeyboardInterrupt`/`GeneratorExit` (which
+  are `BaseException`, not `Exception`) still propagate rather than being
+  swallowed by a failure-reporting sink. It is the LAST layer in this
+  chain (all 14 call sites,
   including `main()`'s own outermost per-phase catches, report a failure
   *through* it, and nothing downstream catches a failure of the failure-
   reporter itself), and a rule adopted the same day this function was

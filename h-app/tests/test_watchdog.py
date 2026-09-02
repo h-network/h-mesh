@@ -621,6 +621,31 @@ class ErrorCategoryTests(unittest.TestCase):
         self.assertEqual(category, "internal-error (derived)")
         self.assertNotIn("REMOTE_SECRET_CLASS_NAME", category)
 
+    def test_a_hostile_exception_metaclass_does_not_crash_the_classifier(self):
+        """Reviewer's exact finding: `type(exc) in _INTERNAL_ERROR_TYPES`
+        used equality (`in` on a tuple), and `type(exc) == some_builtin`
+        invokes `type(exc)`'s own METACLASS `__eq__` -- the metaclass of a
+        class is what defines how that class object itself compares, the
+        same way an instance's class defines how the instance compares. A
+        custom exception whose metaclass raises out of __eq__ crashed this
+        function entirely under the `in`-based version. Fixed with `is`
+        (a pointer comparison, no method dispatch, cannot be hijacked by
+        any override). This constructs exactly that hostile metaclass and
+        confirms the classifier still returns its closed fallback instead
+        of propagating the crash."""
+
+        class HostileMeta(type):
+            def __eq__(cls, other):
+                raise RuntimeError("hostile metaclass __eq__")
+
+            def __hash__(cls):
+                return 0
+
+        class HostileException(Exception, metaclass=HostileMeta):
+            pass
+
+        self.assertEqual(service._error_category(HostileException("x")), "external-error")
+
     def test_a_genuine_transport_error_is_not_classified_as_internal(self):
         """The mirror clients-agent specifically warned not to skip: without
         this, "ours" could quietly widen until it swallows "theirs", passing
@@ -731,6 +756,34 @@ class ErrorSinkContentTests(unittest.TestCase):
                 service.Watchdog._error("some_job", ValueError("x"))
             except Exception as exc:
                 self.fail(f"_error() propagated {exc!r} instead of failing silently")
+
+    def test_a_hostile_exception_metaclass_still_reaches_a_closed_fallback_record(self):
+        """Reviewer's exact ask, not just the classifier in isolation:
+        confirm the SINK still emits a real record with the closed
+        fallback category for this exact input, rather than the record
+        silently vanishing into _error()'s own try/except: pass. Before
+        the `is`-identity fix, this exact input crashed _error_category,
+        which was then swallowed whole by _error()'s outer guard -- zero
+        output, not a fallback -- a worse failure than the original leak:
+        not just unsafe content, but no diagnostic at all."""
+
+        class HostileMeta(type):
+            def __eq__(cls, other):
+                raise RuntimeError("hostile metaclass __eq__")
+
+            def __hash__(cls):
+                return 0
+
+        class HostileException(Exception, metaclass=HostileMeta):
+            pass
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            service.Watchdog._error("some_job", HostileException("x"))
+        self.assertTrue(out.getvalue().strip(), "the record must not vanish")
+        record = json.loads(out.getvalue().strip())
+        self.assertEqual(record["job"], "some_job")
+        self.assertEqual(record["reason"], "external-error")
 
 
 def _kicks():
