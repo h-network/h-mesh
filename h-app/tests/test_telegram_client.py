@@ -4097,3 +4097,153 @@ def test_a_nested_transaction_is_refused_rather_than_deadlocking():
         # and it is usable again afterwards
         with bot_instance.chat_txn(12345):
             pass
+
+
+def test_updates_for_one_chat_are_applied_in_arrival_order():
+    """Mutual exclusion is not ordering. Lock acquisition is not FIFO, so with
+    a lock alone the answers "sme-9" then "-" could be applied "-" first --
+    rejected against stage=name -- leaving the flow at profile instead of
+    provider, with nothing crashed and a normal-looking log. The per-chat
+    worker keeps Telegram's own order.
+
+    Falsify by replacing submit_update's body with
+    `threading.Thread(target=self._dispatch_update, args=(update,)).start()`:
+    the first answer is held inside its handler, the second overtakes it, and
+    the final stage is profile."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        holding = threading.Event()
+
+        class SlowFirstTelegram(DummyTelegramClient):
+            seen = 0
+
+            def send_message(self, chat_id, text, **kwargs):
+                SlowFirstTelegram.seen += 1
+                if SlowFirstTelegram.seen == 1:
+                    holding.wait(timeout=2)
+                return super().send_message(chat_id, text, **kwargs)
+
+        bot_instance, mesh, telegram = _make_bot(telegram=SlowFirstTelegram(), tmpdir=tmpdir,
+                                                 allowed_chat_id=12345)
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending[12345] = {"flow": "hire", "stage": "name", "message_id": 1}
+
+        def update(uid, text):
+            return {"update_id": uid, "message": {"chat": {"id": 12345}, "message_id": uid, "text": text}}
+
+        bot_instance.submit_update(update(1, "sme-9"))
+        bot_instance.submit_update(update(2, "-"))
+        time.sleep(0.1)  # give a mis-ordered implementation every chance to run second first
+        holding.set()
+        assert bot_instance.chat_worker(12345).wait_idle(timeout=5)
+
+        state = bot_instance.pending.get("12345")
+        assert state is not None, "the flow should still be open at the provider stage"
+        assert state["stage"] == "provider"
+        assert state["name"] == "sme-9"
+
+
+def test_a_handler_that_raises_does_not_kill_the_chat_worker():
+    """Before, each update owned a bare thread: an exception killed it
+    silently and the operator saw nothing. The worker logs and keeps going."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir, allowed_chat_id=12345)
+        calls = []
+
+        def explode(update):
+            calls.append(update["update_id"])
+            if update["update_id"] == 1:
+                raise RuntimeError("boom")
+
+        worker = bot.ChatWorker("12345", explode)
+        worker.submit({"update_id": 1})
+        worker.submit({"update_id": 2})
+
+        assert worker.wait_idle(timeout=5)
+        assert calls == [1, 2]
+
+
+def test_an_overlapping_reply_finalizes_the_wrong_turns_render():
+    """⚠ Pins a KNOWN LIMIT rather than correct behaviour. ReplyPusher has no
+    render handle because a reply carries no link back to its prompt -- the
+    api mints a fresh correlation_id per envelope and an agent's reply is its
+    own envelope. So with two overlapping prompts to one agent, the first
+    reply ends whichever render is installed. This test exists so that limit
+    is documented and would be noticed if the wire ever gains turn
+    correlation and someone fixes it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        key = "12345:architect"
+        with bot_instance.chat_txn(12345):
+            render_b = ActivityRender("12345", "architect")
+            bot_instance.activity_renders[key] = render_b
+
+        # the reply to an earlier, already-swapped-out turn
+        bot_instance.finalize_activity(12345, "architect")
+
+        assert render_b.completed is True
+        assert bot_instance.activity_renders.get(key) is None
+
+
+def test_every_mutating_method_on_per_chat_state_is_refused_without_a_transaction():
+    """The previous version subclassed dict, so update/clear/popitem/|= all
+    bypassed the guard: "omission is an error" was false for four spellings of
+    the same write. ChatDict is a MutableMapping over a private dict now, so
+    every mutator routes through __setitem__/__delitem__."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending[12345] = {"flow": "hire", "stage": "name"}
+
+        for label, mutate in [
+            ("__setitem__", lambda: bot_instance.pending.__setitem__("12345", {"flow": "x"})),
+            ("update", lambda: bot_instance.pending.update({"12345": {"flow": "x"}})),
+            ("setdefault", lambda: bot_instance.pending.setdefault("999", {"flow": "x"})),
+            ("pop", lambda: bot_instance.pending.pop("12345")),
+            ("popitem", lambda: bot_instance.pending.popitem()),
+            ("clear", lambda: bot_instance.pending.clear()),
+            ("__ior__", lambda: bot_instance.pending.__ior__({"12345": {"flow": "x"}})),
+            ("__delitem__", lambda: bot_instance.pending.__delitem__("12345")),
+        ]:
+            with pytest.raises(bot.ChatTransactionError):
+                mutate()
+            assert bot_instance.pending.get("12345")["flow"] == "hire", f"{label} changed state anyway"
+
+
+def test_state_handed_out_by_a_read_cannot_be_mutated_in_place():
+    """`state = pending.get(cid); state["stage"] = ...` used to change live
+    shared state with no transaction and no error -- the guard cannot see a
+    write it never receives. Stored values are frozen, so that write is
+    refused at the point it happens."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending[12345] = {"flow": "hire", "stage": "name"}
+
+        state = bot_instance.pending.get("12345")
+        with pytest.raises(bot.ChatTransactionError):
+            state["stage"] = "provider"
+        with pytest.raises(bot.ChatTransactionError):
+            del state["stage"]
+        assert bot_instance.pending.get("12345")["stage"] == "name"
+        # the supported way round: write a successor back inside the transaction
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending["12345"] = {**dict(state), "stage": "profile"}
+        assert bot_instance.pending.get("12345")["stage"] == "profile"
+
+
+def test_a_stale_read_is_still_accepted_and_the_docs_say_so():
+    """⚠ Pins a LIMIT, not a guarantee. Reading outside a transaction and
+    writing inside one is exactly what the container cannot detect: by the
+    time the write arrives it looks identical to a fresh one. Ordering comes
+    from the per-chat worker, not from this class, and the docstring says so
+    rather than claiming the guard covers it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending[12345] = {"flow": "hire", "stage": "name"}
+
+        stale = dict(bot_instance.pending.get("12345"))  # read with no transaction
+        with bot_instance.chat_txn(12345):
+            bot_instance.pending[12345] = {**stale, "stage": "profile"}
+
+        assert bot_instance.pending.get("12345")["stage"] == "profile"

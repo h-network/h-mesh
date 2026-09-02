@@ -344,64 +344,65 @@ but drops update types silently and at a distance, so the next handler someone
 adds would fail by never being called — declining in `_dispatch_update` costs
 one visible log line per edit instead.
 
-⚠ **One transaction per chat, around every read-then-write of that chat's
-state.** `run_polling` hands each update to its own thread — it has to, since
-a prompt can block unboundedly and handling updates inline once froze the
-whole bot — so two updates for one chat run at the same time, and every "look
-at the state, then change it" sequence is a race.
+⚠ **Two mechanisms, and they do different jobs.** A per-chat worker gives
+*ordering*; a per-chat transaction gives *mutual exclusion*. Neither implies
+the other, and the branch that shipped only the second was wrong about it.
 
-`TelegramBot.chat_txn(chat_id)` is the one primitive: a per-chat lock, created
-under its own guard because "fetch a lock or make one" is the same
-check-then-mutate one level up.
+**Ordering — `ChatWorker`, one thread and one queue per chat.** `getUpdates`
+returns updates in order; `run_polling` hands each to `submit_update`, which
+routes it to that chat's worker. Updates for one chat are therefore handled in
+arrival order, while different chats stay fully concurrent — the reason
+updates were taken off the polling loop in the first place (a chat waiting on
+a slow call must not stall the poller) still holds. A lock alone does *not*
+give this: lock acquisition is not FIFO, so with only a lock the answers
+`sme-9` then `-` could be applied `-` first, rejected against `stage=name`,
+leaving the flow a step behind with nothing crashed and a log that reads
+normally. A handler that raises is logged and the worker continues; before
+this, each update owned a bare thread and an exception killed it in silence.
 
-**Forgetting it is not a race you have to reproduce — it is an error at the
-first write.** Every per-chat map is a `ChatDict` holding a guard, and a
-mutation made outside that chat's transaction raises `ChatTransactionError`
-naming the fix. Reads are deliberately unguarded: a lone read is always safe,
-and guarding `_target_for`/`is_voice_enabled` would add noise and no
-correctness. Thread-safe containers would not have helped at all here —
-individual dict operations were always atomic; every one of these bugs was in
-the compound transition.
+**Mutual exclusion — `TelegramBot.chat_txn(chat_id)`.** Still needed, because
+the worker is not the only thread touching a chat's state: `ReplyPusher`,
+`AlertPusher`, activity watchers and `/watch`'s own thread all do. Every
+read-then-write holds it: a whole pending-flow step, `handle_addticket_priority`'s
+claim, `/watch`'s replace (read incumbent, signal, install) and
+`_stop_pane_watch`, `handle_voice_toggle`'s read-and-flip, the activity-render
+swap and `finalize_activity`'s compare-and-pop, and every flow install. It is
+a plain non-reentrant lock: nesting raises `ChatTransactionError` naming the
+chat rather than deadlocking, which is why `handle_watch_pick` replaces inline
+instead of calling `_stop_pane_watch`.
 
-The transaction is a **plain, non-reentrant lock**. There is no nested
-acquisition in this client, and re-entrancy is not free future-proofing: it
-would silently accept one handler calling another that re-locks the same chat,
-which is a design error worth seeing. A bare `Lock` would surface it as a
-deadlock — a hang with no message — so `ChatLock` raises
-`ChatTransactionError` naming the chat instead: same error surfaced, an hour
-of debugging cheaper. That is why `handle_watch_pick` replaces a watch inline
-rather than calling `_stop_pane_watch`, which takes the transaction itself.
+**What the guard does and does not catch.** Per-chat maps are `ChatDict`, a
+`MutableMapping` over a private dict — so `update`, `clear`, `popitem`, `pop`,
+`setdefault` and `|=` all route through one guarded choke point, where a
+`dict` subclass had four holes. Stored values are handed out frozen
+(`FrozenChatState`), so `state = pending.get(cid); state["stage"] = ...` is
+refused at the write instead of quietly changing what another thread is
+reading; a step advances by writing a successor back. ⚠ It does **not** catch a
+STALE READ: reading outside a transaction and writing back inside one is
+accepted, and is still wrong. Nothing in a container can see how old the value
+in your hand is — that is what holding the transaction across the whole
+read-then-write is for. Reads themselves stay unguarded: a lone read is always
+safe.
 
-Held by every read-then-write on per-chat state:
+**What a chat's own updates wait for**, with real numbers: a flow step is one
+mesh call (10s timeout) plus typically one or two Telegram calls (30s each;
+60s for a file download, 90s for TTS and the session stream), so tens of
+seconds worst case for that one chat. The step holds throughout rather than
+claiming and releasing, deliberately: the next answer must not be accepted
+before the prompt it answers is visible. Claim-and-release would be safe only
+with an explicit in-progress state that queues or rejects input arriving
+mid-step. The transaction is released on exceptions.
 
-| where | what it protects |
-|---|---|
-| a whole pending-flow step | the stage you read must still be the stage when you act on it |
-| `handle_addticket_priority`'s claim | two taps on one priority screen: one added the ticket, the other died on `del` with `KeyError` |
-| `/watch` replace: read incumbent, signal it, install | two picks each saw no watch, each started one, and left a live watcher untracked with its stop switch unreachable |
-| `_stop_pane_watch` read-and-signal | so it cannot signal a watch a concurrent pick already replaced |
-| `handle_voice_toggle` read-and-flip | two taps both answered "enabled" and left it enabled, where two sequential toggles end disabled |
-| the activity-render swap, and `finalize_activity`'s compare-and-pop | a failing prompt used to finalize a *later* prompt's render, leaving the live one completed and untracked |
-| opening a flow (hire/addticket/retire/broadcast) and setting a chat's target agent | installing state while another update for the chat is mid-step |
-
-Only the state transition is held, not the network call that follows it, wherever
-the two can be separated: `handle_addticket_priority` claims the flow and then
-calls `add_ticket` outside the transaction, and the render swap releases before
-finalizing the loser over the network. A pending-flow step is the exception —
-it holds throughout, because its whole point is that the stage cannot change
-underneath it.
-
-Per chat rather than one global lock: chats never interact, and a global lock
-would let a chat mid-hire stall every other chat's traffic — worse than the
-race it closes.
-
-⚠ **What a chat's own updates actually wait for**, since the trade-off is only
-assessable with real numbers: a flow step makes one mesh call (10s timeout)
-plus typically one or two Telegram calls (30s each; 60s for a file download,
-90s for TTS and the session stream). So the worst-case stall for that one chat
-is tens of seconds, not the single 10s an earlier version of this section
-claimed. The lock is released on exceptions too — it is a context manager — so
-a failing step frees the chat rather than wedging it.
+⚠ **Known limit — a reply cannot say which turn it answers.** `ReplyPusher`
+finalizes a chat+agent's activity render with no render handle, because the
+api door mints a fresh `correlation_id` per envelope and an agent's reply is
+its own envelope: nothing on the wire links it to the prompt. With two
+overlapping prompts to one agent, the first reply ends whichever render is
+installed, which may belong to the second, still-running turn. The display
+stops early; no state is corrupted. Fixing it needs turn correlation on the
+wire — an api change, not this client's to make — and
+`test_an_overlapping_reply_finalizes_the_wrong_turns_render` pins it as a
+documented limit rather than a surprise.
 
 Try it without a bot token: `python3 clients/telegram/bot.py --api-token "$H_MESH_API_TOKEN" --menu`.
 

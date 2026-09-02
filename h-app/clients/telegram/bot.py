@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import pathlib
+import queue
 import re
 import ssl
 import sys
@@ -23,6 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Mapping, MutableMapping
 from websockets.sync.client import connect as ws_connect
 
 LOG_LEVEL_ENV_VAR = "H_MESH_LOG_LEVEL"
@@ -1117,28 +1119,144 @@ class ChatLock:
         self._lock.release()
 
 
-class ChatDict(dict):
-    """Dictionary keyed by chat_id that normalizes int and str keys to str.
+class ChatWorker:
+    """One chat, one thread, one queue: that chat's updates are handled in the
+    order Telegram delivered them.
+
+    ⚠ Mutual exclusion is NOT ordering, and this is the difference. A lock
+    stops two updates changing the state at once; it says nothing about which
+    goes first, because lock acquisition is not FIFO. Measured: answers
+    arriving "sme-9" then "-" could be applied "-" first — rejected against
+    stage=name — leaving the flow one step behind, with nothing crashed and a
+    log that reads normally. `getUpdates` returns updates in order and this
+    keeps them that way per chat.
+
+    ⚠ Per chat, and still one thread each, so the reason updates were taken
+    off the polling loop in the first place still holds: a chat waiting on a
+    slow call delays only itself, never the poller and never another chat.
+
+    A handler that raises is logged and the worker continues. Before this,
+    each update owned a bare thread, so an exception killed that thread
+    silently and the operator saw nothing at all.
+    """
+
+    BACKLOG_WARN = 20
+
+    def __init__(self, chat_id: str, handler):
+        self.chat_id = chat_id
+        self._handler = handler
+        self._queue: "queue.Queue" = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name=f"chat-worker-{chat_id}"
+        )
+        self._thread.start()
+
+    def submit(self, update: dict) -> None:
+        self._queue.put(update)
+        depth = self._queue.qsize()
+        if depth >= self.BACKLOG_WARN:
+            # Visible rather than silent: a chat this far behind is either
+            # being flooded or stuck on a slow call, and both look like "the
+            # bot ignored me" from the chat.
+            logger.warning(f"chat {self.chat_id}: {depth} updates queued behind the one in progress")
+
+    def wait_idle(self, timeout: float = 5.0) -> bool:
+        """Block until this chat's queue is drained. For tests and one-shot
+        paths; the polling loop never waits."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._queue.unfinished_tasks == 0:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def _run(self) -> None:
+        while True:
+            update = self._queue.get()
+            try:
+                self._handler(update)
+            except Exception as exc:
+                logger.error(
+                    f"chat {self.chat_id}: update {update.get('update_id')} handler raised: {exc}",
+                    exc_info=True,
+                )
+            finally:
+                self._queue.task_done()
+
+
+class FrozenChatState(Mapping):
+    """A read-only view of one chat's stored state.
+
+    ⚠ Per-chat values are handed out frozen because the guard on `ChatDict`
+    can only see writes THROUGH it: `state = pending.get(cid)` followed by
+    `state["stage"] = ...` mutates live shared state with no transaction and
+    no error. Freezing turns that into a refusal at the point of the write,
+    which is the only place it can be caught. Advance a flow by writing a NEW
+    state back inside the transaction — `pending[cid] = {**state, "stage": x}`.
+    """
+
+    __slots__ = ("_data",)
+
+    def __init__(self, data: dict):
+        object.__setattr__(self, "_data", dict(data))
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def __repr__(self):
+        return f"FrozenChatState({self._data!r})"
+
+    def __setitem__(self, key, value):
+        raise ChatTransactionError(
+            "per-chat state is read-only once stored: mutating it in place would "
+            "change what another thread is looking at, outside any transaction. "
+            "Write a new state back instead — `pending[chat_id] = {**state, ...}` "
+            "inside `with self.chat_txn(chat_id):`."
+        )
+
+    def __delitem__(self, key):
+        self.__setitem__(key, None)
+
+
+def _frozen(value):
+    """Freeze dict values on the way in; leave everything else alone (renders,
+    watch slots holding threads and events, plain flags)."""
+    return FrozenChatState(value) if isinstance(value, (dict, FrozenChatState)) else value
+
+
+class ChatDict(MutableMapping):
+    """Per-chat state, keyed by chat_id with int and str keys normalized.
 
     ⚠ Every MUTATION must happen inside that chat's transaction
-    (`TelegramBot.chat_txn`), and this refuses the write if it isn't — the
-    point being that omitting the coordination fails loudly at the first
-    attempt rather than becoming a race nobody can reproduce. Individual dict
-    operations were always atomic; that was never the problem. The problem is
-    the compound transition — read a flow's stage, decide, then write — and no
-    thread-safe container can make that atomic for you.
+    (`TelegramBot.chat_txn`), and this refuses the write if it isn't.
+    Deliberately a `MutableMapping` over a private dict rather than a `dict`
+    subclass: `update`, `clear`, `popitem`, `setdefault`, `pop` and `|=` are
+    all implemented by the ABC in terms of `__setitem__`/`__delitem__`, so
+    there is ONE choke point and no mutation method that quietly bypasses it.
+    A `dict` subclass had four such holes.
 
-    Reads are deliberately unguarded: a lone read is always safe, and the
-    handlers that only look (`_target_for`, `is_voice_enabled`) would gain
-    nothing but noise.
+    ⚠ What this does NOT catch, stated because the previous version of this
+    docstring over-claimed: a STALE READ. Reading state outside a transaction
+    and writing it back inside one is accepted here and is still wrong — the
+    container cannot see how old the value in your hand is. Ordering and
+    read-write atomicity come from the per-chat worker and from holding the
+    transaction across the whole read-then-write, not from this class.
+
+    Reads are unguarded on purpose: a lone read is always safe, and values are
+    handed out frozen so a read cannot become an untracked write.
     """
 
     def __init__(self, *args, guard=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        # Callable taking the normalized key, returning whether this thread
-        # holds the transaction for the chat that key belongs to. None on a
-        # bare ChatDict (nothing shares it, so nothing to coordinate).
+        self._data: dict = {}
         self._guard = guard
+        if args or kwargs:
+            self._data.update({str(k): _frozen(v) for k, v in dict(*args, **kwargs).items()})
 
     def _k(self, key):
         return str(key)
@@ -1150,34 +1268,42 @@ class ChatDict(dict):
             raise ChatTransactionError(
                 f"per-chat state for {key} changed outside its transaction. "
                 "Wrap the read-and-write in `with self.chat_txn(chat_id):` — "
-                "another update for this chat runs on its own thread and can "
+                "another update for this chat can run on another thread and "
                 "interleave between the two halves."
             )
 
     def __getitem__(self, key):
-        return super().__getitem__(self._k(key))
+        return self._data[self._k(key)]
 
     def __setitem__(self, key, value):
         self._require_transaction(self._k(key))
-        super().__setitem__(self._k(key), value)
+        self._data[self._k(key)] = _frozen(value)
 
     def __delitem__(self, key):
         self._require_transaction(self._k(key))
-        super().__delitem__(self._k(key))
+        del self._data[self._k(key)]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
 
     def __contains__(self, key):
-        return super().__contains__(self._k(key))
+        return self._k(key) in self._data
 
     def get(self, key, default=None):
-        return super().get(self._k(key), default)
+        return self._data.get(self._k(key), default)
 
-    def pop(self, key, *args):
-        self._require_transaction(self._k(key))
-        return super().pop(self._k(key), *args)
+    def __ior__(self, other):
+        # MutableMapping does not define |=; without this, `state |= {...}`
+        # raises TypeError rather than routing through the guard. Explicit is
+        # better than a spelling that happens to be unavailable today.
+        self.update(other)
+        return self
 
-    def setdefault(self, key, default=None):
-        self._require_transaction(self._k(key))
-        return super().setdefault(self._k(key), default)
+    def __repr__(self):
+        return f"ChatDict({self._data!r})"
 
 
 def _parse_int_overrides(spec: str) -> dict[str, int]:
@@ -1544,6 +1670,7 @@ class TelegramBot:
         # it" sequence is a race. Declared first because every ChatDict below
         # is constructed with a guard that consults it. See chat_txn.
         self._chat_locks: dict[str, ChatLock] = {}
+        self._chat_workers: dict[str, ChatWorker] = {}
         self._chat_locks_guard = threading.Lock()
         # Per-chat multi-step flows (AddTicket's title/description prompts,
         # Hire's name prompt). A chat with no entry here is not mid-flow, so a
@@ -2501,15 +2628,20 @@ class TelegramBot:
         The answer's LENGTH, never its text: the stage names say what the
         operator was asked, which is what a log needs to know.
 
-        ⚠ THE WHOLE STEP RUNS UNDER THIS CHAT'S LOCK, network calls included.
-        Reading the stage and then acting on it is only correct if no other
-        thread can act on the same stage in between, and hire's submission
-        blocks for up to 10s inside `hire_agent` — the widest possible window
-        for a second answer to arrive and submit the same agent again. Holding
-        the lock across that means a chat's answers queue up behind each other
-        (bounded: every outbound call here has a 10s timeout) and are then
-        evaluated against the state the previous one actually left. Other
-        chats are unaffected — the lock is per chat."""
+        ⚠ THE WHOLE STEP RUNS UNDER THIS CHAT'S TRANSACTION, network calls
+        included, and deliberately so: the next answer must not be accepted
+        before the prompt it answers is on screen. Claim-and-release would be
+        safe only with an explicit in-progress state that queues or rejects
+        input arriving mid-step.
+
+        ⚠ What that costs the chat, with real numbers rather than the 10s an
+        earlier version of this docstring claimed: one mesh call (10s timeout)
+        plus typically one or two Telegram calls (30s each; 60s for a file
+        download, 90s for TTS and the session stream), so tens of seconds in
+        the worst case. Other chats are unaffected — the transaction is per
+        chat, and so is the worker that feeds it. The transaction is released
+        on exceptions, so a failing step frees the chat rather than wedging
+        it."""
         cid = str(chat_id)
         with self.chat_txn(cid):
             before = self.pending.get(cid)
@@ -2549,6 +2681,13 @@ class TelegramBot:
         reversing it."""
         return self._send_or_edit_message(chat_id, text, reply_markup=reply_markup)
 
+    def _advance(self, cid: str, state, **changes) -> None:
+        """Write a flow's next state back. Stored state is frozen
+        (`FrozenChatState`), so a step cannot advance by mutating what it read
+        — it builds the successor and stores it, inside the transaction the
+        caller already holds."""
+        self.pending[cid] = {**dict(state), **changes}
+
     def _advance_pending_flow(self, cid: str, text: str) -> str | None:
         """One step of an open flow. Called only by `handle_pending_text`,
         which owns the logging around it; `cid` is already normalised and the
@@ -2579,29 +2718,31 @@ class TelegramBot:
 
         if state["flow"] == "addticket":
             if state["stage"] == "title":
-                state["title"] = text.strip()
-                state["stage"] = "description"
                 reply = "Description? (send - to skip, /cancel to abort)"
-                state["message_id"] = self._send_typed_answer_reply(cid, reply)
+                self._advance(cid, state, title=text.strip(), stage="description",
+                              message_id=self._send_typed_answer_reply(cid, reply))
                 return reply
             if state["stage"] == "description":
-                state["description"] = "" if text.strip() == "-" else text.strip()
-                state["stage"] = "priority"
                 buttons = [[
                     {"text": "🔵 Low", "callback_data": "ap:low"},
                     {"text": "⚪ Normal", "callback_data": "ap:normal"},
                     {"text": "🔴 High", "callback_data": "ap:high"},
                 ]]
                 reply = "Priority?"
-                state["message_id"] = self._send_typed_answer_reply(
-                    cid, reply, reply_markup={"inline_keyboard": buttons}
+                self._advance(
+                    cid, state,
+                    description="" if text.strip() == "-" else text.strip(),
+                    stage="priority",
+                    message_id=self._send_typed_answer_reply(
+                        cid, reply, reply_markup={"inline_keyboard": buttons}
+                    ),
                 )
                 return reply
             # stage == "priority": this step is answered by tapping a button
             # (handle_addticket_priority), not typed text — stray text here
             # just gets pointed back at the buttons rather than silently lost.
             reply = "Tap a priority button above, or /cancel."
-            state["message_id"] = self._send_typed_answer_reply(cid, reply)
+            self._advance(cid, state, message_id=self._send_typed_answer_reply(cid, reply))
             return reply
 
         if state["flow"] == "hire":
@@ -2609,23 +2750,23 @@ class TelegramBot:
                 name = text.strip()
                 if not _AGENT_NAME.match(name) or name in _RESERVED_AGENT_NAMES:
                     reply = "That name won't work — lowercase letters, digits and hyphens, not all digits, not a reserved word. Try again, or /cancel."
-                    state["message_id"] = self._send_typed_answer_reply(cid, reply)
+                    self._advance(cid, state, message_id=self._send_typed_answer_reply(cid, reply))
                     return reply  # stay in "name" stage; do not consume the pending flow
-                state["name"] = name
-                state["stage"] = "profile"
                 # ⚠ No picker: office profiles reads Redis directly and has no
                 # REST equivalent, so this client cannot list valid accounts
                 # ahead of time (see MeshClient.hire_agent). A bad name still
                 # gets a clear error, listing the valid ones, from the api.
                 reply = f"Profile for {name}? (account/profile name, or - for the default; /cancel to abort)"
-                state["message_id"] = self._send_typed_answer_reply(cid, reply)
+                self._advance(cid, state, name=name, stage="profile",
+                              message_id=self._send_typed_answer_reply(cid, reply))
                 return reply
 
             if state["stage"] == "profile":
-                state["profile"] = None if text.strip() == "-" else text.strip()
-                state["stage"] = "provider"
                 reply = f"Provider for {state['name']}? (named local model endpoint, or - for the default; /cancel to abort)"
-                state["message_id"] = self._send_typed_answer_reply(cid, reply)
+                self._advance(cid, state,
+                              profile=None if text.strip() == "-" else text.strip(),
+                              stage="provider",
+                              message_id=self._send_typed_answer_reply(cid, reply))
                 return reply
 
             # stage == "provider"
@@ -2683,7 +2824,7 @@ class TelegramBot:
             agent = state["agent"]
             if text.strip() != agent:
                 reply = f"That doesn't match '{agent}' — type it exactly to confirm, or /cancel."
-                state["message_id"] = self._send_typed_answer_reply(cid, reply)
+                self._advance(cid, state, message_id=self._send_typed_answer_reply(cid, reply))
                 return reply  # stay open for retry, same as the web console's disabled-until-match button
             del self.pending[cid]
             if self.telegram:
@@ -2970,10 +3111,21 @@ class TelegramBot:
         succeeds, A's send then fails and A cleans up "the render for this
         chat and agent" — which is now B's. B stayed live with its render
         completed and nothing tracking it. A caller that installed a render
-        passes it here and only its own is taken; the callback path
-        (`ActivityRender.activity_finalizer_fn`) has no handle and keeps the
-        by-key behaviour, which is correct for it: it fires from the render
-        that is currently installed.
+        passes it here and only its own is taken.
+
+        ⚠ KNOWN LIMIT, not a claim of correctness: `ReplyPusher` calls this
+        with no render handle, because a reply carries no link back to the
+        prompt that caused it. The api door mints a fresh `correlation_id` for
+        every envelope (`modules/api/server.py`), and an agent's reply is its
+        own envelope, so there is nothing in a mailbox message that says which
+        turn it answers. With two overlapping prompts to the same agent, the
+        first reply therefore finalizes whatever render is installed — which
+        may belong to the second, still-running turn. The display ends early;
+        no state is corrupted and the second render is correctly untracked
+        afterwards. Fixing it properly needs turn correlation on the wire,
+        which is an api change and not this client's to make. Pinned by
+        test_an_overlapping_reply_finalizes_the_wrong_turns_render so it is a
+        documented limit rather than a surprise.
         """
         cid = str(chat_id)
         key = f"{cid}:{agent}"
@@ -3162,6 +3314,41 @@ class TelegramBot:
             "Send it as a new message, or /cancel.",
         )
 
+    @staticmethod
+    def _update_chat_id(update: dict) -> str | None:
+        """The chat an update belongs to, for routing only — `_dispatch_update`
+        does its own extraction and its own authorisation check."""
+        callback = update.get("callback_query")
+        if callback:
+            return str(callback.get("message", {}).get("chat", {}).get("id"))
+        msg = update.get("message") or update.get("edited_message")
+        if msg:
+            return str(msg.get("chat", {}).get("id"))
+        return None
+
+    def chat_worker(self, chat_id: int | str) -> ChatWorker:
+        """That chat's serial worker, created under the same guard as its
+        transaction — "fetch one or make one" is the check-then-mutate this
+        whole branch is about, and two workers for one chat would reintroduce
+        exactly the concurrency they exist to remove."""
+        cid = str(chat_id)
+        with self._chat_locks_guard:
+            worker = self._chat_workers.get(cid)
+            if worker is None:
+                worker = self._chat_workers[cid] = ChatWorker(cid, self._dispatch_update)
+            return worker
+
+    def submit_update(self, update: dict) -> None:
+        """Hand one update to its chat's worker. The polling loop never blocks
+        here; ordering within a chat is the worker's job."""
+        cid = self._update_chat_id(update)
+        if cid is None:
+            # Nothing to order it against and nothing to authorise it as —
+            # _dispatch_update logs and drops it.
+            self._dispatch_update(update)
+            return
+        self.chat_worker(cid).submit(update)
+
     def _dispatch_update(self, update: dict) -> None:
         """⚠ Logs the SHAPE of an update, never its text: update id, kind,
         chat, message id, and how many characters arrived. A callback's `data`
@@ -3264,7 +3451,7 @@ class TelegramBot:
                 updates = self.telegram.get_updates(offset=offset, timeout=20)
                 for update in updates:
                     offset = update["update_id"] + 1
-                    threading.Thread(target=self._dispatch_update, args=(update,), daemon=True).start()
+                    self.submit_update(update)
             except Exception as exc:
                 logger.error(f"Error in long-polling loop: {exc}")
                 time.sleep(3.0)
