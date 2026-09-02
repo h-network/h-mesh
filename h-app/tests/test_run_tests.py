@@ -205,7 +205,37 @@ def test_setup_phase_skip_cannot_satisfy_execution_invariant(tmp_path: Path) -> 
     assert result.returncode != 0, (
         "a setup-phase skip must not be certified as an executed test call"
     )
-    assert "not executed: h-app/tests/test_target.py::test_target_tree_marker" in output
+    assert (
+        "not executed: no call-phase report: "
+        "h-app/tests/test_target.py::test_target_tree_marker"
+    ) in output
+    assert "suite execution invariant satisfied" not in output
+
+
+def test_call_phase_skip_cannot_satisfy_execution_invariant(tmp_path: Path) -> None:
+    target = _make_isolated_harness_tree(
+        tmp_path,
+        "import pytest\n"
+        "def test_target_tree_marker():\n"
+        "    pytest.skip('Redis server is unavailable')\n"
+        "    raise AssertionError('reviewed assertion did not run')\n",
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(target / "h-app")
+    result = subprocess.run(
+        [sys.executable, "-m", "tools.run_tests"],
+        cwd=target,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, (
+        "a call-phase skip must not certify when the reviewed assertion never ran"
+    )
+    assert "not executed: skipped" in output.lower()
+    assert "Redis server is unavailable" in output
     assert "suite execution invariant satisfied" not in output
 
 
