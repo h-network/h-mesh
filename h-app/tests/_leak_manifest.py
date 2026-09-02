@@ -136,8 +136,9 @@ _OWNED_PREFIX = "h_mesh_test_"
 # A STUCK claim whose target cannot be proven to be an owned test directory is
 # deliberate fail-closed retention, not a reaper bug: its evidence is kept
 # because the target's identity is unknown. Operators may clear one manually
-# only in an exclusive quiet window where no reapers can start. Inspect the
-# claim JSON, verify that the target is invalid or unowned, quarantine/remove
+# with best-effort coordination to avoid reaper starts (there is no shared lock
+# or maintenance flag, so exclusion is not guaranteed). Inspect the claim JSON,
+# verify that the target is invalid or unowned, quarantine/remove
 # the corresponding public entry first, then remove all matching claim files
 # and verify both public and claim forms are absent. Automatic deletion is refused
 # by the reaper because it would destroy the evidence
