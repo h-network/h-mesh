@@ -786,6 +786,7 @@ h-app/tests/test_tmux_port.py::TmuxPortTests::test_main_entrypoint_missing_arg_e
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_main_entrypoint_skips_when_paused
 h-app/tests/test_tmux_port.py::TmuxPortTests::test_mark_delivery_pending
 h-app/tests/test_tmux_real.py::RealTmuxIntegrationTests::test_ambient_tmux_refusal
+h-app/tests/test_tmux_real.py::RealTmuxIntegrationTests::test_concurrent_submit_text_with_shared_stream_id_does_not_collide_paste_buffer
 h-app/tests/test_tmux_real.py::RealTmuxIntegrationTests::test_empty_roster_refusal_and_override
 h-app/tests/test_tmux_real.py::RealTmuxIntegrationTests::test_generate_agents_md_command_derivation
 h-app/tests/test_tmux_real.py::RealTmuxIntegrationTests::test_hired_agent_pane_process_has_venv_bin_on_path_in_proc_environ

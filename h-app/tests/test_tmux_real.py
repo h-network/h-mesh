@@ -836,6 +836,26 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         except Exception:
             pass
 
+    def test_concurrent_submit_text_with_shared_stream_id_does_not_collide_paste_buffer(self):
+        import concurrent.futures
+        from modules.tmux.ops import run_tmux, submit_text
+
+        run_tmux("new-session", "-d", "-s", self.session_name, "-n", "agent1", "bash", socket=self.socket)
+        run_tmux("new-window", "-t", f"{self.session_name}:", "-n", "agent2", "bash", socket=self.socket)
+
+        stream_id = "82605b8b1234567890abcdef12345678"
+
+        # 20 trials of concurrent submissions with the same stream_id across different agents
+        for trial in range(20):
+            def deliver(agent: str, text: str) -> None:
+                submit_text(self.session_name, agent, text, stream_id=stream_id, socket=self.socket)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                f1 = executor.submit(deliver, "agent1", f"echo agent1_trial_{trial}")
+                f2 = executor.submit(deliver, "agent2", f"echo agent2_trial_{trial}")
+                f1.result()
+                f2.result()
+
 
 if __name__ == "__main__":
     unittest.main()
