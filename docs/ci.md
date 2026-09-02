@@ -55,7 +55,9 @@ Those diagnostics compare current collection with the checked-in manifest
 snapshot inherited from `main`, not with the branch's latest commit. Until the
 branch deliberately updates that snapshot, a long-open branch reports its
 entire cumulative test change across every rework. An unexpectedly large count
-is therefore not evidence that the manifest is broken or stale.
+therefore does not by itself prove that the manifest is broken or stale. It can
+also result from a stale, wrong-base, or corrupted manifest, so every `added`
+and `missing` entry still requires accounting regardless of the totals.
 
 A `missing` entry can be legitimate: a test may have been renamed, or its
 coverage may have been absorbed into another test that asserts strictly more.
