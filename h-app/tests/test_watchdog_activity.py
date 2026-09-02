@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -8,6 +9,7 @@ import unittest
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 H_APP = Path(__file__).resolve().parents[1]
 if str(H_APP) not in sys.path:
@@ -262,6 +264,52 @@ class ActivityTailerTests(unittest.TestCase):
         self.assertEqual(_events(r, "backend"), [
             {"v": 1, "agent": "backend", "ts": "back", "kind": "output"}
         ])
+
+    def test_codex_and_agy_attribution_survive_a_relocated_non_workdir_root(self):
+        """Real regression for the host-fallback relocation, not the
+        coincidence every OTHER attribution test above rests on: they all
+        build their fixture input via _wd(), the SAME get_agent_workdir()
+        production compares against -- so in this office's own sandbox,
+        where /workdir genuinely exists, reverting activity.py to its old
+        hardcoded f"/workdir/{agent}" literal would STILL pass every one
+        of them, because both sides happen to agree on /workdir here. This
+        test forces get_workdir_root() to resolve somewhere that is
+        definitely not /workdir, so it can only pass if the code under
+        test is actually calling get_agent_workdir() (or genuinely agrees
+        with it), not a hardcoded /workdir literal that would now silently
+        diverge from the real relocated root.
+        """
+        with tempfile.TemporaryDirectory() as relocated_root:
+            with patch.dict(os.environ, {"H_MESH_WORKDIR": relocated_root}, clear=False):
+                self.assertFalse(
+                    get_agent_workdir("codex-agent").startswith("/workdir"),
+                    "test setup itself is broken -- H_MESH_WORKDIR override did not take",
+                )
+
+                # codex
+                r = FakeRedis(agents=("codex-agent",))
+                r.values[prefix(POD, TENANT, "codex-agent", "launch")] = "codex"
+                codex_session = self.tmp_path / ".codex" / "sessions" / "2026" / "08" / "rollout-one.jsonl"
+                _write_lines(codex_session, [
+                    {"type": "session_meta", "payload": {"cwd": _wd("codex-agent")}},
+                    {"type": "event_msg", "timestamp": "one", "payload": {"type": "user_message"}},
+                ])
+                ActivityTailer(r, pod=POD, tenant=TENANT, home_root=self.tmp_path).poll()
+                self.assertEqual(_events(r, "codex-agent"), [
+                    {"v": 1, "agent": "codex-agent", "ts": "one", "kind": "input"}
+                ])
+
+                # agy
+                r2 = FakeRedis(agents=("agy-agent",))
+                r2.values[prefix(POD, TENANT, "agy-agent", "launch")] = "agy"
+                _write_lines(
+                    _history_path(self.tmp_path),
+                    [{"display": "hi", "timestamp": _ms("2026-08-09T10:00:00"), "workspace": _wd("agy-agent")}],
+                )
+                ActivityTailer(r2, pod=POD, tenant=TENANT, home_root=self.tmp_path).poll()
+                self.assertEqual(_events(r2, "agy-agent"), [
+                    {"v": 1, "agent": "agy-agent", "ts": "2026-08-09T10:00:00.000Z", "kind": "input"}
+                ])
 
     def test_agy_agent_has_empty_stream_even_when_an_old_claude_session_exists(self):
         r = FakeRedis()

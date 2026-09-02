@@ -21,6 +21,11 @@ def get_workdir_root() -> str:
        (see install.sh) precisely so the two don't collide -- code and
        state (and now workdirs) are kept apart on purpose; an app
        reinstall must not touch a live workdir, and vice versa.
+
+    ⚠ No migration or collision handling for a pre-existing ~/h-mesh
+    checkout from before this default moved -- operator's explicit call:
+    we are the only people running h-mesh, there are no third-party
+    installs to protect, and our own boxes get reinstalled, not migrated.
     """
     if "H_MESH_WORKDIR" in os.environ:
         return os.environ["H_MESH_WORKDIR"]
