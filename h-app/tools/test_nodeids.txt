@@ -94,6 +94,7 @@ h-app/tests/test_agentlifecycle.py::test_logging_failure_does_not_replace_partia
 h-app/tests/test_agentlifecycle.py::test_logging_failure_does_not_replace_success
 h-app/tests/test_api.py::ApiTests::test_api_port_writes_mailbox_and_dead_letters_corrupt_input
 h-app/tests/test_api.py::ApiTests::test_auth_and_health
+h-app/tests/test_api.py::ApiTests::test_deliver_api_does_not_dead_letter_an_envelope_after_a_failed_inbox_write
 h-app/tests/test_api.py::ApiTests::test_deliver_api_drops_a_peer_tmux_originated_id_toward_any_api_client
 h-app/tests/test_api.py::ApiTests::test_deliver_api_drops_and_logs_distinct_reason_when_provenance_unavailable
 h-app/tests/test_api.py::ApiTests::test_deliver_api_drops_in_reply_to_delivered_by_a_different_client
@@ -103,10 +104,14 @@ h-app/tests/test_api.py::ApiTests::test_deliver_api_drops_present_empty_string_i
 h-app/tests/test_api.py::ApiTests::test_deliver_api_drops_present_null_in_reply_to
 h-app/tests/test_api.py::ApiTests::test_deliver_api_keeps_in_reply_to_when_delivered_by_the_claimed_client
 h-app/tests/test_api.py::ApiTests::test_deliver_api_leaves_absent_in_reply_to_untouched
+h-app/tests/test_api.py::ApiTests::test_deliver_api_never_logs_the_in_reply_to_value_or_reply_source_it_drops
+h-app/tests/test_api.py::ApiTests::test_deliver_api_never_logs_the_raw_content_of_a_rejected_envelope
 h-app/tests/test_api.py::ApiTests::test_external_route_contract
 h-app/tests/test_api.py::ApiTests::test_idle_sse_stream_emits_keepalive_without_new_entries
+h-app/tests/test_api.py::ApiTests::test_known_reply_correlation_and_dead_letter_branches_use_closed_literal_reasons
 h-app/tests/test_api.py::ApiTests::test_nonlocal_and_malformed_destination_statuses
 h-app/tests/test_api.py::ApiTests::test_overlapping_prompts_answered_out_of_order_correlate_independently
+h-app/tests/test_api.py::ApiTests::test_post_envelope_does_not_report_a_write_failure_as_a_rejection
 h-app/tests/test_api.py::ApiTests::test_qualified_destination_routes_through_core_channel
 h-app/tests/test_api.py::ApiTests::test_real_tmux_delivery_then_deliver_api_rejects_peer_originated_correlation
 h-app/tests/test_api.py::RealApiPortSubprocessTests::test_real_api_module_subprocess_invocation
