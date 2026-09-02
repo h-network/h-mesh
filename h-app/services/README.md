@@ -18,6 +18,17 @@ separate reconciler daemon as two different things.
 Nothing per-request (e.g. `agentlifecycle`) and nothing CLI-invoked (e.g.
 `office`) belongs here.
 
+`services.daemons` writes a numeric `.pid` file for compatibility and a paired
+`.pid.identity` record containing the process's Linux `/proc` start time. Stop
+opens a Linux pidfd before checking that identity and sends every signal through
+that same handle, binding evidence and signalling to one process lifetime even
+if its numeric PID is reused. Missing, unreadable, malformed, or mismatched evidence never
+falls back to trusting the number: it fails closed. A first upgrade from a
+legacy numeric-only pidfile authenticates the expected `python -m` module plus
+its POD/TENANT environment before stopping it; otherwise it refuses to signal.
+A proven reused PID is ordinary stale state (“daemon not running”), not an
+operator error.
+
 A pod/tenant-scoped launcher first calls
 `services.daemon_identity.require_daemon_identity()`, before connections,
 threads, or other daemon work. This gives directly invoked daemons the same
