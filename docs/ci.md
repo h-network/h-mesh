@@ -49,11 +49,27 @@ being reported as a successful suite.
 Any test addition, removal, or rename makes the harness fail with separately
 labeled `added` and `missing` node IDs. `missing` means a previously reviewed
 test would not execute; `added` means a new or renamed test has not yet been
-accounted for in the manifest. Regenerating the file mechanically clears the
-mismatch whether or not anyone reviewed it. The team procedure is therefore to
-explain every missing and added entry in independent review, then regenerate the
-manifest from the repository root and review its diff before running the
-harness again:
+accounted for in the manifest.
+
+Those diagnostics compare current collection with the checked-in manifest
+snapshot inherited from `main`, not with the branch's latest commit. Until the
+branch deliberately updates that snapshot, a long-open branch reports its
+entire cumulative test change across every rework. An unexpectedly large count
+therefore does not by itself prove that the manifest is broken or stale. It can
+also result from a stale, wrong-base, or corrupted manifest, so every `added`
+and `missing` entry still requires accounting regardless of the totals.
+
+A `missing` entry can be legitimate: a test may have been renamed, or its
+coverage may have been absorbed into another test that asserts strictly more.
+Those cases should account for the old node ID and its replacement explicitly.
+A deliberately deleted test needs its own coverage rationale; an unexplained
+missing entry is evidence of possible lost coverage, not routine drift.
+
+Regenerating the file mechanically clears the mismatch whether or not anyone
+reviewed it. **Account first, regenerate second.** Explain every missing and
+added entry in independent review and preserve that accounting in the manifest
+update's commit message. Only then regenerate the manifest from the repository
+root and review its diff before running the harness again:
 
 ```bash
 PYTHONPATH=h-app python -m pytest --collect-only -q \
