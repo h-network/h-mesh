@@ -32,6 +32,22 @@ manifest. A zero exit with an absent, partial, stale, or mismatched attestation
 is a failure. Selection alone and absence of a reported error are not execution
 evidence.
 
+Execution accounting uses call-phase reports only. If an environment-dependent
+fixture skips a test during setup—for example, because Redis is unavailable—the
+test produces no call report. The harness lists that node as `not executed`,
+returns non-zero, and issues no certificate. That setup skip cannot silently
+turn the environment-dependent guarantee into a no-op.
+
+Bare focused pytest can exit zero while reporting the same setup skips. That is
+valid pytest behavior, but it is not merge evidence: it proves neither that the
+skipped test body ran nor that its guarantee held. Use bare pytest for focused
+development feedback and the canonical runner for merge evidence. This rule is
+specifically about setup-phase skips lacking call reports; it does not claim
+that every environment-dependent test is safe or that every kind of visible
+skip lacks a call-phase report. Reaching a terminal call-phase outcome is
+execution accounting; it is not proof that the test asserted or verified its
+intended guarantee.
+
 The evidence is the pair of runner exit status zero **and** its post-validation
 certificate line. Pytest and the tests share stdout with the runner, so child
 code can print identical text; line presence alone is never evidence. Every
