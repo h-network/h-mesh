@@ -240,15 +240,101 @@ def _watchdog_records(out, destination="architect"):
     return records
 
 
-def _claims_delivery(records):
-    """Whether any record's own vocabulary (its event name or a `state`
-    field, wherever a given implementation puts the claim) asserts the
-    alert was sent/delivered, rather than merely admitted. A correct
-    alternate implementation could use one event name with a `state` field
-    instead of distinctly-named events -- this checks the words that would
-    overclaim either way, not one specific implementation's spelling."""
-    text = " ".join(str(record.get(key, "")) for record in records for key in ("event", "state")).lower()
-    return "sent" in text or "delivered" in text
+# The canonical, closed evidence-level contract (core.logging.log_record's
+# `evidence` field -- see modules/watchdog/service.py's _notify_lead for the
+# writer side). A CLOSED allowlist, not a denylist of overclaiming words: a
+# reviewer's finding was that scanning specific fields (or even specific
+# words, wherever found) for "sent"/"delivered" still lets a genuinely novel
+# claim-shaped vocabulary slip through unnoticed ("paste landed", "message
+# confirmed", anything nobody has enumerated yet). An allowlist has the
+# opposite failure mode: anything NOT explicitly recognized is rejected,
+# including vocabulary nobody has written yet, which is what a real contract
+# needs.
+_ADMISSION_ONLY_EVIDENCE = frozenset({"admitted", "rejected", "unknown", "no_lead"})
+
+
+def _assert_admission_only_evidence(testcase, records):
+    """Assert every record's `evidence` tag is one of the admission-only
+    values -- never `delivered`/`sent`/`created`, and never silently absent.
+    A record with no `evidence` field at all is a contract violation too,
+    not a free pass: the contract requires the tag be PRESENT, not merely
+    that its content happens not to overclaim."""
+    testcase.assertTrue(records, "an alert attempt must leave a record, not silence")
+    for record in records:
+        testcase.assertIn(
+            record.get("evidence"), _ADMISSION_ONLY_EVIDENCE,
+            f"record {record!r} does not carry a closed, admission-only evidence tag",
+        )
+
+
+class AdmissionEvidenceContractTests(unittest.TestCase):
+    """Counterfixtures for _assert_admission_only_evidence itself, per
+    reviewer's finding that the earlier field-scanning version needed
+    tests exercising the HELPER's own correctness directly, not only
+    indirectly through the watchdog scenario tests that happen to call it.
+    Each of these constructs a record by hand -- no Watchdog, no FakeRedis
+    -- so the contract enforcement is pinned in isolation."""
+
+    def test_accepts_every_known_admission_only_value(self):
+        for value in _ADMISSION_ONLY_EVIDENCE:
+            _assert_admission_only_evidence(self, [{"evidence": value}])
+
+    def test_rejects_a_delivered_claim(self):
+        with self.assertRaises(AssertionError):
+            _assert_admission_only_evidence(self, [{"evidence": "delivered"}])
+
+    def test_rejects_a_sent_claim(self):
+        with self.assertRaises(AssertionError):
+            _assert_admission_only_evidence(self, [{"evidence": "sent"}])
+
+    def test_rejects_a_sent_claim_hiding_in_an_unenumerated_field(self):
+        """The exact shape of reviewer's counterexample: a claim expressed
+        through a field name the helper never has to know about, because
+        it checks the canonical `evidence` tag, not a list of field names.
+        This record overclaims via `evidence` regardless of what else it
+        also happens to say in `outcome`/`reason`."""
+        record = {
+            "event": "lead_alert_admitted",
+            "outcome": "delivered",
+            "reason": "alert sent",
+            "evidence": "sent",
+        }
+        with self.assertRaises(AssertionError):
+            _assert_admission_only_evidence(self, [record])
+
+    def test_rejects_a_missing_evidence_tag(self):
+        """A record with no `evidence` field at all is a contract
+        violation, not a free pass -- the contract requires presence, not
+        just non-overclaiming content."""
+        with self.assertRaises(AssertionError):
+            _assert_admission_only_evidence(self, [{"event": "lead_alert_admitted", "reason": "ok"}])
+
+    def test_rejects_an_unrecognized_future_value(self):
+        """A vocabulary nobody has thought of yet -- an evidence tag that
+        is neither a known-safe value nor a word this file specifically
+        bans -- must still fail. This is what makes a closed allowlist
+        different from scanning for specific overclaiming words: a NEW
+        claim-shaped value that was never enumerated anywhere still cannot
+        slip through silently, because the allowlist is closed rather than
+        the denylist being (necessarily incompletely) open."""
+        with self.assertRaises(AssertionError):
+            _assert_admission_only_evidence(self, [{"evidence": "paste_landed"}])
+
+    def test_rejects_an_empty_record_list(self):
+        """Silence is still the original defect this whole family exists to
+        fix -- no records at all must fail exactly like an overclaiming one,
+        not pass by vacuous truth."""
+        with self.assertRaises(AssertionError):
+            _assert_admission_only_evidence(self, [])
+
+    def test_accepts_multiple_records_only_if_all_are_admission_only(self):
+        _assert_admission_only_evidence(
+            self, [{"evidence": "no_lead"}, {"evidence": "admitted"}]
+        )
+        with self.assertRaises(AssertionError):
+            _assert_admission_only_evidence(
+                self, [{"evidence": "admitted"}, {"evidence": "delivered"}]
+            )
 
 
 def _kicks():
@@ -561,7 +647,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(len(r.lists[_key("architect", "ingress")]), 300)
         events = [json.loads(line) for line in out.splitlines()]
         self.assertTrue(any(event.get("event") == "lead_alert_capacity" for event in events))
-        self.assertFalse(_claims_delivery(_watchdog_records(out)))
+        _assert_admission_only_evidence(self, _watchdog_records(out))
 
     def test_notify_lead_logs_unknown_and_does_not_kick_on_a_redis_fault(self):
         r = FakeRedis(fails_on={"eval": ConnectionError})
@@ -574,7 +660,7 @@ class WatchdogTests(unittest.TestCase):
 
         events = [json.loads(line) for line in out.splitlines()]
         self.assertTrue(any(event.get("event") == "lead_alert_unknown" for event in events))
-        self.assertFalse(_claims_delivery(_watchdog_records(out)))
+        _assert_admission_only_evidence(self, _watchdog_records(out))
 
     def test_notify_lead_logs_a_record_when_the_lead_is_not_a_registered_agent(self):
         """A dangling `lead` key pointing at a retired agent must not vanish
@@ -595,7 +681,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(no_lead[0]["destination"], "retired-lead")
         self.assertIn("not a registered agent", no_lead[0]["reason"])
         self.assertTrue(no_lead[0].get("stream_id"))
-        self.assertFalse(_claims_delivery(_watchdog_records(out, destination="retired-lead")))
+        _assert_admission_only_evidence(self, _watchdog_records(out, destination="retired-lead"))
 
     def test_notify_lead_logs_a_record_when_the_lead_is_not_a_tmux_agent(self):
         r = FakeRedis()
@@ -613,7 +699,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(len(no_lead), 1)
         self.assertEqual(no_lead[0]["destination"], "api")
         self.assertIn("port_type is not tmux", no_lead[0]["reason"])
-        self.assertFalse(_claims_delivery(_watchdog_records(out, destination="api")))
+        _assert_admission_only_evidence(self, _watchdog_records(out, destination="api"))
 
     def test_lead_window_missing_dead_letters_with_a_real_record_not_replayed(self):
         """A registered tmux lead whose window is merely missing right now
@@ -641,7 +727,7 @@ class WatchdogTests(unittest.TestCase):
         # delivery either, since admission is genuinely all that's known
         # here. See test_admission_only_logs_as_admitted_never_as_sent_or_
         # delivered below for the dedicated claim-vs-vocabulary check.
-        self.assertTrue(_watchdog_records(out))
+        _assert_admission_only_evidence(self, _watchdog_records(out))
 
     def test_admission_only_logs_as_admitted_never_as_sent_or_delivered(self):
         """ALLOCATED/ADMITTED/CREATED discipline: at the point admit_ingress
@@ -650,15 +736,29 @@ class WatchdogTests(unittest.TestCase):
         be recorded (silence was the original defect), but whatever it says
         must not claim delivery.
 
-        Asserts the CLAIM, not the VOCABULARY. A correct alternate
-        implementation could log a single event name with a `state` field
-        ("admitted" vs "sent") instead of distinctly-named events per
-        outcome -- this test must still pass against that implementation,
-        which is why it checks for the overclaiming WORDS ("sent",
-        "delivered") rather than this implementation's specific event-name
-        string. An earlier version of this test asserted the literal string
-        `lead_alert_admitted` and would have broken on exactly such a
-        correct alternate -- caught on self-audit, not by a reviewer.
+        Asserts the CONTRACT, not a word list. Scanning specific fields (or
+        even every field, for specific overclaiming words) still lets a
+        genuinely novel claim-shaped vocabulary slip through unnoticed --
+        an implementation could always find a new way to say "delivered"
+        that a hardcoded word list never enumerated. The actual fix: every
+        watchdog record now carries a canonical `evidence` tag
+        (core.logging.log_record's `evidence` field) drawn from a CLOSED
+        allowlist -- `_assert_admission_only_evidence` rejects anything not
+        explicitly in it, including a vocabulary nobody has thought of yet,
+        not just the two words this ticket happened to start with. See
+        AdmissionEvidenceContractTests below for direct counterfixtures
+        pinning that the allowlist itself actually rejects an overclaim
+        (in `evidence` specifically, and a missing tag entirely) rather
+        than only being exercised indirectly through this scenario.
+
+        History: an earlier version of this test asserted the literal
+        string `lead_alert_admitted` as the event name; a correct alternate
+        implementation using one event name with a `state` field would have
+        broken it. The version after that scanned "event"/"state" fields
+        for overclaiming words; reviewer's counterexample
+        (outcome="delivered", reason="alert sent") showed a fixed field
+        list has the same shape of gap with more entries. This version is
+        the third: a closed contract instead of an enumerated one.
 
         Same window-missing scenario as the dead-letter test above -- this
         one exists specifically to pin the claim discipline, not the
@@ -670,9 +770,7 @@ class WatchdogTests(unittest.TestCase):
         with patch("modules.tmux.port.list_windows", return_value=set()):
             out = _capture(lambda: _watchdog(r).poll(now=NOW))
 
-        records = _watchdog_records(out)
-        self.assertTrue(records, "an alert attempt must leave a record, not silence")
-        self.assertFalse(_claims_delivery(records))
+        _assert_admission_only_evidence(self, _watchdog_records(out))
 
     def test_no_delivery_claim_follows_a_successful_deliver_tmux_call(self):
         """No claim stronger than ADMITTED follows a successful deliver_tmux
@@ -692,9 +790,7 @@ class WatchdogTests(unittest.TestCase):
 
         out = _capture(lambda: _watchdog(r).poll(now=NOW))
 
-        records = _watchdog_records(out)
-        self.assertTrue(records)
-        self.assertFalse(_claims_delivery(records))
+        _assert_admission_only_evidence(self, _watchdog_records(out))
 
     # -- ack loop -------------------------------------------------------------
 

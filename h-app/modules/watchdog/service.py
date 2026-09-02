@@ -387,6 +387,7 @@ class Watchdog:
                 "watchdog", "lead_alert_no_lead",
                 stream_id=envelope["stream_id"], destination=lead,
                 reason=f"lead {lead!r} is not a registered agent",
+                evidence="no_lead",
             )
             return
         if port_type(self.r, pod=self.pod, tenant=self.tenant, agent=lead) != "tmux":
@@ -394,6 +395,7 @@ class Watchdog:
                 "watchdog", "lead_alert_no_lead",
                 stream_id=envelope["stream_id"], destination=lead,
                 reason=f"lead {lead!r} port_type is not tmux",
+                evidence="no_lead",
             )
             return
         try:
@@ -410,6 +412,7 @@ class Watchdog:
                 "watchdog", "lead_alert_unknown",
                 stream_id=envelope["stream_id"], destination=lead,
                 reason=f"admission outcome UNKNOWN after {exc}",
+                evidence="unknown",
             )
             return
         if not admitted:
@@ -417,12 +420,17 @@ class Watchdog:
                 "watchdog", "lead_alert_capacity",
                 stream_id=envelope["stream_id"], destination=lead,
                 reason=f"lead ingress full: depth {depth} has reached INGRESS_MAX {self.ingress_max}",
+                evidence="rejected",
             )
             return
         # ⚠ ADMITTED, not sent/delivered: this only proves the envelope was
         # durably written to the lead's ingress list. deliver_tmux has not
         # been called yet, let alone confirmed -- admission and delivery are
         # different facts, and this event must not be read as the second one.
+        # `evidence="admitted"` (core.logging.log_record) is the enforceable
+        # form of that claim -- a closed, machine-checkable tag a test can
+        # assert against directly, not a word a reviewer has to trust nobody
+        # contradicted in `reason` or some other free-text field.
         #
         # ⚠ No second "attempted"/"delivered" event is logged here on purpose.
         # deliver_tmux -> core.channels.receive() catches DeadLetter INSIDE
@@ -436,7 +444,11 @@ class Watchdog:
         # logged by channels.receive() itself under module="tmux", each
         # backed by an actual distinguishing fact instead of an absence of
         # exception.
-        log_record("watchdog", "lead_alert_admitted", stream_id=envelope["stream_id"], destination=lead)
+        log_record(
+            "watchdog", "lead_alert_admitted",
+            stream_id=envelope["stream_id"], destination=lead,
+            evidence="admitted",
+        )
         try:
             deliver_tmux(
                 self.r, self.pod, self.tenant, lead,
