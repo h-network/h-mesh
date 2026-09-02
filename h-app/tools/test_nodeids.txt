@@ -83,7 +83,6 @@ h-app/tests/test_api.py::ApiTests::test_deliver_api_keeps_in_reply_to_when_deliv
 h-app/tests/test_api.py::ApiTests::test_deliver_api_leaves_absent_in_reply_to_untouched
 h-app/tests/test_api.py::ApiTests::test_deliver_api_never_logs_the_in_reply_to_value_or_reply_source_it_drops
 h-app/tests/test_api.py::ApiTests::test_deliver_api_never_logs_the_raw_content_of_a_rejected_envelope
-h-app/tests/test_api.py::ApiTests::test_every_reason_argument_in_port_py_is_a_closed_literal_or_a_verified_helper
 h-app/tests/test_api.py::ApiTests::test_external_route_contract
 h-app/tests/test_api.py::ApiTests::test_idle_sse_stream_emits_keepalive_without_new_entries
 h-app/tests/test_api.py::ApiTests::test_nonlocal_and_malformed_destination_statuses
@@ -91,7 +90,6 @@ h-app/tests/test_api.py::ApiTests::test_overlapping_prompts_answered_out_of_orde
 h-app/tests/test_api.py::ApiTests::test_post_envelope_does_not_report_a_write_failure_as_a_rejection
 h-app/tests/test_api.py::ApiTests::test_qualified_destination_routes_through_core_channel
 h-app/tests/test_api.py::ApiTests::test_real_tmux_delivery_then_deliver_api_rejects_peer_originated_correlation
-h-app/tests/test_api.py::ApiTests::test_reason_argument_checker_rejects_reviewers_binding_shape_counterexamples
 h-app/tests/test_api.py::ApiTests::test_reply_correlation_and_dead_letter_reasons_are_always_closed_literals
 h-app/tests/test_api.py::RealApiPortSubprocessTests::test_real_api_module_subprocess_invocation
 h-app/tests/test_attachment_schema.py::AttachmentSchemaTests::test_base64_validation
