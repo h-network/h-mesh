@@ -306,6 +306,53 @@ def test_hire_wait_times_out_as_unknown_not_failed_when_neither_happens(mock_sen
     assert "NOT a failure" in err
 
 
+# ⚠ Reviewer FAILED this branch on exactly this: `type=float` accepted nan/
+# inf/-inf/negative unvalidated. With --wait nan, deadline and remaining
+# both become NaN; every comparison against NaN is False, so
+# `remaining <= 0` never becomes true and `min(POLL_INTERVAL, nan)` returns
+# POLL_INTERVAL unchanged -- the poll loop never terminates and the exit-2
+# "unknown" outcome the whole three-state design exists to guarantee never
+# fires. Confirmed empirically before fixing (min(0.5, float('nan')) ==
+# 0.5, float('nan') <= 0 is False) -- reviewer's claim matched exactly, not
+# just plausible. +inf is real but unbounded, contradicting "wait up to
+# SECONDS"; negative gives an already-past deadline with a nonsensical
+# negative duration in the message. All four are now rejected by argparse's
+# own type= callback, which runs during parse_args() -- strictly before the
+# send() call below it in this file -- so no hire is ever admitted from an
+# invalid --wait.
+@pytest.mark.parametrize("bad_value", ["nan", "inf", "-inf", "-5"])
+@patch("modules.office.cli.send")
+def test_hire_wait_rejects_non_finite_and_negative_values_before_any_send(mock_send, monkeypatch, bad_value):
+    _env(monkeypatch)
+    r = FakeRedis()
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit) as exc_info:
+            # `=` form, not a separate argv token -- "-inf"/"-5" as a bare
+            # next token can be swallowed by argparse's own "looks like an
+            # option" heuristic for an optional nargs='?' value before ever
+            # reaching this option's type= callback; --wait=<value> removes
+            # that ambiguity so every one of these four is actually
+            # exercising the same validation path, not two different ones.
+            office_main(["hire", "worker-1", "--cli", "claude", f"--wait={bad_value}"])
+    assert exc_info.value.code == 2
+    mock_send.assert_not_called()
+
+
+@patch("modules.office.cli.send")
+def test_hire_wait_accepts_zero_as_an_immediate_single_check(mock_send, monkeypatch, capsys):
+    # 0 is finite and non-negative -- a legitimate "check once now, don't
+    # actually wait" mode, not something the nan/inf/negative fix should
+    # also reject.
+    _env(monkeypatch)
+    mock_send.return_value = "stream-1"
+    r = FakeRedis()
+    _member(r, "worker-1", "tmux")
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["hire", "worker-1", "--cli", "claude", "--wait", "0"])
+    mock_send.assert_called_once()
+    assert "confirmed: worker-1 registered" in capsys.readouterr().out
+
+
 @patch("modules.office.cli.send")
 def test_hire_without_wait_stays_fire_and_forget(mock_send, monkeypatch, capsys):
     # The default, unflagged path must be unchanged -- callers that want

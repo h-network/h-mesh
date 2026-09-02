@@ -12,6 +12,7 @@ agentlifecycle itself, the same separation `office/cli.py` and
 import argparse
 import base64
 import json
+import math
 import mimetypes
 import os
 import re
@@ -431,6 +432,33 @@ def _now() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _wait_seconds(raw: str) -> float:
+    """argparse type= for --wait -- rejects anything that would break the
+    bounded-wait contract, before parse_args() returns and long before any
+    send() call.
+
+    ⚠ Bare `float()` accepts "nan"/"inf"/"-inf" without complaint. NaN is
+    the dangerous one: every comparison against NaN is False, so `remaining
+    <= 0` in _await_hire_confirmation's poll loop never becomes true and
+    `min(POLL_INTERVAL, nan)` returns POLL_INTERVAL unchanged -- the loop
+    polls forever and the exit-2 "unknown" outcome the whole three-state
+    design exists to guarantee never fires. +inf is a real, finite-looking
+    value that is unbounded by definition, contradicting "wait up to
+    SECONDS". A negative value would make the deadline already-past,
+    returning "unknown" immediately with a nonsensical negative duration in
+    the message. All four are rejected here, not handled downstream.
+    """
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid SECONDS value: {raw!r}") from exc
+    if math.isnan(value) or math.isinf(value) or value < 0:
+        raise argparse.ArgumentTypeError(
+            f"--wait SECONDS must be a finite, non-negative number, got {raw!r}"
+        )
+    return value
+
+
 def _lifecycle_command(command: str, argv: list[str]) -> None:
     descriptions = {
         "hire": "Enrol a new agent.",
@@ -495,7 +523,7 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
         # operator was told an agent existed when it did not. A caller that
         # wants to print CREATED-level language must earn it, not assume it.
         parser.add_argument(
-            "--wait", nargs="?", const=30.0, type=float, default=None, metavar="SECONDS",
+            "--wait", nargs="?", const=30.0, type=_wait_seconds, default=None, metavar="SECONDS",
             help="wait up to SECONDS (default 30) for confirmation the agent actually "
                  "registered, instead of returning as soon as the request is merely "
                  "accepted. Three distinct outcomes, not two: exit 0 = confirmed "
