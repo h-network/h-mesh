@@ -14,6 +14,7 @@ from pathlib import Path
 
 
 RUNNER_PATH = Path(__file__).resolve()
+FIRST_PARTY_PROBE = "services.daemons"
 
 
 def _find_invoked_tree(start: Path) -> Path | None:
@@ -40,6 +41,38 @@ def _print_provenance(tree: Path | None) -> None:
     print(f"test tree: {rendered_tree}", flush=True)
     print(f"runner module: {RUNNER_PATH}", flush=True)
     print(f"pytest cwd: {rendered_tree}", flush=True)
+
+
+def _suite_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.pop("PYTEST_ADDOPTS", None)
+    environment.pop("PYTEST_PLUGINS", None)
+    environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    return environment
+
+
+def _child_import_path(
+    module: str, *, cwd: Path, env: dict[str, str]
+) -> tuple[Path | None, str]:
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; "
+            f"import {module} as target; "
+            "print(Path(target.__file__).resolve())",
+        ],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        return None, probe.stderr.strip()
+    try:
+        return Path(probe.stdout.strip()).resolve(), ""
+    except (OSError, RuntimeError) as exc:
+        return None, f"invalid child module path: {exc}"
 
 
 def main() -> int:
@@ -71,16 +104,33 @@ def main() -> int:
         )
         return 1
 
+    pytest_env = _suite_environment()
+    imported_path, import_error = _child_import_path(
+        FIRST_PARTY_PROBE, cwd=repo_root, env=pytest_env
+    )
+    expected_package_root = (repo_root / "h-app").resolve()
+    if imported_path is None or not imported_path.is_relative_to(expected_package_root):
+        rendered_import = str(imported_path) if imported_path is not None else "<not importable>"
+        print(
+            "error: the test interpreter cannot import first-party children from "
+            "the tree being certified\n"
+            f"interpreter: {sys.executable}\n"
+            f"module: {FIRST_PARTY_PROBE}\n"
+            f"resolved module: {rendered_import}\n"
+            f"child import error: {import_error or '<none>'}\n"
+            f"expected under: {expected_package_root}\n"
+            "install this tree into the environment before running the suite:\n"
+            f"  {sys.executable} -m pip install -e {repo_root}",
+            file=sys.stderr,
+        )
+        return 1
+
     manifest = repo_root / "h-app" / "tools" / "test_nodeids.txt"
     manifest_bytes = manifest.read_bytes()
     expected_count = len([line for line in manifest_bytes.splitlines() if line.strip()])
     nonce = secrets.token_hex(32)
     with tempfile.TemporaryDirectory(prefix="h-mesh-test-attestation-") as temp_dir:
         attestation_path = Path(temp_dir) / "complete.json"
-        pytest_env = os.environ.copy()
-        pytest_env.pop("PYTEST_ADDOPTS", None)
-        pytest_env.pop("PYTEST_PLUGINS", None)
-        pytest_env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
         pytest_env["H_MESH_TEST_ATTESTATION_PATH"] = str(attestation_path)
         pytest_env["H_MESH_TEST_ATTESTATION_NONCE"] = nonce
         child_status = subprocess.call(

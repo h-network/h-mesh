@@ -789,14 +789,14 @@ class OfficeHandler(SimpleHTTPRequestHandler):
             cookie_header = f"hmesh_session={token}; Path=/; HttpOnly; SameSite=Strict"
             if getattr(self.server, "api_base", "").startswith("https://"):
                 cookie_header += "; Secure"
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Set-Cookie", cookie_header)
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(json.dumps({"authenticated": True}).encode("utf-8"))
+            # ⚠ AUDIT BEFORE RESPONDING. The record used to be written after
+            # the body, so an operator who logged in and immediately read
+            # /api/audit could see zero records — the action had happened, the
+            # response said so, and the log did not yet. A different thread
+            # serves that next request, so nothing made it wait.
             session_id_str = token[:12] + "..."
-            self._audit_log("login_success", {}, session_id=session_id_str)
+            self._json(200, {"authenticated": True}, set_cookie=cookie_header,
+                       audit=("login_success", {}, session_id_str))
         else:
             if lock is not None:
                 with lock:
@@ -894,13 +894,12 @@ class OfficeHandler(SimpleHTTPRequestHandler):
         cookie_header = f"hmesh_session={token}; Path=/; HttpOnly; SameSite=Strict"
         if getattr(self.server, "api_base", "").startswith("https://"):
             cookie_header += "; Secure"
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Set-Cookie", cookie_header)
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(json.dumps({"authenticated": True, "read_only": True}).encode("utf-8"))
-        self._audit_log("telegram_auth_success", {"user_id": user_id}, session_id=f"{token[:12]}...")
+        # ⚠ Same, for the Mini App's login: a session created here is
+        # functionally identical to an operator one, and its record was on the
+        # wrong side of the body in the same way.
+        self._json(200, {"authenticated": True, "read_only": True},
+                   set_cookie=cookie_header,
+                   audit=("telegram_auth_success", {"user_id": user_id}, f"{token[:12]}..."))
 
     def _handle_logout(self) -> None:
         self._audit_log("logout", {})
@@ -1429,12 +1428,54 @@ class OfficeHandler(SimpleHTTPRequestHandler):
         except Exception:
             pass
 
-    def _json(self, status: int, value: object) -> None:
+    def _json(self, status: int, value: object, set_cookie: str | None = None,
+              audit: tuple | None = None) -> None:
+        """A JSON response, optionally setting one session cookie and
+        optionally writing the operator action log record that goes with it.
+
+        ⚠ `audit=(event, details)` or `(event, details, session_id)` is written
+        BEFORE the first byte of the response, and that is the point of it
+        being a parameter rather than a separate call at the call site. An
+        order a caller cannot express wrongly cannot be got wrong. Three
+        successive AST guards tried to DETECT the wrong order instead, and each
+        was falsified by a construct the previous one did not model — branches,
+        then compound statements, then `break` and `continue`, which the last
+        version treated as leaving the handler when they leave only the loop.
+        The equivalent narrowing of this method's headers has needed no second
+        round, which is the argument for doing the same here.
+
+        ⚠ `set_cookie` — not a general `headers` argument. It exists because
+        both authentication SUCCESS paths needed `Set-Cookie`, this helper
+        could not do it, so both hand-rolled the whole response and both then
+        wrote their audit record AFTER the body: an operator could log in, be
+        told it worked, read the log back and see nothing. Covering the case
+        that made someone reach past the helper is the fix.
+
+        ⚠ A general `headers=[(name, value)]` was the first version of that,
+        and reviewer was right to reject it. It appended caller pairs after
+        this method's own `Content-Type`, `Content-Length` and `Cache-Control`,
+        so a caller could send a second, conflicting `Content-Length` —
+        `BaseHTTPRequestHandler` does not resolve that, and the framing of the
+        response is then whatever the recipient decides it is. An abstraction
+        added to prevent one hand-rolled response should not hand the next
+        handler a response-splitting footgun. One named parameter for the one
+        header that is actually needed cannot express the conflict at all.
+        """
+        if audit is not None:
+            # before send_response, before the headers, before the body
+            self._audit_log(*audit)
+        if set_cookie is not None and ("\r" in set_cookie or "\n" in set_cookie):
+            # Server-constructed today, so this is about the edit that puts a
+            # remote value in it: a bare CR or LF ends the header and starts
+            # whatever follows as a new one.
+            raise ValueError("cookie value must not contain CR or LF")
         body = json.dumps(value).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        if set_cookie is not None:
+            self.send_header("Set-Cookie", set_cookie)
         self.end_headers()
         self.wfile.write(body)
 

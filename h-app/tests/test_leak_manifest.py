@@ -17,6 +17,7 @@ practice: at the start of the NEXT pytest session, not the one that died.
 import errno
 import json
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -24,6 +25,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+import pytest
 
 from _leak_manifest import MANIFEST_DIR, _process_start_time, reap_all_orphans, register
 
@@ -93,6 +96,59 @@ def _alive(pid: int) -> bool:
     return True
 
 
+def _describe_exit(proc: subprocess.Popen) -> str:
+    """Distinguish "still running" from "exited" from "killed by a signal" --
+    the three outcomes a bare `assert ready` used to collapse into one
+    indistinguishable message."""
+    code = proc.returncode
+    if code is None:
+        return "still running"
+    if code < 0:
+        try:
+            return f"killed by signal {signal.Signals(-code).name}"
+        except ValueError:
+            return f"killed by signal {-code}"
+    return f"exited with code {code}"
+
+
+def _wait_for_ready_line(proc: subprocess.Popen, timeout: float) -> tuple[bool, str]:
+    """Wait for a "READY" line without blocking past `timeout` even if the
+    child never writes anything, or writes a partial, unterminated line and
+    then goes on being silently alive.
+
+    Reviewer's finding on an earlier version of this helper: `select`
+    reports the pipe readable as soon as ANY bytes exist -- it answers "is
+    there data", not "is there a line". A text-mode `proc.stdout.readline()`
+    called right after still blocks until a newline or EOF, so a child that
+    writes a partial line and then keeps running silently could hang this
+    wait past its own deadline anyway, the exact "deadline that never fires"
+    harm this helper exists to close. Fixed by reading raw, available bytes
+    directly off the fd (`os.read`, which -- unlike a buffered readline --
+    returns as soon as `select` says there's anything, never blocking for a
+    newline that hasn't arrived yet) into our own incremental buffer, and
+    detecting "READY" from that buffer rather than from the stream. Partial,
+    unterminated output is retained in the buffer either way, since that's
+    the other half of the evidence a bare pass/fail throws away."""
+    deadline = time.monotonic() + timeout
+    fd = proc.stdout.fileno()
+    buffer = b""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        readable, _, _ = select.select([fd], [], [], min(0.2, remaining))
+        if not readable:
+            continue
+        chunk = os.read(fd, 4096)
+        if chunk == b"":
+            break  # EOF: the child's stdout closed, which only happens on exit.
+        buffer += chunk
+        if b"READY" in buffer:
+            return True, buffer.decode("utf-8", errors="replace")
+    proc.poll()
+    return False, buffer.decode("utf-8", errors="replace")
+
+
 def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_path):
     script_path = tmp_path / "victim.py"
     script_path.write_text(_VICTIM_SCRIPT.format(tests_dir=str(REPO_ROOT / "h-app" / "tests")))
@@ -101,22 +157,16 @@ def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_pa
 
     proc = subprocess.Popen(
         [sys.executable, str(script_path), str(victim_tmpdir)],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     daemon_pid: int | None = None
     manifest_entry = MANIFEST_DIR / f"{victim_tmpdir.name}.json"
     try:
-        deadline = time.monotonic() + 10.0
-        ready = False
-        while time.monotonic() < deadline:
-            line = proc.stdout.readline()
-            if not line:
-                time.sleep(0.05)
-                continue
-            if "READY" in line:
-                ready = True
-                break
-        assert ready, "victim process never signalled readiness"
+        ready, captured = _wait_for_ready_line(proc, timeout=10.0)
+        assert ready, (
+            f"victim process never signalled readiness -- {_describe_exit(proc)}; "
+            f"captured output: {captured!r}"
+        )
 
         assert manifest_entry.exists(), "victim never registered before we killed it"
         daemon_pid = int((victim_tmpdir / "run" / "switch.pid").read_text().strip())
@@ -139,9 +189,17 @@ def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_pa
         # THE GUARD: this is what pytest_sessionstart runs automatically at
         # the start of the next session. Called directly here so this test
         # doesn't depend on spawning a whole second pytest process.
-        reaped, stuck = reap_all_orphans(log=lambda *_: None)
-        assert reaped >= 1
-        assert stuck == 0
+        #
+        # Not `assert reaped >= 1`: a genuinely dead victim, once its
+        # manifest entry is visible in the shared MANIFEST_DIR, is just as
+        # reapable by a DIFFERENT concurrent process's own ordinary sweep
+        # as by this one -- if that process wins the race, THIS call's own
+        # `reaped` can legitimately be 0 even though the victim WAS reaped
+        # (just not by this invocation). Which process did it doesn't
+        # matter to this test's actual claim; the victim's own outcome
+        # (daemon dead, tmpdir gone, entry gone) is what's asserted below,
+        # by its own identity, regardless of who did the reaping.
+        reap_all_orphans(log=lambda *_: None)
 
         deadline = time.monotonic() + 5.0
         while _alive(daemon_pid) and time.monotonic() < deadline:
@@ -165,6 +223,42 @@ def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_pa
         shutil.rmtree(victim_tmpdir, ignore_errors=True)
 
 
+def test_wait_for_ready_line_does_not_block_past_its_deadline_on_a_partial_line():
+    """Reviewer's finding on an earlier version of `_wait_for_ready_line`:
+    `select` reporting a pipe readable only means SOME bytes are there -- a
+    text-mode `readline()` called right after still blocks until a newline
+    or EOF, so a child that writes a PARTIAL, unterminated line and then
+    goes on being silently alive (not exiting) could still hang the wait
+    well past its own deadline, exactly the "deadline that never fires"
+    harm this helper exists to close. Reviewer's exact reproduction,
+    reused directly: a child writes and flushes "PARTIAL" with no trailing
+    newline, then sleeps well past the given timeout. Asserts BOTH the
+    message (ready is False, the partial text was captured, not lost) AND
+    the elapsed wall-clock time -- a message-only assertion would pass
+    identically whether this returned in 0.2s or 2s, which is exactly the
+    cannot-fail-in-the-direction-of-the-harm gap a bound on elapsed time
+    closes."""
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys, time; sys.stdout.write('PARTIAL'); sys.stdout.flush(); time.sleep(2)"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    try:
+        start = time.monotonic()
+        ready, captured = _wait_for_ready_line(proc, timeout=0.2)
+        elapsed = time.monotonic() - start
+
+        assert ready is False, "a partial, unterminated line was mistaken for READY"
+        assert "PARTIAL" in captured, "the partial, unterminated line was lost rather than captured"
+        assert elapsed < 1.0, (
+            f"wait blocked well past its own 0.2s deadline on a partial line: {elapsed:.3f}s elapsed"
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
 def test_reaper_does_not_touch_a_tmpdir_whose_owner_is_genuinely_still_running(tmp_path):
     """The mirror of the harm test above, and the one that matters most: a
     reaper that reaps too eagerly is worse than one that reaps too little.
@@ -184,10 +278,15 @@ def test_reaper_does_not_touch_a_tmpdir_whose_owner_is_genuinely_still_running(t
     try:
         assert entry.exists()
 
-        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+        # NOT `assert reaped == 0` / `assert stuck == 0`: on a shared
+        # sandbox, reap_all_orphans() sweeps the WHOLE manifest directory,
+        # not just this test's own entry -- a different agent's concurrent
+        # session registering (and later genuinely dying) at the same time
+        # legitimately makes these aggregate counts nonzero without this
+        # test's own entry ever being touched. What this test actually
+        # claims is scoped to its OWN entry/tmpdir, asserted directly below.
+        reap_all_orphans(log=lambda *_: None)
 
-        assert reaped == 0, "reaper touched a tmpdir whose owner is this live test process"
-        assert stuck == 0
         assert real_tmpdir.exists()
         assert marker.exists()
         assert entry.exists(), "reaper deleted a live entry's manifest record"
@@ -218,11 +317,14 @@ def test_reaper_ignores_bare_pid_reuse_and_requires_start_time_to_match(tmp_path
         data["owner_start_time"] = "0"
         entry.write_text(json.dumps(data))
 
-        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+        # Not `assert reaped == 1` / `assert stuck == 0`: a concurrent
+        # agent's own entries in the same shared manifest directory can
+        # move these aggregate counts independently of this test's own
+        # entry. This test's own claim -- that its OWN entry was reaped
+        # despite the pid-reuse shape -- is scoped to it directly below.
+        reap_all_orphans(log=lambda *_: None)
 
-        assert reaped == 1, "reaper trusted bare pid liveness instead of the authenticated start time"
-        assert stuck == 0
-        assert not real_tmpdir.exists()
+        assert not real_tmpdir.exists(), "reaper trusted bare pid liveness instead of the authenticated start time"
         assert not entry.exists()
     finally:
         shutil.rmtree(real_tmpdir, ignore_errors=True)
@@ -266,10 +368,12 @@ def test_reaper_leaves_an_unauthenticatable_daemon_pid_running_and_retries_forev
     }))
 
     try:
+        # Not `assert reaped == 0` / `assert stuck == 1`: a concurrent
+        # agent's own entries in the shared manifest directory move these
+        # aggregate counts independently of this test's own entry, which is
+        # asserted directly below by its own identity instead.
         for attempt in range(2):
-            reaped, stuck = reap_all_orphans(log=lambda *_: None)
-            assert reaped == 0, f"attempt {attempt}: reaper killed/removed an unauthenticatable entry"
-            assert stuck == 1, f"attempt {attempt}: entry was not reported as stuck"
+            reap_all_orphans(log=lambda *_: None)
             assert unrelated.poll() is None, f"attempt {attempt}: an unauthenticated pid was signalled"
             assert real_tmpdir.exists(), f"attempt {attempt}: tmpdir removed despite unauthenticated daemon"
             assert entry.exists(), f"attempt {attempt}: manifest entry cleared despite unauthenticated daemon"
@@ -305,10 +409,11 @@ def test_unverifiable_owner_at_registration_is_stuck_not_silently_running(tmp_pa
     }))
 
     try:
+        # Not `assert reaped == 0` / `assert stuck == 1`: see the identical
+        # note in the unauthenticatable-daemon test above -- these are
+        # whole-shared-directory aggregates, not this entry's own outcome.
         for attempt in range(2):
-            reaped, stuck = reap_all_orphans(log=lambda *_: None)
-            assert reaped == 0, f"attempt {attempt}: an unverifiable owner was treated as dead and reaped"
-            assert stuck == 1, f"attempt {attempt}: unverifiable owner was not counted as stuck"
+            reap_all_orphans(log=lambda *_: None)
             assert real_tmpdir.exists(), f"attempt {attempt}: tmpdir removed despite unverifiable owner"
             assert entry.exists(), f"attempt {attempt}: manifest entry cleared despite unverifiable owner"
     finally:
@@ -323,16 +428,22 @@ def test_malformed_manifest_entry_is_left_visible_not_deleted(tmp_path):
     whatever it pointed at, the exact evidence-loss problem this module
     exists to prevent one level earlier. Proves both malformed shapes are
     now left in place and counted as stuck instead."""
-    bad_json_entry = MANIFEST_DIR / "h_mesh_test_leak_harm_bad_json.json"
+    # Filenames include this process's own pid: a hardcoded, shared name
+    # here collides with a concurrent copy of THIS SAME test running in a
+    # different process against the same shared MANIFEST_DIR.
+    bad_json_entry = MANIFEST_DIR / f"h_mesh_test_leak_harm_bad_json_{os.getpid()}.json"
     bad_json_entry.write_text("{not valid json")
 
-    missing_fields_entry = MANIFEST_DIR / "h_mesh_test_leak_harm_missing_fields.json"
+    missing_fields_entry = MANIFEST_DIR / f"h_mesh_test_leak_harm_missing_fields_{os.getpid()}.json"
     missing_fields_entry.write_text(json.dumps({"owner_pid": "not-an-int", "tmpdir": None}))
 
     try:
-        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+        # `reaped` and `stuck` are whole-shared-directory aggregates, not
+        # scoped to these two entries -- `reaped` is not asserted directly,
+        # see the ticket. `stuck >= 2` stays: a lower bound is safe under
+        # concurrent pollution (it can only grow, never shrink).
+        _reaped, stuck = reap_all_orphans(log=lambda *_: None)
 
-        assert reaped == 0
         assert stuck >= 2, "malformed entries were not both counted as stuck"
         assert bad_json_entry.exists(), "unreadable manifest entry was deleted rather than left visible"
         assert missing_fields_entry.exists(), "malformed manifest entry was deleted rather than left visible"
@@ -522,7 +633,10 @@ def test_forged_entry_pointing_outside_tmp_is_never_touched(tmp_path):
     dead_owner = subprocess.Popen([sys.executable, "-c", "pass"])
     dead_owner.wait()
 
-    entry = MANIFEST_DIR / "forged_out_of_scope.json"
+    # A pid-suffixed name, not a hardcoded one: a shared literal filename
+    # collides with a concurrent copy of THIS SAME test in a different
+    # process against the same shared MANIFEST_DIR.
+    entry = MANIFEST_DIR / f"forged_out_of_scope_{os.getpid()}.json"
     entry.write_text(json.dumps({
         "tmpdir": str(victim),
         "owner_pid": dead_owner.pid,
@@ -531,9 +645,11 @@ def test_forged_entry_pointing_outside_tmp_is_never_touched(tmp_path):
     }))
 
     try:
-        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+        # `reaped == 0` removed: a whole-shared-directory aggregate, not
+        # scoped to this entry (see the ticket). `victim.exists()` below is
+        # the correctly-scoped equivalent -- if it were reaped, it wouldn't.
+        _reaped, stuck = reap_all_orphans(log=lambda *_: None)
 
-        assert reaped == 0, "a forged entry naming a directory outside /tmp was reaped"
         assert stuck >= 1
         assert victim.exists(), "the out-of-scope directory was deleted"
         assert marker.exists(), "content inside the out-of-scope directory was destroyed"
@@ -554,7 +670,8 @@ def test_forged_entry_with_wrong_prefix_under_tmp_is_never_touched():
     dead_owner = subprocess.Popen([sys.executable, "-c", "pass"])
     dead_owner.wait()
 
-    entry = MANIFEST_DIR / "forged_wrong_prefix.json"
+    # Pid-suffixed for the same reason as the sibling test above.
+    entry = MANIFEST_DIR / f"forged_wrong_prefix_{os.getpid()}.json"
     entry.write_text(json.dumps({
         "tmpdir": str(victim),
         "owner_pid": dead_owner.pid,
@@ -563,9 +680,11 @@ def test_forged_entry_with_wrong_prefix_under_tmp_is_never_touched():
     }))
 
     try:
-        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+        # `reaped == 0` removed: whole-shared-directory aggregate, not
+        # scoped to this entry (see the ticket). `victim.exists()` below is
+        # the correctly-scoped equivalent.
+        _reaped, stuck = reap_all_orphans(log=lambda *_: None)
 
-        assert reaped == 0
         assert stuck >= 1
         assert victim.exists()
         assert marker.exists()
@@ -599,9 +718,11 @@ def test_forged_entry_whose_tmpdir_does_not_match_its_own_filename_is_never_touc
     }))
 
     try:
-        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+        # `reaped == 0` removed: whole-shared-directory aggregate, not
+        # scoped to this entry (see the ticket). `decoy.exists()` below is
+        # the correctly-scoped equivalent.
+        _reaped, stuck = reap_all_orphans(log=lambda *_: None)
 
-        assert reaped == 0
         assert stuck >= 1
         assert decoy.exists(), "the mismatched tmpdir was deleted despite not matching its own entry's filename"
         assert marker.exists()
@@ -637,9 +758,11 @@ def test_a_symlink_standing_in_for_the_tmpdir_is_never_touched():
     }))
 
     try:
-        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+        # `reaped == 0` removed: whole-shared-directory aggregate, not
+        # scoped to this entry (see the ticket). The symlink/target checks
+        # below are the correctly-scoped equivalent.
+        _reaped, stuck = reap_all_orphans(log=lambda *_: None)
 
-        assert reaped == 0, "a symlink standing in for the tmpdir was followed and reaped"
         assert stuck >= 1
         assert link_path.is_symlink(), "the symlink itself was removed"
         assert real_target.exists(), "the symlink's real target was deleted"
@@ -676,9 +799,11 @@ def test_an_entry_owned_by_a_different_uid_is_never_touched(monkeypatch):
     monkeypatch.setattr(_leak_manifest.os, "getuid", lambda: real_uid + 1)
 
     try:
-        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+        # `reaped == 0` removed: whole-shared-directory aggregate, not
+        # scoped to this entry (see the ticket). `real_tmpdir.exists()`
+        # below is the correctly-scoped equivalent.
+        _reaped, stuck = reap_all_orphans(log=lambda *_: None)
 
-        assert reaped == 0, "an entry was reaped despite failing the (simulated) uid check"
         assert stuck >= 1
         assert real_tmpdir.exists()
         assert marker.exists()
@@ -728,9 +853,11 @@ def test_an_unrecognized_pidfile_name_blocks_the_whole_entry_before_any_kill(tmp
     }))
 
     try:
-        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+        # `reaped == 0` removed: whole-shared-directory aggregate, not
+        # scoped to this entry (see the ticket). `real_tmpdir`/`entry`
+        # existence below is the correctly-scoped equivalent.
+        _reaped, stuck = reap_all_orphans(log=lambda *_: None)
 
-        assert reaped == 0, "an entry with an unrecognized pidfile name was reaped anyway"
         assert stuck >= 1
         assert known.poll() is None, "the RECOGNIZED daemon was killed despite the unrecognized sibling blocking the entry"
         assert unknown.poll() is None, "the unrecognized process was killed"
@@ -785,11 +912,12 @@ def test_a_provably_stale_daemon_pidfile_does_not_block_reaping(tmp_path):
     }))
 
     try:
-        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+        # Not `assert reaped == 1` / `assert stuck == 0`: whole-shared-
+        # directory aggregates, not scoped to this entry (see the ticket).
+        # The existence checks below are the correctly-scoped equivalent.
+        reap_all_orphans(log=lambda *_: None)
 
-        assert reaped == 1, "a provably-stale (already-exited) daemon pidfile blocked reaping instead of being treated as safe"
-        assert stuck == 0
-        assert not real_tmpdir.exists()
+        assert not real_tmpdir.exists(), "a provably-stale (already-exited) daemon pidfile blocked reaping instead of being treated as safe"
         assert not entry.exists()
     finally:
         entry.unlink(missing_ok=True)
@@ -957,7 +1085,19 @@ def test_a_transient_nonempty_directory_is_stuck_then_cleanly_reaped_next_sessio
     its SIGHUP-triggered history flush a few milliseconds late), then
     behaves normally on every later call -- so the FIRST reap attempt must
     leave the entry stuck with surviving content, and a SECOND, later
-    attempt (nothing new races the second time) must fully reap it."""
+    attempt (nothing new races the second time) must fully reap it.
+
+    ⚠ This entry looks genuinely dead (`owner_start_time: "0"`) the moment
+    it's written -- indistinguishable, from a DIFFERENT concurrent
+    process's own unrelated `reap_all_orphans()` sweep of the same shared
+    MANIFEST_DIR, from any other reapable orphan. That other process's
+    `os.rmdir` is real, not monkeypatched, so if it wins the race it
+    reaps this entry cleanly with no ENOTEMPTY at all -- THIS process's
+    own `racing_rmdir` is then never called for "home", and the claim
+    this test exists to prove (the stuck-then-reaped cycle) was never
+    actually exercised by this attempt. `raced_once["done"]` is the
+    ground truth for whether that happened; when it's False this test
+    says so and stops rather than asserting a claim it did not establish."""
     import _leak_manifest
 
     real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_transient_race_")
@@ -995,17 +1135,87 @@ def test_a_transient_nonempty_directory_is_stuck_then_cleanly_reaped_next_sessio
     monkeypatch.setattr(_leak_manifest.os, "rmdir", racing_rmdir)
 
     try:
-        reaped_1, stuck_1 = reap_all_orphans(log=lambda *_: None)
-        assert reaped_1 == 0, "the raced entry was reaped on the first attempt anyway"
-        assert stuck_1 == 1, "the raced entry was not counted stuck on the first attempt"
+        # Not `assert reaped_N == ...` / `assert stuck_N == ...`: whole-
+        # shared-directory aggregates, not scoped to this entry (see the
+        # ticket). The existence checks below are the correctly-scoped
+        # equivalent for each attempt. Log lines are captured (not
+        # discarded) so a failure below can show real evidence of what
+        # reap_all_orphans actually did with THIS entry, not just infer it.
+        captured_log: list[str] = []
+        reap_all_orphans(log=captured_log.append)
+        own_log_lines = [line for line in captured_log if real_tmpdir.name in line]
+        # Two distinct windows where a DIFFERENT concurrent process's own,
+        # entirely ordinary (non-monkeypatched) sweep of the same shared
+        # MANIFEST_DIR can finish this entry's job before -- or right after
+        # -- this process's own attempt: (a) it reaps the entry outright
+        # before THIS process's racing_rmdir is ever called for "home", so
+        # `raced_once["done"]` stays False; or (b) THIS process's own
+        # attempt correctly leaves it stuck (raced_once IS True), but the
+        # entry is still visible in the shared directory afterward, and a
+        # different concurrent sweep finishes removing it (a real,
+        # unmonkeypatched rmdir has no trouble with a directory that
+        # genuinely, ordinarily contains one leftover file) before this
+        # process gets to check.
+        #
+        # ⚠ Reviewer's finding: `not raced_once["done"]` is NOT by itself a
+        # safe skip condition. A concurrent process finishing the job
+        # requires the tmpdir to be GONE -- if it's still present, no
+        # process (this one or a concurrent one) has completed removing
+        # it, so "someone else finished the job" cannot explain this
+        # state. That state-based reasoning is what justifies failing
+        # rather than skipping here; it does not by itself say WHY this
+        # process's own attempt didn't complete (see the diagnostic
+        # below, which states what's known and doesn't guess the rest).
+        # Skip ONLY when the tmpdir is gone -- otherwise fall through and
+        # let `raced_once` itself be asserted, which fails loudly instead
+        # of turning the only test for this recovery path into
+        # permanently green noise.
+        if not real_tmpdir.exists():
+            pytest.skip(
+                "a concurrent process's ordinary sweep of the same shared "
+                "MANIFEST_DIR reaped this entry before this attempt could "
+                "establish the stuck-then-reaped claim itself (this "
+                f"process's own race fired: {raced_once['done']})"
+            )
+        if not raced_once["done"]:
+            if not own_log_lines:
+                # Reviewer's finding: absence of a matching captured line is
+                # NOT proof this entry was never reached -- only proof there
+                # is no captured evidence that it was. A matching line
+                # would positively prove reaching a logged point; the
+                # absence of one cannot positively prove the opposite (the
+                # sweep could have reached the entry and failed before its
+                # first matching log call, the wording could have stopped
+                # including this entry's name, or logging on this path
+                # could have been removed/moved). State the absence, list
+                # what it could mean, and pick none of them.
+                cause = (
+                    "no captured log line mentions this entry at all -- this "
+                    "could mean reap_all_orphans never reached it in its "
+                    "sweep, OR that it reached it and failed/stopped before "
+                    "any matching log call, OR that a matching line exists "
+                    "but no longer mentions this entry's name/path. Absence "
+                    "of a captured line proves absence of evidence, not "
+                    "absence of the attempt."
+                )
+            else:
+                cause = (
+                    "reap_all_orphans reached this entry (log line(s) below) "
+                    "but never called rmdir('home') for it -- it failed or "
+                    "stopped somewhere on the way to the injected race, not "
+                    f"at it: {own_log_lines!r}"
+                )
+            raise AssertionError(
+                "the tmpdir is still here and nothing reaped it, with no "
+                "concurrent process having touched it either -- this is a "
+                f"genuine failure to complete the owned orphan's removal: {cause}"
+            )
         assert real_tmpdir.exists(), "the tmpdir was removed despite the transient race"
         assert (subdir / "race-injected.txt").exists(), "the injected content was lost anyway"
         assert entry.exists(), "the manifest entry was cleared despite the transient race"
 
         # Second attempt, later "session" -- nothing races this time.
-        reaped_2, stuck_2 = reap_all_orphans(log=lambda *_: None)
-        assert reaped_2 == 1, "the entry was not cleanly reaped once the race had passed"
-        assert stuck_2 == 0
+        reap_all_orphans(log=lambda *_: None)
         assert not real_tmpdir.exists(), "the tmpdir survived the second, unraced attempt"
         assert not entry.exists(), "the manifest entry survived the second, unraced attempt"
     finally:

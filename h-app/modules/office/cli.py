@@ -28,7 +28,7 @@ import redis
 
 from core.channels import send
 from core.envelope import EnvelopeError, parse
-from core.keys import prefix, receive_unresolved_key
+from core.keys import prefix, receive_undeliverable_key, receive_unresolved_key
 from core.logging import log_record, record_task_event
 from core.registry import is_member, members, port_type
 from lib.attachment_schema import ATTACHMENT_MAX_BYTES, MIME_TYPE_REGEX
@@ -383,8 +383,14 @@ def _status_row(r, *, pod: str, tenant: str, agent: str, now: datetime) -> str:
         blocked = r.hgetall(prefix(pod, tenant, agent=agent, resource="blocked")) or None
     except Exception:
         blocked = None
-    presence_state = decoded_presence.get("state") or "unknown"
-    state = "blocked" if blocked is not None else presence_state
+    decoded_blocked = (
+        {_text(field): _text(value) for field, value in blocked.items()} if blocked else None
+    )
+    # Presence and delivery verification are different facts with different
+    # owners. A blocked hash says one paste was not verified; it does not say
+    # the agent is currently unable to work, and must not override the state
+    # PresenceSampler derived from current activity.
+    state = decoded_presence.get("state") or "unknown"
 
     doing_key = prefix(pod, tenant, agent=agent, resource="tasks.doing")
     raw_ticket = next(iter(r.lrange(doing_key, 0, 0)), None)
@@ -395,11 +401,18 @@ def _status_row(r, *, pod: str, tenant: str, agent: str, now: datetime) -> str:
         opened = _age(ticket.get("started_ts"), now=now)
         task = f'"{ticket["title"]}"' + (f" {opened}" if opened else "")
 
-    if presence_state == "unknown":
+    if state == "unknown":
         activity = "no activity feed"
     else:
         last = _age(decoded_presence.get("last_activity"), now=now)
         activity = f"last activity {last} ago" if last else "no activity yet"
+    if decoded_blocked is not None:
+        unverified_age = _age(decoded_blocked.get("since"), now=now)
+        activity += (
+            f"; delivery unverified for {unverified_age}"
+            if unverified_age
+            else "; delivery unverified (age unknown)"
+        )
     return f"  {agent:<12}{state:<10}{task:<35}{activity}"
 
 
@@ -1014,7 +1027,11 @@ def _unresolved_command(argv: list[str]) -> None:
     for stored in r.lrange(receive_unresolved_key(pod, tenant), 0, -1):
         try:
             record = json.loads(_text(stored))
-            envelope = parse(record["envelope"])
+            raw = (
+                bytes.fromhex(record["envelope"])
+                if record.get("encoding") == "hex" else record["envelope"]
+            )
+            envelope = parse(raw)
             agent = record["agent"]
             if args.agent and agent != args.agent:
                 continue
@@ -1027,6 +1044,36 @@ def _unresolved_command(argv: list[str]) -> None:
             }, separators=(",", ":")))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError, EnvelopeError):
             print("unparseable unresolved custody record", file=sys.stderr)
+
+
+def _undeliverable_command(argv: list[str]) -> None:
+    parser = _operation_parser(
+        "undeliverable",
+        "Read messages whose destination retired before opening them.",
+    )
+    parser.add_argument("-a", "--agent", metavar="AGENT")
+    args = parser.parse_args(argv)
+    r, pod, tenant, _ = _context()
+    for stored in r.lrange(receive_undeliverable_key(pod, tenant), 0, -1):
+        try:
+            record = json.loads(_text(stored))
+            raw = (
+                bytes.fromhex(record["envelope"])
+                if record.get("encoding") == "hex" else record["envelope"]
+            )
+            envelope = parse(raw)
+            agent = record["agent"]
+            if args.agent and agent != args.agent:
+                continue
+            print(json.dumps({
+                "agent": agent,
+                "stream_id": envelope["stream_id"],
+                "kind": envelope["kind"],
+                "source": envelope["l2"]["source"],
+                "reason": record.get("reason", "destination retired before opening"),
+            }, separators=(",", ":")))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, EnvelopeError):
+            print("unparseable undeliverable custody record", file=sys.stderr)
 
 
 def _take_command(argv: list[str]) -> None:
@@ -1607,6 +1654,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("resume",), "resume an agent's CLI and inbox", lambda argv: _lifecycle_command("resume", argv)),
     (("list",), "show a task board", _list_command),
     (("unresolved",), "show unresolved delivery outcomes", _unresolved_command),
+    (("undeliverable",), "show messages not opened before retirement", _undeliverable_command),
     (("take",), "take your next todo task", _take_command),
     (("done",), "finish your open task and record its outcome", _done_command),
     (("cancel",), "cancel your open task", _cancel_command),

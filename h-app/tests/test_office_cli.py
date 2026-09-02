@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,7 +18,7 @@ if str(H_APP) not in sys.path:
 
 from core.channels import receive
 from core.envelope import build, encode, parse
-from core.keys import prefix, receive_unresolved_key
+from core.keys import prefix, receive_undeliverable_key, receive_unresolved_key
 from modules.office import cli as office_cli
 from modules.office.cli import main as office_main
 
@@ -236,6 +237,50 @@ def test_unresolved_names_exact_identity_without_consuming(monkeypatch, capsys):
         "agent": "worker-1", "stream_id": envelope["stream_id"],
         "kind": "Command", "source": "alice", "reason": "ack outcome unknown",
     }
+    assert r.lrange(key, 0, -1) == [record]
+
+
+def test_undeliverable_names_terminal_identity_without_consuming(monkeypatch, capsys):
+    r = FakeRedis()
+    _env(monkeypatch)
+    envelope = build(
+        "Command", "alice", "worker-1", {"text": "never opened"},
+        pod=POD, tenant=TENANT,
+    )
+    record = json.dumps({
+        "agent": "worker-1",
+        "reason": "destination retired before opening",
+        "encoding": "hex",
+        "envelope": encode(envelope).encode().hex(),
+    })
+    key = receive_undeliverable_key(POD, TENANT)
+    r.rpush(key, record)
+    with patch("modules.office.cli.redis.Redis.from_url", return_value=r):
+        office_main(["undeliverable", "--agent", "worker-1"])
+    shown = json.loads(capsys.readouterr().out)
+    assert shown == {
+        "agent": "worker-1", "stream_id": envelope["stream_id"],
+        "kind": "Command", "source": "alice",
+        "reason": "destination retired before opening",
+    }
+    assert r.lrange(key, 0, -1) == [record]
+
+
+def test_undeliverable_malformed_record_is_reported_without_consuming(monkeypatch, capsys):
+    r = FakeRedis()
+    _env(monkeypatch)
+    record = json.dumps({
+        "agent": "worker-1", "encoding": "hex", "envelope": [],
+    })
+    key = receive_undeliverable_key(POD, TENANT)
+    r.rpush(key, record)
+
+    with patch("modules.office.cli.redis.Redis.from_url", return_value=r):
+        office_main(["undeliverable"])
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "unparseable undeliverable custody record\n"
     assert r.lrange(key, 0, -1) == [record]
 
 
@@ -1272,7 +1317,7 @@ def test_clone_to_all_uses_host_workdir_fallback(monkeypatch, tmp_path):
     ):
         office_main(["clone-to-all", "git@example.com:org/repo.git"])
 
-    expected = tmp_path / "h-mesh" / "workdir" / "backend" / "repo"
+    expected = tmp_path / "h-mesh" / "backend" / "repo"
     git_clone.assert_called_once_with(
         "git@example.com:org/repo.git", expected, "git@example.com:org/repo.git"
     )
@@ -1366,6 +1411,70 @@ def test_status_reports_unknown_with_no_activity_feed(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "unknown" in out
     assert "no activity feed" in out
+
+
+def test_status_does_not_report_active_empty_board_as_blocked_by_delivery_marker(
+    monkeypatch, capsys
+):
+    """Delivery uncertainty must not silently remove an available agent."""
+    _env(monkeypatch)
+    r = FakeRedis(registry={"ci-agent": "tmux"})
+    now = datetime.now(timezone.utc)
+    r.hashes[prefix(POD, TENANT, "ci-agent", "presence")] = {
+        "state": "idle",
+        "since": (now - timedelta(minutes=1)).isoformat(),
+        "last_activity": (now - timedelta(seconds=8)).isoformat(),
+    }
+    r.hashes[prefix(POD, TENANT, "ci-agent", "blocked")] = {
+        "since": (now - timedelta(minutes=2)).isoformat(),
+        "stream_id": "a" * 32,
+    }
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["status", "ci-agent"])
+
+    row = capsys.readouterr().out
+    assert "ci-agent    idle" in row
+    assert "ci-agent    blocked" not in row
+    assert "—" in row
+    assert "last activity 8s ago" in row
+    assert "delivery unverified for 2m" in row
+
+
+def test_status_keeps_unknown_presence_unknown_with_delivery_marker(monkeypatch, capsys):
+    """Missing presence is not silently promoted to availability or blockage."""
+    _env(monkeypatch)
+    r = FakeRedis(registry={"ci-agent": "tmux"})
+    r.hashes[prefix(POD, TENANT, "ci-agent", "blocked")] = {
+        "since": "2026-09-02T09:59:00.000Z",
+        "stream_id": "a" * 32,
+    }
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["status", "ci-agent"])
+
+    row = capsys.readouterr().out
+    assert "ci-agent    unknown" in row
+    assert "ci-agent    idle" not in row
+    assert "no activity feed; delivery unverified" in row
+
+
+def test_status_keeps_delivery_marker_visible_when_its_age_is_malformed(monkeypatch, capsys):
+    """Bad marker age degrades to explicit unknown context, not silence or blockage."""
+    _env(monkeypatch)
+    r = FakeRedis(registry={"ci-agent": "tmux"})
+    r.hashes[prefix(POD, TENANT, "ci-agent", "presence")] = {"state": "idle"}
+    r.hashes[prefix(POD, TENANT, "ci-agent", "blocked")] = {
+        "since": "not-a-timestamp",
+        "stream_id": "a" * 32,
+    }
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["status", "ci-agent"])
+
+    row = capsys.readouterr().out
+    assert "ci-agent    idle" in row
+    assert "delivery unverified (age unknown)" in row
 
 
 @patch("modules.office.cli.send")

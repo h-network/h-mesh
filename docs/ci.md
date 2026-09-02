@@ -111,6 +111,29 @@ instead of silently testing the installed clone. Run it with an environment
 installed from the tree being verified; do not treat that refusal as a reason
 to fall back to a narrower pytest command.
 
+Before collection, the runner starts a fresh child with the same sanitized
+environment that pytest and test-spawned processes will inherit. That child
+must import `services.daemons` from the named tree. A missing or cross-tree
+import fails immediately with the interpreter, module path, expected tree, and
+editable-install command instead of surfacing later as a product-test failure.
+The runner deliberately does not inject the checkout into `PYTHONPATH`: doing
+so would let source imports hide a broken installation. Install the tree with
+the command in the diagnostic, then rerun the canonical suite. A manually
+supplied `PYTHONPATH` that points at the named tree can satisfy the child-import
+check, but that only demonstrates the import property for that invocation; the
+documented production-equivalent setup remains an editable install from the
+tree under test.
+
+The complete suite is expected to pass both from an editable install of the
+named tree and when a caller explicitly supplies that tree's `h-app` directory
+on `PYTHONPATH`. These are distinct environment contracts: the latter proves
+only that invocation's first-party import path and may resolve third-party
+dependencies from a different environment. CI uses the editable-install form.
+Use an owned environment installed with `.[test]` when reproducing CI or
+reporting results intended to be comparable with CI; a `PYTHONPATH` run is
+useful source-tree evidence but is not a reproduction of CI's dependency
+environment.
+
 ## There is no enforced merge gate, and that is deliberate
 
 Nothing in the repository prevents a change from reaching `main` without

@@ -38,17 +38,30 @@ Board transitions run in one isolated Lua script and preflight both Redis key
 types before mutation; `take` also checks destination emptiness before its
 first write. This keeps the one-doing-ticket invariant under concurrent
 `office take` calls and prevents WRONGTYPE from leaving a removed-only ticket.
-A malformed todo/held entry is moved without
-rewriting into the visible `invalid` list instead of being discarded or
-permanently blocking later tickets. `office hold --reason TEXT [ID]` requires
+A malformed todo/held entry is moved without rewriting into the stored
+`invalid` list instead of being discarded or permanently blocking later
+tickets; the h-mesh CLI renders that list without interpreting its contents.
+`office hold --reason TEXT [ID]` requires
 and stores the blocking reason; with an explicit ID it can park a queued ticket
 without taking it or displacing the active ticket. The one-open-task limit
 applies to `doing`, not `hold`: parked tickets remain visible in `office list`
-with their reasons and are still subject to hold-duration alerts. Use
-`office return [ID]` to put work back in `todo`; `cancel` remains a terminal,
+with their reasons and are still subject to hold-duration alerts.
+
+That visibility depends on the reader as well as the stored record. h-mesh
+stores `hold_reason` and its CLI renders it, but a reader running an older CLI
+can show the ticket's held state, title, and age without showing the reason.
+A guarantee that depends on what the reader is running is not a guarantee
+about what every intended reader can observe. In a mixed-version office,
+communicate the reason through a channel every intended reader can consume
+until their CLI deployment supports it; otherwise the work is visibly parked
+but its explanation is effectively hidden.
+
+Use `office return [ID]` to put work back in `todo`; `cancel` remains a terminal,
 auditable state and `delete` is the explicit permanent-removal operation.
 `office done --outcome {completed,passed,failed} [ID]` requires and records the
-result, so completed review work retains its verdict in `office list`.
+result in the ticket. The h-mesh CLI renders that stored verdict in `office
+list`; an older reader can list the completed ticket without displaying its
+outcome, just as it can omit `hold_reason`.
 An interactive legacy invocation of plain `office done` prompts for that
 outcome; a non-interactive invocation fails with the exact replacement syntax.
 Already-hired agents deliberately keep their existing guides indefinitely,
@@ -73,9 +86,21 @@ answers block the verdict; use `completed` only when its questions are
 non-blocking. Returned work joins the back of a nonempty `todo` queue.
 
 The receiving port delegates to the settled `lib.agentlifecycle` API.
-`stop_agent` removes the retired instance's ingress queue and paused marker as
-well as its registry membership and delivery lock, so a later hire that reuses
-the name cannot inherit queued messages or paused state. Registry removal also
+
+Delivery evidence has three read paths because it has three different facts:
+`dead` contains raw envelopes explicitly rejected by a recipient;
+`office unresolved [--agent AGENT]` shows envelopes whose external effect may
+have happened; and `office undeliverable [--agent AGENT]` shows envelopes known
+not to have begun because their destination retired. The latter two are
+tenant-level, read-only evidence. Neither has replay, delete, or expiry today;
+those missing exact-identity resolution verbs are a deliberate product gap,
+not permission to discard the records automatically.
+`stop_agent` transfers the retired instance's queued receive custody to the
+phase-appropriate tenant evidence list, then removes its per-name receive keys
+and paused marker with its registry membership and delivery lock. A later hire
+that reuses the name therefore cannot inherit either messages or coordination
+state, while every transferred envelope remains named by exact identity.
+Registry removal also
 atomically clears the tenant lead key when (and only when) it still names the
 retired agent; all type checks occur before the first removal, so a runtime
 error cannot leave only half of that combined transition applied.
@@ -103,3 +128,16 @@ followed one stdin envelope by identity through recipient opening, and the
 committed regression asserts the recipient opens the exact reported identity
 and body. This does not make a general promise about another CLI implementation
 or deployment.
+
+`office status` reports `working`, `idle`, or `unknown` from the watchdog's
+activity-derived presence record. A separate `blocked` hash means only that a
+past delivery could not be verified; it does not establish that the agent is
+currently unable to work, so status renders it as `delivery unverified`
+context—with its age, or an explicit unknown age—instead of replacing presence
+with a `blocked` state. DeliveryVerifier clears the marker when a later
+input/output/tool activity timestamp is strictly newer than its `since`, or
+when a later delivery verifies. A quiet agent can retain it indefinitely:
+there is no TTL or manual resolution today, so the age is essential context,
+not a promise that the uncertainty will self-clear. With no presence evidence
+the state remains `unknown`, never guessed available from the board or guessed
+blocked from delivery uncertainty.

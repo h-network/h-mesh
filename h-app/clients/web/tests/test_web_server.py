@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
 import hmac
 import json
 import socket
@@ -15,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from clients.web import server
 from clients.web.server import OfficeHandler, _telegram_read_allowed, verify_telegram_init_data
 
 
@@ -1324,4 +1327,253 @@ def test_proxy_422_policy_refusal(tmp_path):
         web_server.server_close()
         upstream_server.shutdown()
         upstream_server.server_close()
+
+
+# ── the operator action log is written BEFORE the caller is told ────────────
+
+def _delaying_audit(monkeypatch, seconds=0.3):
+    """Make the audit write slow, and change nothing else.
+
+    ⚠ The shim only DELAYS: no value, branch or call is altered. The
+    interleaving it produces is one the runtime produces unaided — the flake
+    was seen three times in suite order on two agents' machines, and passes in
+    isolation precisely because the window is narrow there. Delaying makes the
+    window reliable; it does not invent it.
+
+    ⚠ To watch this fail against the unfixed code, move the `self._audit_log(...)`
+    call in `_handle_login` back below the `self._json(...)` that follows it.
+    """
+    original = OfficeHandler._audit_log
+
+    def slow_audit(self, event, details, session_id=None):
+        time.sleep(seconds)
+        return original(self, event, details, session_id)
+
+    monkeypatch.setattr(OfficeHandler, "_audit_log", slow_audit)
+
+
+def test_a_login_record_is_readable_by_the_caller_that_just_logged_in(tmp_path, monkeypatch):
+    """⚠ HARM: the operator acts, is told it worked, reads the log back, and
+    the log is empty. /login wrote its whole response — including Set-Cookie —
+    before writing the audit record, and a DIFFERENT thread serves the next
+    request, so nothing made the reader wait for the writer.
+
+    Observed with the audit call back below the response: `records visible to
+    the caller that just acted: 0`, and `assert len(records) == 1` failing with
+    `len(records) == 0` — the same assertion, on the same line, as the
+    intermittent failure of
+    test_direct_api_traffic_bypasses_operator_action_log in suite order."""
+    audit_file = tmp_path / "audit.jsonl"
+    _delaying_audit(monkeypatch)
+    web_server = _telegram_web_server(audit_log=str(audit_file))
+    web_port = web_server.server_address[1]
+    threading.Thread(target=web_server.serve_forever, daemon=True).start()
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{web_port}/login",
+            data=json.dumps({"secret": "topsecret123"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            cookie = resp.headers.get("Set-Cookie").split(";")[0]
+
+        audit_req = urllib.request.Request(
+            f"http://127.0.0.1:{web_port}/api/audit", headers={"Cookie": cookie})
+        with urllib.request.urlopen(audit_req) as resp:
+            records = json.loads(resp.read().decode("utf-8"))["records"]
+
+        assert len(records) == 1, (
+            "the operator read back the log immediately after logging in and the "
+            "record of that login was not there yet"
+        )
+        assert records[0]["event"] == "login_success"
+    finally:
+        web_server.shutdown()
+        web_server.server_close()
+
+
+def test_a_telegram_auth_record_is_durable_before_the_caller_is_told(tmp_path, monkeypatch):
+    """⚠ HARM, same defect on the Mini App's login. A session created here is
+    functionally identical to an operator one, so its record has to be on disk
+    before the response says the session exists.
+
+    Asserted against the FILE rather than /api/audit, because that is the
+    stronger statement: not "a reader can see it" but "it is durable by the
+    time the caller is told". Observed with the audit call back below the
+    response: `FileNotFoundError: .../audit.jsonl` — not a short file, no file
+    at all, while the caller already holds a valid session cookie."""
+    audit_file = tmp_path / "audit.jsonl"
+    _delaying_audit(monkeypatch)
+    web_server = _telegram_web_server(audit_log=str(audit_file))
+    web_port = web_server.server_address[1]
+    threading.Thread(target=web_server.serve_forever, daemon=True).start()
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{web_port}/api/telegram-auth",
+            data=json.dumps({"initData": _signed_init_data("test-bot-token", 555)}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            assert resp.status == 200
+            assert resp.headers.get("Set-Cookie")
+
+        lines = audit_file.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 1, (
+            "the caller holds a session cookie for a login that is not in the log yet"
+        )
+        assert json.loads(lines[0])["event"] == "telegram_auth_success"
+    finally:
+        web_server.shutdown()
+        web_server.server_close()
+
+
+def test_a_json_response_cannot_be_given_conflicting_or_split_headers():
+    """⚠ HARM for the abstraction itself, added with it. The first version of
+    the header support took `headers=[(name, value)]` and appended them after
+    this method's own Content-Type, Content-Length and Cache-Control, so a
+    caller could send a second, conflicting Content-Length —
+    BaseHTTPRequestHandler does not resolve that, and the framing of the
+    response becomes whatever the recipient decides. Reviewer caught it: an
+    abstraction added to prevent one hand-rolled response should not hand the
+    next handler a response-splitting footgun.
+
+    The fix is that the conflict is UNREPRESENTABLE — there is no general
+    headers argument to pass one through, only `set_cookie`. This test states
+    both halves: the general parameter is gone, and the narrow one refuses a
+    value carrying CR or LF."""
+    signature = inspect.signature(OfficeHandler._json)
+    assert "headers" not in signature.parameters, (
+        "a general headers argument is back, and with it a caller's ability to "
+        "send a second Content-Length"
+    )
+    assert "set_cookie" in signature.parameters
+
+    handler = OfficeHandler.__new__(OfficeHandler)
+    with pytest.raises(ValueError):
+        handler._json(200, {"ok": True}, set_cookie="s=1\r\nX-Injected: yes")
+
+
+class _OrderingWatch:
+    """Records, per request, whether an audit followed the response.
+
+    ⚠ THE FOURTH VERSION OF THIS GUARD, AND THE FIRST THAT MODELS NOTHING.
+    Three AST walkers came before it and each was falsified by a construct the
+    previous one did not model: branches, then compound statements, then
+    `break` and `continue` — which the last version treated as leaving the
+    handler when they leave only the loop, so `while True: ... _json(); break`
+    followed by an audit came back clean. Writing a small interpreter for
+    Python's control flow means the failures arrive one construct at a time.
+
+    This watches what actually happened instead. It cannot certify a path the
+    tests never take — a real limit, stated in the test below — but everything
+    it does say is about executed code rather than about my reading of the
+    grammar.
+    """
+
+    def __init__(self):
+        self.violations = []
+
+    def response_started(self, handler):
+        handler._ordering_responded = True
+
+    def audited(self, handler, event):
+        if getattr(handler, "_ordering_responded", False):
+            self.violations.append(event)
+
+
+@pytest.fixture(autouse=True)
+def audit_ordering(monkeypatch):
+    """⚠ AUTOUSE: every request any test in this file makes is checked.
+
+    The ordering is owned by `_json(audit=...)` now — a caller handing over its
+    record cannot place it after the body, because `_json` writes it before
+    `send_response`. This fixture is what notices a future handler going back
+    to writing its own response and its own audit call.
+    """
+    watch = _OrderingWatch()
+    real_audit = OfficeHandler._audit_log
+    real_send_response = OfficeHandler.send_response
+    real_handle_one = OfficeHandler.handle_one_request
+
+    def audit(self, event, details, session_id=None):
+        watch.audited(self, event)
+        return real_audit(self, event, details, session_id)
+
+    def send_response(self, code, message=None):
+        watch.response_started(self)
+        return real_send_response(self, code, message)
+
+    def handle_one_request(self):
+        # a kept-alive connection reuses the handler instance, and a stale flag
+        # would report the NEXT request's audit as late
+        self._ordering_responded = False
+        return real_handle_one(self)
+
+    monkeypatch.setattr(OfficeHandler, "_audit_log", audit)
+    monkeypatch.setattr(OfficeHandler, "send_response", send_response)
+    monkeypatch.setattr(OfficeHandler, "handle_one_request", handle_one_request)
+    yield watch
+    assert not watch.violations, (
+        f"these audit records were written after their response: {watch.violations}"
+    )
+
+
+def test_the_ordering_watch_catches_a_handler_that_audits_after_responding(audit_ordering):
+    """⚠ THE WATCH'S OWN FALSIFICATION, end to end through a real request.
+    Without it, a fixture that silently stopped matching would look exactly
+    like a codebase with no violations — the vacuous pass this office has
+    deleted three times tonight.
+
+    ⚠ AND THE LIMIT, stated rather than implied: this covers the paths the
+    suite executes. A handler nothing calls is not covered, and no runtime
+    watch can cover it. The guard it replaces claimed every path by reading the
+    source, and was wrong three times about what the source meant; this claims
+    less and is true."""
+    class LateAuditHandler(OfficeHandler):
+        def do_GET(self):
+            self._json(200, {"ok": True})
+            self._audit_log("deliberately_late", {})
+
+    web_server = ThreadingHTTPServer(("127.0.0.1", 0), LateAuditHandler)
+    web_server.audit_log = None          # writing the record is not the point
+    web_server.api_base = "http://127.0.0.1:8080"
+    web_port = web_server.server_address[1]
+    threading.Thread(target=web_server.serve_forever, daemon=True).start()
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{web_port}/anything") as resp:
+            assert resp.status == 200
+    finally:
+        web_server.shutdown()
+        web_server.server_close()
+
+    assert audit_ordering.violations == ["deliberately_late"], (
+        "the watch did not notice an audit written after its response"
+    )
+    # consumed deliberately, so the fixture's own teardown assertion passes
+    audit_ordering.violations.clear()
+
+
+def test_the_audit_ordering_is_owned_by_the_response_helper():
+    """⚠ STRUCTURAL, and the reason the walkers are gone. `_json` writes the
+    record before `send_response`, so a caller that hands one over cannot put
+    it after the body: the wrong order is not expressible rather than
+    detectable. Both authentication success paths hand theirs over.
+
+    Reviewer's counterexamples that defeated the AST versions —
+    `while True: ... _json(); break` then an audit, `continue` in a loop, an
+    audit in a `finally` after a response in the try — are all still writable
+    Python. What changed is that neither site this ticket is about writes its
+    own response any more, and the runtime watch sees any handler that does."""
+    source = inspect.getsource(server.OfficeHandler._json)
+    assert source.index("self._audit_log(*audit)") < source.index("self.send_response("), (
+        "the audit record is no longer written before the response starts"
+    )
+
+    handler_source = inspect.getsource(server.OfficeHandler)
+    for site in ("login_success", "telegram_auth_success"):
+        assert f'audit=("{site}"' in handler_source, (
+            f"{site} no longer hands its record to _json, so nothing orders it"
+        )
 
