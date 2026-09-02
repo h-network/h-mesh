@@ -632,48 +632,88 @@ def test_chat_allowed_matches_configured_id_across_str_int():
         assert bot_instance._chat_allowed(99999) is False
 
 
-def _update_types_dispatch_routes():
-    """The update TYPES `_dispatch_update` actually reads, from its own source.
+def test_every_allowed_type_is_routed_and_nothing_else_is():
+    """⚠ BEHAVIOURAL, replacing an AST derivation reviewer defeated in one
+    pass. That test scanned `_dispatch_update` for `update.get("...")` literals
+    and called the result "what dispatch routes" — but `update["poll"]`,
+    `"chat_member" in update`, `update.pop(...)`, a computed key, or a helper
+    handed the raw update all route a type the scan cannot see. Enumerating
+    spellings certifies the spellings.
 
-    ⚠ Derived rather than listed, because a hardcoded list that drifts from the
-    handlers is the same defect one step along: the point of asserting
-    `allowed_updates` is to stop a filter arriving from OUTSIDE, and a stale
-    list would reintroduce one from inside.
+    `_routed_type` iterates `ALLOWED_UPDATE_TYPES`, so this asks the question
+    directly and there is no syntax to bypass: every type in the list routes,
+    and a type outside it does not."""
+    for kind in bot.ALLOWED_UPDATE_TYPES:
+        payload = {"marker": kind}
+        assert bot._routed_type({"update_id": 1, kind: payload}) == (kind, payload)
 
-    `update_id` is excluded — it is the envelope's id, not a type. Anything
-    else new that dispatch reads off an update counts as a type and fails the
-    comparison; that is a false failure in the odd case, which is the safe
-    direction and forces someone to look."""
-    # textwrap.dedent: a method's source is indented, and ast.parse wants a module
-    tree = ast.parse(textwrap.dedent(inspect.getsource(bot._dispatch_update_source_owner())))
-    return {
-        call.args[0].value
-        for call in ast.walk(tree)
-        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "get" and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == "update" and call.args
-        and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)
-    } - {"update_id"}
+    for outside in ("poll", "chat_member", "my_chat_member", "shipping_query"):
+        assert bot._routed_type({"update_id": 1, outside: {"x": 1}}) == (None, None), (
+            f"{outside} routed without being in ALLOWED_UPDATE_TYPES, so getUpdates "
+            "would never have asked Telegram for it"
+        )
 
 
-def test_allowed_updates_matches_what_dispatch_routes():
-    """⚠ THE OBJECTION THE OLD COMMENT RAISED, ANSWERED. Narrowing at
-    getUpdates drops types silently and at a distance, so a later handler fails
-    by never being called. Sending the COMPLETE set narrows nothing — but only
-    while the set matches what dispatch routes, so this derives the routed
-    types from `_dispatch_update`'s own source and fails when they diverge.
+def test_an_update_of_an_unrequested_type_is_dropped_and_said_so(caplog):
+    """The dispatcher's half of the same property: an update carrying only a
+    type this bot does not request is dropped with a log line rather than
+    half-handled. Silence here is what made "the button does nothing"
+    undiagnosable."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        with caplog.at_level(logging.DEBUG, logger="mesh_telegram"):
+            bot_instance._dispatch_update({"update_id": 7, "poll": {"id": "1"}})
 
-    Add a handler for a new update type without adding it to
-    `ALLOWED_UPDATE_TYPES` and this fails loudly. That is the difference
-    between a list that drifts and one that cannot."""
-    routed = _update_types_dispatch_routes()
-    assert routed, "the derivation found no update types at all — is it still reading dispatch?"
-    assert routed == set(bot.ALLOWED_UPDATE_TYPES), (
-        f"dispatch routes {sorted(routed)} but getUpdates asks for "
-        f"{sorted(bot.ALLOWED_UPDATE_TYPES)}; a type dispatch handles and the list "
-        "omits would silently never arrive"
-    )
-    assert {"message", "edited_message", "callback_query"} <= routed
+        log = "\n".join(r.getMessage() for r in caplog.records)
+        assert "nothing to dispatch" in log
+        assert telegram.sent_messages == []
+
+
+def test_a_handler_added_after_routing_cannot_read_the_raw_update():
+    """⚠ THE GUARD'S OWN GUARD — a test that fails if `del update` is removed.
+
+    The structural claim rests on one line, and a comment explaining why a line
+    exists does not survive a refactor by someone in a hurry. But deleting the
+    `del` changes NO behaviour today: nothing below it reads the update, so no
+    ordinary test can tell the two versions apart. The property is about code
+    that does not exist yet.
+
+    So this constructs that code. It takes the real dispatcher's source, appends
+    the read a future handler would naturally write — the way anyone picks up a
+    new Telegram type — compiles it, and asserts it raises NameError. With the
+    `del` present the appended read cannot run; with the `del` removed it
+    succeeds and this fails.
+
+    ⚠ The bound, honestly: this proves a handler appended AFTER routing cannot
+    reach the raw update. Code inserted ABOVE the `del` still can, which is why
+    the claim is "not without a visible edit at the boundary" rather than
+    "cannot drift"."""
+    source = textwrap.dedent(inspect.getsource(bot.TelegramBot._dispatch_update))
+    tree = ast.parse(source)
+    function = tree.body[0]
+
+    # ⚠ Placed where a handler would actually go: at the end of the prologue,
+    # immediately after routing and before the first branch. Appending to the
+    # END of the body proves nothing — every branch returns, so the line is
+    # unreachable and the test passes without exercising anything. That first
+    # version of this test was green against BOTH versions of the dispatcher,
+    # which is the failure mode it exists to catch, one level up.
+    insert_at = next(i for i, node in enumerate(function.body) if isinstance(node, ast.If))
+    probe = ast.parse('_ = update["poll"]').body[0]
+    function.body.insert(insert_at, probe)
+    ast.fix_missing_locations(tree)
+
+    namespace = dict(vars(bot))
+    exec(compile(tree, "<dispatch-with-a-future-handler>", "exec"), namespace)
+    patched = namespace["_dispatch_update"]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        # a message for the allowed chat, so control reaches the appended line
+        update = {"update_id": 1, "message": {"chat": {"id": 12345}, "text": "hello"},
+                  "poll": {"id": "unused"}}
+        with pytest.raises(NameError):
+            patched(bot_instance, update)
 
 
 def test_get_updates_sends_the_complete_allowed_updates_every_call():

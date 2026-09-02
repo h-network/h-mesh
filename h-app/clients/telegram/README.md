@@ -60,14 +60,38 @@ carry an offset.
 reasoning — filtering here drops types silently and at a distance, so the next
 handler added would fail by never being called — is sound, and it is about
 removing types from the list. This adds none and removes none; it asserts the
-full set so it cannot drift from outside.
+full set, so the SERVER-SIDE value cannot be inherited from whatever last
+touched the token.
 
-⚠ **And a hardcoded list that drifts from the handlers is the same defect one
-step along**, so `test_allowed_updates_matches_what_dispatch_routes` derives
-the routed types from `_dispatch_update`'s own source and fails when they
-diverge. Add a handler for a new update type without adding it to
-`ALLOWED_UPDATE_TYPES` and the suite fails loudly rather than the type silently
-never arriving.
+⚠ **A hardcoded list that drifts from the handlers is the same defect one step
+along**, so the list OWNS the routing rather than describing it: `_routed_type`
+is the only place an update's type is decided and it iterates
+`ALLOWED_UPDATE_TYPES`, and the dispatcher unbinds the raw update immediately
+afterwards. A handler added after that point which reads `update["poll"]` — the
+ordinary way a new Telegram type gets picked up — is a `NameError` on the first
+update dispatched.
+
+⚠ **The claim at its real strength: a handler cannot acquire a new top-level
+update type without a visible edit AT that boundary.** Not "cannot drift". Code
+inserted above the unbinding, or deleting that line, still reaches the raw
+update. What is ruled out is the silent case — routing a new type while the
+requested list stays stale, so Telegram filters it before it ever arrives.
+
+An earlier version of this section claimed more: a test derived the routed
+types by scanning the dispatcher for `update.get("...")` literals, and reviewer
+defeated it in one pass with `update["poll"]`, `"chat_member" in update`,
+`update.pop(...)`, a computed key, and a helper handed the raw update. Every
+one routes a type the scan cannot see. **Enumerating spellings certifies the
+spellings**, which is why the tests here are behavioural — every type in the
+list routes, a type outside it does not — with nothing syntactic to bypass.
+
+⚠ **And the unbinding has its own test**, because the whole structural claim
+otherwise rests on one line defended by a comment. Deleting it changes no
+behaviour today, so no ordinary test could see it; the property is about code
+that does not exist yet. `test_a_handler_added_after_routing_cannot_read_the_raw_update`
+constructs that code — it appends the read a future handler would write to the
+real dispatcher's source, at the routing boundary, and asserts `NameError`.
+Remove the unbinding and it fails.
 
 ### Log Verbosity
 

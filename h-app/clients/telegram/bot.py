@@ -846,21 +846,41 @@ class ReplyPusher:
 # ⚠ THIS IS NOT THE FILTERING `_handle_edited_message` ARGUES AGAINST, and that
 # argument is sound: narrowing here would drop update types silently and at a
 # distance, so a later handler would fail by never being called. This does the
-# opposite — it ASSERTS the full set so it cannot drift from outside. The two
-# only agree while this list matches what dispatch actually routes, which is
-# why `test_allowed_updates_matches_what_dispatch_routes` derives the routed
-# types from `_dispatch_update` itself and fails if they diverge.
+# opposite — it ASSERTS the full set, so the SERVER-SIDE value cannot be
+# inherited from whatever last touched this token.
+#
+# ⚠ That leaves the other direction — this list going stale while dispatch
+# routes something new — and it is handled structurally rather than by a check:
+# `_routed_type` is the only place a type is decided and it iterates this
+# tuple, and `_dispatch_update` unbinds the raw update immediately after
+# calling it. So a handler cannot acquire a new top-level type without a
+# visible edit at that boundary. Not "cannot drift": code above the unbinding,
+# or deleting it, still reaches the raw update — which is why the unbinding has
+# a test of its own.
 ALLOWED_UPDATE_TYPES = ("message", "edited_message", "callback_query")
 
 
-def _dispatch_update_source_owner():
-    """The function whose source defines which update types are routed.
+def _routed_type(update: dict) -> "tuple[str | None, dict | None]":
+    """The one place an update's TYPE is decided, and it iterates the list.
 
-    Exists so the drift test reads the real dispatcher rather than re-deriving
-    a path to it — if `_dispatch_update` moves or is renamed, this fails to
-    resolve instead of the test silently deriving nothing.
+    ⚠ THIS EXISTS SO THE ALLOWED SET OWNS THE ROUTING rather than describing
+    it. The previous attempt was a test that derived the routed types by
+    scanning `_dispatch_update` for `update.get("...")` literals, and reviewer
+    defeated it in one pass: `update["poll"]`, `"chat_member" in update`,
+    `update.pop(...)`, a computed key, or a helper handed the raw update all
+    route a type the scan cannot see. Enumerating spellings certifies the
+    spellings, never the property — the same defect this office retreated from
+    in the provenance checker four hours ago.
+
+    So routing a new type now requires adding it to `ALLOWED_UPDATE_TYPES`,
+    because nothing else looks for one, and the dispatcher unbinds the raw
+    update immediately after calling this.
     """
-    return TelegramBot._dispatch_update
+    for kind in ALLOWED_UPDATE_TYPES:
+        payload = update.get(kind)
+        if payload is not None:
+            return kind, payload
+    return None, None
 
 
 class TelegramClient:
@@ -3523,12 +3543,28 @@ class TelegramBot:
         is logged in full because it is one of this bot's own short codes
         ("hi", "at:agent"), not something a person typed."""
         update_id = update.get("update_id")
-        callback = update.get("callback_query")
+        kind, payload = _routed_type(update)
+        chat_id = self._update_chat_id(update)
+        # ⚠ EVERYTHING THE RAW UPDATE IS ALLOWED TO PROVIDE HAS BEEN TAKEN, so
+        # it is unbound here on purpose. A handler added below that reads
+        # `update["poll"]` — the way a new Telegram type would ordinarily be
+        # picked up — is a NameError on the first update dispatched, rather
+        # than a type silently routed while `ALLOWED_UPDATE_TYPES` stays stale
+        # and getUpdates never asks for it.
+        #
+        # ⚠ The bound, stated at its real strength: this does not make a new
+        # type impossible. Code inserted ABOVE this line, or deleting this
+        # line, still gets the raw update — so the claim is that a handler
+        # cannot acquire a new top-level type WITHOUT A VISIBLE EDIT AT THIS
+        # BOUNDARY, not that it cannot drift. Pinned by
+        # test_a_handler_added_after_routing_cannot_read_the_raw_update.
+        del update
+
+        callback = payload if kind == "callback_query" else None
         if callback:
             # ⚠ .get, not [...]: a malformed update must be dropped with a log
             # line, not raise out of the dispatcher. Found by the test that
             # feeds it an update with no chat at all.
-            chat_id = self._update_chat_id(update)
             if chat_id is None:
                 logger.debug(f"update {update_id}: callback with no chat id, dropped")
                 return
@@ -3548,13 +3584,12 @@ class TelegramBot:
             self.handle_callback_query(chat_id, callback["id"], callback.get("data", ""), message_id)
             return
 
-        edited = update.get("edited_message")
-        msg = update.get("message") or edited
+        edited = payload if kind == "edited_message" else None
+        msg = payload if kind in ("message", "edited_message") else None
         if not msg:
             logger.debug(f"update {update_id}: no message or callback in it, nothing to dispatch")
             return
 
-        chat_id = self._update_chat_id(update)
         if chat_id is None:
             logger.debug(f"update {update_id}: message with no chat id, dropped")
             return
