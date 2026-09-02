@@ -1595,7 +1595,7 @@ def test_hire_completes_when_the_anchor_can_never_be_edited():
         reply = bot_instance.handle_text_message(12345, "-")
 
         assert mesh.hired == [{"agent": "sme-9", "cli": "claude", "profile": None, "provider": None}]
-        assert "Hire accepted for sme-9" in reply
+        assert reply == "⏳ Hire request admitted for sme-9 · agent creation is not yet confirmed."
         assert "12345" not in bot_instance.pending
         # every failed edit fell back to a fresh send, so the operator sees
         # each question as a new message rather than a silent in-place update
