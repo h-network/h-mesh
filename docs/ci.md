@@ -26,17 +26,19 @@ The reviewed node set is checked in at `h-app/tools/test_nodeids.txt`. A plugin
 inside the pytest process compares its selected items to that manifest before
 the first test runs, then records actual runtest reports. It issues the suite
 attestation only after every expected node has reached a terminal test outcome.
-The outer runner issues the public certificate only after pytest exits zero and
-the nonce-bound attestation matches that invocation and manifest. A zero exit
-with an absent, partial, stale, or mismatched attestation is a failure. Selection
-alone and absence of a reported error are not execution evidence.
+The outer runner returns success and issues its public certificate only after
+pytest exits zero and the nonce-bound attestation matches that invocation and
+manifest. A zero exit with an absent, partial, stale, or mismatched attestation
+is a failure. Selection alone and absence of a reported error are not execution
+evidence.
 
-This is a positive-evidence boundary: only the outer runner prints the
-certificate, after the pytest child has returned and the attestation validates.
-An unenumerated termination that prevents the outer runner from completing that
+The evidence is the pair of runner exit status zero **and** its post-validation
+certificate line. Pytest and the tests share stdout with the runner, so child
+code can print identical text; line presence alone is never evidence. An
+unenumerated termination that prevents the outer runner from completing its
 check—such as an external timeout, supervisor kill, signal, or native
-crash—cannot print a certificate. The harness does not need to predict every
-way either process can die in order for those paths to fail safe.
+crash—cannot produce that success pair. The harness does not need to predict
+every way either process can die in order for those paths to fail safe.
 
 The runner removes external `PYTEST_ADDOPTS` and `PYTEST_PLUGINS`, disables
 ambient plugin autoloading, overrides repository `addopts`, and rejects parsed
