@@ -14,6 +14,7 @@ if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
 from core.keys import prefix
+from lib.paths import get_agent_workdir
 from modules.watchdog.activity import ActivityTailer
 
 
@@ -63,6 +64,14 @@ class FakeRedis:
 def _events(r, agent="sme-2"):
     key = prefix(POD, TENANT, agent, "activity")
     return [json.loads(entry[1]["event"]) for entry in r.streams.get(key, [])]
+
+
+def _wd(agent: str) -> str:
+    """The real cwd/workspace attribution logic (activity.py) now compares
+    against get_agent_workdir(), not a hardcoded literal -- build fixture
+    values through the same function so these tests match whatever the
+    ambient environment actually resolves it to, in any environment."""
+    return get_agent_workdir(agent)
 
 
 def _write_lines(path: Path, records: list) -> None:
@@ -207,7 +216,7 @@ class ActivityTailerTests(unittest.TestCase):
         _write_lines(
             session,
             [
-                {"type": "session_meta", "payload": {"cwd": "/workdir/sme-2"}},
+                {"type": "session_meta", "payload": {"cwd": _wd("sme-2")}},
                 {"type": "event_msg", "timestamp": "one", "payload": {"type": "user_message", "message": "secret"}},
                 {"type": "event_msg", "timestamp": "two", "payload": {"type": "agent_message", "message": "secret"}},
                 {
@@ -231,14 +240,14 @@ class ActivityTailerTests(unittest.TestCase):
         _write_lines(
             shared / "rollout-frontend.jsonl",
             [
-                {"type": "session_meta", "payload": {"cwd": "/workdir/frontend"}},
+                {"type": "session_meta", "payload": {"cwd": _wd("frontend")}},
                 {"type": "event_msg", "timestamp": "front", "payload": {"type": "user_message"}},
             ],
         )
         _write_lines(
             shared / "rollout-backend.jsonl",
             [
-                {"type": "session_meta", "payload": {"cwd": "/workdir/backend"}},
+                {"type": "session_meta", "payload": {"cwd": _wd("backend")}},
                 {"type": "event_msg", "timestamp": "back", "payload": {"type": "agent_message"}},
             ],
         )
@@ -271,10 +280,10 @@ class ActivityTailerTests(unittest.TestCase):
         _write_lines(
             _history_path(self.tmp_path),
             [
-                {"display": "hi", "timestamp": _ms("2026-08-09T10:00:00"), "workspace": "/workdir/frontend", "conversationId": "a"},
-                {"display": "hi", "timestamp": _ms("2026-08-09T10:00:01"), "workspace": "/workdir/backend", "conversationId": "b"},
-                {"display": "/model", "timestamp": _ms("2026-08-09T10:00:02"), "workspace": "/workdir/frontend", "type": "slash_command"},
-                {"display": "not ours", "timestamp": _ms("2026-08-09T10:00:03"), "workspace": "/workdir/someone-else"},
+                {"display": "hi", "timestamp": _ms("2026-08-09T10:00:00"), "workspace": _wd("frontend"), "conversationId": "a"},
+                {"display": "hi", "timestamp": _ms("2026-08-09T10:00:01"), "workspace": _wd("backend"), "conversationId": "b"},
+                {"display": "/model", "timestamp": _ms("2026-08-09T10:00:02"), "workspace": _wd("frontend"), "type": "slash_command"},
+                {"display": "not ours", "timestamp": _ms("2026-08-09T10:00:03"), "workspace": _wd("someone-else")},
             ],
         )
 
@@ -297,7 +306,7 @@ class ActivityTailerTests(unittest.TestCase):
         r.values[prefix(POD, TENANT, "sme-2", "launch")] = "agy"
         _write_lines(
             _history_path(self.tmp_path),
-            [{"display": "hi", "timestamp": _ms("2026-08-09T10:00:00"), "workspace": "/workdir/sme-2"}],
+            [{"display": "hi", "timestamp": _ms("2026-08-09T10:00:00"), "workspace": _wd("sme-2")}],
         )
         ActivityTailer(r, pod=POD, tenant=TENANT, home_root=self.tmp_path).poll()
         self.assertNotIn(prefix(POD, TENANT, resource="usage"), r.streams)
@@ -347,13 +356,13 @@ class ActivityTailerTests(unittest.TestCase):
         history = _history_path(self.tmp_path)
         _write_lines(
             history,
-            [{"display": "hi", "timestamp": _ms("2026-08-09T10:00:00"), "workspace": "/workdir/frontend"}],
+            [{"display": "hi", "timestamp": _ms("2026-08-09T10:00:00"), "workspace": _wd("frontend")}],
         )
         tailer = ActivityTailer(r, pod=POD, tenant=TENANT, home_root=self.tmp_path)
         tailer.poll()
 
         with history.open("a") as output:
-            output.write(json.dumps({"display": "hi again", "timestamp": _ms("2026-08-09T10:00:05"), "workspace": "/workdir/backend"}) + "\n")
+            output.write(json.dumps({"display": "hi again", "timestamp": _ms("2026-08-09T10:00:05"), "workspace": _wd("backend")}) + "\n")
         tailer.poll()
 
         self.assertEqual(len(_events(r, "frontend")), 1)
@@ -370,7 +379,7 @@ class ActivityTailerTests(unittest.TestCase):
             _history_path(self.tmp_path),
             [
                 {"display": "welcome", "timestamp": _ms("2026-08-09T10:00:00")},  # no workspace at all yet
-                {"display": "hi", "timestamp": _ms("2026-08-09T10:00:01"), "workspace": "/workdir/sme-2"},
+                {"display": "hi", "timestamp": _ms("2026-08-09T10:00:01"), "workspace": _wd("sme-2")},
             ],
         )
         ActivityTailer(r, pod=POD, tenant=TENANT, home_root=self.tmp_path).poll()
