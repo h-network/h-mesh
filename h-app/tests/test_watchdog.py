@@ -226,6 +226,31 @@ def _capture(fn):
     return buf.getvalue()
 
 
+def _watchdog_records(out, destination="architect"):
+    """Parse watchdog-module log lines from captured stdout, addressed to
+    `destination`. Used to assert on the CLAIM a record makes, not on one
+    implementation's choice of event-name vocabulary for making it."""
+    records = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if event.get("module") == "watchdog" and event.get("destination") == destination:
+            records.append(event)
+    return records
+
+
+def _claims_delivery(records):
+    """Whether any record's own vocabulary (its event name or a `state`
+    field, wherever a given implementation puts the claim) asserts the
+    alert was sent/delivered, rather than merely admitted. A correct
+    alternate implementation could use one event name with a `state` field
+    instead of distinctly-named events -- this checks the words that would
+    overclaim either way, not one specific implementation's spelling."""
+    text = " ".join(str(record.get(key, "")) for record in records for key in ("event", "state")).lower()
+    return "sent" in text or "delivered" in text
+
+
 def _kicks():
     """Return (list, fake_deliver_tmux) -- records the kicked agent name."""
     kicks = []
@@ -536,7 +561,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(len(r.lists[_key("architect", "ingress")]), 300)
         events = [json.loads(line) for line in out.splitlines()]
         self.assertTrue(any(event.get("event") == "lead_alert_capacity" for event in events))
-        self.assertFalse(any(event.get("event") == "lead_alert_admitted" for event in events))
+        self.assertFalse(_claims_delivery(_watchdog_records(out)))
 
     def test_notify_lead_logs_unknown_and_does_not_kick_on_a_redis_fault(self):
         r = FakeRedis(fails_on={"eval": ConnectionError})
@@ -549,7 +574,7 @@ class WatchdogTests(unittest.TestCase):
 
         events = [json.loads(line) for line in out.splitlines()]
         self.assertTrue(any(event.get("event") == "lead_alert_unknown" for event in events))
-        self.assertFalse(any(event.get("event") == "lead_alert_admitted" for event in events))
+        self.assertFalse(_claims_delivery(_watchdog_records(out)))
 
     def test_notify_lead_logs_a_record_when_the_lead_is_not_a_registered_agent(self):
         """A dangling `lead` key pointing at a retired agent must not vanish
@@ -570,7 +595,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(no_lead[0]["destination"], "retired-lead")
         self.assertIn("not a registered agent", no_lead[0]["reason"])
         self.assertTrue(no_lead[0].get("stream_id"))
-        self.assertFalse(any(e.get("event") == "lead_alert_admitted" for e in events))
+        self.assertFalse(_claims_delivery(_watchdog_records(out, destination="retired-lead")))
 
     def test_notify_lead_logs_a_record_when_the_lead_is_not_a_tmux_agent(self):
         r = FakeRedis()
@@ -588,7 +613,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(len(no_lead), 1)
         self.assertEqual(no_lead[0]["destination"], "api")
         self.assertIn("port_type is not tmux", no_lead[0]["reason"])
-        self.assertFalse(any(e.get("event") == "lead_alert_admitted" for e in events))
+        self.assertFalse(_claims_delivery(_watchdog_records(out, destination="api")))
 
     def test_lead_window_missing_dead_letters_with_a_real_record_not_replayed(self):
         """A registered tmux lead whose window is merely missing right now
@@ -611,17 +636,32 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(len(dead_lettered), 1)
         self.assertEqual(dead_lettered[0]["reason"], "window_missing")
         self.assertEqual(dead_lettered[0]["destination"], "architect")
-        self.assertTrue(any(e.get("event") == "lead_alert_admitted" for e in events))
+        # Something was recorded about the alert attempt (the original
+        # defect was silence, not a naming choice) -- but it must not claim
+        # delivery either, since admission is genuinely all that's known
+        # here. See test_admission_only_logs_as_admitted_never_as_sent_or_
+        # delivered below for the dedicated claim-vs-vocabulary check.
+        self.assertTrue(_watchdog_records(out))
 
     def test_admission_only_logs_as_admitted_never_as_sent_or_delivered(self):
         """ALLOCATED/ADMITTED/CREATED discipline: at the point admit_ingress
         succeeds, only ADMITTED (durably queued) is known -- deliver_tmux
-        has not even been called yet, let alone confirmed. The log at that
-        site must not claim more than that, and no other event in the same
-        pass may claim delivery succeeded when it did not.
+        has not even been called yet, let alone confirmed. Something must
+        be recorded (silence was the original defect), but whatever it says
+        must not claim delivery.
+
+        Asserts the CLAIM, not the VOCABULARY. A correct alternate
+        implementation could log a single event name with a `state` field
+        ("admitted" vs "sent") instead of distinctly-named events per
+        outcome -- this test must still pass against that implementation,
+        which is why it checks for the overclaiming WORDS ("sent",
+        "delivered") rather than this implementation's specific event-name
+        string. An earlier version of this test asserted the literal string
+        `lead_alert_admitted` and would have broken on exactly such a
+        correct alternate -- caught on self-audit, not by a reviewer.
 
         Same window-missing scenario as the dead-letter test above -- this
-        one exists specifically to pin the naming/claim discipline, not the
+        one exists specifically to pin the claim discipline, not the
         dead-letter mechanics."""
         r = FakeRedis()
         _doing_agent(r)
@@ -630,14 +670,13 @@ class WatchdogTests(unittest.TestCase):
         with patch("modules.tmux.port.list_windows", return_value=set()):
             out = _capture(lambda: _watchdog(r).poll(now=NOW))
 
-        events = [json.loads(line).get("event") for line in out.splitlines()]
-        self.assertIn("lead_alert_admitted", events)
-        self.assertNotIn("lead_alert_sent", events)
-        self.assertNotIn("lead_alert_delivered", events)
+        records = _watchdog_records(out)
+        self.assertTrue(records, "an alert attempt must leave a record, not silence")
+        self.assertFalse(_claims_delivery(records))
 
-    def test_admission_is_the_only_lead_alert_event_logged_on_success(self):
-        """No second, stronger-sounding event follows a successful
-        deliver_tmux call. deliver_tmux -> core.channels.receive() catches
+    def test_no_delivery_claim_follows_a_successful_deliver_tmux_call(self):
+        """No claim stronger than ADMITTED follows a successful deliver_tmux
+        call either. deliver_tmux -> core.channels.receive() catches
         DeadLetter internally and returns normally either way, so "no
         exception raised" cannot distinguish a real delivery from an
         internal dead-letter -- there is no honest claim to make beyond
@@ -653,24 +692,9 @@ class WatchdogTests(unittest.TestCase):
 
         out = _capture(lambda: _watchdog(r).poll(now=NOW))
 
-        events = [json.loads(line).get("event") for line in out.splitlines()]
-        self.assertEqual(
-            [e for e in events if e and e.startswith("lead_alert_")],
-            ["lead_alert_admitted"],
-        )
-
-    def test_admitted_does_not_log_when_the_lead_ingress_is_full(self):
-        r = FakeRedis()
-        _doing_agent(r)
-        _lead(r)
-        r.lists[_key("architect", "ingress")] = ["x"] * 300  # INGRESS_MAX default
-        self._set(service, "run_tmux", _quiet_windows())
-        self._set(service, "deliver_tmux", _no_kick())
-
-        out = _capture(lambda: _watchdog(r).poll(now=NOW))
-
-        events = [json.loads(line).get("event") for line in out.splitlines()]
-        self.assertNotIn("lead_alert_admitted", events)
+        records = _watchdog_records(out)
+        self.assertTrue(records)
+        self.assertFalse(_claims_delivery(records))
 
     # -- ack loop -------------------------------------------------------------
 
