@@ -17,14 +17,17 @@ def _make_isolated_harness_tree(tmp_path: Path, test_source: str) -> Path:
     target = tmp_path / "isolated-tree"
     tools = target / "h-app" / "tools"
     tests = target / "h-app" / "tests"
+    services = target / "h-app" / "services"
     tools.mkdir(parents=True)
     tests.mkdir()
+    services.mkdir()
     shutil.copy(H_APP / "tools" / "run_tests.py", tools / "run_tests.py")
     shutil.copy(H_APP / "tools" / "manifest_plugin.py", tools / "manifest_plugin.py")
     (tools / "test_nodeids.txt").write_text(
         "h-app/tests/test_target.py::test_target_tree_marker\n"
     )
     (tests / "test_target.py").write_text(test_source)
+    (services / "daemons.py").write_text("# first-party child import probe\n")
     (target / "pyproject.toml").write_text(
         "[tool.pytest.ini_options]\n"
         "testpaths = ['h-app']\n"
@@ -32,6 +35,89 @@ def _make_isolated_harness_tree(tmp_path: Path, test_source: str) -> Path:
     )
     subprocess.run(["git", "init", "-q", str(target)], check=True)
     return target
+
+
+def test_runner_environment_reaches_first_party_child_processes() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import services.daemons as m; "
+            "print(Path(m.__file__).resolve())",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, (
+        "a suite environment must let spawned children import first-party modules; "
+        f"stderr was {result.stderr!r}"
+    )
+    assert Path(result.stdout.strip()).is_relative_to(H_APP), (
+        "the child must import services.daemons from the tree being certified; "
+        f"resolved {result.stdout.strip()!r}"
+    )
+
+
+def test_runner_refuses_before_pytest_when_child_import_path_is_missing(
+    tmp_path: Path,
+) -> None:
+    target = _make_isolated_harness_tree(
+        tmp_path, "def test_target_tree_marker():\n    assert True\n"
+    )
+    (target / "h-app" / "services" / "daemons.py").unlink()
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, str(target / "h-app" / "tools" / "run_tests.py")],
+        cwd=target,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert f"interpreter: {sys.executable}" in output
+    assert "module: services.daemons" in output
+    assert "resolved module: <not importable>" in output
+    assert "ModuleNotFoundError" in output
+    assert f"expected under: {(target / 'h-app').resolve()}" in output
+    assert "pip install -e" in output
+    assert "collected" not in output
+    assert "suite execution invariant satisfied" not in output
+
+
+def test_runner_refuses_before_pytest_when_child_imports_another_tree(
+    tmp_path: Path,
+) -> None:
+    target = _make_isolated_harness_tree(
+        tmp_path, "def test_target_tree_marker():\n    assert True\n"
+    )
+    foreign = tmp_path / "foreign" / "services"
+    foreign.mkdir(parents=True)
+    foreign_daemons = foreign / "daemons.py"
+    foreign_daemons.write_text("# wrong-tree module\n")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(foreign.parent)
+    result = subprocess.run(
+        [sys.executable, str(target / "h-app" / "tools" / "run_tests.py")],
+        cwd=target,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert f"interpreter: {sys.executable}" in output
+    assert "module: services.daemons" in output
+    assert f"resolved module: {foreign_daemons.resolve()}" in output
+    assert f"expected under: {(target / 'h-app').resolve()}" in output
+    assert "pip install -e" in output
+    assert "collected" not in output
+    assert "suite execution invariant satisfied" not in output
 
 
 def test_runner_refuses_to_report_success_for_a_different_tree(tmp_path: Path) -> None:

@@ -200,6 +200,32 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(queued["l2"]["destination"], "alice")
         self.assertEqual(queued["l3"]["destination"], "test:office:alice")
 
+    def test_post_envelope_does_not_report_a_write_failure_as_a_rejection(self):
+        """CLASS 2, architect's provenance audit (ticket 51caad5f): the
+        only except clause converting a post_envelope failure into an
+        explicit HTTP 422 rejection catches EnvelopeError specifically --
+        and core.channels.send()'s own contract (its comment above the
+        rpush call: "Only RPUSH belongs inside the outcome-unknown
+        window") proves EnvelopeError is raised only by validation that
+        completes BEFORE the egress write. A failure from the write step
+        itself must never be classified as a proven rejection: the caller
+        cannot tell from a 422 whether their message was actually queued,
+        so reporting a write failure that way would be a confident, wrong
+        claim -- the exact harm this ticket's Class 2 predicate names.
+        Simulates the write step itself failing with a plain exception
+        (never EnvelopeError -- send() cannot raise that type from within
+        the rpush try) and confirms it does NOT come back as this
+        endpoint's 422 rejection status."""
+        def failing_rpush(*args, **kwargs):
+            raise ConnectionError("redis unreachable")
+
+        with patch.object(self.redis, "rpush", side_effect=failing_rpush):
+            with self.assertRaises(ConnectionError):
+                request(
+                    self.app, "POST", "/agents/test:office:alice/envelopes",
+                    token="secret", body={"text": "hello"},
+                )
+
     def test_nonlocal_and_malformed_destination_statuses(self):
         status, _ = request(
             self.app, "POST", "/agents/other:office:alice/envelopes",
@@ -224,6 +250,228 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(self.redis.streams[inbox]), 1)
         self.assertEqual(json.loads(self.redis.streams[inbox][0][1]["envelope"])["payload"], {"text": "reply"})
         self.assertEqual(self.redis.lists[dead], ["not an envelope"])
+
+    def test_deliver_api_does_not_dead_letter_an_envelope_after_a_failed_inbox_write(self):
+        """CLASS 2, architect's provenance audit (ticket 51caad5f), second
+        candidate site: deliver_api's only except clause that classifies a
+        rejection wraps parse(raw) alone, never the r.xadd inbox write that
+        follows it -- parse() takes no Redis handle at all, so it cannot
+        have touched storage, which is a stronger guarantee than an
+        in-function comment (core.channels.send()'s case) because it holds
+        structurally, by parse()'s own signature. The fragile part is the
+        SHAPE of the try/except, not parse()'s purity: if a later change
+        widened that except to also cover the xadd call, a write failure
+        would be misclassified as a proven rejection (dead-lettered) when
+        the caller cannot actually tell whether inbox storage received it.
+        Simulates the write step failing and confirms it propagates
+        uncaught -- never silently classified into the dead-letter queue."""
+        ingress = prefix("test", "office", "telegram", "ingress")
+        valid = encode(build("Message", "alice", "telegram", {"text": "reply"}, pod="test", tenant="office"))
+        self.redis.lists[ingress] = [valid]
+
+        def failing_xadd(*args, **kwargs):
+            raise ConnectionError("redis unreachable")
+
+        with patch.object(self.redis, "xadd", side_effect=failing_xadd):
+            with self.assertRaises(ConnectionError):
+                deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+
+        dead = prefix("test", "office", "telegram", "dead")
+        self.assertEqual(self.redis.lists.get(dead, []), [])
+
+    def test_deliver_api_never_logs_the_raw_content_of_a_rejected_envelope(self):
+        """CLASS 1, architect's provenance audit (ticket 51caad5f):
+        parse()'s EnvelopeError messages are constructed in core/envelope.py
+        from whatever the wire said -- _address/_segment interpolate the
+        remote value itself (`{value!r}`) into several of them -- so
+        str(exc) is remote-influenced by construction, exactly like the
+        telegram client and watchdog leaks this ticket cites. Craft a wire
+        frame with a VALID L2 header (parse_for_switch succeeds) but an L3
+        source that fails segment validation, carrying a marker that must
+        never reach the durable custody log deliver_api writes."""
+        valid = encode(build("Message", "alice", "telegram", {"text": "hi"}, pod="test", tenant="office"))
+        header, body = valid[:256], valid[256:]
+        body_dict = json.loads(body)
+        marker = "UNTRUSTED_REMOTE_MARKER_should_never_reach_logs"
+        body_dict["l3"]["source"] = f"test:office:{marker}"
+        tampered = header + json.dumps(body_dict, separators=(",", ":"))
+        ingress = prefix("test", "office", "telegram", "ingress")
+        self.redis.lists[ingress] = [tampered]
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+
+        self.assertNotIn(marker, out.getvalue())
+        dead = prefix("test", "office", "telegram", "dead")
+        self.assertEqual(self.redis.lists[dead], [tampered])
+
+    def test_deliver_api_never_logs_the_in_reply_to_value_or_reply_source_it_drops(self):
+        """Reviewer's exact finding against 301ae87 (ticket 51caad5f):
+        is_valid_reply_id restricts SHAPE (32 lowercase hex characters), not
+        provenance -- a remote sender chooses the bytes freely within that
+        shape, so a syntactically valid in_reply_to is still remote data by
+        origin, same predicate as a malformed one. The prior fix closed
+        EnvelopeError's str(exc) but left _drop_untrustworthy_reply_correlation
+        interpolating in_reply_to, reply_source and agent directly into the
+        free-text `reason` -- redundant with the dedicated source/destination
+        fields _record already populates, and a second instance of the same
+        leak class. Covers both branches that interpolated a value: verdict
+        False ("was never delivered") and verdict None ("provenance
+        unavailable")."""
+        marker = "deadbeefdeadbeefdeadbeefdeadbeef"
+        ingress = prefix("test", "office", "telegram", "ingress")
+        envelope = build(
+            "Message", "alice", "telegram", {"text": "hi"},
+            pod="test", tenant="office", in_reply_to=marker,
+        )
+        self.redis.lists[ingress] = [encode(envelope)]
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+        self.assertNotIn(marker, out.getvalue())
+
+        self.redis.lists[ingress] = [encode(envelope)]
+
+        def broken_get(key):
+            raise ConnectionError("redis unavailable")
+
+        out2 = io.StringIO()
+        with patch.object(self.redis, "get", side_effect=broken_get), redirect_stdout(out2):
+            deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+        self.assertNotIn(marker, out2.getvalue())
+
+    def test_known_reply_correlation_and_dead_letter_branches_use_closed_literal_reasons(self):
+        """EXAMPLE-LEVEL coverage, not a module-wide guarantee -- reviewer's
+        exact correction, still the accurate description after the source
+        checker's retreat (ticket 0e6cdc0f), and now reflected in this
+        test's own name too (reviewer's second, scoped correction on
+        d4431bd: the old name's "always" claimed the module-wide guarantee
+        this retreat withdrew, even after the docstring was fixed -- a
+        node ID is what the manifest and a reviewer see first). This drives
+        every branch that exists TODAY (the ones enumerated below) with
+        adversarial values and confirms none of them currently leak. It has
+        no mechanism to discover a NEW caller added elsewhere in the file,
+        so it cannot and does not prove "any third site would fail". A
+        prior AST-based source checker attempted that stronger, module-wide
+        claim and was retired after five review rounds each found a real
+        way past it, the last being a `global` declaration moving binding
+        ownership without changing nesting depth -- a genuinely new
+        category its own documented stopping condition correctly refused
+        to patch a sixth time. No automated module-wide guarantee remains
+        in this file -- a future or new call site requires manual review.
+        This test only pins the branches enumerated here today -- and the
+        name's own claim was re-checked against the body for exactly this
+        risk: `closed_reasons` originally listed "in_reply_to present but
+        reply has no l2 source" without ever producing it, since parse()
+        guarantees a non-empty l2.source for anything that reaches
+        deliver_api at all -- that branch is dead code on the wire path,
+        reachable only by calling _drop_untrustworthy_reply_correlation
+        directly. Added that direct call so every literal this test
+        allows is also a literal this test actually observed at least
+        once, not merely a member of a superset nothing produces."""
+        closed_reasons = {
+            None,
+            "malformed in_reply_to",
+            "in_reply_to present but reply has no l2 source",
+            "in_reply_to provenance unavailable (storage unreachable)",
+            "in_reply_to was never delivered to the claimed source",
+            "malformed envelope",
+        }
+
+        def reasons_from(out: str) -> set:
+            return {json.loads(line).get("reason") for line in out.splitlines()}
+
+        ingress = prefix("test", "office", "telegram", "ingress")
+        adversarial_markers = [
+            "deadbeefdeadbeefdeadbeefdeadbeef",
+            "cafebabecafebabecafebabecafebabe",
+            "0" * 32,
+            "not-a-valid-hex-id-at-all-nope!!",
+            "SECRET_LEAK_ATTEMPT_UPPER_CASE_XX",
+        ]
+
+        # Malformed and never-delivered branches: build(in_reply_to=...)
+        # rejects anything not already 32 lowercase hex, so tamper the
+        # wire form directly to reach deliver_api with whatever the
+        # marker actually is, valid-shaped or not.
+        for marker in adversarial_markers:
+            envelope = build("Message", "alice", "telegram", {"text": "hi"}, pod="test", tenant="office")
+            raw = self._tamper_in_reply_to(envelope, marker)
+            self.redis.lists[ingress] = [raw]
+            out = io.StringIO()
+            with redirect_stdout(out):
+                deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+            self.assertNotIn(marker, out.getvalue())
+            self.assertLessEqual(reasons_from(out.getvalue()), closed_reasons)
+
+        # Provenance-unavailable branch: valid-shaped id, storage unreachable.
+        for marker in ("deadbeefdeadbeefdeadbeefdeadbeef", "cafebabecafebabecafebabecafebabe"):
+            envelope = build(
+                "Message", "alice", "telegram", {"text": "hi"},
+                pod="test", tenant="office", in_reply_to=marker,
+            )
+            self.redis.lists[ingress] = [encode(envelope)]
+
+            def broken_get(key):
+                raise ConnectionError("redis unavailable")
+
+            out = io.StringIO()
+            with patch.object(self.redis, "get", side_effect=broken_get), redirect_stdout(out):
+                deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+            self.assertNotIn(marker, out.getvalue())
+            self.assertLessEqual(reasons_from(out.getvalue()), closed_reasons)
+
+        # Dead-letter path: malformed frames hitting different EnvelopeError
+        # raise sites in core/envelope.py -- a bad L2 header name, a bad L3
+        # body address, and non-JSON body -- must all reduce to the single
+        # "malformed envelope" literal, regardless of what remote text
+        # triggered the rejection or which field carried it.
+        valid = encode(build("Message", "alice", "telegram", {"text": "hi"}, pod="test", tenant="office"))
+        header = valid[:256]
+        marker = "LEAK_MARKER_FOR_DEAD_LETTER_PATH"
+        malformed_raws = [
+            "short",
+            header + "not json",
+            valid[:65] + marker.ljust(63) + valid[128:256] + valid[256:],
+            header + json.dumps({
+                "kind": "Message", "ts": "x",
+                "l3": {"source": f"test:office:{marker}", "destination": "test:office:telegram"},
+                "payload": {},
+            }, separators=(",", ":")),
+        ]
+        for raw in malformed_raws:
+            self.redis.lists[ingress] = [raw]
+            out = io.StringIO()
+            with redirect_stdout(out):
+                deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+            self.assertNotIn(marker, out.getvalue())
+            self.assertLessEqual(reasons_from(out.getvalue()), closed_reasons)
+
+        # "no l2 source" branch: unreachable through the wire/parse() path
+        # above -- parse_for_switch's _segment validates L2 source as a
+        # non-empty identifier for every envelope that reaches deliver_api
+        # at all, so an empty l2.source can never survive a real parse().
+        # Called directly, bypassing parse(), the way a differently-shaped
+        # future caller of this function might; closed_reasons above would
+        # otherwise list a literal this test never actually produces.
+        from modules.api.port import _drop_untrustworthy_reply_correlation
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            _drop_untrustworthy_reply_correlation(
+                self.redis, pod="test", tenant="office", agent="telegram",
+                envelope={
+                    "stream_id": "a" * 32, "correlation_id": "b" * 32,
+                    "l2": {"source": ""}, "in_reply_to": "c" * 32,
+                },
+            )
+        self.assertLessEqual(reasons_from(out.getvalue()), closed_reasons)
+        self.assertIn(
+            "in_reply_to present but reply has no l2 source",
+            reasons_from(out.getvalue()),
+        )
 
     def _tamper_in_reply_to(self, envelope, value):
         """Bypass build()/encode()'s strict validation to simulate an

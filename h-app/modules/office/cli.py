@@ -28,7 +28,7 @@ import redis
 
 from core.channels import send
 from core.envelope import EnvelopeError, parse
-from core.keys import prefix, receive_unresolved_key
+from core.keys import prefix, receive_undeliverable_key, receive_unresolved_key
 from core.logging import log_record, record_task_event
 from core.registry import is_member, members, port_type
 from lib.attachment_schema import ATTACHMENT_MAX_BYTES, MIME_TYPE_REGEX
@@ -1014,7 +1014,11 @@ def _unresolved_command(argv: list[str]) -> None:
     for stored in r.lrange(receive_unresolved_key(pod, tenant), 0, -1):
         try:
             record = json.loads(_text(stored))
-            envelope = parse(record["envelope"])
+            raw = (
+                bytes.fromhex(record["envelope"])
+                if record.get("encoding") == "hex" else record["envelope"]
+            )
+            envelope = parse(raw)
             agent = record["agent"]
             if args.agent and agent != args.agent:
                 continue
@@ -1027,6 +1031,36 @@ def _unresolved_command(argv: list[str]) -> None:
             }, separators=(",", ":")))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError, EnvelopeError):
             print("unparseable unresolved custody record", file=sys.stderr)
+
+
+def _undeliverable_command(argv: list[str]) -> None:
+    parser = _operation_parser(
+        "undeliverable",
+        "Read messages whose destination retired before opening them.",
+    )
+    parser.add_argument("-a", "--agent", metavar="AGENT")
+    args = parser.parse_args(argv)
+    r, pod, tenant, _ = _context()
+    for stored in r.lrange(receive_undeliverable_key(pod, tenant), 0, -1):
+        try:
+            record = json.loads(_text(stored))
+            raw = (
+                bytes.fromhex(record["envelope"])
+                if record.get("encoding") == "hex" else record["envelope"]
+            )
+            envelope = parse(raw)
+            agent = record["agent"]
+            if args.agent and agent != args.agent:
+                continue
+            print(json.dumps({
+                "agent": agent,
+                "stream_id": envelope["stream_id"],
+                "kind": envelope["kind"],
+                "source": envelope["l2"]["source"],
+                "reason": record.get("reason", "destination retired before opening"),
+            }, separators=(",", ":")))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, EnvelopeError):
+            print("unparseable undeliverable custody record", file=sys.stderr)
 
 
 def _take_command(argv: list[str]) -> None:
@@ -1607,6 +1641,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("resume",), "resume an agent's CLI and inbox", lambda argv: _lifecycle_command("resume", argv)),
     (("list",), "show a task board", _list_command),
     (("unresolved",), "show unresolved delivery outcomes", _unresolved_command),
+    (("undeliverable",), "show messages not opened before retirement", _undeliverable_command),
     (("take",), "take your next todo task", _take_command),
     (("done",), "finish your open task and record its outcome", _done_command),
     (("cancel",), "cancel your open task", _cancel_command),
