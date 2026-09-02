@@ -141,9 +141,9 @@ _OWNED_PREFIX = "h_mesh_test_"
 # guaranteed and prose cannot create one. A target judged unowned may still
 # satisfy the reaper's owned-root and prefix checks, so a concurrent reaper may
 # already be acting on it while its claim evidence is removed. Inspect the
-# claim JSON, verify that the target is invalid or unowned, quarantine/remove
-# the corresponding public entry first, then remove all matching claim files
-# and verify both public and claim forms are absent. Repeat, or fail and leave
+# claim JSON, verify that the target is invalid or unowned, quarantine the
+# corresponding public entry first, then remove all matching claim files, and
+# verify both public and claim forms are absent. Repeat, or fail and leave
 # evidence, if either form reappears. Automatic deletion is refused by the
 # reaper because it would destroy evidence this module is designed to preserve
 # and silently reopen arbitrary-tree risk; guaranteed cleanup would require a
