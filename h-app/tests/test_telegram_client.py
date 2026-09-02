@@ -124,7 +124,10 @@ class DummyMeshClient:
         batch = res[:limit]
         return 200, {"agent": agent, "activity": batch, "next_cursor": batch[-1]["cursor"] if batch else after}
 
-    def stream_activity(self, agent, after=None):
+    def stream_activity(self, agent, after=None, heartbeat=False):
+        # heartbeat mirrors the real client: an idle stream yields None so a
+        # consumer with a deadline gets a turn. Kept here so the fake cannot
+        # drift from the signature the watcher actually calls.
         for evt in self.activity_queue:
             if after is None or evt["cursor"] > after:
                 yield evt
@@ -2403,8 +2406,14 @@ def test_parse_sse_events_multiple_frames_and_comment_lines():
         "\n",
     ]
     events = list(_parse_sse_events(lines))
-    assert [e[1] for e in events] == ["1-0", "2-0"]
-    assert [e[2] for e in events] == ['{"kind": "stalled"}', '{"kind": "credential"}']
+    # ⚠ Keepalive comments are now REPORTED (data None) rather than swallowed:
+    # an idle stream sends nothing else, so a consumer with a deadline needs
+    # them to get a turn. Consumers that don't care filter on data is None,
+    # which is what stream_alerts does.
+    assert [e for e in events if e[2] is None] == [("keepalive", None, None)]
+    real = [e for e in events if e[2] is not None]
+    assert [e[1] for e in real] == ["1-0", "2-0"]
+    assert [e[2] for e in real] == ['{"kind": "stalled"}', '{"kind": "credential"}']
 
 
 def test_parse_sse_events_multiline_data_is_joined():
@@ -3353,7 +3362,7 @@ def test_telegram_bot_live_activity_with_user_prompt_and_reply_pusher(monkeypatc
         {"agent": "architect", "kind": "output", "cursor": "53-0"},
     ]
 
-    def fake_stream(agent, after=None):
+    def fake_stream(agent, after=None, heartbeat=False):
         yield from activity_events
 
     monkeypatch.setattr(mesh, "stream_activity", fake_stream)
@@ -3426,7 +3435,7 @@ def test_telegram_bot_multi_output_turn_does_not_early_exit(monkeypatch, tmp_pat
     event_index = 0
     event_lock = threading.Lock()
 
-    def fake_stream(agent, after=None):
+    def fake_stream(agent, after=None, heartbeat=False):
         nonlocal event_index
         while True:
             with event_lock:
@@ -4378,3 +4387,102 @@ def test_updates_are_acknowledged_to_telegram_before_they_are_handled():
         finally:
             holding.set()
             loop.join(timeout=5)
+
+
+# ── idle activity watchers (ticket b6c8b819) ─────────────────────────────────
+
+def test_a_watcher_on_a_silent_stream_still_stops_at_its_deadline():
+    """⚠ HARM, not mechanism: a watcher started against an idle agent used to
+    live forever, holding a thread and an SSE connection, because its 300s
+    deadline was only evaluated when an event arrived and an idle agent sends
+    none. Measured on the acceptance instance: four live watcher threads for
+    one agent. The stream now reports keepalives as heartbeats, so the loop
+    gets a turn to look at the clock."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        render = ActivityRender("12345", "architect")
+        ticks = {"n": 0}
+
+        def silent_stream():
+            # what an idle agent produces: keepalives, forever
+            while True:
+                ticks["n"] += 1
+                yield None
+
+        started = time.time()
+        bot_instance._watch_activity("12345", "architect", None, render,
+                                     timeout_s=0.05, stream_fn=silent_stream)
+
+        assert time.time() - started < 5, "the watcher must end on its own deadline"
+        assert ticks["n"] > 0, "the heartbeat is what gives the deadline a chance to fire"
+
+
+def test_a_watcher_without_heartbeats_would_never_reach_its_deadline():
+    """The falsification, kept as a test: a stream that yields nothing at all
+    blocks the loop in next() forever, which is exactly what swallowing
+    keepalives did. Asserted with a thread and a timeout rather than by
+    hanging the suite."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        render = ActivityRender("12345", "architect")
+        release = threading.Event()
+
+        def silent_forever():
+            release.wait(timeout=5)   # never yields: no events, no heartbeats
+            return
+            yield  # pragma: no cover
+
+        done = threading.Event()
+
+        def run():
+            bot_instance._watch_activity("12345", "architect", None, render,
+                                         timeout_s=0.05, stream_fn=silent_forever)
+            done.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        assert not done.wait(timeout=0.5), (
+            "without heartbeats the deadline cannot fire — this is the leak, pinned"
+        )
+        release.set()
+        assert done.wait(timeout=5)
+
+
+def test_a_newer_turn_stops_the_previous_watcher_instead_of_stacking():
+    """Four watcher threads for one agent was the observed symptom. Swapping
+    the render finalized the old one but left its thread running against the
+    same agent until its own deadline; the stop switch is checked on every
+    tick, and heartbeats guarantee ticks."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bot_instance, mesh, telegram = _make_bot(tmpdir=tmpdir)
+        first = ActivityRender("12345", "architect")
+        first.stop_event = threading.Event()
+        ended = threading.Event()
+
+        def heartbeat_stream():
+            while not ended.is_set():
+                yield None
+                time.sleep(0.01)
+
+        def run():
+            bot_instance._watch_activity("12345", "architect", None, first,
+                                         timeout_s=30, stream_fn=heartbeat_stream)
+            ended.set()
+
+        threading.Thread(target=run, daemon=True).start()
+        time.sleep(0.05)
+        assert not ended.is_set()
+
+        first.stop_event.set()  # what handle_user_prompt does on a newer turn
+        assert ended.wait(timeout=5), "a replaced watcher must end, not run out its own deadline"
+
+
+def test_the_pane_watcher_does_not_have_the_same_shape():
+    """⚠ Checked because the ticket asked, and the answer is no: _run_pane_watch
+    drives its own loop (`ws.recv` with a drain deadline, then
+    `stop_event.wait(refresh_s)`) and evaluates its max duration at the top of
+    every iteration regardless of traffic. Its deadline does not depend on
+    anything arriving, so it needs no equivalent fix. Pinned so that stays
+    true."""
+    source = inspect.getsource(TelegramBot._run_pane_watch)
+    assert "stop_event.wait(self.pane_watch_refresh_s)" in source
+    assert "time.time() - start_time > self.pane_watch_max_duration_s" in source
