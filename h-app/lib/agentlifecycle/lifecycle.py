@@ -93,6 +93,14 @@ class _PartialLifecycle(RuntimeError):
     """Some work was acknowledged before a later action provably failed."""
 
 
+def _lifecycle_log(event: str, **fields) -> None:
+    """Secondary observation must never replace lifecycle classification."""
+    try:
+        log_record("agentlifecycle", event, **fields)
+    except Exception:
+        pass
+
+
 def _record_lifecycle(kind: str):
     """Record accepted, partially failed, incomplete, or pre-mutation failure outcomes."""
     def decorate(opener):
@@ -104,30 +112,28 @@ def _record_lifecycle(kind: str):
             try:
                 result = opener(r, pod=pod, tenant=tenant, envelope=envelope, **kwargs)
             except _PartialLifecycle as exc:
-                log_record(
-                    "agentlifecycle", f"{kind}_partially_failed", correlation_id=correlation_id,
+                _lifecycle_log(
+                    f"{kind}_partially_failed", correlation_id=correlation_id,
                     destination=agent if isinstance(agent, str) else None,
                     reason=str(exc),
                 )
                 raise
             except _IncompleteLifecycle as exc:
-                log_record(
-                    "agentlifecycle", f"{kind}_incomplete", correlation_id=correlation_id,
+                _lifecycle_log(
+                    f"{kind}_incomplete", correlation_id=correlation_id,
                     destination=agent if isinstance(agent, str) else None,
                     reason=str(exc),
                 )
                 raise
             except Exception as exc:
-                log_record(
-                    "agentlifecycle", f"{kind}_failed", correlation_id=correlation_id,
+                _lifecycle_log(
+                    f"{kind}_failed", correlation_id=correlation_id,
                     destination=agent if isinstance(agent, str) else None,
                     reason=str(exc) or type(exc).__name__,
                 )
-                if isinstance(exc, (KeyError, ValueError)):
-                    raise ProvableLifecycleRejection(str(exc)) from exc
                 raise
-            log_record(
-                "agentlifecycle", f"{kind}_accepted", correlation_id=correlation_id,
+            _lifecycle_log(
+                f"{kind}_accepted", correlation_id=correlation_id,
                 destination=agent if isinstance(agent, str) else None,
             )
             return result
@@ -184,15 +190,25 @@ def _actual_failed(
 
 
 def _target(envelope: dict, allowed_keys: frozenset[str]) -> tuple[str, dict]:
-    payload = envelope["payload"]
+    if not isinstance(envelope, dict):
+        raise ProvableLifecycleRejection("lifecycle envelope must be an object")
+    try:
+        payload = envelope["payload"]
+    except KeyError as exc:
+        raise ProvableLifecycleRejection("lifecycle envelope requires payload") from exc
+    if not isinstance(payload, dict):
+        raise ProvableLifecycleRejection("lifecycle payload must be an object")
     unknown_keys = sorted(set(payload) - allowed_keys)
     if unknown_keys:
-        raise ValueError(f"unknown payload key {unknown_keys[0]!r}")
+        raise ProvableLifecycleRejection(f"unknown payload key {unknown_keys[0]!r}")
     agent = payload.get("agent")
     if not isinstance(agent, str):
-        raise ValueError("lifecycle payload.agent must be a string")
+        raise ProvableLifecycleRejection("lifecycle payload.agent must be a string")
     # Constructing an agent key validates the target before any state changes.
-    prefix("check", "check", agent=agent, resource="launch")
+    try:
+        prefix("check", "check", agent=agent, resource="launch")
+    except KeyError as exc:
+        raise ProvableLifecycleRejection(str(exc)) from exc
     return agent, payload
 
 
@@ -218,38 +234,104 @@ def start_agent(
             not isinstance(values, list)
             or not all(isinstance(value, str) and SEGMENT_REGEX.fullmatch(value) for value in values)
         ):
-            raise ValueError(f"StartAgent payload.{side} must be a list of tag names")
+            raise ProvableLifecycleRejection(
+                f"StartAgent payload.{side} must be a list of tag names"
+            )
         policy[side] = sorted(set(values))
 
     agent_port_type = payload.get("port_type", "tmux")
     if agent_port_type not in _STARTABLE_VABS:
-        raise ValueError(f"StartAgent payload.port_type must be one of: {', '.join(sorted(_STARTABLE_VABS))}")
+        raise ProvableLifecycleRejection(
+            f"StartAgent payload.port_type must be one of: {', '.join(sorted(_STARTABLE_VABS))}"
+        )
 
     make_lead = payload.get("lead", False)
     if not isinstance(make_lead, bool):
-        raise ValueError("StartAgent payload.lead must be a boolean")
+        raise ProvableLifecycleRejection("StartAgent payload.lead must be a boolean")
     if make_lead and agent_port_type != "tmux":
-        raise ValueError("StartAgent payload.lead only applies to port_type 'tmux'")
+        raise ProvableLifecycleRejection("StartAgent payload.lead only applies to port_type 'tmux'")
 
     hmac_secret = payload.get("hmac_secret")
     kid = payload.get("kid")
     revoke_kid = payload.get("revoke_kid")
     if (hmac_secret is None) != (kid is None):
-        raise ValueError("StartAgent payload.hmac_secret and payload.kid must be supplied together")
+        raise ProvableLifecycleRejection(
+            "StartAgent payload.hmac_secret and payload.kid must be supplied together"
+        )
     if kid is not None and not (isinstance(kid, str) and SEGMENT_REGEX.fullmatch(kid)):
-        raise ValueError("StartAgent payload.kid must be a segment string")
+        raise ProvableLifecycleRejection("StartAgent payload.kid must be a segment string")
     if hmac_secret is not None and not (
         isinstance(hmac_secret, str) and len(hmac_secret) >= _MIN_HMAC_SECRET_LEN
     ):
-        raise ValueError(
+        raise ProvableLifecycleRejection(
             f"StartAgent payload.hmac_secret must be a string of at least {_MIN_HMAC_SECRET_LEN} characters"
         )
     if revoke_kid is not None and not (isinstance(revoke_kid, str) and SEGMENT_REGEX.fullmatch(revoke_kid)):
-        raise ValueError("StartAgent payload.revoke_kid must be a segment string")
+        raise ProvableLifecycleRejection("StartAgent payload.revoke_kid must be a segment string")
     if agent_port_type != "api" and (kid is not None or revoke_kid is not None):
-        raise ValueError("StartAgent payload.hmac_secret/kid/revoke_kid only apply to port_type 'api'")
+        raise ProvableLifecycleRejection(
+            "StartAgent payload.hmac_secret/kid/revoke_kid only apply to port_type 'api'"
+        )
 
+    # Complete validation, key construction, and fallible serialization before
+    # the first desired-state mutation. This is the only boundary from which a
+    # validation rejection can truthfully be labelled pre-mutation.
+    serialized_policy = {
+        side: json.dumps(values, separators=(",", ":"))
+        for side, values in policy.items()
+    }
+    hmac_keys_key = prefix(pod, tenant, agent=agent, resource="hmac-keys")
+    policy_key = tags_key(pod, tenant, agent)
+    key_record = (
+        json.dumps({"secret": hmac_secret, "created_ts": time.time()}, separators=(",", ":"))
+        if kid is not None else None
+    )
     registry_key = prefix(pod, tenant, resource="registry")
+    launch_key = prefix(pod, tenant, agent=agent, resource="launch")
+    profile_key = prefix(pod, tenant, agent=agent, resource="profile")
+    provider_key = prefix(pod, tenant, agent=agent, resource="provider")
+    resume_key = prefix(pod, tenant, agent=agent, resource="resume")
+    skip_key = prefix(pod, tenant, agent=agent, resource="skip-permissions")
+    tools_key = prefix(pod, tenant, agent=agent, resource="claude-tools")
+    cause_key = prefix(pod, tenant, agent=agent, resource="window.cause")
+
+    cli = payload.get("cli", "claude")
+    profile = payload.get("profile")
+    provider = payload.get("provider")
+    resume = payload.get("resume")
+    skip_permissions = payload.get("skip_permissions")
+    claude_tools = payload.get("claude_tools") if "claude_tools" in payload else None
+    if agent_port_type == "tmux":
+        if not isinstance(cli, str) or not cli:
+            raise ProvableLifecycleRejection("StartAgent payload.cli must be a non-empty string")
+        if profile:
+            try:
+                prefix("check", "check", agent=profile, resource="profile")
+            except KeyError as exc:
+                raise ProvableLifecycleRejection(str(exc)) from exc
+            profiles = available_profiles(pod, tenant)
+            if profiles is not None and profile not in profiles:
+                raise ProvableLifecycleRejection(
+                    f"unknown account {profile!r}; available accounts: {', '.join(profiles)}"
+                )
+        elif profile not in (None, ""):
+            raise ProvableLifecycleRejection("StartAgent payload.profile must be a segment string")
+        if provider:
+            try:
+                prefix("check", "check", agent=provider, resource="provider")
+            except KeyError as exc:
+                raise ProvableLifecycleRejection(str(exc)) from exc
+        elif provider not in (None, ""):
+            raise ProvableLifecycleRejection("StartAgent payload.provider must be a segment string")
+        if resume is not None and not isinstance(resume, bool):
+            raise ProvableLifecycleRejection("StartAgent payload.resume must be a boolean")
+        if skip_permissions is not None and not isinstance(skip_permissions, bool):
+            raise ProvableLifecycleRejection(
+                "StartAgent payload.skip_permissions must be a boolean"
+            )
+        if "claude_tools" in payload and not isinstance(claude_tools, str):
+            raise ProvableLifecycleRejection("StartAgent payload.claude_tools must be a string")
+
     committed: list[str] = []
     if agent_port_type == "api":
         # Both self-supplied: the enrolling client generates its own secret and
@@ -259,22 +341,17 @@ def start_agent(
         # recompute the MAC, so it is stored in the clear here, not hashed —
         # unlike a password hash, a digest of the secret could never reproduce
         # a matching signature.
-        hmac_keys_key = prefix(pod, tenant, agent=agent, resource="hmac-keys")
         if revoke_kid is not None:
             _write_desired(
                 committed, f"hmac key {revoke_kid!r} revoked", "hmac key revoke",
                 lambda: r.hdel(hmac_keys_key, revoke_kid),
             )
         if kid is not None:
-            key_record = json.dumps(
-                {"secret": hmac_secret, "created_ts": time.time()}, separators=(",", ":")
-            )
             _write_desired(
                 committed, f"hmac key {kid!r} published", "hmac key publish",
                 lambda: r.hset(hmac_keys_key, kid, key_record),
             )
         if policy_supplied:
-            policy_key = tags_key(pod, tenant, agent)
             _write_desired(
                 committed, "policy reset", "policy reset", lambda: r.delete(policy_key)
             )
@@ -282,7 +359,7 @@ def start_agent(
                 _write_desired(
                     committed, f"{side} policy published", f"{side} policy publish",
                     lambda side=side, values=values: r.hset(
-                        policy_key, side, json.dumps(values, separators=(",", ":"))
+                        policy_key, side, serialized_policy[side]
                     ),
                 )
         _write_desired(
@@ -291,29 +368,8 @@ def start_agent(
         )
         return
 
-    cli = payload.get("cli", "claude")
-    if not isinstance(cli, str) or not cli:
-        raise ValueError("StartAgent payload.cli must be a non-empty string")
-
-    profile = payload.get("profile")
-    if profile:
-        prefix("check", "check", agent=profile, resource="profile")
-        profiles = available_profiles(pod, tenant)
-        if profiles is not None and profile not in profiles:
-            raise ValueError(
-                f"unknown account {profile!r}; available accounts: {', '.join(profiles)}"
-            )
-    elif profile not in (None, ""):
-        raise ValueError("StartAgent payload.profile must be a segment string")
-
-    provider = payload.get("provider")
-    if provider:
-        prefix("check", "check", agent=provider, resource="provider")
-    elif provider not in (None, ""):
-        raise ValueError("StartAgent payload.provider must be a segment string")
-
     existing_port_type = port_type(r, pod=pod, tenant=tenant, agent=agent)
-    old_launch = r.get(prefix(pod, tenant, agent=agent, resource="launch")) if existing_port_type == "tmux" else None
+    old_launch = r.get(launch_key) if existing_port_type == "tmux" else None
     old_launch = old_launch.decode() if isinstance(old_launch, bytes) else old_launch
 
     config_changed = existing_port_type == "tmux" and old_launch != cli
@@ -321,7 +377,6 @@ def start_agent(
         # A profile becomes part of a config-directory path. Validate it before
         # any state mutation, then persist it before registry visibility: tmuxhost
         # may reconcile as soon as the row appears and must see the right account.
-        profile_key = prefix(pod, tenant, agent=agent, resource="profile")
         old_profile = r.get(profile_key) if existing_port_type == "tmux" else None
         old_profile = old_profile.decode() if isinstance(old_profile, bytes) else old_profile
         config_changed = config_changed or (existing_port_type == "tmux" and old_profile != profile)
@@ -333,7 +388,6 @@ def start_agent(
     if provider:
         # Same ordering rule as profile: published before registry visibility, or
         # tmuxhost builds the window against the vendor's provider instead.
-        provider_key = prefix(pod, tenant, agent=agent, resource="provider")
         old_provider = r.get(provider_key) if existing_port_type == "tmux" else None
         old_provider = old_provider.decode() if isinstance(old_provider, bytes) else old_provider
         config_changed = config_changed or (existing_port_type == "tmux" and old_provider != provider)
@@ -342,18 +396,13 @@ def start_agent(
             lambda: r.set(provider_key, provider),
         )
 
-    launch_key = prefix(pod, tenant, agent=agent, resource="launch")
     # Publish all launch state before registry membership: tmuxhost reconciles on
     # that row and an early window cannot be corrected by name-idempotent create.
     _write_desired(
         committed, "launch published", "launch publish", lambda: r.set(launch_key, cli)
     )
 
-    resume = payload.get("resume")
     if resume is not None:
-        if not isinstance(resume, bool):
-            raise ValueError("StartAgent payload.resume must be a boolean")
-        resume_key = prefix(pod, tenant, agent=agent, resource="resume")
         old_resume = r.get(resume_key) if existing_port_type == "tmux" else None
         old_resume = old_resume.decode() if isinstance(old_resume, bytes) else old_resume
         desired_resume = "1" if resume else "0"
@@ -363,11 +412,7 @@ def start_agent(
             lambda: r.set(resume_key, desired_resume),
         )
 
-    skip_permissions = payload.get("skip_permissions")
     if skip_permissions is not None:
-        if not isinstance(skip_permissions, bool):
-            raise ValueError("StartAgent payload.skip_permissions must be a boolean")
-        skip_key = prefix(pod, tenant, agent=agent, resource="skip-permissions")
         old_skip = r.get(skip_key) if existing_port_type == "tmux" else None
         old_skip = old_skip.decode() if isinstance(old_skip, bytes) else old_skip
         desired_skip = "1" if skip_permissions else "0"
@@ -381,10 +426,6 @@ def start_agent(
     # value, distinct from the key being absent from the payload at all — same
     # "absent is not empty" rule `window_env` applies on the way out.
     if "claude_tools" in payload:
-        claude_tools = payload["claude_tools"]
-        if not isinstance(claude_tools, str):
-            raise ValueError("StartAgent payload.claude_tools must be a string")
-        tools_key = prefix(pod, tenant, agent=agent, resource="claude-tools")
         old_tools = r.get(tools_key) if existing_port_type == "tmux" else None
         old_tools = old_tools.decode() if isinstance(old_tools, bytes) else old_tools
         config_changed = config_changed or (existing_port_type == "tmux" and old_tools != claude_tools)
@@ -393,7 +434,6 @@ def start_agent(
             lambda: r.set(tools_key, claude_tools),
         )
     if policy_supplied:
-        policy_key = tags_key(pod, tenant, agent)
         _write_desired(
             committed, "policy reset", "policy reset", lambda: r.delete(policy_key)
         )
@@ -401,7 +441,7 @@ def start_agent(
             _write_desired(
                 committed, f"{side} policy published", f"{side} policy publish",
                 lambda side=side, values=values: r.hset(
-                    policy_key, side, json.dumps(values, separators=(",", ":"))
+                    policy_key, side, serialized_policy[side]
                 ),
             )
     correlation_id = envelope.get("correlation_id")
@@ -429,7 +469,6 @@ def start_agent(
         # cause before registry visibility so tmuxhost cannot observe the hire
         # without also observing the join key. Idempotent starts do not replace
         # this marker: their envelope did not cause a new window.
-        cause_key = prefix(pod, tenant, agent=agent, resource="window.cause")
         _write_desired(
             committed,
             "window cause and registry row published",
@@ -470,7 +509,7 @@ def stop_agent(
     """Remove desired state, then any port_type-specific state or actual window."""
     agent, _ = _target(envelope, _TARGET_ONLY_KEYS)
     if agent in _FIXED_PARTICIPANTS:
-        raise ValueError(f"cannot stop fixed participant: {agent}")
+        raise ProvableLifecycleRejection(f"cannot stop fixed participant: {agent}")
     registry_key = prefix(pod, tenant, resource="registry")
     agent_port_type = port_type(r, pod=pod, tenant=tenant, agent=agent)
     committed: list[str] = []

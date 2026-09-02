@@ -13,8 +13,13 @@ from core.channels import receive
 from core.envelope import build, encode
 from core.keys import prefix, receive_opened_key, receive_opening_key, receive_processing_key, receive_unresolved_key
 from lib.agentlifecycle.lifecycle import (
+    ProvableActualFailure,
+    ProvableLifecycleRejection,
+    _IncompleteLifecycle,
     _PUBLISH_LEAD_MEMBERSHIP_LUA,
     _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
+    _PartialLifecycle,
+    resume_agent,
     start_agent,
     stop_agent,
 )
@@ -219,3 +224,86 @@ def test_start_agent_rejects_api_lead_before_mutation(_mock_log_record):
     else:
         raise AssertionError("api lead was accepted")
     assert r.method_calls == []
+
+
+@patch("lib.agentlifecycle.lifecycle.log_record", side_effect=RuntimeError("log unavailable"))
+def test_logging_failure_does_not_replace_proven_rejection(_mock_log_record):
+    r = MagicMock()
+    with pytest.raises(ProvableLifecycleRejection, match="payload.resume must be a boolean"):
+        start_agent(
+            r,
+            pod=POD,
+            tenant=TENANT,
+            envelope={"payload": {"agent": "worker", "resume": "yes"}},
+            replace_window=MagicMock(),
+            available_profiles=lambda *_: None,
+        )
+    assert r.method_calls == []
+
+
+@pytest.mark.parametrize("payload", [None, [], "agent=worker"])
+def test_hostile_payload_shape_is_proven_rejection_without_writes(payload):
+    r = MagicMock()
+    with pytest.raises(ProvableLifecycleRejection, match="payload must be an object"):
+        start_agent(
+            r,
+            pod=POD,
+            tenant=TENANT,
+            envelope={"payload": payload},
+            replace_window=MagicMock(),
+            available_profiles=lambda *_: None,
+        )
+    assert r.method_calls == []
+
+
+@patch("lib.agentlifecycle.lifecycle.log_record", side_effect=RuntimeError("log unavailable"))
+def test_logging_failure_does_not_replace_unknown_write_outcome(_mock_log_record):
+    r = MagicMock()
+    r.set.side_effect = ValueError("encoder failed after submission")
+    with pytest.raises(_IncompleteLifecycle, match="outcome UNKNOWN"):
+        start_agent(
+            r,
+            pod=POD,
+            tenant=TENANT,
+            envelope={"payload": {"agent": "worker"}},
+            replace_window=MagicMock(),
+            available_profiles=lambda *_: None,
+        )
+
+
+@patch("lib.agentlifecycle.lifecycle.log_record", side_effect=RuntimeError("log unavailable"))
+@patch("lib.agentlifecycle.lifecycle.port_type", return_value="tmux")
+def test_logging_failure_does_not_replace_partial_actual_failure(
+    _mock_port_type, _mock_log_record
+):
+    r = MagicMock()
+    r.llen.return_value = 1
+    with pytest.raises(_PartialLifecycle, match="kick 1 failed"):
+        resume_agent(
+            r,
+            pod=POD,
+            tenant=TENANT,
+            envelope={"payload": {"agent": "worker"}},
+            resume_window=lambda _agent: None,
+            kick_agent=lambda _agent: (_ for _ in ()).throw(
+                ProvableActualFailure("not started")
+            ),
+        )
+    r.delete.assert_called_once()
+
+
+@patch("lib.agentlifecycle.lifecycle.log_record", side_effect=RuntimeError("log unavailable"))
+@patch("lib.agentlifecycle.lifecycle.port_type", return_value=None)
+def test_logging_failure_does_not_replace_success(_mock_port_type, _mock_log_record):
+    r = MagicMock()
+    start_agent(
+        r,
+        pod=POD,
+        tenant=TENANT,
+        envelope={"payload": {"agent": "worker"}},
+        replace_window=MagicMock(),
+        available_profiles=lambda *_: None,
+    )
+    r.hset.assert_called_once_with(
+        prefix(POD, TENANT, resource="registry"), "worker", "tmux"
+    )

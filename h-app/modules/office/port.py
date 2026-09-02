@@ -45,9 +45,9 @@ def _kick(agent: str) -> None:
 def _lifecycle_opener(operation, **kwargs):
     """Make only pre-mutation validation rejection explicit to receive().
 
-    Lifecycle validates payload shape before its first desired-state write.
-    ValueError therefore proves the effect did not begin; every other exception
-    retains its UNKNOWN semantics and must reach receive() unchanged.
+    Lifecycle emits an explicit rejection only from its preflight boundary.
+    Exception types observed outside that boundary do not prove whether a
+    mutation began; every other exception retains its UNKNOWN semantics.
     """
     try:
         return operation(**kwargs)

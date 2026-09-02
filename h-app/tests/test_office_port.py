@@ -35,6 +35,20 @@ def test_lifecycle_unknown_failure_is_not_misclassified_as_rejection():
         )
 
 
+def test_late_validation_rejection_writes_nothing_and_is_dead_letterable():
+    r = MagicMock()
+    with pytest.raises(DeadLetter, match="payload.resume must be a boolean"):
+        port._lifecycle_opener(
+            port.start_agent, r=r, pod=POD, tenant=TENANT,
+            envelope={"payload": {"agent": "worker", "resume": "yes"}},
+            replace_window=MagicMock(), available_profiles=lambda *_: None,
+        )
+
+    # The harm is partial desired state followed by a dead-letter verdict.
+    # A proven rejection must reach the dead path with no lifecycle writes.
+    assert r.method_calls == []
+
+
 @patch("modules.office.port.receive")
 def test_deliver_office_registers_all_lifecycle_openers(mock_receive):
     r = MagicMock()

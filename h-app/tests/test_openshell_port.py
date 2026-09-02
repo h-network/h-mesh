@@ -127,6 +127,35 @@ class OpenShellPortTests(unittest.TestCase):
         )
         self.assertEqual(list(self.redis.lists[prefix(POD, TENANT, "bob", "dead")]), [])
 
+    def test_sandbox_lookup_failure_is_proven_dead_before_submission(self):
+        stream_id = self.queue("Command", {"text": "never submitted"})
+        self.client.get_sandbox.side_effect = OpenShellUnavailable("lookup failed")
+
+        deliver_openshell(self.redis, pod=POD, tenant=TENANT, agent="bob", client=self.client)
+
+        dead = self.redis.lists[prefix(POD, TENANT, "bob", "dead")]
+        self.assertEqual([parse(raw)["stream_id"] for raw in dead], [stream_id])
+        self.assertEqual(
+            list(self.redis.lists[prefix(POD, TENANT, resource="unresolved")]), []
+        )
+        self.client.exec_sandbox.assert_not_called()
+
+    def test_unsupported_cli_is_proven_dead_before_submission(self):
+        stream_id = self.queue("Command", {"text": "never submitted"})
+        self.redis.set(
+            prefix(POD, TENANT, agent="bob", resource="launch"), "unsupported"
+        )
+
+        deliver_openshell(self.redis, pod=POD, tenant=TENANT, agent="bob", client=self.client)
+
+        dead = self.redis.lists[prefix(POD, TENANT, "bob", "dead")]
+        self.assertEqual([parse(raw)["stream_id"] for raw in dead], [stream_id])
+        self.assertEqual(
+            list(self.redis.lists[prefix(POD, TENANT, resource="unresolved")]), []
+        )
+        self.client.get_sandbox.assert_not_called()
+        self.client.exec_sandbox.assert_not_called()
+
     def test_attachment_writes_atomically_then_notifies(self):
         stream_id = self.queue(
             "Attachment",

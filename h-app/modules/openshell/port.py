@@ -48,6 +48,14 @@ def _profile_env_suffix(profile: str | None) -> str:
     return (profile or "default").upper().replace("-", "_")
 
 
+def _sandbox_before_effect(client: OpenShellClient, sbx_name: str):
+    """Resolve the sandbox before submission; failure here proves no effect began."""
+    try:
+        return client.get_sandbox(sbx_name)
+    except OpenShellUnavailable as exc:
+        raise DeadLetter(f"gateway_unavailable_before_submission: {exc}") from exc
+
+
 def _write_credential_file(
     client: OpenShellClient, sandbox_id: str, path: str, content: bytes
 ) -> None:
@@ -88,8 +96,11 @@ def _exec_headless(
     written immediately before exec and wiped in a finally immediately after.
     Credentials must never be persisted in the sandbox creation environment.
     """
-    ref = client.get_sandbox(sbx_name)
-    command = headless_command(cli, resume=True)
+    try:
+        command = headless_command(cli, resume=True)
+    except ValueError as exc:
+        raise DeadLetter(str(exc)) from exc
+    ref = _sandbox_before_effect(client, sbx_name)
     stdin = stdin_text.encode("utf-8")
 
     if cli == "claude":
@@ -180,7 +191,7 @@ def _write_attachment(
     `/sandbox` is the sandbox home; h-mesh's host `/workdir` does not exist
     there and may not be writable.
     """
-    ref = client.get_sandbox(sbx_name)
+    ref = _sandbox_before_effect(client, sbx_name)
     target_dir = f"/sandbox/attachments/{stream_id}"
     final_path = f"{target_dir}/{filename}"
     temp_path = f"{target_dir}/.tmp.{os.urandom(8).hex()}"
