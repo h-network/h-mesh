@@ -64,6 +64,16 @@ try:
 except ImportError:
     receive_opened_key = receive_opening_key = receive_unresolved_key = None  # pre-phases shape
 
+try:
+    from core.keys import receive_undeliverable_key
+except ImportError:
+    receive_undeliverable_key = None  # pre-retirement-conservation shape
+
+try:
+    from lib.agentlifecycle.lifecycle import stop_agent
+except ImportError:
+    stop_agent = None  # not present on this tree
+
 
 def _redis_url() -> str:
     return os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
@@ -145,17 +155,53 @@ def _unresolved_key(pod: str, tenant: str) -> str:
     return receive_unresolved_key(pod, tenant)
 
 
+def _decode_evidence_envelope(record: dict):
+    """The envelope field of a tenant evidence record (unresolved or
+    undeliverable), decoded the same way `office`'s own reader does: hex
+    when the record says `encoding: "hex"` (switch-agent's stop_agent Lua
+    script -- Lua strings can hold arbitrary bytes that don't always
+    round-trip through JSON's own string encoding, so it hex-encodes
+    rather than risk that), otherwise the plain text core.channels.py's
+    own crash-recovery path writes directly. Getting this wrong silently
+    drops every hex-encoded record from every stream-id lookup below --
+    found and fixed here, not assumed: an earlier version of this
+    function always treated `envelope` as plain text and would have
+    reported every stop-retirement record as absent."""
+    envelope_field = record["envelope"]
+    if record.get("encoding") == "hex":
+        return bytes.fromhex(envelope_field)
+    return envelope_field
+
+
 def _unresolved_stream_ids(r, pod: str, tenant: str) -> dict[str, dict]:
     """Parse every record currently in the tenant unresolved sink, keyed by
     the stream_id of the envelope it names -- the same read receive()'s
     own successor-recovery path and `office unresolved` both do: an
     {agent, reason, envelope} JSON record whose `envelope` field is the
-    original encoded raw frame."""
+    original encoded raw frame (plain text or hex, see
+    _decode_evidence_envelope)."""
     result = {}
     for stored in r.lrange(_unresolved_key(pod, tenant), 0, -1):
         try:
             record = json.loads(stored.decode() if isinstance(stored, bytes) else stored)
-            header = parse_for_switch(record["envelope"])
+            header = parse_for_switch(_decode_evidence_envelope(record))
+        except Exception:
+            continue
+        result[header["stream_id"]] = record
+    return result
+
+
+def _undeliverable_stream_ids(r, pod: str, tenant: str) -> dict[str, dict]:
+    """Parse every record in the tenant undeliverable sink -- the same
+    shape as unresolved, but for identities proven never to have begun
+    (moved there when their destination retired before opening)."""
+    if receive_undeliverable_key is None:
+        return {}
+    result = {}
+    for stored in r.lrange(receive_undeliverable_key(pod, tenant), 0, -1):
+        try:
+            record = json.loads(stored.decode() if isinstance(stored, bytes) else stored)
+            header = parse_for_switch(_decode_evidence_envelope(record))
         except Exception:
             continue
         result[header["stream_id"]] = record
@@ -177,6 +223,8 @@ def _cleanup(r, pod: str, tenant: str, agents: list[str]) -> None:
     ]
     if receive_unresolved_key is not None:
         keys.append(receive_unresolved_key(pod, tenant))
+    if receive_undeliverable_key is not None:
+        keys.append(receive_undeliverable_key(pod, tenant))
     r.delete(*keys)
 
 
@@ -692,6 +740,217 @@ def scenario_rehire_preserves_unresolved_evidence(r, pod: str, tenant: str) -> l
 
 
 # ---------------------------------------------------------------------------
+# Scenario 6 (phases shape only): retirement must not turn admitted custody
+# into ABSENCE. Reviewer's blocker on the parent 6c85c72 was that the
+# membership Lua DELETED ingress, processing, opening, and opened outright,
+# destroying the envelope and the phase evidence needed to classify its
+# outcome; that test asserted the old per-agent keys were empty afterward,
+# which proves CLEANUP, not PRESERVATION, and so pinned the harm rather than
+# catching it. This seeds one distinct, independently-named identity per
+# phase and reconciles where EACH ONE ended up, by identity.
+# ---------------------------------------------------------------------------
+
+def scenario_retirement_conserves_admitted_envelopes(r, pod: str, tenant: str) -> list[str] | None:
+    if _custody_shape() != "phases":
+        return None  # not applicable -- no opening/unresolved concept here
+    if stop_agent is None or receive_undeliverable_key is None:
+        return None  # not applicable -- this tree has no retirement path yet
+
+    sender, target = "harness-sender-6", "harness-recipient-6"
+    _setup(r, pod, tenant, [sender, target])
+    try:
+        # 1. One genuine, complete round trip FIRST, so `opened` is
+        #    populated by the real send/step/receive/open mechanics before
+        #    anything else is seeded -- receive()'s own opening-sweep-on-
+        #    startup would otherwise consume anything placed directly into
+        #    the opening key ahead of this.
+        opened_seen = []
+        with redirect_stdout(io.StringIO()):
+            opened_stream_id = send(
+                r, pod=pod, tenant=tenant, source=sender, destination=target,
+                payload={"text": "retirement-opened-target"},
+            )
+            switch = Switch(r, pod=pod, tenant=tenant, kick=lambda *a: None)
+            if not switch.step(timeout=1):
+                raise AssertionError("switch did not forward the opened-control envelope")
+            receive(
+                r, pod=pod, tenant=tenant, agent=target,
+                openers={"Message": opened_seen.append}, timeout=1, blocking=False,
+            )
+        if opened_stream_id not in {e["stream_id"] for e in opened_seen}:
+            return [
+                "HARNESS ERROR: control envelope was not opened normally before "
+                "seeding the other three phases -- the setup for this scenario "
+                "didn't behave as expected, narrowing the claim"
+            ]
+
+        # 2. Seed one distinct envelope directly into each of the other
+        #    three phase keys, built and encoded the same way
+        #    core.envelope.build()/encode() always do. Direct RPUSH, not
+        #    send()+Switch (which always targets ingress, and LMOVE always
+        #    takes the oldest item regardless of which envelope was
+        #    "intended") -- this is what keeps each phase's identity
+        #    unambiguous.
+        def _seed(key: str, name: str) -> str:
+            envelope = build("Message", sender, target, {"text": name}, pod=pod, tenant=tenant)
+            r.rpush(key, encode(envelope))
+            return envelope["stream_id"]
+
+        ingress_key = prefix(pod, tenant, target, "ingress")
+        processing_key = _processing_key(pod, tenant, target)
+        opening_key = _opening_key(pod, tenant, target)
+
+        ingress_stream_id = _seed(ingress_key, "retirement-ingress-target")
+        processing_stream_id = _seed(processing_key, "retirement-processing-target")
+        opening_stream_id = _seed(opening_key, "retirement-opening-target")
+
+        before_undeliverable = _undeliverable_stream_ids(r, pod, tenant)
+        before_unresolved = _unresolved_stream_ids(r, pod, tenant)
+
+        # 3. The real stop_agent -- not a description of it, not a
+        #    synthetic Lua stand-in.
+        with redirect_stdout(io.StringIO()):
+            stop_agent(
+                r, pod=pod, tenant=tenant, envelope={"payload": {"agent": target}},
+                kill_window=lambda agent: None,
+            )
+
+        failures: list[str] = []
+        after_undeliverable = _undeliverable_stream_ids(r, pod, tenant)
+        after_unresolved = _unresolved_stream_ids(r, pod, tenant)
+        opened_ids_after = _stream_ids_in(r.lrange(_opened_key(pod, tenant, target), 0, -1))
+
+        for stream_id, label in ((ingress_stream_id, "ingress"), (processing_stream_id, "processing")):
+            record = after_undeliverable.get(stream_id)
+            if record is None:
+                failures.append(
+                    f"CUSTODY LOST: {label} identity {stream_id} is not in tenant "
+                    "undeliverable after stop_agent -- retirement must not turn "
+                    "admitted custody into absence. undeliverable now holds: "
+                    f"{sorted(after_undeliverable)!r}"
+                )
+            elif record.get("agent") != target:
+                failures.append(
+                    f"MISATTRIBUTED: {label} identity {stream_id}'s undeliverable "
+                    f"record names agent {record.get('agent')!r}, expected {target!r}"
+                )
+            elif stream_id in before_undeliverable:
+                failures.append(
+                    f"HARNESS ERROR: {label} identity {stream_id} was already in "
+                    "undeliverable BEFORE stop_agent ran -- seeding collided with "
+                    "prior state, narrowing the claim"
+                )
+
+        record = after_unresolved.get(opening_stream_id)
+        if record is None:
+            failures.append(
+                f"CUSTODY LOST: opening identity {opening_stream_id} is not in "
+                "tenant unresolved after stop_agent -- an outcome-unknown "
+                "envelope must not become absence either. unresolved now holds: "
+                f"{sorted(after_unresolved)!r}"
+            )
+        elif record.get("agent") != target:
+            failures.append(
+                f"MISATTRIBUTED: opening identity {opening_stream_id}'s unresolved "
+                f"record names agent {record.get('agent')!r}, expected {target!r}"
+            )
+        elif opening_stream_id in before_unresolved:
+            failures.append(
+                f"HARNESS ERROR: opening identity {opening_stream_id} was already "
+                "in unresolved BEFORE stop_agent ran -- seeding collided with "
+                "prior state, narrowing the claim"
+            )
+        # A record in the wrong sink lies about what's known just as badly
+        # as no record at all: proven-not-begun must never read as
+        # outcome-unknown, and outcome-unknown must never read as proven.
+        if ingress_stream_id in after_unresolved or processing_stream_id in after_unresolved:
+            failures.append(
+                "MISCLASSIFIED: an ingress or processing identity (proven never "
+                "to have begun) landed in unresolved (outcome-unknown) instead "
+                "of undeliverable."
+            )
+        if opening_stream_id in after_undeliverable:
+            failures.append(
+                "MISCLASSIFIED: the opening identity (outcome unknown) landed in "
+                "undeliverable (proven-not-begun) instead of unresolved."
+            )
+        if opened_stream_id not in opened_ids_after:
+            failures.append(
+                f"EVIDENCE ERASED: opened identity {opened_stream_id} is gone "
+                "from the opened receipt list after stop_agent -- completed "
+                "effects must never be discarded on retirement."
+            )
+        for key, label in ((ingress_key, "ingress"), (processing_key, "processing"), (opening_key, "opening")):
+            remaining = r.llen(key)
+            if remaining:
+                failures.append(
+                    f"HARNESS ERROR: per-agent {label} key still has {remaining} "
+                    "item(s) after stop_agent -- expected the membership Lua to "
+                    "have moved everything out; narrowing the claim on the "
+                    "assertions above"
+                )
+
+        if failures:
+            return failures
+
+        # 4. A same-name successor must inherit none of the retired agent's
+        #    custody, and must not disturb the evidence stop_agent just
+        #    wrote for it.
+        evidence_before_undeliverable = r.lrange(receive_undeliverable_key(pod, tenant), 0, -1)
+        evidence_before_unresolved = r.lrange(_unresolved_key(pod, tenant), 0, -1)
+
+        _setup(r, pod, tenant, [target])  # re-hire under the same name
+        successor_opened = []
+        with redirect_stdout(io.StringIO()):
+            successor_stream_id = send(
+                r, pod=pod, tenant=tenant, source=sender, destination=target,
+                payload={"text": "retirement-successor-target"},
+            )
+            switch = Switch(r, pod=pod, tenant=tenant, kick=lambda *a: None)
+            switch.step(timeout=1)
+            receive(
+                r, pod=pod, tenant=tenant, agent=target,
+                openers={"Message": successor_opened.append}, timeout=1, blocking=False,
+            )
+
+        successor_opened_ids = {e["stream_id"] for e in successor_opened}
+        predecessor_ids = {ingress_stream_id, processing_stream_id, opening_stream_id, opened_stream_id}
+        if predecessor_ids & successor_opened_ids:
+            failures.append(
+                "SUCCESSOR INHERITED CUSTODY: the rehired agent's own fresh "
+                "receive() call opened one of the PREDECESSOR's stream_ids -- a "
+                "same-name successor must consume none of a retired "
+                "predecessor's custody."
+            )
+        if successor_stream_id not in successor_opened_ids:
+            failures.append(
+                f"HARNESS ERROR: the successor's own target envelope "
+                f"{successor_stream_id} was not opened normally -- the control "
+                "case for this half of the scenario didn't behave as expected, "
+                "narrowing the claim on the inheritance assertion above"
+            )
+
+        evidence_after_undeliverable = r.lrange(receive_undeliverable_key(pod, tenant), 0, -1)
+        evidence_after_unresolved = r.lrange(_unresolved_key(pod, tenant), 0, -1)
+        if evidence_after_undeliverable != evidence_before_undeliverable:
+            failures.append(
+                "EVIDENCE MUTATED: tenant undeliverable changed shape across a "
+                "same-name rehire -- retirement evidence must survive a "
+                "successor's ordinary operation untouched."
+            )
+        if evidence_after_unresolved != evidence_before_unresolved:
+            failures.append(
+                "EVIDENCE MUTATED: tenant unresolved changed shape across a "
+                "same-name rehire -- retirement evidence must survive a "
+                "successor's ordinary operation untouched."
+            )
+
+        return failures
+    finally:
+        _cleanup(r, pod, tenant, [sender, target])
+
+
+# ---------------------------------------------------------------------------
 # Scenario 3 (legacy shape): a durable write failing -- the dead-letter
 # RPUSH itself, for an envelope whose body fails to parse. _open_received's
 # malformed-frame path is not wrapped in any try/except on main, so this
@@ -926,6 +1185,8 @@ SCENARIOS = [
      scenario_death_after_opening),
     ("stopped-and-rehired agent preserves unrelated unresolved evidence (phases shape only)",
      scenario_rehire_preserves_unresolved_evidence),
+    ("retirement conserves admitted envelopes by phase, exactly-once by identity (phases shape only)",
+     scenario_retirement_conserves_admitted_envelopes),
     ("two concurrent default-namespace invocations do not collide",
      scenario_concurrent_invocations_do_not_collide),
 ]

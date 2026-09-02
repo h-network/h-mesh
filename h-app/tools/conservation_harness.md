@@ -27,6 +27,19 @@ envelope's own `stream_id` -- never by count. Five scenarios:
 5. A stopped-and-rehired agent name: must not inherit a predecessor's stuck
    custody, and must not erase a *different* identity's already-recorded
    unresolved evidence (phases shape only).
+6. Retirement itself (`lib.agentlifecycle.lifecycle.stop_agent`): must not
+   turn admitted custody into absence. Seeds one distinct identity in each
+   of `ingress`, `processing`, and `opening`, plus one genuinely completed
+   `opened` receipt, then calls the real `stop_agent` and asserts each
+   identity's EXACT final location -- `ingress`/`processing` in tenant
+   `undeliverable` (proven never to have begun), `opening` in tenant
+   `unresolved` (outcome unknown), `opened` untouched -- and separately
+   asserts each is not ALSO in the wrong sink, since a known non-effect
+   landing in `unresolved` lies about it just as badly as landing nowhere.
+   Then rehires the same name and asserts the successor inherits none of it
+   and the retirement evidence is byte-identical before and after (phases
+   shape only, and only where `stop_agent`/`receive_undeliverable_key`
+   exist on the tree under test).
 
 Every scenario that found loss was falsified by hand before being trusted:
 the underlying fix (or the harness's own detection logic) was deliberately
@@ -41,6 +54,16 @@ That is a distinct property, verified by `opener_classification_harness.py`
 instead; using this harness's clean transfer-mechanics result as evidence
 about opener correctness would repeat the exact blind spot that harness
 exists to close.
+
+Scenario 6 does not independently re-derive `stop_agent`'s own dedicated
+harm tests -- hostile non-UTF-8 raw bytes surviving hex-encoding exactly,
+and the read-only CLI's malformed-record handling being non-consuming
+(`tests/test_agentlifecycle.py::test_undeliverable_record_preserves_non_utf8_raw_exactly`,
+`tests/test_office_cli.py::test_undeliverable_malformed_record_is_reported_without_consuming`).
+Those were run directly against a real Redis on the same exact hash this
+scenario was verified against, and passed, but that is the suite's job, not
+this instrument's; duplicating it here would test the same claim twice
+without widening what's covered.
 
 ## Shape-detected, not hash-pinned
 
