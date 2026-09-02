@@ -161,7 +161,11 @@ class TmuxReconciler:
                 cmd.extend(["-c", cwd])
 
             if initial_window != "__init__":
-                write_agent_guide(cwd, initial_window, self.tenant, lead=lead, profile=profile, cli=cli)
+                all_members = members(r, pod=self.pod, tenant=self.tenant)
+                write_agent_guide(
+                    cwd, initial_window, self.tenant, lead=lead, profile=profile, cli=cli,
+                    enrolled_entrances=all_members,
+                )
                 if cli:
                     if resume is None:
                         should_resume = tmux_ops.has_session_history(initial_window, cli, profile=profile, cwd=cwd)
@@ -231,9 +235,10 @@ class TmuxReconciler:
         else:
             command = env_args + ["bash", "-il"]
 
+        all_members = members(r, pod=self.pod, tenant=self.tenant)
         ret, stdout, stderr = tmux_ops.create_window(
             self.session_name, agent_name, command=command, cwd=cwd, socket=self.socket,
-            lead=lead, profile=profile, cli=cli,
+            lead=lead, profile=profile, cli=cli, enrolled_entrances=all_members,
         )
         if ret == 0:
             self.log_window_created(r, agent_name)

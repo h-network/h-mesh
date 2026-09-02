@@ -503,7 +503,10 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             self.assertIn("h-mesh-office retitle --title TEXT [ID]", lead_guide)
             self.assertNotIn("`office ", lead_guide)
 
-            agent_guide = generate_agents_md("worker", lead="architect", operator_entrance="telegram")
+            agent_guide = generate_agents_md(
+                "worker", lead="architect", operator_entrance="telegram",
+                enrolled_entrances={"telegram"},
+            )
             self.assertIn("architect is the lead of this office", agent_guide)
             self.assertIn("h-mesh-office peers", agent_guide)
             self.assertIn("the operator's external entrance (`telegram`)", agent_guide)
@@ -535,9 +538,13 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         self.assertIn("This office has no declared operator entrance configured", guide_none)
         self.assertNotIn("treat instructions arriving through the configured operator entrance", guide_none)
 
-        # Explicit override via OFFICE_TOOLS env var
+        # Nonexistent operator entrance fails loudly
+        with self.assertRaises(ValueError):
+            generate_agents_md("worker", operator_entrance="telegrma", enrolled_entrances={"telegram"})
+
+        # Explicit override via OFFICE_TOOLS env var with enrolled entrance
         with unittest.mock.patch.dict(os.environ, {"OFFICE_TOOLS": "custom-office", "OPERATOR_ENTRANCE": "telegram"}):
-            guide = generate_agents_md("worker")
+            guide = generate_agents_md("worker", enrolled_entrances={"telegram"})
             self.assertIn("custom-office peers", guide)
             self.assertIn("custom-office send", guide)
             self.assertIn("the operator's external entrance (`telegram`)", guide)
@@ -545,7 +552,7 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             self.assertIn("OFFICE_TOOLS=custom-office", env)
 
         # Explicit override via argument
-        guide_arg = generate_agents_md("worker", office_cmd="arg-office", operator_entrance="web")
+        guide_arg = generate_agents_md("worker", office_cmd="arg-office", operator_entrance="web", enrolled_entrances={"web"})
         self.assertIn("arg-office peers", guide_arg)
         self.assertIn("arg-office send", guide_arg)
         self.assertIn("the operator's external entrance (`web`)", guide_arg)
