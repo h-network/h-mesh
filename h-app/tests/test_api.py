@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import io
 import json
@@ -21,6 +22,88 @@ from core.keys import prefix
 from modules.api import server as server_module
 from modules.api.port import deliver_api
 from modules.api.server import ApiSettings, create_app
+
+
+def _reason_argument_violations(source: str) -> list[str]:
+    """Syntactic invariant, not a runtime one: every `reason` argument at
+    every call to `_record(...)` in `source` must be a string/None
+    constant, a reference to a module-level name that is ONLY EVER
+    assigned string/None constants anywhere in the module, or a call to a
+    same-module function whose every `return` is itself one of those two
+    things. Deliberately no control-flow modelling (no branch, loop, or
+    exception reasoning) -- a name or function is "safe" only if EVERY
+    assignment or return anywhere in the module qualifies, independent of
+    which branch actually runs. That conservatism is the point: it can
+    only be too strict, never miss a dynamic value by assuming a branch
+    won't be taken.
+    """
+    tree = ast.parse(source)
+
+    def is_literal(node: ast.AST) -> bool:
+        return isinstance(node, ast.Constant) and (node.value is None or isinstance(node.value, str))
+
+    def returns_of(func_node: ast.FunctionDef) -> list[ast.AST]:
+        found: list[ast.AST] = []
+
+        class _ReturnCollector(ast.NodeVisitor):
+            def visit_FunctionDef(self, node):
+                pass  # do not attribute a nested def's returns to this one
+
+            def visit_AsyncFunctionDef(self, node):
+                pass
+
+            def visit_Lambda(self, node):
+                pass
+
+            def visit_Return(self, node):
+                found.append(node.value)
+                self.generic_visit(node)
+
+        collector = _ReturnCollector()
+        for stmt in func_node.body:
+            collector.visit(stmt)
+        return found
+
+    literal_only_functions = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and (rets := returns_of(node))
+        and all(is_literal(r) for r in rets)
+    }
+
+    literal_only_names: set[str] = set()
+    dynamic_names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    (literal_only_names if is_literal(node.value) else dynamic_names).add(target.id)
+    literal_only_names -= dynamic_names
+
+    def is_safe(node: ast.AST) -> bool:
+        if is_literal(node):
+            return True
+        if isinstance(node, ast.Name):
+            return node.id in literal_only_names
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            return node.func.id in literal_only_functions
+        if isinstance(node, ast.IfExp):
+            return is_safe(node.body) and is_safe(node.orelse)
+        return False
+
+    violations = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_record"):
+            continue
+        reason_node = next((kw.value for kw in node.keywords if kw.arg == "reason"), None)
+        if reason_node is None and len(node.args) >= 4:
+            reason_node = node.args[3]
+        if reason_node is None:
+            continue  # not provided -- defaults to None, safe
+        if not is_safe(reason_node):
+            violations.append(f"line {node.lineno}: {ast.dump(reason_node)}")
+    return violations
 
 
 class FakeRedis:
@@ -343,16 +426,16 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn(marker, out2.getvalue())
 
     def test_reply_correlation_and_dead_letter_reasons_are_always_closed_literals(self):
-        """Answers architect's question after reviewer's second find on
-        this same function: is the search PREDICATE fixed now, or only its
-        two known outputs? Fuzzes every branch of both log-reaching paths
-        in this module with adversarial values, not just reviewer's one
-        marker, and asserts every resulting `reason` is a member of the
-        closed, hardcoded literal set. A THIRD interpolation site anywhere
-        in this module would fail this test regardless of what the leaked
-        value looked like -- the actual guarantee "closed literals only"
-        is supposed to give is not "these two are fixed" but "there is no
-        runtime value between the code and this field at all"."""
+        """EXAMPLE-LEVEL coverage, not a module-wide guarantee -- reviewer's
+        exact correction: this drives every branch that exists TODAY (the
+        ones enumerated below) with adversarial values and confirms none of
+        them currently leak. It has no mechanism to discover a NEW caller
+        added elsewhere in the file, so it cannot and does not prove "any
+        third site would fail" -- that claim belongs to
+        test_every_reason_argument_in_port_py_is_a_closed_literal_or_a_verified_helper
+        below, which inspects the source directly. Keep both: this one
+        pins today's specific branches' actual runtime output; the AST
+        test enforces the module-wide shape going forward."""
         closed_reasons = {
             None,
             "malformed in_reply_to",
@@ -430,6 +513,40 @@ class ApiTests(unittest.TestCase):
                 deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
             self.assertNotIn(marker, out.getvalue())
             self.assertLessEqual(reasons_from(out.getvalue()), closed_reasons)
+
+    def test_every_reason_argument_in_port_py_is_a_closed_literal_or_a_verified_helper(self):
+        """The real source-level invariant reviewer asked for, after
+        proving the fuzz test above can't discover a NEW caller: adding
+
+            def _future_log_path(remote_value: str) -> None:
+                _record("future", {}, "api", reason=f"remote value: {remote_value}")
+
+        anywhere in modules/api/port.py left the fuzz test green, because
+        it only drives branches this file's author already knew about.
+        This instead parses port.py's actual source and inspects every
+        `reason` argument reaching `_record(...)`, by syntax, not by
+        exercising it at runtime -- deliberately NOT modelling control
+        flow (no branch/loop/exception semantics), only asking: is this
+        argument expression a plain string constant, a reference to a name
+        assigned ONLY string constants anywhere in the module, or a call to
+        a function defined in this same file whose every `return` is
+        itself one of those two things? Reviewer's exact counterexample is
+        the harm test: fed as a source string (not written to disk), it
+        must be flagged."""
+        source = (H_APP / "modules" / "api" / "port.py").read_text()
+        violations = _reason_argument_violations(source)
+        self.assertEqual(violations, [], f"unverified reason argument(s): {violations}")
+
+        hostile_source = source + (
+            "\n\n"
+            "def _future_log_path(remote_value: str) -> None:\n"
+            '    _record("future", {}, "api", reason=f"remote value: {remote_value}")\n'
+        )
+        hostile_violations = _reason_argument_violations(hostile_source)
+        self.assertTrue(
+            hostile_violations,
+            "the checker must flag reviewer's exact counterexample -- it did not",
+        )
 
     def _tamper_in_reply_to(self, envelope, value):
         """Bypass build()/encode()'s strict validation to simulate an
