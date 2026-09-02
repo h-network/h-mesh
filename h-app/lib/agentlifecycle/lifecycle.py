@@ -96,6 +96,16 @@ redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
 return 1
 """
 
+# tools/conservation_harness.py's retirement-conservation scenario assumes
+# this is one of exactly two scripts (the other is core/channels.py's
+# _TRANSFER_RECEIVE_CUSTODY) that ever move a raw ENVELOPE (something with
+# a `stream_id`, sourced from KEYS[3]/[4]/[5] processing/opening/ingress)
+# out of custody -- a new envelope-shaped destination added here needs
+# that instrument's sink list updated too (see tools/conservation_harness.md).
+# The inbox-conservation branch below is NOT that: it moves stream ENTRIES
+# (keyed by `entry_id`, sourced from KEYS[20], a disjoint identifier space
+# with no `stream_id` at all) and does not need that instrument's scan to
+# reach it -- see the .md for why that's a real distinction, not a gap.
 _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA = """
 -- Atomic through deterministic preflight, not because EVAL rolls back (it
 -- does not). Validate every type-sensitive source and destination, snapshot

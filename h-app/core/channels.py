@@ -46,6 +46,12 @@ redis.call('HSET', KEYS[1], ARGV[1], cjson.encode({count=count, since=since}))
 return count
 """
 
+# tools/conservation_harness.py's retirement-conservation scenario assumes
+# this is one of exactly two scripts (the other is
+# lib/agentlifecycle/lifecycle.py's _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA)
+# that ever move a raw envelope out of processing/opening custody -- a new
+# destination added to a call site of this script needs that instrument's
+# sink list updated too (see tools/conservation_harness.md).
 _TRANSFER_RECEIVE_CUSTODY = """
 -- core receive custody transfer v1
 for _, key in ipairs(KEYS) do
