@@ -49,21 +49,24 @@ SSE_KEEPALIVE_INTERVAL_S = 3.0
 # CPU: 0.21% baseline to 2.88% at 100 concurrent streams.
 # THE ASSUMPTION THIS RESTS ON IS A NUMBER, NOT AN ARCHITECTURE: the total
 # count of concurrently open SSE responses against this server, summed
-# across every tab, panel, and process, stays single-digit to low-tens in
-# practice -- not hundreds. That total already includes three concurrent
-# streams per open console tab today (activity, alerts, messages -- one
-# ResumableFeed each, see clients/web/app.js), not one; the assumption
-# accounts for that, it does not exclude it. 100 was tested as roughly 10x
-# the realistic total, deliberately, to leave margin.
-# IF THE REAL TOTAL IS HEADING TOWARD THAT TESTED CEILING -- however it
-# gets there: more console tabs open at once than assumed here, more
-# feeds/panels added per tab, a stream opened per agent within a client
-# instead of one shared feed, or tenant concurrency otherwise climbing
-# toward the 100s -- stop and count the actual number of concurrently open
-# streams, and if it's approaching 100, re-run this measurement first,
-# same method (docker-stats CPU, Redis COMMANDSTATS calls/usec, a separate
-# client's PING latency) at that concurrency. Don't assume linear-but-cheap
-# stays cheap at 10x the scale it was last measured at; it stays linear,
+# across every tab, panel, and process, stays around 10 in practice (one
+# telegram bot process plus roughly three open console tabs at three
+# streams each -- activity, alerts, messages, one ResumableFeed each, see
+# clients/web/app.js) -- not hundreds. That reference count already
+# includes the three-per-tab reality, it does not exclude it. 100 was
+# tested as roughly 10x that reference count, deliberately, to leave
+# margin -- it is the top of what was actually measured, not a discovered
+# capacity limit; nothing above 100 was tried.
+# IF THE REAL TOTAL IS CLIMBING TOWARD THE EDGE OF THAT MEASURED RANGE --
+# however it gets there: more console tabs open at once than assumed here,
+# more feeds/panels added per tab, a stream opened per agent within a
+# client instead of one shared feed, or tenant concurrency otherwise
+# climbing toward the 100s -- stop and count the actual number of
+# concurrently open streams, and if it's approaching 100, re-run this
+# measurement first, same method (docker-stats CPU, Redis COMMANDSTATS
+# calls/usec, a separate client's PING latency) at that concurrency. Don't
+# assume linear-but-cheap stays cheap at 10x the scale it was last measured
+# at; it stays linear,
 # which is not the same thing.
 SSE_POLL_INTERVAL_S = 0.1
 ATTACHMENT_MAX_BYTES = 10_485_760
