@@ -1039,7 +1039,10 @@ def _add_command(argv: list[str]) -> None:
     r, pod, tenant, source = _context()
     if not is_member(r, pod=pod, tenant=tenant, agent=args.agent):
         raise OfficeError(f"unknown destination agent {args.agent!r}")
-    ticket_id = os.urandom(4).hex()
+    # Allocate the established 32-lowercase-hex identity locally. This state is
+    # ALLOCATED; send returning below advances the envelope to ADMITTED, while
+    # only downstream custody can prove the board ticket was CREATED.
+    ticket_id = os.urandom(16).hex()
     payload = {
         "v": 1,
         "id": ticket_id,
