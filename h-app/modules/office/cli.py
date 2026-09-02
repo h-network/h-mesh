@@ -637,7 +637,12 @@ def _transition_selected(
 
 
 def _rewrite_selected(r, *, key: str, raw, replacement) -> None:
-    """Atomically rewrite one exact list entry without changing its position."""
+    """Rewrite one exact entry without a partial multi-command state.
+
+    LRANGE preflights list type and finds the index before the only mutation,
+    LSET. Nothing mutating follows LSET, so a later command cannot expose a
+    partially applied rewrite.
+    """
     if not r.eval(_ATOMIC_REWRITE, 1, key, raw, replacement):
         raise OfficeError("task changed while the command was running; try again")
 
