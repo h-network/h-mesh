@@ -203,47 +203,10 @@ window created, `pane_current_command=claude`, connected to
 predates the fix and reflected the documented manual-`PATH`-prepend
 workaround; rerun after the merge to get a clean-install result.
 
-## lead-replacement.sh (retired)
 
-This executable scenario was removed when dynamic leadership transfer was
-removed. It is retained only as a historical heading; there is no command,
-probe list, or current retirement claim here.
+## lead-replacement.sh (removed)
 
-The former six transfer probes were removed with the executable; this note
-makes no claim about current leadership-retirement behavior.
-   sequence, issued from its own pane, survive past the pane's death and
-   come back as lead (not just alive)? **Yes** — `hire`/`letGo` are
-   fire-and-forget bus sends (`modules/office/cli.py`), not synchronous
-   in-process actions, so both envelopes are already durably enqueued
-   before the actual (asynchronous) window-kill could ever interrupt the
-   issuing shell. Verified live: a real self-issued retire+rehire produces
-   a live replacement window whose `AGENTS.md` is the lead version.
-2. **The lead brief (retired).** Transfer probes are retired; the first hire
-   lead-specific paragraph? **Yes, deliberately now** — verified for both a
-   now receives the lead guide and later hires preserve the incumbent.
-3. **(Historical) The lead registry key.** The old probe asked whether `StopAgent` clear it. **It was
-   right now, in both directions** — verified live: retiring a
-   *non-current* lead (leadership already transferred elsewhere) leaves the
-   key alone; retiring the *current* lead clears it to empty. The Lua
-   compare-then-delete (`_REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA`) does exactly
-   what its name says.
-4. **(Historical) Alert routing during the gap.** The old probe covered two cases. While the lead is
-   fully retired (unregistered): `_notify_lead()` now logs a structured
-   `lead_alert_no_lead` record with a reason before returning — verified
-   live, fix confirmed, no more silent drop. While registered but the
-   window is transiently missing (deliberately unchanged): the alert is
-   still durably admitted to ingress first, then immediately dead-lettered
-   (`window_missing`) — not queued for later, no automatic replay when the
-   window recovers; this is a real dead-letter, unit-tested elsewhere via
-   the real (unmocked) `deliver_tmux`/`DeadLetter` path.
-5. **Board survival.** Does `stop_agent` purge the lead's task board?
-   **No** — confirmed both by reading `stop_agent()` (never touches
-   `tasks.*` keys) and live: a seeded ticket survives retirement intact.
-   Not a bug, never was.
-6. **In-flight messages across the gap.** A normal message sent to the
-   fully-retired (unregistered) lead is dead-lettered by the switch itself
-   (`"destination is not in tenant registry"`) — never reaches an ingress
-   queue, and isn't queued for the eventual replacement either, but there
-   IS a custody record. Architect treated this as consistent with an
-   earlier decision not to build dead-letter replay machinery — accepted
-   behavior, not routed as a bug.
+This scenario verified dynamic leadership transfer, which no longer exists.
+The `--lead` flag was removed: the first tmux hire claims the lead when the
+lead key is absent, and later hires preserve the incumbent. See
+`h-app/lib/agentlifecycle/README.md` for current behaviour.
