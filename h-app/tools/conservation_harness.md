@@ -32,10 +32,12 @@ envelope's own `stream_id` -- never by count. Five scenarios:
    EXACTLY ONE terminal location, never zero, never more than one. Seeds one
    distinct identity in each of `ingress`, `processing`, and `opening`, plus
    one genuinely completed `opened` receipt, calls the real `stop_agent`,
-   then counts every occurrence of each seeded identity across EVERY real
-   terminal custody sink combined -- tenant `undeliverable`, tenant
-   `unresolved`, the target's own `opened`, and the target's own `dead`
-   (see `_stream_id_occurrences`,
+   then counts every occurrence of each seeded identity across the four
+   terminal custody sinks this file's own trace found (tenant
+   `undeliverable`, tenant `unresolved`, the target's own `opened`, the
+   target's own `dead` -- see below for what makes that trace exhaustive
+   at this hash, and what would invalidate it) combined (see
+   `_stream_id_occurrences`,
    which keeps every parsed record rather than indexing by identity -- a
    dict/set collapses two occurrences into one and cannot prove
    "exactly once" at all, only "at least one"). Absence, more-than-one, and
@@ -69,9 +71,35 @@ reproduction -- append a genuine undeliverable record's raw envelope
 directly to the target's own `dead` list after a normal retirement --
 reported clean before this fix. Added `dead` to the scan; confirmed the
 same reproduction is RED against the pre-fix code and GREEN against this
-one. This is the second time this file's own detection logic has been the
+one. This is the third time this file's own detection logic has been the
 false-negative, not the thing it was pointed at -- see
 `_decode_evidence_envelope`'s docstring for the first.
+
+⚠ WHAT MAKES THE FOUR-SINK LIST A CHECKABLE CLAIM, NOT A FOURTH GUESS: after
+the `dead` gap, the question was whether the sink list is complete or just
+hasn't been caught missing a fifth yet. Traced rather than guessed: exactly
+TWO Lua scripts in this whole tree ever move a raw envelope out of
+processing/opening custody -- `_TRANSFER_RECEIVE_CUSTODY` (`core/channels.py`)
+and `_REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA` (`lib/agentlifecycle/lifecycle.py`).
+Every call site of both was read completely. `_TRANSFER_RECEIVE_CUSTODY` has
+four call sites (three inside `_open_received`, one in `receive()`'s
+successor-recovery sweep), naming exactly three destinations across all of
+them: `dead`, `unresolved`, `opened`. `_REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA`
+has one call site (`stop_agent`), naming exactly two: `undeliverable`,
+`unresolved`. The union is the same four this scenario scans, and no fifth
+appears anywhere in either script's call sites.
+
+That trace is exhaustive AT THIS HASH -- it is not something this instrument
+derives itself, and that is the limit to state plainly rather than imply
+past: **this scenario assumes there are only two scripts that ever move a
+raw envelope out of custody.** If a third one is added, or either script
+grows a new destination, this scan goes stale exactly the way it did three
+times already, and nothing here would catch that drift automatically.
+Deriving the sink list from the source itself (AST-reading both scripts'
+call sites, the way `_custody_shape()` already inspects `_open_received`'s
+signature and `_transfer_script()` resolves the Lua constant by identity)
+would close this permanently -- recorded as a real, separate follow-up, not
+started here.
 
 ## What it does NOT reach
 
