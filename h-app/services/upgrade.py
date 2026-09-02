@@ -116,7 +116,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     print()
 
     print("Stopping existing daemons (if any)...")
-    stop_daemons(config.run_dir)
+    stop_daemons(config.run_dir, env=config.env)
     print()
 
     config.tmux_tmpdir.mkdir(parents=True, exist_ok=True)

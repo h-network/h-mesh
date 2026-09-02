@@ -158,7 +158,14 @@ that refresh would mean killing live agent sessions on every upgrade.
 `h-mesh-start` (`services.daemons`) starts the same daemons without pulling
 or reinstalling -- useful after a crash, or on a host where they aren't
 running yet. It's also duplicate-safe: a daemon it finds already alive (via
-its pidfile) is left running rather than started a second time. A start is
+its authenticated pidfile) is left running rather than started a second time.
+Pidfiles are paired with the Linux process start time, and daemon management
+opens a Linux pidfd before authentication then signals through that same process
+handle, so a reused numeric PID cannot redirect a signal to an unrelated
+process. If ownership cannot be
+proved, daemon management fails closed and reports the condition without
+signalling; a stale PID that demonstrably belongs to another process is treated
+as the normal “daemon not running” state. A start is
 atomic with respect to processes that invocation creates: they are reported
 as started only after surviving the startup health window, and if any one
 fails, all newly created siblings are stopped. Processes found running before

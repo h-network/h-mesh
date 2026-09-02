@@ -1,4 +1,6 @@
+import json
 import os
+import signal
 import shutil
 import socket
 import subprocess
@@ -96,12 +98,14 @@ def test_start_daemons_then_stop_daemons_cleanly():
         for name, pid in pids.items():
             assert pid_alive(pid), f"{name} (pid {pid}) not alive right after start"
             assert (run_dir / f"{name}.pid").read_text().strip() == str(pid)
+            assert (run_dir / f"{name}.pid.identity").exists()
             assert (run_dir / f"{name}.log").exists()
 
         stop_daemons(run_dir)
         for name, pid in pids.items():
             assert not pid_alive(pid), f"{name} (pid {pid}) still alive after stop"
             assert not (run_dir / f"{name}.pid").exists()
+            assert not (run_dir / f"{name}.pid.identity").exists()
 
         # Idempotent: stopping again (nothing running, no pidfiles) is a no-op.
         stop_daemons(run_dir)
@@ -140,6 +144,230 @@ def test_stop_daemons_removes_stale_pidfile_without_error():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_stop_daemons_does_not_signal_an_unrelated_live_process(tmp_path):
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+    pidfile = tmp_path / "switch.pid"
+    pidfile.write_text(f"{unrelated.pid}\n")
+    (tmp_path / "switch.pid.identity").write_text(json.dumps({
+        "v": 1,
+        "pid": unrelated.pid,
+        "name": "switch",
+        "module": "core.service",
+        # Deliberately not this live process's start time: the daemon that
+        # owned the numeric PID has exited and the kernel reused its number.
+        "start_time": "0",
+    }))
+    try:
+        stop_daemons(tmp_path)
+
+        assert unrelated.poll() is None, (
+            "an unrelated process named by a stale daemon pidfile was signalled"
+        )
+        assert not pidfile.exists()
+    finally:
+        if unrelated.poll() is None:
+            unrelated.kill()
+        unrelated.wait(timeout=5)
+
+
+def test_legacy_daemon_is_authenticated_then_stopped_during_first_upgrade():
+    _skip_unless_redis()
+    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_daemons_legacy_")
+    run_dir = Path(tmpdir) / "run"
+    env = _env(f"testpod-{os.urandom(4).hex()}", f"testtenant-{os.urandom(4).hex()}", tmpdir)
+    pids = {}
+    try:
+        pids = start_daemons(
+            python=Path(sys.executable), run_dir=run_dir, env=env,
+        )
+        for name in pids:
+            (run_dir / f"{name}.pid.identity").unlink()
+
+        stop_daemons(run_dir, env=env)
+
+        assert all(not pid_alive(pid) for pid in pids.values())
+    finally:
+        _kill_and_cleanup(run_dir, tmpdir, env)
+
+
+def test_stop_daemons_fails_closed_when_process_identity_cannot_be_read(tmp_path):
+    import services.daemons as daemons_mod
+
+    pidfile = tmp_path / "switch.pid"
+    pidfile.write_text("1234\n")
+    (tmp_path / "switch.pid.identity").write_text(json.dumps({
+        "v": 1,
+        "pid": 1234,
+        "name": "switch",
+        "module": "core.service",
+        "start_time": "999",
+    }))
+    logs = []
+    read_fd, write_fd = os.pipe()
+    with (
+        patch.object(daemons_mod.os, "pidfd_open", return_value=read_fd),
+        patch.object(daemons_mod, "_process_start_time", return_value=None),
+        patch.object(daemons_mod.signal, "pidfd_send_signal") as send_signal,
+    ):
+        stop_daemons(tmp_path, log=logs.append)
+    os.close(write_fd)
+
+    send_signal.assert_not_called()
+    assert pidfile.exists()
+    assert any("cannot verify" in message and "refusing to signal" in message for message in logs)
+
+
+def test_stop_daemons_fails_closed_when_pidfds_are_unavailable(monkeypatch, tmp_path):
+    import services.daemons as daemons_mod
+
+    pidfile = tmp_path / "switch.pid"
+    pidfile.write_text(f"{os.getpid()}\n")
+    monkeypatch.delattr(daemons_mod.os, "pidfd_open")
+    with patch.object(daemons_mod.os, "kill") as numeric_kill:
+        stop_daemons(tmp_path)
+
+    numeric_kill.assert_not_called()
+    assert pidfile.exists()
+
+
+def test_authenticated_daemon_is_signalled_through_pidfd_not_numeric_pid(
+    monkeypatch, tmp_path,
+):
+    """Prove signalling cannot resolve a possibly reused numeric PID."""
+    import services.daemons as daemons_mod
+
+    daemon = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        start_new_session=True,
+    )
+    pidfile = tmp_path / "switch.pid"
+    pidfile.write_text(f"{daemon.pid}\n")
+    (tmp_path / "switch.pid.identity").write_text(json.dumps({
+        "v": 1,
+        "pid": daemon.pid,
+        "name": "switch",
+        "module": "core.service",
+        "start_time": daemons_mod._process_start_time(daemon.pid),
+    }))
+    real_kill = os.kill
+
+    def forbid_numeric_signal(pid, sig):
+        if sig in (signal.SIGTERM, signal.SIGKILL):
+            raise AssertionError(f"numeric signal {sig} attempted for pid {pid}")
+        return real_kill(pid, sig)
+
+    monkeypatch.setattr(daemons_mod.os, "kill", forbid_numeric_signal)
+    try:
+        stop_daemons(tmp_path)
+
+        assert daemon.poll() is not None, "the authenticated daemon was not stopped"
+    finally:
+        if daemon.poll() is None:
+            real_kill(daemon.pid, signal.SIGKILL)
+        daemon.wait(timeout=5)
+
+
+@pytest.mark.parametrize("signal_error", [AttributeError("unavailable"), OSError("denied")])
+def test_pidfd_signal_failure_retains_evidence_and_never_falls_back(
+    signal_error, tmp_path,
+):
+    import services.daemons as daemons_mod
+
+    pidfile = tmp_path / "switch.pid"
+    identity_file = tmp_path / "switch.pid.identity"
+    pidfile.write_text("1234\n")
+    identity_file.write_text("identity evidence\n")
+    read_fd, write_fd = os.pipe()
+    logs = []
+    try:
+        with (
+            patch.object(
+                daemons_mod, "_open_owned_pidfd", return_value=(read_fd, "owned")
+            ),
+            patch.object(
+                daemons_mod.signal, "pidfd_send_signal", side_effect=signal_error
+            ),
+            patch.object(daemons_mod.os, "kill") as numeric_kill,
+        ):
+            stop_daemons(tmp_path, log=logs.append)
+    finally:
+        os.close(write_fd)
+
+    numeric_kill.assert_not_called()
+    assert pidfile.read_text() == "1234\n"
+    assert identity_file.read_text() == "identity evidence\n"
+    assert any("cannot safely signal" in message for message in logs)
+    assert not any(": stopped" in message for message in logs)
+
+
+def test_post_sigkill_timeout_retains_evidence_and_reports_unverified_exit(
+    monkeypatch, tmp_path,
+):
+    import services.daemons as daemons_mod
+
+    pidfile = tmp_path / "switch.pid"
+    identity_file = tmp_path / "switch.pid.identity"
+    pidfile.write_text("1234\n")
+    identity_file.write_text("identity evidence\n")
+    read_fd, write_fd = os.pipe()
+    logs = []
+    monkeypatch.setattr(daemons_mod, "STOP_TIMEOUT_SECONDS", 0)
+    try:
+        with (
+            patch.object(
+                daemons_mod, "_open_owned_pidfd", return_value=(read_fd, "owned")
+            ),
+            patch.object(daemons_mod.select, "select", return_value=([], [], [])),
+            patch.object(daemons_mod.signal, "pidfd_send_signal") as pidfd_signal,
+            patch.object(daemons_mod.os, "kill") as numeric_kill,
+        ):
+            stop_daemons(tmp_path, log=logs.append)
+    finally:
+        os.close(write_fd)
+
+    assert [call.args[1] for call in pidfd_signal.call_args_list] == [
+        signal.SIGTERM,
+        signal.SIGKILL,
+    ]
+    numeric_kill.assert_not_called()
+    assert pidfile.read_text() == "1234\n"
+    assert identity_file.read_text() == "identity evidence\n"
+    assert any("cannot verify pid 1234 exited after SIGKILL" in message for message in logs)
+    assert not any(": stopped" in message for message in logs)
+
+
+def test_pidfd_processlookup_cleans_up_stale_evidence_without_numeric_signal(tmp_path):
+    import services.daemons as daemons_mod
+
+    pidfile = tmp_path / "switch.pid"
+    identity_file = tmp_path / "switch.pid.identity"
+    pidfile.write_text("1234\n")
+    identity_file.write_text("identity evidence\n")
+    read_fd, write_fd = os.pipe()
+    try:
+        with (
+            patch.object(
+                daemons_mod, "_open_owned_pidfd", return_value=(read_fd, "owned")
+            ),
+            patch.object(
+                daemons_mod.signal,
+                "pidfd_send_signal",
+                side_effect=ProcessLookupError,
+            ),
+            patch.object(daemons_mod.os, "kill") as numeric_kill,
+        ):
+            stop_daemons(tmp_path)
+    finally:
+        os.close(write_fd)
+
+    numeric_kill.assert_not_called()
+    assert not pidfile.exists()
+    assert not identity_file.exists()
+
+
 def test_start_daemons_raises_daemon_error_when_module_is_broken(monkeypatch):
     tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_daemons_")
     run_dir = Path(tmpdir) / "run"
@@ -167,6 +395,12 @@ def test_failed_start_rolls_back_only_daemons_started_by_this_call(monkeypatch, 
     (tmp_path / "existing.pid").write_text("99\n")
     alive = {99: True, 101: True, 102: False}
     monkeypatch.setattr(daemons_mod, "pid_alive", lambda pid: alive[pid])
+    monkeypatch.setattr(
+        daemons_mod,
+        "_open_owned_pidfd",
+        lambda pid, *_args: ((999, "owned") if pid == 99 else (None, "mismatch")),
+    )
+    monkeypatch.setattr(daemons_mod.os, "close", lambda _fd: None)
 
     logs = []
     with patch.object(daemons_mod, "_stop_one") as stop_one:
@@ -184,8 +418,8 @@ def test_failed_start_rolls_back_only_daemons_started_by_this_call(monkeypatch, 
             )
 
     assert stop_one.call_args_list == [
-        call("new-a", tmp_path / "new-a.pid", log=ANY),
-        call("new-b", tmp_path / "new-b.pid", log=ANY),
+        call("new-a", tmp_path / "new-a.pid", log=ANY, env=ANY),
+        call("new-b", tmp_path / "new-b.pid", log=ANY, env=ANY),
     ]
     assert not any(": started" in message for message in logs)
 
