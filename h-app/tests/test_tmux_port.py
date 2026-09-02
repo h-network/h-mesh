@@ -18,7 +18,7 @@ if str(H_APP) not in sys.path:
 
 from core.channels import send
 from core.envelope import parse
-from core.keys import prefix
+from core.keys import incarnation_key, prefix
 from modules.tmux import (
     attachment_opener,
     command_opener,
@@ -161,6 +161,13 @@ class FakeRedis:
                 value = {"count": 1, "since": since}
             self.hset(key, client, json.dumps(value, separators=(",", ":")))
             return value["count"]
+        if "reply_correlation verify delivery" in script:
+            incarnation_key, claim_key = keys
+            expected = argv[0]
+            current = self.get(incarnation_key)
+            if current is None or current != expected:
+                return None
+            return self.get(claim_key)
         raise AssertionError(f"unexpected Lua script: {script}")
 
 
@@ -203,6 +210,11 @@ class TmuxPortTests(unittest.TestCase):
         # pane, so a later --reply-to naming this id must not validate.
         from lib.reply_correlation import was_delivered
 
+        # An established incarnation for bob, so the eventual False below is
+        # proven by the failed-paste protection this test names, not merely
+        # by the absence of an incarnation (a different, unrelated reason
+        # was_delivered would also return False for).
+        self.redis.set(incarnation_key(POD, TENANT, "bob"), "test-incarnation")
         self.register(alice="tmux", bob="tmux")
         stream_id = send(
             self.redis, pod=POD, tenant=TENANT, source="alice",
