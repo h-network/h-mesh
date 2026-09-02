@@ -188,6 +188,7 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
         # with no other change. One retry covers that cheaply; a second
         # failure is treated as real.
         h_agent_installed=0
+        h_agent_install_statuses=()
         for attempt in 1 2; do
             echo "  h-agent not found -- installing via its own installer (attempt $attempt/2)..."
             if command -v curl >/dev/null 2>&1; then
@@ -196,6 +197,7 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
                 wget -qO- "$H_AGENT_URL" | bash
             fi
             h_agent_install_status=$?
+            h_agent_install_statuses+=("$h_agent_install_status")
             # ⚠ h-agent's installer only updates ~/.bashrc/~/.profile, for
             # FUTURE shells -- it never touches this process's own PATH. Left
             # alone, the daemons this same run starts later (which is what
@@ -223,6 +225,25 @@ if [ "$SKIP_DEPS" -eq 0 ]; then
         # can exit 0 and still not place the binary where this expects it.
         if [ "$h_agent_installed" -ne 1 ]; then
             echo "error: h-agent installer failed twice (last exit $h_agent_install_status) -- h-agent is still not on PATH or at ${PREFIX:-$HOME/.local}/bin/h-agent." >&2
+            # ⚠ Report the exit-status OBSERVATION only, never a conclusion
+            # drawn from it, and never upstream's message text (matching a
+            # phrase from an installer we don't own is a dependency on a
+            # string nobody promised us -- the same "trust a moving external
+            # thing exactly" shape as the agy version pin that produced this
+            # exact incident). Reviewer FAILED an earlier version of this
+            # exact line for calling two equal exit codes "identical" and
+            # "non-transient": h-agent's own installer already exits 1 for
+            # MULTIPLE distinct causes (claude/codex/agy each have their own
+            # exit-1 verification-failed path), so two attempts returning
+            # the same number proves only that -- not that the underlying
+            # cause was the same, not that it's deterministic, and not that
+            # a third attempt or an upstream/host fix is what's needed. The
+            # honest, useful thing to tell the operator is what we DON'T
+            # know and what to do about it: look at the actual output above.
+            if [ "${#h_agent_install_statuses[@]}" -eq 2 ] \
+                && [ "${h_agent_install_statuses[0]}" = "${h_agent_install_statuses[1]}" ]; then
+                echo "  Both attempts exited with status ${h_agent_install_statuses[0]}. setup.sh cannot tell from the exit status alone whether both attempts failed for the same reason -- check the installer output above before deciding whether to retry or to change something on this host or upstream." >&2
+            fi
             echo "  Install it manually (see $H_AGENT_URL) and re-run setup.sh." >&2
             exit 1
         fi

@@ -42,6 +42,21 @@ def _fake_h_agent_installer(tmpdir: str, *, behavior: str) -> str:
                               where re-running the same installer by hand
                               right after a failure succeeded with no
                               other change.
+      "fail_differently"   -- exits 1 on the first invocation, 42 on the
+                              second, neither placing h-agent -- a
+                              deliberately NON-identical pair of failures,
+                              so the equal-exit-status reporting only fires
+                              when the codes actually match.
+      "fail_same_code_different_cause" -- exits 1 BOTH times, neither
+                              placing h-agent, but prints different stderr
+                              text each time (h-agent's real installer
+                              exits 1 for multiple distinct causes --
+                              claude/codex/agy each have their own
+                              verification-failed path). The counterexample
+                              that breaks a message claiming equal exit
+                              codes mean an identical, deterministic
+                              failure: two different real failures can
+                              produce this exact pair of codes.
     """
     script_path = os.path.join(tmpdir, "fake_h_agent_install.sh")
     counter_path = os.path.join(tmpdir, "h_agent_install_attempts")
@@ -57,6 +72,16 @@ exit 0
         body = "exit 1\n"
     elif behavior == "fail_then_succeed":
         body = f'if [ "$count" -eq 1 ]; then exit 1; fi\n{place_binary}'
+    elif behavior == "fail_differently":
+        body = 'if [ "$count" -eq 1 ]; then exit 1; fi\nexit 42\n'
+    elif behavior == "fail_same_code_different_cause":
+        body = (
+            'if [ "$count" -eq 1 ]; then '
+            'echo "simulated: claude 2.1.251 verification could not be confirmed" >&2; exit 1; '
+            'fi\n'
+            'echo "simulated: agy 1.1.24 does not match the pinned 1.1.23" >&2\n'
+            'exit 1\n'
+        )
     else:
         raise ValueError(behavior)
 
@@ -113,11 +138,104 @@ def test_setup_fails_loudly_when_h_agent_installer_fails_twice():
         )
         assert res.returncode != 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
         assert "h-agent installer failed twice" in res.stderr, res.stderr
+        # Both attempts here exit 1 -- reviewer FAILED an earlier version of
+        # this report for calling that "identical" and "non-transient",
+        # which the exit status alone can't prove (h-agent's installer
+        # exits 1 for multiple distinct causes -- see the same-code/
+        # different-cause test below). Report the OBSERVATION and the
+        # limit, not a conclusion.
+        assert "Both attempts exited with status 1" in res.stderr, res.stderr
+        assert "cannot tell from the exit status alone whether both attempts failed for the same reason" in res.stderr, res.stderr
         assert "✓ h-agent installed" not in res.stdout
         assert "✓ Daemons are healthy" not in res.stdout, (
             "setup.sh must not proceed past a failed h-agent install:\n" + res.stdout
         )
         assert os.path.exists(counter_path)
+        assert open(counter_path).read().strip() == "2", "expected exactly 2 attempts"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_setup_does_not_report_equal_exit_status_when_attempts_actually_differ():
+    # The equal-exit-status line is only accurate when both attempts really
+    # did exit the same way -- assert it's absent when the codes differ, so
+    # the reporting can't be implemented as "always say this on the second
+    # failure" and still pass the matching-codes tests.
+    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_setup_h_agent_")
+    try:
+        h_agent_url, counter_path = _fake_h_agent_installer(tmpdir, behavior="fail_differently")
+        run_dir = os.path.join(tmpdir, "run")
+        env = _dep_check_env(tmpdir, h_agent_url=h_agent_url)
+        env["H_MESH_RUN_DIR"] = run_dir
+        res = subprocess.run(
+            [str(SETUP_SH), "--pod", "p", "--tenant", "t", "--non-interactive"],
+            env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+        assert res.returncode != 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+        assert "h-agent installer failed twice (last exit 42)" in res.stderr, res.stderr
+        assert "Both attempts exited with status" not in res.stderr, res.stderr
+        assert open(counter_path).read().strip() == "2", "expected exactly 2 attempts"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_setup_reports_only_the_observed_status_and_uncertainty_when_exit_codes_match():
+    # Reviewer's exact counterexample: h-agent's real installer exits 1 for
+    # MULTIPLE distinct causes (claude/codex/agy each have their own
+    # verification-failed path), so two attempts returning the same code
+    # does not mean they failed for the same reason, that either was
+    # deterministic, or that a third attempt or an upstream/host change is
+    # what's needed. Two DIFFERENT simulated failures here both exit 1.
+    #
+    # ⚠ A denylist of forbidden words ("identical", "deterministic", ...)
+    # is not proof of anything -- reviewer FAILED an earlier version of this
+    # test for exactly that: a future message could add "there is no point
+    # retrying" or "another attempt is futile" and every denylisted spelling
+    # check would still pass while the same overclaim returned, with the
+    # test's own name falsely certifying it can't. Assert the EXACT text of
+    # the one line setup.sh itself emits for this case instead of trying to
+    # enumerate every dishonest paraphrase -- any future wording change that
+    # adds a conclusion this line doesn't already make will change the
+    # string and fail here, whatever words it uses. The simulated
+    # installer's OWN stderr (a fake dependency's output, not setup.sh's
+    # own words) is deliberately left unconstrained -- that content belongs
+    # to the dependency, not to what's under test.
+    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_setup_h_agent_")
+    try:
+        h_agent_url, counter_path = _fake_h_agent_installer(
+            tmpdir, behavior="fail_same_code_different_cause"
+        )
+        run_dir = os.path.join(tmpdir, "run")
+        env = _dep_check_env(tmpdir, h_agent_url=h_agent_url)
+        env["H_MESH_RUN_DIR"] = run_dir
+        res = subprocess.run(
+            [str(SETUP_SH), "--pod", "p", "--tenant", "t", "--non-interactive"],
+            env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+        )
+        assert res.returncode != 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+        assert "h-agent installer failed twice (last exit 1)" in res.stderr, res.stderr
+
+        observation_lines = [
+            line for line in res.stderr.splitlines()
+            if line.strip().startswith("Both attempts exited with status")
+        ]
+        assert len(observation_lines) == 1, (
+            f"expected exactly one setup-owned observation line, got "
+            f"{observation_lines!r}\nfull stderr:\n{res.stderr}"
+        )
+        expected = (
+            "  Both attempts exited with status 1. setup.sh cannot tell "
+            "from the exit status alone whether both attempts failed for "
+            "the same reason -- check the installer output above before "
+            "deciding whether to retry or to change something on this "
+            "host or upstream."
+        )
+        assert observation_lines[0] == expected, (
+            f"setup.sh's own diagnostic line drifted from the approved "
+            f"observation-and-uncertainty wording:\n"
+            f"  actual:   {observation_lines[0]!r}\n"
+            f"  expected: {expected!r}"
+        )
         assert open(counter_path).read().strip() == "2", "expected exactly 2 attempts"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
