@@ -193,6 +193,34 @@ class ChannelTests(unittest.TestCase):
             f"Delivery to host failed for message {envelope_id}: unknown kind: Message",
         )
 
+    def test_one_receive_drains_valid_request_behind_stale_rejected_entry(self):
+        self.register(alice="tmux", host="office")
+        stale_id = send(
+            self.redis, pod=POD, tenant=TENANT, source="alice",
+            destination="host", payload={"text": "stale broadcast"},
+        )
+        request_id = send(
+            self.redis, pod=POD, tenant=TENANT, source="alice",
+            destination="host", kind="StartAgent", payload={"agent": "worker"},
+        )
+        ingress = prefix(POD, TENANT, "host", "ingress")
+        for _ in range(2):
+            self.redis.rpush(
+                ingress,
+                self.redis.lpop(prefix(POD, TENANT, "alice", "egress")),
+            )
+        opened = []
+
+        receive(
+            self.redis, pod=POD, tenant=TENANT, agent="host",
+            openers={"StartAgent": opened.append}, timeout=0, blocking=False,
+        )
+
+        self.assertEqual([envelope["stream_id"] for envelope in opened], [request_id])
+        self.assertIsNone(self.redis.lpop(ingress))
+        dead = parse(self.redis.lpop(prefix(POD, TENANT, "host", "dead")))
+        self.assertEqual(dead["stream_id"], stale_id)
+
     def test_receive_does_not_notify_non_tmux_sender(self):
         self.register(client="api", host="control")
         send(
