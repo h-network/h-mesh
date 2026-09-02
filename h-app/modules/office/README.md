@@ -35,7 +35,11 @@ Board transitions keep the one-doing-ticket invariant atomically, including
 concurrent `office take` calls. A malformed todo/held entry is moved without
 rewriting into the visible `invalid` list instead of being discarded or
 permanently blocking later tickets. `office hold --reason TEXT [ID]` requires
-and stores the blocking reason; `office list` shows it on held tickets.
+and stores the blocking reason; `office list` shows it on held tickets. Use
+`office return [ID]` to put work back in `todo`; `cancel` remains a terminal,
+auditable state and `delete` is the explicit permanent-removal operation.
+`office done --outcome {completed,passed,failed} [ID]` requires and records the
+result, so completed review work retains its verdict in `office list`.
 
 The receiving port delegates to the settled `lib.agentlifecycle` API.
 `stop_agent` removes the retired instance's ingress queue and paused marker as

@@ -647,6 +647,8 @@ def _ticket_line(ticket: dict, *, state: str, now: datetime) -> str:
         line += f"  age:{age}"
     if state == "hold" and ticket.get("hold_reason"):
         line += f"  reason:{' '.join(ticket['hold_reason'].split())}"
+    if state == "done" and ticket.get("outcome"):
+        line += f"  outcome:{ticket['outcome']}"
     return line
 
 
@@ -744,23 +746,60 @@ def _take_command(argv: list[str]) -> None:
 
 
 def _done_command(argv: list[str]) -> None:
-    _finish_command("done", argv)
+    parser = _operation_parser("done", "Finish your open task and record its outcome.")
+    parser.add_argument("id", nargs="?", help="ticket id or unique prefix")
+    parser.add_argument(
+        "--outcome",
+        required=True,
+        choices=("completed", "passed", "failed"),
+        help="completed work, or the verdict from review work",
+    )
+    args = parser.parse_args(argv)
+    _finish_command("done", args.id, outcome=args.outcome)
 
 
-def _finish_command(action: str, argv: list[str]) -> None:
-    parser = _operation_parser(action, f"{action.title()} your open task.")
+def _cancel_command(argv: list[str]) -> None:
+    parser = _operation_parser("cancel", "Cancel your open task.")
+    parser.add_argument("id", nargs="?", help="ticket id or unique prefix")
+    args = parser.parse_args(argv)
+    _finish_command("cancel", args.id)
+
+
+def _finish_command(action: str, task_id: str | None, *, outcome: str | None = None) -> None:
+    r, pod, tenant, source = _context()
+    keys = _task_keys(pod, tenant, source)
+    _, raw, ticket = _select(r, keys, ("doing",), task_id)
+    _remove(r, keys["doing"], raw)
+    ticket["status"] = "done" if action == "done" else "cancelled"
+    ticket["done_ts"] = _now()
+    if outcome is not None:
+        ticket["outcome"] = outcome
+    r.rpush(keys["done"], serialize_ticket(ticket))
+    record_task_event(action, id=ticket["id"], title=ticket["title"], agent=source, actor=source)
+    log_event = "task_done" if action == "done" else "task_cancelled"
+    _log_task(log_event, agent=source, ticket=ticket)
+    print(serialize_ticket(ticket))
+
+
+def _return_command(argv: list[str]) -> None:
+    parser = _operation_parser("return", "Return your open task to todo.")
     parser.add_argument("id", nargs="?", help="ticket id or unique prefix")
     args = parser.parse_args(argv)
     r, pod, tenant, source = _context()
     keys = _task_keys(pod, tenant, source)
     _, raw, ticket = _select(r, keys, ("doing",), args.id)
     _remove(r, keys["doing"], raw)
-    ticket["status"] = "done" if action == "done" else "cancelled"
-    ticket["done_ts"] = _now()
-    r.rpush(keys["done"], serialize_ticket(ticket))
-    record_task_event(action, id=ticket["id"], title=ticket["title"], agent=source, actor=source)
-    log_event = "task_done" if action == "done" else "task_cancelled"
-    _log_task(log_event, agent=source, ticket=ticket)
+    ticket["status"] = "todo"
+    ticket["started_ts"] = None
+    ticket["done_ts"] = None
+    ticket["held_ts"] = None
+    ticket.pop("hold_reason", None)
+    ticket.pop("outcome", None)
+    r.rpush(keys["todo"], serialize_ticket(ticket))
+    record_task_event(
+        "return", id=ticket["id"], title=ticket["title"], agent=source, actor=source
+    )
+    _log_task("task_returned", agent=source, ticket=ticket)
     print(serialize_ticket(ticket))
 
 
@@ -1129,8 +1168,9 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("resume",), "resume an agent's CLI and inbox", lambda argv: _lifecycle_command("resume", argv)),
     (("list",), "show a task board", _list_command),
     (("take",), "take your next todo task", _take_command),
-    (("done",), "finish your open task", _done_command),
-    (("cancel",), "cancel your open task", lambda argv: _finish_command("cancel", argv)),
+    (("done",), "finish your open task and record its outcome", _done_command),
+    (("cancel",), "cancel your open task", _cancel_command),
+    (("return",), "return your open task to todo", _return_command),
     (("hold",), "put your open task on hold", _hold_command),
     (("delete",), "permanently remove a task", _delete_command),
     (("add",), "add a task to another agent's board", _add_command),

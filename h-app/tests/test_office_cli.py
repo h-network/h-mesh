@@ -332,6 +332,41 @@ def test_take_refuses_when_doing_nonempty(monkeypatch, capsys):
     assert "already have one open task" in capsys.readouterr().err
 
 
+def test_return_moves_doing_ticket_back_to_todo(monkeypatch):
+    _env(monkeypatch)
+    r = FakeRedis()
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    todo_key = prefix(POD, TENANT, "architect", "tasks.todo")
+    r.lists[doing_key].append(
+        json.dumps(_ticket("architect", status="doing", started_ts="2026-09-01T00:00:00Z"))
+    )
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["return"])
+
+    assert r.lists[doing_key] == []
+    returned = json.loads(r.lists[todo_key][0])
+    assert returned["status"] == "todo"
+    assert returned["started_ts"] is None
+
+
+def test_done_requires_and_lists_outcome(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis()
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    r.lists[doing_key].append(json.dumps(_ticket("architect", status="doing")))
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit):
+            office_main(["done"])
+        assert r.lists[doing_key]
+        office_main(["done", "--outcome", "failed"])
+        capsys.readouterr()
+        office_main(["list"])
+
+    assert "outcome:failed" in capsys.readouterr().out
+
+
 def test_hold_then_list_shows_priority_and_age(monkeypatch, capsys):
     _env(monkeypatch)
     r = FakeRedis()

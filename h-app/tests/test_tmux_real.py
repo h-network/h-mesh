@@ -497,7 +497,7 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             self.assertIn("h-mesh-office send", lead_guide)
             self.assertIn("h-mesh-office list", lead_guide)
             self.assertIn("h-mesh-office take", lead_guide)
-            self.assertIn("h-mesh-office done", lead_guide)
+            self.assertIn("h-mesh-office done --outcome completed", lead_guide)
             self.assertNotIn("`office ", lead_guide)
 
             agent_guide = generate_agents_md("worker", lead="architect")
