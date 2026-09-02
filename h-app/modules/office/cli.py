@@ -28,7 +28,7 @@ import redis
 
 from core.channels import send
 from core.envelope import EnvelopeError, parse
-from core.keys import prefix, receive_undeliverable_key, receive_unresolved_key
+from core.keys import prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key
 from core.logging import log_record, record_task_event
 from core.registry import is_member, members, port_type
 from lib.attachment_schema import ATTACHMENT_MAX_BYTES, MIME_TYPE_REGEX
@@ -1070,6 +1070,73 @@ def _undeliverable_command(argv: list[str]) -> None:
             print("unparseable undeliverable custody record", file=sys.stderr)
 
 
+def _decoded_component(raw: bytes) -> dict:
+    """One field or value, decoded independently of its pair partner: a
+    duplicate-field or hostile-byte scheme can put a cleanly-decodable
+    name next to an undecodable value (or vice versa), and collapsing
+    them as a matched pair would throw away the half that DID decode.
+    Each component carries its own encoding tag rather than being folded
+    into a shared key -- see _retired_inbox_command's docstring for why a
+    dict was wrong for this."""
+    try:
+        return {"value": raw.decode(), "encoding": "utf8"}
+    except UnicodeDecodeError:
+        return {"value": raw.hex(), "encoding": "hex"}
+
+
+def _retired_inbox_command(argv: list[str]) -> None:
+    """Read api-type agents' inbox content conserved at retirement.
+
+    Same shape as unresolved/undeliverable: read-only, no replay/delete/
+    expiry verb -- a durable sink nobody can inspect is hiding, not
+    conserving, so this exists in the same commit as the write path
+    that fills it. Records here are not envelopes (deliver_api's inbox
+    entries aren't wire frames), so this decodes each hex field/value
+    pair directly rather than going through core.envelope.parse().
+
+    ⚠ `fields` PRINTS AS AN ORDERED LIST OF PAIR RECORDS, NEVER A DICT.
+    A first version collapsed it to a dict for readability and broke the
+    one property the stored record exists to preserve: a duplicate field
+    name silently kept only its last value, and two DIFFERENT raw field
+    names could even collide onto the same displayed key under a mixed
+    text/hex fallback scheme (a UTF-8 field literally named "ff" and a
+    binary field whose hex form is "ff" both became key "ff"). The
+    durable record already preserves exact order and duplicates; a
+    reader that cannot show the same is not actually inspectable, it
+    just looks like it is. Each field and value is decoded
+    INDEPENDENTLY (not as a matched pair) via _decoded_component, so an
+    undecodable value never hides an otherwise-readable field name.
+    """
+    parser = _operation_parser(
+        "retired-inbox",
+        "Read api agents' inbox content still unread when their destination retired.",
+    )
+    parser.add_argument("-a", "--agent", metavar="AGENT")
+    args = parser.parse_args(argv)
+    r, pod, tenant, _ = _context()
+    for stored in r.lrange(retired_inbox_key(pod, tenant), 0, -1):
+        try:
+            record = json.loads(_text(stored))
+            agent = record["agent"]
+            if args.agent and agent != args.agent:
+                continue
+            fields = [
+                {
+                    "field": _decoded_component(bytes.fromhex(field_hex)),
+                    "value": _decoded_component(bytes.fromhex(value_hex)),
+                }
+                for field_hex, value_hex in record["fields"]
+            ]
+            print(json.dumps({
+                "agent": agent,
+                "entry_id": record["entry_id"],
+                "reason": record.get("reason", "destination retired with unread inbox content"),
+                "fields": fields,
+            }, separators=(",", ":")))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            print("unparseable retired-inbox custody record", file=sys.stderr)
+
+
 def _take_command(argv: list[str]) -> None:
     parser = _operation_parser("take", "Move a todo or held task into doing.")
     parser.add_argument("id", nargs="?", help="ticket id or unique prefix")
@@ -1649,6 +1716,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("list",), "show a task board", _list_command),
     (("unresolved",), "show unresolved delivery outcomes", _unresolved_command),
     (("undeliverable",), "show messages not opened before retirement", _undeliverable_command),
+    (("retired-inbox",), "show api agents' inbox content conserved at retirement", _retired_inbox_command),
     (("take",), "take your next todo task", _take_command),
     (("done",), "finish your open task and record its outcome", _done_command),
     (("cancel",), "cancel your open task", _cancel_command),
