@@ -1,6 +1,5 @@
 import io
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -35,6 +34,39 @@ LEGACY_BANNED_NAMES = (
 LEGACY_ALLOW_MARKER = "# legacy-name-" + "allow:"
 
 
+def _identifier_spans(text: str, identifier: str) -> list[tuple[int, int]]:
+    """Find exact identifier occurrences using Python continuation semantics."""
+    spans = []
+    start = 0
+    while (found := text.find(identifier, start)) != -1:
+        end = found + len(identifier)
+        preceding_continues = found > 0 and ("a" + text[found - 1]).isidentifier()
+        following_continues = end < len(text) and ("a" + text[end]).isidentifier()
+        if not preceding_continues and not following_continues:
+            spans.append((found, end))
+        start = found + 1
+    return spans
+
+
+def _remove_exact_identifiers(text: str, identifiers: list[str]) -> str:
+    # Resolve every span against the original text. Sequential substitution
+    # must not create a new occurrence eligible for a later allowance.
+    spans = sorted(
+        {
+            span
+            for identifier in identifiers
+            for span in _identifier_spans(text, identifier)
+        }
+    )
+    pieces = []
+    cursor = 0
+    for start, end in spans:
+        pieces.append(text[cursor:start])
+        cursor = end
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
 def legacy_name_violations(root: Path) -> tuple[int, list[str]]:
     checked = 0
     violations = []
@@ -54,7 +86,6 @@ def legacy_name_violations(root: Path) -> tuple[int, list[str]]:
             code, marker, allowance_text = line.partition(LEGACY_ALLOW_MARKER)
             folded = code.casefold()
             if marker:
-                code_identifiers = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", code))
                 allowance_values = [
                     value.strip()
                     for value in allowance_text.split(",")
@@ -66,24 +97,16 @@ def legacy_name_violations(root: Path) -> tuple[int, list[str]]:
                     for value in allowance_values
                     if not value.isidentifier()
                     or value != value.upper()
-                    or value not in code_identifiers
+                    or not _identifier_spans(code, value)
                 ]
                 if not allowed_literals or invalid:
                     violations.append(
                         f"{relative}:{line_number}: invalid legacy allowance"
                     )
-                for allowed_literal in (
-                    value
-                    for value, raw_value in zip(
-                        allowed_literals, allowance_values, strict=True
-                    )
-                    if raw_value not in invalid
-                ):
-                    folded = re.sub(
-                        rf"(?<![a-z0-9_]){re.escape(allowed_literal)}(?![a-z0-9_])",
-                        "",
-                        folded,
-                    )
+                folded = _remove_exact_identifiers(
+                    code,
+                    [value for value in allowance_values if value not in invalid],
+                ).casefold()
             matches = [name for name in LEGACY_BANNED_NAMES if name in folded]
             if matches:
                 violations.append(f"{relative}:{line_number}: {', '.join(matches)}")
@@ -158,6 +181,24 @@ def test_legacy_name_allowance_does_not_apply_inside_longer_identifier(tmp_path:
     )
 
 
+def test_legacy_name_allowance_respects_unicode_identifier_boundaries(tmp_path: Path):
+    source = tmp_path / "module.py"
+    allowed_name = "F" + "LOCK"
+    unicode_identifier = f"α{allowed_name}β"
+    source.write_text(
+        f"{allowed_name} = 1; {unicode_identifier} = 2  "
+        f"{LEGACY_ALLOW_MARKER} {allowed_name}\n"
+    )
+
+    _, violations = legacy_name_violations(tmp_path)
+
+    banned_match = "f" + "lock"
+    assert violations == [f"module.py:1: {banned_match}"], (
+        "an allowance must not erase its substring from a Unicode identifier; "
+        f"observed {violations}"
+    )
+
+
 def test_legacy_name_allowance_must_name_a_literal_on_its_line(tmp_path: Path):
     source = tmp_path / "module.py"
     absent_name = "F" + "LOCK_ALLOW_PLAINTEXT"
@@ -165,6 +206,7 @@ def test_legacy_name_allowance_must_name_a_literal_on_its_line(tmp_path: Path):
     source.write_text(
         f"VALUE = 'safe'  {LEGACY_ALLOW_MARKER} {absent_name}\n"
         f"VALUE = {absent_name!r}  {LEGACY_ALLOW_MARKER} {overly_broad_name}\n"
+        f"VALUE = {absent_name!r}  {LEGACY_ALLOW_MARKER} F, LOCK_ALLOW_PLAINTEXT\n"
     )
 
     _, violations = legacy_name_violations(tmp_path)
@@ -174,6 +216,8 @@ def test_legacy_name_allowance_must_name_a_literal_on_its_line(tmp_path: Path):
         "module.py:1: invalid legacy allowance",
         "module.py:2: invalid legacy allowance",
         f"module.py:2: {banned_match}, {banned_match}_",
+        "module.py:3: invalid legacy allowance",
+        f"module.py:3: {banned_match}, {banned_match}_",
     ]
 
 
