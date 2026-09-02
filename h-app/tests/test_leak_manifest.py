@@ -1433,6 +1433,8 @@ def test_dead_claimant_is_recovered_without_a_timeout():
         assert not entry.exists()
     finally:
         claim.unlink(missing_ok=True)
+        for path in MANIFEST_DIR.glob(f".claim.*.{entry.name}"):
+            path.unlink(missing_ok=True)
         entry.unlink(missing_ok=True)
         shutil.rmtree(real_tmpdir, ignore_errors=True)
 
@@ -1542,6 +1544,8 @@ def test_public_reaper_recovers_authenticated_claim_after_tmpdir_removed():
         assert not claim.exists()
     finally:
         claim.unlink(missing_ok=True)
+        for path in MANIFEST_DIR.glob(f".claim.*.{entry.name}"):
+            path.unlink(missing_ok=True)
 
 
 def test_absence_not_confirmed_on_permission_error_retains_claim(monkeypatch):
