@@ -361,7 +361,16 @@ class ApiTests(unittest.TestCase):
         category its own documented stopping condition correctly refused
         to patch a sixth time. No automated module-wide guarantee remains
         in this file -- a future or new call site requires manual review.
-        This test only pins the branches enumerated here today."""
+        This test only pins the branches enumerated here today -- and the
+        name's own claim was re-checked against the body for exactly this
+        risk: `closed_reasons` originally listed "in_reply_to present but
+        reply has no l2 source" without ever producing it, since parse()
+        guarantees a non-empty l2.source for anything that reaches
+        deliver_api at all -- that branch is dead code on the wire path,
+        reachable only by calling _drop_untrustworthy_reply_correlation
+        directly. Added that direct call so every literal this test
+        allows is also a literal this test actually observed at least
+        once, not merely a member of a superset nothing produces."""
         closed_reasons = {
             None,
             "malformed in_reply_to",
@@ -439,6 +448,30 @@ class ApiTests(unittest.TestCase):
                 deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
             self.assertNotIn(marker, out.getvalue())
             self.assertLessEqual(reasons_from(out.getvalue()), closed_reasons)
+
+        # "no l2 source" branch: unreachable through the wire/parse() path
+        # above -- parse_for_switch's _segment validates L2 source as a
+        # non-empty identifier for every envelope that reaches deliver_api
+        # at all, so an empty l2.source can never survive a real parse().
+        # Called directly, bypassing parse(), the way a differently-shaped
+        # future caller of this function might; closed_reasons above would
+        # otherwise list a literal this test never actually produces.
+        from modules.api.port import _drop_untrustworthy_reply_correlation
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            _drop_untrustworthy_reply_correlation(
+                self.redis, pod="test", tenant="office", agent="telegram",
+                envelope={
+                    "stream_id": "a" * 32, "correlation_id": "b" * 32,
+                    "l2": {"source": ""}, "in_reply_to": "c" * 32,
+                },
+            )
+        self.assertLessEqual(reasons_from(out.getvalue()), closed_reasons)
+        self.assertIn(
+            "in_reply_to present but reply has no l2 source",
+            reasons_from(out.getvalue()),
+        )
 
     def _tamper_in_reply_to(self, envelope, value):
         """Bypass build()/encode()'s strict validation to simulate an
