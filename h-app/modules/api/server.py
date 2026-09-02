@@ -32,6 +32,43 @@ DEFAULT_ENVELOPE_MAX_BYTES = 1_048_576
 # the cause). Module-level so a test can shrink it without waiting out a
 # real multi-second interval.
 SSE_KEEPALIVE_INTERVAL_S = 3.0
+# The idle-poll interval in _stream_response's event_generator: one Redis
+# XRANGE per open connection every SSE_POLL_INTERVAL_S, whether or not
+# anything is queued -- looks like an obvious rate to tighten on sight.
+# Measured before touching it (2026-09-02, on a real server against real
+# Redis, not reasoned about -- docker-stats CPU, Redis COMMANDSTATS
+# calls/usec, and a separate client's PING round-trip latency, each
+# checked at 1/20/100 concurrent idle streams): scales exactly linearly
+# at ~10 XRANGE/sec per idle stream (confirmed at 1, 20, and 100
+# concurrent streams), Redis-side execution cost sub-2-microseconds per
+# call at every scale tested, redis-py's connection pool multiplexes many
+# streams onto few actual connections (100 concurrent streams used 13,
+# not 100), and a separate client's PING round-trip latency was
+# unaffected at mean/p50 even at 100 concurrent streams (p99 tail rose to
+# ~430us from a ~170us baseline -- still sub-millisecond). Redis container
+# CPU: 0.21% baseline to 2.88% at 100 concurrent streams.
+# THE ASSUMPTION THIS RESTS ON IS A NUMBER, NOT AN ARCHITECTURE: the total
+# count of concurrently open SSE responses against this server, summed
+# across every tab, panel, and process, stays around 10 in practice (one
+# telegram bot process plus roughly three open console tabs at three
+# streams each -- activity, alerts, messages, one ResumableFeed each, see
+# clients/web/app.js) -- not hundreds. That reference count already
+# includes the three-per-tab reality, it does not exclude it. 100 was
+# tested as roughly 10x that reference count, deliberately, to leave
+# margin -- it is the top of what was actually measured, not a discovered
+# capacity limit; nothing above 100 was tried.
+# IF THE REAL TOTAL IS CLIMBING TOWARD THE EDGE OF THAT MEASURED RANGE --
+# however it gets there: more console tabs open at once than assumed here,
+# more feeds/panels added per tab, a stream opened per agent within a
+# client instead of one shared feed, or tenant concurrency otherwise
+# climbing toward the 100s -- stop and count the actual number of
+# concurrently open streams, and if it's approaching 100, re-run this
+# measurement first, same method (docker-stats CPU, Redis COMMANDSTATS
+# calls/usec, a separate client's PING latency) at that concurrency. Don't
+# assume linear-but-cheap stays cheap at 10x the scale it was last measured
+# at; it stays linear,
+# which is not the same thing.
+SSE_POLL_INTERVAL_S = 0.1
 ATTACHMENT_MAX_BYTES = 10_485_760
 ATTACHMENT_BASE64_MAX_BYTES = 4 * math.ceil(ATTACHMENT_MAX_BYTES / 3)
 ATTACHMENT_FILENAME_MAX_BYTES = 255
@@ -710,7 +747,7 @@ def _stream_response(
                     # to a stream nobody is reading anymore.
                     yield ": keepalive\n\n"
                     last_sent = now
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(SSE_POLL_INTERVAL_S)
 
     return StreamingResponse(
         event_generator(),
