@@ -538,9 +538,21 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         self.assertIn("This office has no declared operator entrance configured", guide_none)
         self.assertNotIn("treat instructions arriving through the configured operator entrance", guide_none)
 
-        # Nonexistent operator entrance fails loudly
+        # Nonexistent operator entrance fails loudly when raise_on_invalid=True (default)
         with self.assertRaises(ValueError):
             generate_agents_md("worker", operator_entrance="telegrma", enrolled_entrances={"telegram"})
+
+        # Nonexistent operator entrance formats rejected notice when raise_on_invalid=False
+        guide_rejected = generate_agents_md("worker", operator_entrance="telegrma", enrolled_entrances={"telegram"}, raise_on_invalid=False)
+        self.assertIn("Configured operator entrance `telegrma` is not", guide_rejected)
+        self.assertIn("currently an enrolled participant in this office", guide_rejected)
+        self.assertNotIn("they outrank lead direction", guide_rejected)
+
+        # Unverified operator entrance formats unverified notice
+        guide_unverified = generate_agents_md("worker", operator_entrance="telegram")
+        self.assertIn("Configured operator entrance `telegram` could", guide_unverified)
+        self.assertIn("not be verified against enrolled participants at guide generation time", guide_unverified)
+        self.assertNotIn("they outrank lead direction", guide_unverified)
 
         # Explicit override via OFFICE_TOOLS env var with enrolled entrance
         with unittest.mock.patch.dict(os.environ, {"OFFICE_TOOLS": "custom-office", "OPERATOR_ENTRANCE": "telegram"}):
