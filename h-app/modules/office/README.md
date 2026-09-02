@@ -116,3 +116,11 @@ is a courtesy, not the trust boundary -- the recipient's door
 against real delivery provenance and silently drops it if it doesn't hold,
 same as if `--reply-to` had never been passed. See `lib/reply_correlation.py`
 and `modules/api/README.md` for the full mechanism.
+
+`office status` reports `working`, `idle`, or `unknown` from the watchdog's
+activity-derived presence record. A separate `blocked` hash means only that a
+past delivery could not be verified; it does not establish that the agent is
+currently unable to work, so status renders it as `delivery unverified`
+context instead of replacing presence with a `blocked` state. With no presence
+evidence the state remains `unknown`, never guessed available from the board or
+guessed blocked from delivery uncertainty.
