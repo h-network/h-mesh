@@ -12,6 +12,7 @@ import pytest
 
 NODEID_MANIFEST = Path(__file__).with_name("test_nodeids.txt")
 _terminal_nodeids: set[str] = set()
+_skipped_nodeids: dict[str, str] = {}
 
 
 def manifest_difference(actual: set[str]) -> tuple[list[str], list[str]]:
@@ -44,6 +45,7 @@ def pytest_configure(config: pytest.Config) -> None:
 
 def pytest_sessionstart() -> None:
     _terminal_nodeids.clear()
+    _skipped_nodeids.clear()
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
@@ -64,7 +66,15 @@ def pytest_collection_finish(session: pytest.Session) -> None:
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     if report.when == "call":
-        _terminal_nodeids.add(report.nodeid)
+        if report.skipped:
+            # report.wasxfail identifies expected-failure call skips if a future
+            # concrete use case gives them deliberately different semantics.
+            # Today every skipped call is non-certifying.
+            longrepr = report.longrepr
+            reason = str(longrepr[2] if isinstance(longrepr, tuple) else longrepr)
+            _skipped_nodeids[report.nodeid] = reason
+        else:
+            _terminal_nodeids.add(report.nodeid)
 
 
 @pytest.hookimpl(trylast=True)
@@ -74,16 +84,23 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
 
     expected = {item.nodeid for item in session.items}
     incomplete = sorted(expected - _terminal_nodeids)
+    skipped = sorted(expected & _skipped_nodeids.keys())
+    no_call_report = sorted(set(incomplete) - set(skipped))
     reporter = session.config.pluginmanager.get_plugin("terminalreporter")
     if incomplete:
         session.exitstatus = 1
         if reporter is not None:
             reporter.write_sep("=", "suite execution invariant failed", red=True)
-            reporter.write_line(
-                "successful pytest session lacked terminal outcomes for:", red=True
-            )
-            for nodeid in incomplete:
-                reporter.write_line(f"  not executed: {nodeid}", red=True)
+            reporter.write_line("suite cannot certify these nodes:", red=True)
+            for nodeid in skipped:
+                reporter.write_line(
+                    f"  not executed: skipped: {nodeid} ({_skipped_nodeids[nodeid]})",
+                    red=True,
+                )
+            for nodeid in no_call_report:
+                reporter.write_line(
+                    f"  not executed: no call-phase report: {nodeid}", red=True
+                )
         return
 
     attestation_path = Path(os.environ["H_MESH_TEST_ATTESTATION_PATH"])

@@ -32,21 +32,24 @@ manifest. A zero exit with an absent, partial, stale, or mismatched attestation
 is a failure. Selection alone and absence of a reported error are not execution
 evidence.
 
-Execution accounting uses call-phase reports only. If an environment-dependent
-fixture skips a test during setup—for example, because Redis is unavailable—the
-test produces no call report. The harness lists that node as `not executed`,
-returns non-zero, and issues no certificate. That setup skip cannot silently
-turn the environment-dependent guarantee into a no-op.
+Execution accounting requires a non-skipped call-phase report. A setup skip
+produces no call report; an in-body `pytest.skip()` produces a skipped call
+report. Neither counts as execution. The harness distinguishes `not executed:
+skipped` (including pytest's reason) from `not executed: no call-phase report`,
+returns non-zero, and issues no certificate.
 
-Bare focused pytest can exit zero while reporting the same setup skips. That is
-valid pytest behavior, but it is not merge evidence: it proves neither that the
-skipped test body ran nor that its guarantee held. Use bare pytest for focused
-development feedback and the canonical runner for merge evidence. This rule is
-specifically about setup-phase skips lacking call reports; it does not claim
-that every environment-dependent test is safe or that every kind of visible
-skip lacks a call-phase report. Reaching a terminal call-phase outcome is
-execution accounting; it is not proof that the test asserted or verified its
-intended guarantee.
+This makes the required environment a hard prerequisite for merge evidence. In
+particular, eleven tests currently gate on Redis during their call phase: a
+machine without reachable Redis cannot produce a suite certificate. Start the
+required service and rerun; a skip failure is not a manifest mismatch and
+regenerating the manifest cannot fix it.
+
+Bare focused pytest can exit zero while reporting skips. That is valid pytest
+behavior, but it is not merge evidence: it proves neither that the skipped test
+body ran nor that its guarantee held. Use bare pytest for focused development
+feedback and the canonical runner for merge evidence. A terminal call-phase
+outcome is execution accounting; it is not by itself proof that the test's
+assertions adequately verify their intended guarantee.
 
 The evidence is the pair of runner exit status zero **and** its post-validation
 certificate line. Pytest and the tests share stdout with the runner, so child
