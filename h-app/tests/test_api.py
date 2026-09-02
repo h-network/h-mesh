@@ -17,6 +17,7 @@ if str(H_APP) not in sys.path:
 
 from core.channels import send
 from core.envelope import build, encode, parse
+from clients.telegram.bot import TelegramBot
 from core.keys import incarnation_key, prefix
 from modules.api import server as server_module
 from modules.api.port import deliver_api
@@ -192,6 +193,72 @@ class ApiTests(unittest.TestCase):
             ("GET", "/openapi.json"),
         }
         self.assertTrue(expected.issubset(routes))
+
+    def test_unverified_delivery_does_not_override_active_presence(self):
+        """A stale observation must not make Telegram refuse the fresh probe
+        that could resolve it; actual inability belongs to that send result."""
+        presence = prefix("test", "office", "alice", "presence")
+        blocked = prefix("test", "office", "alice", "blocked")
+        self.redis.hashes[presence] = {
+            "state": "idle",
+            "since": "2026-09-02T10:00:00Z",
+            "last_activity": "2026-09-02T10:00:08Z",
+        }
+        self.redis.hashes[blocked] = {
+            "since": "2026-09-02T06:00:00Z",
+            "stream_id": "a" * 32,
+        }
+
+        class ApiBackedMesh:
+            def get_presence(inner_self, agent):
+                return request(self.app, "GET", f"/agents/{agent}", token="secret")
+
+            def send_message(inner_self, destination, text):
+                return request(
+                    self.app, "POST", f"/agents/{destination}/envelopes",
+                    token="secret", body={"text": text, "as": "telegram"},
+                )
+
+        class TelegramSink:
+            def __init__(inner_self):
+                inner_self.messages = []
+
+            def send_chat_action(inner_self, chat_id):
+                return None
+
+            def send_message(inner_self, chat_id, text, **kwargs):
+                inner_self.messages.append(text)
+
+        telegram = TelegramSink()
+        bot = TelegramBot(
+            ApiBackedMesh(), telegram, target_agent="alice", no_activity_push=True,
+        )
+
+        reply = bot.handle_user_prompt("operator", "new evidence")
+
+        self.assertEqual(
+            reply,
+            "✅ Sent to alice. A prior delivery remains unverified; this send is fresh evidence.",
+        )
+        self.assertEqual(len(self.redis.lists[prefix("test", "office", "telegram", "egress")]), 1)
+        status, body = request(self.app, "GET", "/agents/alice", token="secret")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["presence"]["state"], "idle")
+        self.assertEqual(body["delivery_unverified"], {
+            "since": "2026-09-02T06:00:00Z",
+            "stream_id": "a" * 32,
+        })
+
+    def test_absent_presence_stays_unknown_with_unverified_delivery(self):
+        """Delivery uncertainty cannot be promoted into either availability or blockage."""
+        blocked = prefix("test", "office", "alice", "blocked")
+        self.redis.hashes[blocked] = {"since": "", "stream_id": ""}
+
+        status, body = request(self.app, "GET", "/agents/alice", token="secret")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["presence"]["state"], "unknown")
+        self.assertEqual(body["delivery_unverified"], {"since": "", "stream_id": ""})
 
     def test_qualified_destination_routes_through_core_channel(self):
         status, body = request(

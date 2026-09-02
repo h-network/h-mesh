@@ -34,6 +34,7 @@ class DummyMeshClient:
         self.token = token
         self.ssl_context = None
         self.presence_state = "idle"
+        self.delivery_unverified = None
         self.messages_queue = []
         self.activity_queue = []
         # agent -> port_type; defaults cover the common tmux roster used by tests
@@ -69,12 +70,14 @@ class DummyMeshClient:
         return 202, {"stream_id": "s3", "correlation_id": "c3"}
 
     def get_presence(self, agent):
-        return 200, {
+        result = {
             "agent": agent,
             "port_type": self.roster.get(agent, "tmux"),
             "depths": {"ingress": 0, "egress": 0, "dead": 0},
             "presence": {"state": self.presence_state, "since": "2026-08-09T15:00:00Z"},
         }
+        result["delivery_unverified"] = self.delivery_unverified
+        return 200, result
 
     def get_board(self, agent):
         board = self.boards.get(agent, {"todo": [], "doing": [], "hold": [], "done": []})
@@ -565,6 +568,37 @@ def test_handle_user_prompt_skips_the_redundant_text_confirmation_once_reacted()
         assert reply == "✅ Sent to architect."
         assert telegram.reactions_set == [{"chat_id": "12345", "message_id": 7, "emoji": "👀"}]
         assert telegram.sent_messages == []
+
+
+def test_unverified_delivery_notice_failure_cannot_replace_known_prompt_admission():
+    """A routed warning-sink failure after reaction must leave admission known."""
+    class RaisingNoticeTelegram(DummyTelegramClient):
+        def __init__(self):
+            super().__init__()
+            self.notice_attempts = []
+
+        def send_message(self, chat_id, text, **kwargs):
+            self.notice_attempts.append(text)
+            raise OSError("telegram notice unavailable")
+
+    mesh = DummyMeshClient()
+    mesh.delivery_unverified = {"since": "2026-09-02T06:00:00Z", "stream_id": "a" * 32}
+    telegram = RaisingNoticeTelegram()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = CursorStore(str(Path(tmpdir) / "cursor.json"))
+        bot_instance = TelegramBot(
+            mesh, telegram, store, target_agent="architect", no_activity_push=True,
+        )
+        with bot_instance.chat_txn(12345):
+            bot_instance.chat_target_agent["12345"] = "sme-2"
+
+        reply = bot_instance.handle_user_prompt(12345, "fresh evidence", message_id=7)
+
+    assert mesh.sent_envelopes == [{"destination": "sme-2", "text": "fresh evidence"}]
+    assert telegram.reactions_set == [{"chat_id": "12345", "message_id": 7, "emoji": "👀"}]
+    expected = "✅ Sent to sme-2. A prior delivery remains unverified; this send is fresh evidence."
+    assert telegram.notice_attempts == [expected]
+    assert reply == expected
 
 
 def test_handle_user_prompt_confirms_by_text_when_there_is_no_message_id():
@@ -2381,6 +2415,20 @@ def test_handle_photo_message_respects_blocked_presence():
         assert reply == "architect is not accepting messages right now"
         assert mesh.sent_attachments == []
         assert telegram.requests == []
+
+
+def test_handle_photo_message_attempts_send_and_warns_when_prior_delivery_is_unverified():
+    """The warning must remain visible without becoming the gate it replaced."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        mesh = DummyMeshClient()
+        mesh.delivery_unverified = {"since": "2026-09-02T06:00:00Z", "stream_id": "a" * 32}
+        bot_instance, mesh, telegram = _make_bot(mesh=mesh, tmpdir=tmpdir)
+
+        reply = bot_instance.handle_photo_message(12345, [{"file_id": "full"}], "")
+
+        assert len(mesh.sent_attachments) == 1
+        assert reply.startswith("✅ Photo sent to architect.")
+        assert "prior delivery remains unverified" in reply
 
 
 def test_handle_photo_message_rejects_an_oversized_reported_file_size():

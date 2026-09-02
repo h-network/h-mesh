@@ -71,7 +71,7 @@ export class AgentsPanel {
     const matches = ([agent, detail]) => {
       if (!this.filter) return true;
       const doing = this.boards.get(agent)?.doing || [];
-      return [agent, detail.port_type, detail.presence?.state, ...doing.map((value) => typeof value === "string" ? value : `${value?.id || ""} ${value?.title || ""}`)]
+      return [agent, detail.port_type, detail.presence?.state, detail.delivery_unverified ? "delivery unverified" : "", ...doing.map((value) => typeof value === "string" ? value : `${value?.id || ""} ${value?.title || ""}`)]
         .some((value) => String(value || "").toLowerCase().includes(this.filter));
     };
     const valueFor = ([agent, detail], key) => {
@@ -129,11 +129,12 @@ export class AgentsPanel {
 
   agentRow(agent, detail) {
     const presence = detail.presence?.state || "unknown";
+    const deliveryUnverified = Boolean(detail.delivery_unverified);
     const doing = this.boards.get(agent)?.doing || [];
     const ticket = typeof doing[0] === "string" ? { title: doing[0] } : doing[0];
-    const stateLabel = `${presence}${presence === "blocked" ? " · action required" : ""}`;
+    const stateLabel = `${presence}${deliveryUnverified ? " · delivery unverified" : ""}`;
     const lastActivity = detail.presence?.last_activity;
-    return `<tr class="agent-row state-${presence}${agent === this.selected ? " selected" : ""}"><th scope="row"><button type="button" class="agent-link" data-agent="${escapeHtml(agent)}"><span class="state-icon" aria-hidden="true">${{ working: "●", idle: "○", blocked: "⊘", unknown: "?", pending: "…" }[presence] || "?"}</span><span>${escapeHtml(agent)}</span></button></th><td><span class="presence-label"${presence === "blocked" ? ' title="Action required"' : ""}>${escapeHtml(stateLabel)}</span></td><td class="port_type">${escapeHtml(detail.port_type || "unknown")}</td><td class="ticket">${presence === "pending" ? "Roster and window are converging" : ticket ? escapeHtml(ticket.title || ticket.id || "open ticket") : "No open ticket"}</td><td class="age">${ticket?.started_ts ? `<time datetime="${escapeHtml(ticket.started_ts)}" title="${escapeHtml(absoluteTime(ticket.started_ts))}">${escapeHtml(relativeTime(ticket.started_ts))}</time>` : "—"}</td><td><time datetime="${escapeHtml(lastActivity || "")}" title="${escapeHtml(lastActivity ? absoluteTime(lastActivity) : "No activity recorded")}">${lastActivity ? escapeHtml(relativeTime(lastActivity)) : "Unknown"}</time></td></tr>`;
+    return `<tr class="agent-row state-${presence}${agent === this.selected ? " selected" : ""}"><th scope="row"><button type="button" class="agent-link" data-agent="${escapeHtml(agent)}"><span class="state-icon" aria-hidden="true">${{ working: "●", idle: "○", unknown: "?", pending: "…" }[presence] || "?"}</span><span>${escapeHtml(agent)}</span></button></th><td><span class="presence-label"${deliveryUnverified ? ' title="A prior delivery could not be verified"' : ""}>${escapeHtml(stateLabel)}</span></td><td class="port_type">${escapeHtml(detail.port_type || "unknown")}</td><td class="ticket">${presence === "pending" ? "Roster and window are converging" : ticket ? escapeHtml(ticket.title || ticket.id || "open ticket") : "No open ticket"}</td><td class="age">${ticket?.started_ts ? `<time datetime="${escapeHtml(ticket.started_ts)}" title="${escapeHtml(absoluteTime(ticket.started_ts))}">${escapeHtml(relativeTime(ticket.started_ts))}</time>` : "—"}</td><td><time datetime="${escapeHtml(lastActivity || "")}" title="${escapeHtml(lastActivity ? absoluteTime(lastActivity) : "No activity recorded")}">${lastActivity ? escapeHtml(relativeTime(lastActivity)) : "Unknown"}</time></td></tr>`;
   }
 
   demoState(value) { forceDemoState(this.status, value); }
