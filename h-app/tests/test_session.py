@@ -368,7 +368,7 @@ class SessionTests(unittest.TestCase):
             )
             settings.validate()
 
-    def test_flock_allow_plaintext_is_ignored(self):
+    def test_legacy_plaintext_override_is_ignored(self):
         with patch.dict(os.environ, {"FLOCK_ALLOW_PLAINTEXT": "1", "H_MESH_ALLOW_PLAINTEXT": "0"}):
             settings = SessionSettings(
                 tenant="office",

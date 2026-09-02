@@ -43,6 +43,9 @@ class FakeRedis:
     def lpop(self, key):
         return self.lists[key].popleft() if self.lists[key] else None
 
+    def llen(self, key):
+        return len(self.lists[key])
+
     def blpop(self, keys, timeout=0):
         if isinstance(keys, str):
             keys = [keys]
@@ -67,13 +70,17 @@ class FakeRedis:
     def hget(self, key, field):
         return self.hashes[key].get(field)
 
-    def hdel(self, key, field):
-        return int(self.hashes[key].pop(field, None) is not None)
+    def hdel(self, key, *fields):
+        count = 0
+        for field in fields:
+            if self.hashes[key].pop(field, None) is not None:
+                count += 1
+        return count
 
     def get(self, key):
         return self.kv.get(key)
 
-    def set(self, key, value, nx=False, px=None):
+    def set(self, key, value, nx=False, px=None, ex=None):
         if nx and key in self.kv:
             return False
         self.kv[key] = value
@@ -146,6 +153,33 @@ class TmuxPortTests(unittest.TestCase):
 
     @patch("modules.tmux.port.submit_text")
     @patch("modules.tmux.port.list_windows", return_value={"alice", "bob"})
+    def test_a_failed_paste_never_counts_as_delivered(self, mock_list, mock_submit):
+        # record_delivered runs after submit_text, not before: if the paste
+        # itself fails, neither the message nor any reply hint reached the
+        # pane, so a later --reply-to naming this id must not validate.
+        from lib.reply_correlation import was_delivered
+
+        self.register(alice="tmux", bob="tmux")
+        stream_id = send(
+            self.redis, pod=POD, tenant=TENANT, source="alice",
+            destination="bob", payload={"text": "hello bob"},
+        )
+        raw = self.redis.lpop(prefix(POD, TENANT, "alice", "egress"))
+        self.redis.rpush(prefix(POD, TENANT, "bob", "ingress"), raw)
+        mock_submit.side_effect = RuntimeError("tmux paste failed")
+
+        # receive() converts an opener exception into a dead-letter rather
+        # than propagating it -- confirm that happened, then check the
+        # thing this test is actually about.
+        deliver_tmux(self.redis, pod=POD, tenant=TENANT, agent="bob", session_name="testtenant")
+        self.assertEqual(len(self.redis.lists[prefix(POD, TENANT, "bob", "dead")]), 1)
+
+        self.assertFalse(
+            was_delivered(self.redis, pod=POD, tenant=TENANT, agent="bob", stream_id=stream_id, source="alice")
+        )
+
+    @patch("modules.tmux.port.submit_text")
+    @patch("modules.tmux.port.list_windows", return_value={"alice", "bob"})
     def test_deliver_tmux_message_from_api_adds_reply_notice(self, mock_list, mock_submit):
         self.register(telegram="api", bob="tmux")
         stream_id = send(
@@ -157,7 +191,10 @@ class TmuxPortTests(unittest.TestCase):
 
         deliver_tmux(self.redis, pod=POD, tenant=TENANT, agent="bob", session_name="testtenant")
 
-        expected_msg = "[message from telegram] ping\n[reply to telegram]\n"
+        expected_msg = (
+            f"[message from telegram] ping\n"
+            f'[reply to telegram: office send -a telegram --reply-to {stream_id} "..."]\n'
+        )
         mock_submit.assert_called_once_with(
             "testtenant", "bob", expected_msg,
             stream_id=stream_id, socket=None,
@@ -257,7 +294,7 @@ class TmuxPortTests(unittest.TestCase):
 
     @patch("modules.tmux.port.submit_text")
     @patch("modules.tmux.port.list_windows", return_value={"bob"})
-    def test_deliver_tmux_pops_one_envelope_per_call(self, mock_list, mock_submit):
+    def test_deliver_tmux_drains_queued_envelopes_in_one_call(self, mock_list, mock_submit):
         self.register(alice="tmux", bob="tmux")
         id1 = send(self.redis, pod=POD, tenant=TENANT, source="alice", destination="bob", payload={"text": "msg 1"})
         raw1 = self.redis.lpop(prefix(POD, TENANT, "alice", "egress"))
@@ -266,17 +303,15 @@ class TmuxPortTests(unittest.TestCase):
 
         self.redis.rpush(prefix(POD, TENANT, "bob", "ingress"), raw1, raw2)
 
-        # First call pops msg 1
-        deliver_tmux(self.redis, pod=POD, tenant=TENANT, agent="bob", session_name="testtenant")
-        self.assertEqual(mock_submit.call_count, 1)
-        mock_submit.assert_called_with("testtenant", "bob", "[message from alice] msg 1\n", stream_id=id1, socket=None)
-
-        # Second call pops msg 2
         deliver_tmux(self.redis, pod=POD, tenant=TENANT, agent="bob", session_name="testtenant")
         self.assertEqual(mock_submit.call_count, 2)
-        mock_submit.assert_called_with("testtenant", "bob", "[message from alice] msg 2\n", stream_id=id2, socket=None)
-
-        # Ingress is now empty
+        self.assertEqual(
+            [(call.args[2], call.kwargs["stream_id"]) for call in mock_submit.call_args_list],
+            [
+                ("[message from alice] msg 1\n", id1),
+                ("[message from alice] msg 2\n", id2),
+            ],
+        )
         self.assertIsNone(self.redis.lpop(prefix(POD, TENANT, "bob", "ingress")))
 
     def test_mark_delivery_pending(self):

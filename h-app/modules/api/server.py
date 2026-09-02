@@ -566,7 +566,15 @@ def _render_restdoc_html(app: FastAPI) -> str:
       It does <strong>NOT</strong> mean the envelope has been delivered to the destination or executed. Delivery is asynchronous: the switch moves envelopes from egress to destination ingress queues and kicks the corresponding port process. Unenrolled local destinations are rejected synchronously with HTTP <code>404 Not Found</code>; failures after registry validation succeeds (for example, an opener failure) dead-letter asynchronously. To trace envelope progress, inspect log output using the returned <code>stream_id</code>.
     </p>
 
-    <h2>4. Live Terminal Session Protocol</h2>
+    <h2>4. Reply Correlation (<code>in_reply_to</code>)</h2>
+    <p>
+      A mailbox message read from <code>GET /agents/{{agent}}/messages</code> (or its SSE stream) may carry a top-level <code>in_reply_to</code> field: the <code>stream_id</code> of the envelope it answers. <strong>Absent means genuinely absent</strong> -- never <code>null</code>, never <code>""</code> -- so check for the key's presence, not its truthiness.
+    </p>
+    <p>
+      Three states, not two, and the third is permanent, not a gap to be closed later: <strong>correlated</strong> (the replying agent opted in with a real, previously-delivered id, and it validated); <strong>uncorrelated</strong> (the replying agent didn't opt in, can't, or is on a route this doesn't cover -- keep this working indefinitely, it is accepted behaviour, not a known limit); and <strong>dropped</strong> (a claimed id that was malformed, or well-formed but never actually delivered to that agent <em>by this specific API client</em>, stripped before storage -- indistinguishable from uncorrelated on the wire, by design, so a client never sees a confidently wrong pointer minted by a different client). See <code>modules/api/README.md</code> for the full mechanism.
+    </p>
+
+    <h2>5. Live Terminal Session Protocol</h2>
     <p>
       Live terminal streaming and driving takes place over a dedicated WebSocket service on port 8081 at <code>ws://&lt;host&gt;:8081/session</code>.
     </p>

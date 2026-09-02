@@ -11,7 +11,7 @@ import uuid
 from contextlib import contextmanager
 from typing import Any, Callable, Union
 
-from .keys import prefix
+from .keys import delivery_lock_key, prefix
 from .logging import log_record
 
 logger = logging.getLogger(__name__)
@@ -56,11 +56,6 @@ if #items > 0 then
 end
 return items
 """
-
-
-def delivery_lock_key(pod: str, tenant: str, agent: str) -> str:
-    """Canonical Redis key for one destination's delivery lease."""
-    return prefix(pod, tenant, agent=agent, resource="delivering")
 
 
 def register_type(port_type_name: str, handler: HandlerSpec) -> None:

@@ -15,6 +15,7 @@ from core.registry import port_type
 from lib.attachment_schema import validate_attachment_payload
 from lib.board_interaction import add_ticket
 from lib.paths import get_workdir_root
+from lib.reply_correlation import record_delivered
 from .ops import list_windows, submit_text
 
 # The CLIs that write a session file the switch can tail. An agent running
@@ -103,19 +104,30 @@ def message_opener(
     source = envelope.get("l2", {}).get("source", "unknown")
     payload = envelope.get("payload", {})
     text = payload.get("text", "") if isinstance(payload, dict) else str(payload)
+    stream_id = envelope.get("stream_id", "")
     blocks = [f"[message from {source}] {text}\n"]
     try:
         pt = port_type(r, pod=pod, tenant=tenant, agent=source)
     except Exception:
         pt = None
     if pt == "api":
-        blocks.append(f"[reply to {source}]\n")
+        # The id only goes here, not on the primary line above: in_reply_to
+        # is only ever validated by modules/api/port.py's deliver_api, which
+        # only ever runs for an api-type destination -- exactly the
+        # condition that already gates this hint line. Exposing it on every
+        # message (tmux-to-tmux included, where nothing would ever read it)
+        # would be a permanent width tax on the line every agent actually
+        # reads, for a benefit that only exists here. See lib/reply_correlation.py.
+        blocks.append(f"[reply to {source}: office send -a {source} --reply-to {stream_id} \"...\"]\n")
 
     msg = "".join(blocks)
-    stream_id = envelope.get("stream_id", "")
     corr_id = envelope.get("correlation_id")
     mark_delivery_pending(r, pod, tenant, agent, stream_id, correlation_id=corr_id)
     submit_text(session_name, agent, msg, stream_id=stream_id, socket=socket)
+    # Recorded only after submit_text returns successfully: if it raises,
+    # the message never reached the pane, and a stream_id "delivered" here
+    # but never actually seen must not later validate a reply's in_reply_to.
+    record_delivered(r, pod=pod, tenant=tenant, agent=agent, stream_id=stream_id, source=source)
 
 
 def messages_opener(
