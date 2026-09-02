@@ -23,34 +23,65 @@ passing CI. This is a decision, not an oversight, and it is recorded here so
 that nobody mistakes the absence of a rule for a rule nobody got around to
 configuring.
 
-GitHub's merge-gating rules — "Require a pull request before merging" and
-"Require workflows to pass before merging" — only take effect on pull-request
-merges and merge queues. They do not evaluate a direct push. We merge to `main`
-by direct push and do not use pull requests, so enabling those rules would gate
-a path we never take while leaving the path we do take untouched. Turning them
-on would produce the appearance of enforcement without the substance, which is
-worse than no rule at all: a reader of the settings page would conclude that
-`main` is protected when it is not.
+As of this writing the repository has **no rulesets and no branch protection on
+`main`** — `GET /repos/{owner}/{repo}/rulesets` returns an empty list and
+`GET /repos/{owner}/{repo}/branches/main/protection` returns 404. Nothing is
+being bypassed. Nothing is configured.
 
-What actually gates a merge here is procedural, not mechanical:
+⚠ Do not justify that state by claiming GitHub's rules cannot gate a direct
+push. They can. Branch rulesets and protected-branch rules target *updates to
+the branch*, not merely actions taken through the pull-request UI: required
+status checks must pass before a collaborator can change the targeted branch,
+and "require a pull request before merging" rejects direct pushes outright
+unless an actor has bypass. An earlier draft of this document asserted the
+opposite and was wrong.
+
+The real obstacle is our own workflow triggers, and it is specific:
+`.github/workflows/ci.yml` runs on `pull_request`, `merge_group`, and pushes to
+`main`. It does **not** run on pushes to topic branches. So a commit sitting on
+a topic branch has no check run attached to it at all. Turn on required status
+checks for `main` while merging by direct push, and every direct push is
+rejected forever — not because the code fails, but because the required check
+can never come into existence for a commit that has not already landed on
+`main`. Requiring a pull request has the same effect by design: it ends direct
+pushes.
+
+That is the actual trade. A mechanical gate here is not weak, it is
+*load-bearing*: enabling one means adopting pull requests, or restoring CI on
+topic-branch pushes so commits can carry a check before they land. Both are
+real options and neither has been taken. Until one is, the absence of a gate is
+a standing decision to rely on process instead — made knowingly, and revisitable
+the moment someone is willing to pay for one of those two changes.
+
+What gates a merge here today is procedural, not mechanical:
 
 1. **An independent review before merge**, raised as a ticket against a
    specific commit hash. A review verdict attaches to that hash and does not
-   carry forward to later commits on the same branch. A branch stays frozen
-   while a review ticket against it is open; if it moves anyway, the review is
-   re-raised against the new head rather than stretched to cover it.
+   carry forward to later commits on the same branch. A branch **must remain
+   frozen** while a review ticket against it is open. This is a rule, not an
+   observed property: heads have moved under open tickets, and the required
+   response is to re-raise the review against the new head rather than stretch
+   the old verdict to cover it.
 2. **A full-suite run reproduced by whoever merges**, not accepted as a
    reported number from the branch author. A focused subset passing is
-   evidence about the change; only `python -m tools.run_tests` on the merge
-   result is evidence about the suite.
+   evidence about the change; only a full run on the merge result is evidence
+   about the suite.
+
+   ⚠ State which tree the run was in. `python -m tools.run_tests` resolves its
+   own repository root from the installed module's path, so invoking it from a
+   git worktree or a second checkout runs the suite against the *install* clone
+   while you stand in the branch — exiting 0 with a believable count. Confirm
+   with `python -c "import tools.run_tests as m; print(m.REPO_ROOT)"` and check
+   the path is the tree you meant to test.
 
 Both steps are human discipline and can be skipped by anyone who decides to
-skip them. That is the honest cost of not using pull requests, and it should be
-weighed rather than forgotten.
+skip them. That is the honest cost of not having a mechanical gate, and it
+should be weighed rather than forgotten.
 
-⚠ If this project ever adopts pull requests, revisit this section first. The
-two rules above become worth enabling the moment merges actually flow through
-PRs, and at that point the preferred form is an organization or enterprise
+⚠ If this project ever adopts pull requests, revisit this section first. Both
+rules become straightforward to enable once merges actually flow through
+PRs — a pull request gives each commit a check to satisfy, which is the piece
+missing today. The preferred form is then an organization or enterprise
 ruleset targeting `main` that requires a pull request and pins
 `.github/workflows/ci.yml` **from the `main` branch** as a required workflow.
 Pinning the workflow to `main` is the part that matters: it stops a topic
