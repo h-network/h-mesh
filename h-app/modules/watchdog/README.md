@@ -93,6 +93,22 @@ deliberately rather than by accident (2026-09-02):
   `core.channels.send()` (confirmed by reading it directly) -- that family
   is dormant, not broken. Documented in its own docstring so a quiet ack-
   loop check is not mistaken for "no ack-looping happening."
+- **`_EMIT_USAGE_LUA` preflights every key it may write, before the first
+  mutation.** A Redis `EVAL` is isolated from other clients but NOT
+  transactional with itself -- a runtime error partway through does not
+  undo `redis.call()` side effects the same script already applied.
+  Confirmed on real Redis (FakeRedis cannot reproduce mid-script `WRONGTYPE`
+  faithfully): with `attributed_key` holding the wrong type, the pre-fix
+  script emitted the usage record and set its dedup marker, then failed on
+  the attribution `SADD` -- a real usage record survives, silently missing
+  its delivery correlation, with the caller swallowing the error entirely.
+  The fix checks `TYPE` on `stream_key`/`seen_key`/`attributed_key` before
+  any mutation and returns an error reply if any is wrong, so the script now
+  does nothing at all or everything -- never partially. The eval-failure
+  path (preflight rejection or otherwise) also now logs `usage_emit_failed`
+  instead of silently returning; a systemic problem here (e.g. something
+  elsewhere writing the wrong type to one of these keys) used to be able to
+  stop all usage tracking for an agent forever with no trace of why.
 
 ## Imports from core
 

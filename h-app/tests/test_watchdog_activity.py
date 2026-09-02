@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import shutil
 import sys
@@ -20,12 +22,22 @@ TENANT = "hq"
 
 
 class FakeRedis:
-    def __init__(self, agents=("sme-2",)):
+    def __init__(self, agents=("sme-2",), fail_eval=False):
         self.values = {}
         self.hashes = defaultdict(dict)
         self.streams = defaultdict(list)
+        self.fail_eval = fail_eval
         registry_key = prefix(POD, TENANT, resource="registry")
         self.hashes[registry_key] = {agent: "tmux" for agent in agents}
+
+    def eval(self, script, numkeys, *args):
+        # Only ever configured to fail in these tests -- stands in for a
+        # real preflight rejection (see the real-Redis verification for the
+        # actual WRONGTYPE repro; this just exercises the Python-side
+        # exception handling around the eval() call).
+        if self.fail_eval:
+            raise Exception("simulated: wrong type for attributed_key")
+        raise NotImplementedError("this FakeRedis only simulates eval failure")
 
     def get(self, key):
         return self.values.get(key)
@@ -289,6 +301,44 @@ class ActivityTailerTests(unittest.TestCase):
         )
         ActivityTailer(r, pod=POD, tenant=TENANT, home_root=self.tmp_path).poll()
         self.assertNotIn(prefix(POD, TENANT, resource="usage"), r.streams)
+
+    def test_usage_emit_failure_is_logged_not_swallowed(self):
+        """A rejected eval() (preflight or otherwise) used to vanish with a
+        bare `except: return` -- a systemic problem (e.g. something writing
+        the wrong type to one of the usage keys) could silently stop all
+        usage tracking for an agent forever, with nothing to find it by.
+        Must be observable."""
+        r = FakeRedis(fail_eval=True)
+        session = self.tmp_path / ".claude" / "projects" / "-workdir-sme-2" / "one.jsonl"
+        _write_lines(session, [
+            {
+                "type": "assistant",
+                "timestamp": "2026-08-09T10:00:01Z",
+                "message": {
+                    "id": "req-1",
+                    "model": "claude-x",
+                    "content": [{"type": "text", "text": "hi"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            },
+        ])
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ActivityTailer(r, pod=POD, tenant=TENANT, home_root=self.tmp_path).poll()
+
+        lines = [json.loads(line) for line in buf.getvalue().splitlines() if line.strip()]
+        failures = [line for line in lines if line.get("event") == "usage_emit_failed"]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["destination"], "sme-2")
+        self.assertIn("wrong type for attributed_key", failures[0]["reason"])
+        # The activity event itself (privacy-reduced, no usage) still
+        # emits independently -- a usage-emission failure must not swallow
+        # the rest of the pass.
+        self.assertEqual(
+            [event["kind"] for event in _events(r)],
+            ["output"],
+        )
 
     def test_agy_shared_file_keeps_independent_offsets_per_agent(self):
         r = FakeRedis(agents=("frontend", "backend"))
