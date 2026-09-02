@@ -369,7 +369,10 @@ class SessionTests(unittest.TestCase):
             settings.validate()
 
     def test_legacy_plaintext_override_is_ignored(self):
-        with patch.dict(os.environ, {"FLOCK_ALLOW_PLAINTEXT": "1", "H_MESH_ALLOW_PLAINTEXT": "0"}):
+        with patch.dict(
+            os.environ,
+            {"FLOCK_ALLOW_PLAINTEXT": "1", "H_MESH_ALLOW_PLAINTEXT": "0"},  # legacy-name-allow: FLOCK_ALLOW_PLAINTEXT
+        ):
             settings = SessionSettings(
                 tenant="office",
                 api_token="secret",

@@ -1006,6 +1006,40 @@ def test_hold_requires_and_lists_reason(monkeypatch, capsys):
     assert "reason:waiting for API credentials" in capsys.readouterr().out
 
 
+def test_hold_parks_queued_ticket_without_displacing_active_work(monkeypatch, capsys):
+    """Parking queued work changes the board signal without inventing activity.
+
+    The active ticket must stay exactly where it is, while the selected queued
+    ticket leaves the unpicked queue and remains visible on hold with its reason.
+    """
+    _env(monkeypatch)
+    r = FakeRedis()
+    keys = office_cli._task_keys(POD, TENANT, "architect")
+    active = json.dumps(
+        _ticket("architect", task_id="active-task", status="doing", title="active work")
+    )
+    queued = json.dumps(
+        _ticket("architect", task_id="queued-task", status="todo", title="queued work")
+    )
+    r.lists[keys["doing"]].append(active)
+    r.lists[keys["todo"]].append(queued)
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["hold", "queued", "--reason", "waiting for dependency"])
+        capsys.readouterr()
+        office_main(["list"])
+
+    assert r.lists[keys["doing"]] == [active]
+    assert r.lists[keys["todo"]] == []
+    parked = json.loads(r.lists[keys["hold"]][0])
+    assert parked["id"] == "queued-task"
+    assert parked["status"] == "hold"
+    assert parked["hold_reason"] == "waiting for dependency"
+    listed = capsys.readouterr().out
+    assert "queued-t  queued work" in listed
+    assert "reason:waiting for dependency" in listed
+
+
 def test_list_accepts_legacy_hold_and_done_without_new_fields(monkeypatch, capsys):
     _env(monkeypatch)
     r = FakeRedis()
