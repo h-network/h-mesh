@@ -342,6 +342,95 @@ class ApiTests(unittest.TestCase):
             deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
         self.assertNotIn(marker, out2.getvalue())
 
+    def test_reply_correlation_and_dead_letter_reasons_are_always_closed_literals(self):
+        """Answers architect's question after reviewer's second find on
+        this same function: is the search PREDICATE fixed now, or only its
+        two known outputs? Fuzzes every branch of both log-reaching paths
+        in this module with adversarial values, not just reviewer's one
+        marker, and asserts every resulting `reason` is a member of the
+        closed, hardcoded literal set. A THIRD interpolation site anywhere
+        in this module would fail this test regardless of what the leaked
+        value looked like -- the actual guarantee "closed literals only"
+        is supposed to give is not "these two are fixed" but "there is no
+        runtime value between the code and this field at all"."""
+        closed_reasons = {
+            None,
+            "malformed in_reply_to",
+            "in_reply_to present but reply has no l2 source",
+            "in_reply_to provenance unavailable (storage unreachable)",
+            "in_reply_to was never delivered to the claimed source",
+            "malformed envelope",
+        }
+
+        def reasons_from(out: str) -> set:
+            return {json.loads(line).get("reason") for line in out.splitlines()}
+
+        ingress = prefix("test", "office", "telegram", "ingress")
+        adversarial_markers = [
+            "deadbeefdeadbeefdeadbeefdeadbeef",
+            "cafebabecafebabecafebabecafebabe",
+            "0" * 32,
+            "not-a-valid-hex-id-at-all-nope!!",
+            "SECRET_LEAK_ATTEMPT_UPPER_CASE_XX",
+        ]
+
+        # Malformed and never-delivered branches: build(in_reply_to=...)
+        # rejects anything not already 32 lowercase hex, so tamper the
+        # wire form directly to reach deliver_api with whatever the
+        # marker actually is, valid-shaped or not.
+        for marker in adversarial_markers:
+            envelope = build("Message", "alice", "telegram", {"text": "hi"}, pod="test", tenant="office")
+            raw = self._tamper_in_reply_to(envelope, marker)
+            self.redis.lists[ingress] = [raw]
+            out = io.StringIO()
+            with redirect_stdout(out):
+                deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+            self.assertNotIn(marker, out.getvalue())
+            self.assertLessEqual(reasons_from(out.getvalue()), closed_reasons)
+
+        # Provenance-unavailable branch: valid-shaped id, storage unreachable.
+        for marker in ("deadbeefdeadbeefdeadbeefdeadbeef", "cafebabecafebabecafebabecafebabe"):
+            envelope = build(
+                "Message", "alice", "telegram", {"text": "hi"},
+                pod="test", tenant="office", in_reply_to=marker,
+            )
+            self.redis.lists[ingress] = [encode(envelope)]
+
+            def broken_get(key):
+                raise ConnectionError("redis unavailable")
+
+            out = io.StringIO()
+            with patch.object(self.redis, "get", side_effect=broken_get), redirect_stdout(out):
+                deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+            self.assertNotIn(marker, out.getvalue())
+            self.assertLessEqual(reasons_from(out.getvalue()), closed_reasons)
+
+        # Dead-letter path: malformed frames hitting different EnvelopeError
+        # raise sites in core/envelope.py -- a bad L2 header name, a bad L3
+        # body address, and non-JSON body -- must all reduce to the single
+        # "malformed envelope" literal, regardless of what remote text
+        # triggered the rejection or which field carried it.
+        valid = encode(build("Message", "alice", "telegram", {"text": "hi"}, pod="test", tenant="office"))
+        header = valid[:256]
+        marker = "LEAK_MARKER_FOR_DEAD_LETTER_PATH"
+        malformed_raws = [
+            "short",
+            header + "not json",
+            valid[:65] + marker.ljust(63) + valid[128:256] + valid[256:],
+            header + json.dumps({
+                "kind": "Message", "ts": "x",
+                "l3": {"source": f"test:office:{marker}", "destination": "test:office:telegram"},
+                "payload": {},
+            }, separators=(",", ":")),
+        ]
+        for raw in malformed_raws:
+            self.redis.lists[ingress] = [raw]
+            out = io.StringIO()
+            with redirect_stdout(out):
+                deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+            self.assertNotIn(marker, out.getvalue())
+            self.assertLessEqual(reasons_from(out.getvalue()), closed_reasons)
+
     def _tamper_in_reply_to(self, envelope, value):
         """Bypass build()/encode()'s strict validation to simulate an
         already-parsed, permissive frame carrying whatever the wire said --

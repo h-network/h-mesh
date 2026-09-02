@@ -90,6 +90,7 @@ h-app/tests/test_api.py::ApiTests::test_overlapping_prompts_answered_out_of_orde
 h-app/tests/test_api.py::ApiTests::test_post_envelope_does_not_report_a_write_failure_as_a_rejection
 h-app/tests/test_api.py::ApiTests::test_qualified_destination_routes_through_core_channel
 h-app/tests/test_api.py::ApiTests::test_real_tmux_delivery_then_deliver_api_rejects_peer_originated_correlation
+h-app/tests/test_api.py::ApiTests::test_reply_correlation_and_dead_letter_reasons_are_always_closed_literals
 h-app/tests/test_api.py::RealApiPortSubprocessTests::test_real_api_module_subprocess_invocation
 h-app/tests/test_attachment_schema.py::AttachmentSchemaTests::test_base64_validation
 h-app/tests/test_attachment_schema.py::AttachmentSchemaTests::test_caption_length_validation
