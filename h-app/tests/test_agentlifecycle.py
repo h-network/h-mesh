@@ -13,8 +13,8 @@ from core.channels import receive
 from core.dispatch import delivery_lock_key
 from core.envelope import build, encode, parse
 from core.keys import (
-    prefix, receive_opened_key, receive_opening_key, receive_processing_key,
-    receive_undeliverable_key, receive_unresolved_key,
+    incarnation_key, prefix, receive_opened_key, receive_opening_key, receive_processing_key,
+    receive_undeliverable_key, receive_unresolved_key, retired_inbox_key,
 )
 from core.policy import tags_key
 from lib.agentlifecycle.lifecycle import (
@@ -22,6 +22,8 @@ from lib.agentlifecycle.lifecycle import (
     ProvableLifecycleRejection,
     _IncompleteLifecycle,
     _PUBLISH_LEAD_MEMBERSHIP_LUA,
+    _PUBLISH_MEMBERSHIP_LUA,
+    _PUBLISH_WINDOW_CAUSE_LUA,
     _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
     _PartialLifecycle,
     resume_agent,
@@ -247,6 +249,191 @@ def test_undeliverable_record_preserves_non_utf8_raw_exactly(real_redis):
             real_redis.delete(*keys)
 
 
+def test_stop_conserves_api_inbox_content_with_hex_fields_plain_entry_id(real_redis):
+    """Ticket 97ad745c's second exposure: a same-named successor's own
+    client could otherwise read a retired predecessor's already-delivered
+    mailbox content. switch-agent's exact shape: field NAMES and VALUES
+    hex-encoded as an ORDERED ARRAY of pairs, not a JSON object, so
+    duplicate fields and field order survive exactly rather than being
+    reconstructed -- proven here by planting a genuine duplicate field
+    name via raw XADD (redis-py's own dict-based xadd/xrange cannot even
+    represent this, so this test bypasses both and reads the RESP reply
+    fields flatly, matching what the Lua side actually sees). The stream
+    entry id is kept as plain text (Redis-generated ASCII, a real storage
+    invariant unlike the fields), and a hostile non-UTF8 byte value is
+    planted directly to prove hex-encoding protects the boundary rather
+    than merely matching today's json.dumps-shaped writes."""
+    tenant = f"stop-inbox-{uuid4().hex[:12]}"
+    agent = "worker"
+    registry_key = prefix(POD, tenant, resource="registry")
+    inbox_key = prefix(POD, tenant, agent=agent, resource="inbox")
+    evidence_key = retired_inbox_key(POD, tenant)
+    hostile_value = b"\xff\x00not-valid-utf8"
+    real_redis.hset(registry_key, agent, "api")
+    # A genuine duplicate field name ("dup" twice) in a specific order --
+    # constructed via the raw command, since redis-py's dict-based xadd
+    # cannot represent it at all.
+    expected_pairs = [
+        (b"dup", b"first"), (b"other", hostile_value), (b"dup", b"second"),
+    ]
+    xadd_args = [item for pair in expected_pairs for item in pair]
+    entry_id = real_redis.execute_command("XADD", inbox_key, "*", *xadd_args)
+    try:
+        stop_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent}},
+            kill_window=lambda _agent: None,
+        )
+
+        [record_raw] = real_redis.lrange(evidence_key, 0, -1)
+        record = json.loads(record_raw)
+        assert record["agent"] == agent
+        assert record["reason"] == "destination retired with unread inbox content"
+        assert record["encoding"] == "hex"
+        expected_entry_id = entry_id.decode() if isinstance(entry_id, bytes) else entry_id
+        assert record["entry_id"] == expected_entry_id
+        observed_pairs = [
+            (bytes.fromhex(f), bytes.fromhex(v)) for f, v in record["fields"]
+        ]
+        assert observed_pairs == expected_pairs
+        assert real_redis.exists(inbox_key) == 0
+        assert real_redis.hget(registry_key, agent) is None
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
+def test_stop_conserves_more_than_a_thousand_inbox_entries_by_exact_identity(real_redis):
+    """MAILBOX_MAXLEN=1000 is a writer-side default (approximate trimming
+    can overshoot it), not a validity bound this script may assume -- and
+    the actual concern is constant-arity iteration regardless of count,
+    the same discipline reviewer's 10,000-entry stress test already
+    proved for undeliverable/unresolved. Seeds more than the nominal cap
+    directly (bypassing the writer's own maxlen) and confirms every single
+    one survives conservation by exact identity, not just a plausible
+    count."""
+    # A LIST, not a set: the documented property is exact-once, ORDERED
+    # conservation, and a set comparison cannot fail on duplication or
+    # reordering -- it would pass even if a record were dropped and
+    # another duplicated, as long as the surviving id set matched.
+    tenant = f"stop-inbox-bulk-{uuid4().hex[:12]}"
+    agent = "worker"
+    registry_key = prefix(POD, tenant, resource="registry")
+    inbox_key = prefix(POD, tenant, agent=agent, resource="inbox")
+    evidence_key = retired_inbox_key(POD, tenant)
+    real_redis.hset(registry_key, agent, "api")
+    expected_ids = []
+    for index in range(1200):
+        entry_id = real_redis.xadd(inbox_key, {"n": str(index)})
+        expected_ids.append(entry_id.decode() if isinstance(entry_id, bytes) else entry_id)
+    try:
+        stop_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent}},
+            kill_window=lambda _agent: None,
+        )
+
+        records = [json.loads(raw) for raw in real_redis.lrange(evidence_key, 0, -1)]
+        assert [record["entry_id"] for record in records] == expected_ids
+        assert all(record["agent"] == agent for record in records)
+        assert all(
+            record["reason"] == "destination retired with unread inbox content"
+            for record in records
+        )
+        assert real_redis.exists(inbox_key) == 0
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
+def test_stop_conserves_a_non_api_agents_inbox_so_an_api_successor_cannot_inherit_it(real_redis):
+    """switch-agent's second-pass finding: an earlier version of this
+    fix gated the inbox DEL on `this_port_type == 'api'` and left a
+    non-api agent's inbox key untouched ("preserved in place") when one
+    somehow existed. That still permitted the exact successor
+    contamination this whole script exists to close -- the registry's
+    CURRENT port type at retirement says nothing about what a same-named
+    SUCCESSOR will be hired as next. A tmux-type name retired today can
+    be re-hired as an api-type agent tomorrow, and that successor's
+    GET /agents/{agent}/messages reads the same reusable per-name inbox
+    key regardless of what port type used to own it. So conservation and
+    deletion are now unconditional on whether a stream exists at the
+    inbox key at all, never on the registry's current port-type claim --
+    a non-api origin only changes the RECORDED REASON, not whether the
+    content is conserved and removed. Seeds a tmux-type membership with
+    an inbox stream (unexpected, but not something this script may
+    assume never happens), stops it, re-hires the SAME NAME as an
+    api-type agent, and confirms the predecessor's content is visible
+    only through retired-inbox evidence -- never through the successor's
+    own fresh inbox."""
+    tenant = f"stop-non-api-inbox-{uuid4().hex[:12]}"
+    agent = "worker"
+    registry_key = prefix(POD, tenant, resource="registry")
+    inbox_key = prefix(POD, tenant, agent=agent, resource="inbox")
+    evidence_key = retired_inbox_key(POD, tenant)
+    real_redis.hset(registry_key, agent, "tmux")
+    entry_id = real_redis.xadd(inbox_key, {"unexpected": "content"})
+    expected_entry_id = entry_id.decode() if isinstance(entry_id, bytes) else entry_id
+    try:
+        stop_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent}},
+            kill_window=lambda _agent: None,
+        )
+
+        [record_raw] = real_redis.lrange(evidence_key, 0, -1)
+        record = json.loads(record_raw)
+        assert record["entry_id"] == expected_entry_id
+        assert record["reason"] == "destination retired with unread inbox content for a non-api port type"
+        assert real_redis.exists(inbox_key) == 0
+
+        start_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent, "port_type": "api"}},
+            replace_window=lambda _agent: None,
+            available_profiles=lambda *_: None,
+        )
+        assert real_redis.xrange(inbox_key, "-", "+") == []
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
+def test_successor_cannot_read_predecessors_inbox_content(real_redis):
+    """The harm this exposure describes, exercised end to end: a
+    predecessor's undelivered mailbox content must not be visible through
+    a same-named successor's own fresh inbox after a stop+rehire -- the
+    successor's view is empty by construction, not by relying on anyone
+    remembering to clean up."""
+    tenant = f"stop-inbox-successor-{uuid4().hex[:12]}"
+    agent = "worker"
+    registry_key = prefix(POD, tenant, resource="registry")
+    inbox_key = prefix(POD, tenant, agent=agent, resource="inbox")
+    real_redis.hset(registry_key, agent, "api")
+    real_redis.xadd(inbox_key, {"envelope": "predecessor content nobody read"})
+    try:
+        stop_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent}},
+            kill_window=lambda _agent: None,
+        )
+        start_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent, "port_type": "api"}},
+            replace_window=lambda _agent: None,
+            available_profiles=lambda *_: None,
+        )
+
+        assert real_redis.xrange(inbox_key, "-", "+") == []
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
 @pytest.mark.parametrize(
     ("source_resource", "destination_key", "reason"),
     [
@@ -328,7 +515,7 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
     assert r.method_calls == [
         call.eval(
             ANY,
-            18,
+            21,
             prefix(POD, TENANT, resource="registry"),
             prefix(POD, TENANT, resource="lead"),
             receive_processing_key(POD, TENANT, "worker-1"),
@@ -339,6 +526,9 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
             *_instance_config_keys(POD, TENANT, "worker-1"),
             receive_undeliverable_key(POD, TENANT),
             receive_unresolved_key(POD, TENANT),
+            incarnation_key(POD, TENANT, "worker-1"),
+            prefix(POD, TENANT, agent="worker-1", resource="inbox"),
+            retired_inbox_key(POD, TENANT),
             "worker-1",
         ),
     ]
@@ -468,6 +658,151 @@ def test_rehired_name_cannot_inherit_predecessor_runtime_identity(real_redis):
             real_redis.delete(*keys)
 
 
+def test_fresh_hire_mints_an_incarnation_id(real_redis):
+    """Ticket 97ad745c's foundation: a same-name successor must not inherit
+    a predecessor's delivered.s* provenance, which requires the delivery
+    claim to be bound to something that changes across a stop/rehire but
+    survives an ordinary restart. Confirms the id actually gets minted at
+    all, for the plain membership-only path (no lead, no correlation_id
+    cause) telegram bot's own StartAgent payload takes."""
+    tenant = f"incarnation-fresh-{uuid4().hex[:12]}"
+    agent = "worker"
+    try:
+        start_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent, "port_type": "api"}},
+            replace_window=lambda _agent: None,
+            available_profiles=lambda *_: None,
+        )
+        minted = real_redis.get(incarnation_key(POD, tenant, agent))
+        assert minted is not None
+        assert len(minted) == 32  # uuid4().hex
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
+def test_idempotent_reenrol_does_not_change_incarnation(real_redis):
+    """Architect's explicit inverse case, and the exact bug a naive
+    unconditional mint would cause: clients/telegram/bot.py calls
+    StartAgent on every process restart, documented there as safe and
+    idempotent. If start_agent rebound the incarnation id on every such
+    call, a bot crash-restart would invalidate its OWN just-established
+    delivered.s* claims and cause redelivery of messages a human already
+    saw -- a worse, quieter bug than the one this feature closes. Calls
+    start_agent twice for the same never-stopped name and confirms the
+    incarnation id is identical both times."""
+    tenant = f"incarnation-reenrol-{uuid4().hex[:12]}"
+    agent = "worker"
+    try:
+        for _ in range(2):
+            start_agent(
+                real_redis, pod=POD, tenant=tenant,
+                envelope={"payload": {"agent": agent, "port_type": "api"}},
+                replace_window=lambda _agent: None,
+                available_profiles=lambda *_: None,
+            )
+        # A third call through the window-cause path (a real envelope's
+        # correlation_id is always present) exercises the other Lua branch
+        # a restart could equally take.
+        start_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={
+                "correlation_id": "b" * 32,
+                "payload": {"agent": agent, "port_type": "api"},
+            },
+            replace_window=lambda _agent: None,
+            available_profiles=lambda *_: None,
+        )
+        final = real_redis.get(incarnation_key(POD, tenant, agent))
+        assert final is not None
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
+def test_legacy_member_with_no_incarnation_self_heals_on_next_reenrol(real_redis):
+    """switch-agent's rollout-gap finding: every publish Lua originally
+    gated minting on HEXISTS==0 alone, so an agent already registered
+    before this binding shipped would NEVER acquire an incarnation id
+    until an actual stop+rehire -- unbounded, not the DELIVERED_TTL_SECONDS
+    -bounded transition window the docs claim, for any agent that simply
+    never gets stopped. Pre-seeds the registry directly (bypassing
+    start_agent, simulating a pre-feature member with no incarnation key
+    at all), confirms an idempotent StartAgent establishes one, then
+    confirms a SECOND idempotent StartAgent leaves it unchanged -- the
+    self-heal must fire exactly once, not on every re-enrol."""
+    tenant = f"incarnation-self-heal-{uuid4().hex[:12]}"
+    agent = "legacy-worker"
+    registry_key = prefix(POD, tenant, resource="registry")
+    try:
+        real_redis.hset(registry_key, agent, "api")
+        assert real_redis.get(incarnation_key(POD, tenant, agent)) is None
+
+        start_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent, "port_type": "api"}},
+            replace_window=lambda _agent: None,
+            available_profiles=lambda *_: None,
+        )
+        healed = real_redis.get(incarnation_key(POD, tenant, agent))
+        assert healed is not None
+
+        start_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent, "port_type": "api"}},
+            replace_window=lambda _agent: None,
+            available_profiles=lambda *_: None,
+        )
+        assert real_redis.get(incarnation_key(POD, tenant, agent)) == healed
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
+def test_stop_then_rehire_mints_a_new_incarnation_id(real_redis):
+    """The exposure ticket 97ad745c exists to close: a same-named
+    successor must get a genuinely different incarnation id than its
+    predecessor had, so lib/reply_correlation.py's incarnation-bound
+    delivered.s* records structurally cannot match the successor's
+    queries."""
+    tenant = f"incarnation-rehire-{uuid4().hex[:12]}"
+    agent = "worker"
+    try:
+        start_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent, "port_type": "api"}},
+            replace_window=lambda _agent: None,
+            available_profiles=lambda *_: None,
+        )
+        predecessor_incarnation = real_redis.get(incarnation_key(POD, tenant, agent))
+        assert predecessor_incarnation is not None
+
+        stop_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent}},
+            kill_window=lambda _agent: None,
+        )
+        assert real_redis.get(incarnation_key(POD, tenant, agent)) is None
+
+        start_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent, "port_type": "api"}},
+            replace_window=lambda _agent: None,
+            available_profiles=lambda *_: None,
+        )
+        successor_incarnation = real_redis.get(incarnation_key(POD, tenant, agent))
+        assert successor_incarnation is not None
+        assert successor_incarnation != predecessor_incarnation
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
+
+
 def test_stop_and_rehire_cannot_open_predecessor_processing_custody(real_redis):
     tenant = f"reuse-{uuid4().hex[:12]}"
     agent = "reused-worker"
@@ -587,14 +922,15 @@ def test_start_agent_publishes_lead_with_membership_and_window_cause_atomically(
         call.set(prefix(POD, TENANT, agent="new-lead", resource="launch"), "claude"),
         call.eval(
             ANY,
-            3,
+            4,
             prefix(POD, TENANT, resource="lead"),
             prefix(POD, TENANT, resource="registry"),
             prefix(POD, TENANT, agent="new-lead", resource="window.cause"),
+            incarnation_key(POD, TENANT, "new-lead"),
             "new-lead",
             "tmux",
             "a" * 32,
-            "0",
+            ANY,
         ),
     ]
 
@@ -677,5 +1013,20 @@ def test_logging_failure_does_not_replace_success(_mock_port_type, _mock_log_rec
         replace_window=MagicMock(),
         available_profiles=lambda *_: None,
     )
+    # A plain {"agent": "worker"} payload defaults to port_type "tmux", so
+    # this now goes through the dynamic lead-claim script regardless of
+    # whether "worker" actually becomes lead -- there is no longer a
+    # separate plain-membership path for a tmux hire at all.
     assert r.hset.call_count == 0
-    assert r.eval.call_count == 1
+    r.eval.assert_called_once_with(
+        _PUBLISH_LEAD_MEMBERSHIP_LUA,
+        4,
+        prefix(POD, TENANT, resource="lead"),
+        prefix(POD, TENANT, resource="registry"),
+        prefix(POD, TENANT, agent="worker", resource="window.cause"),
+        incarnation_key(POD, TENANT, "worker"),
+        "worker",
+        "tmux",
+        "",
+        ANY,
+    )

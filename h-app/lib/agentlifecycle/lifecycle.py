@@ -10,10 +10,11 @@ import json
 import time
 from collections.abc import Callable
 from functools import wraps
+from uuid import uuid4
 
 from core.keys import (
-    SEGMENT_REGEX, prefix, receive_opening_key, receive_processing_key,
-    receive_undeliverable_key, receive_unresolved_key,
+    SEGMENT_REGEX, incarnation_key, prefix, receive_opening_key, receive_processing_key,
+    receive_undeliverable_key, receive_unresolved_key, retired_inbox_key,
 )
 from core.dispatch import delivery_lock_key
 from core.logging import log_record
@@ -35,8 +36,20 @@ _TARGET_ONLY_KEYS = frozenset({"agent"})
 _PUBLISH_WINDOW_CAUSE_LUA = """
 -- Atomic, not merely isolated: the only type-sensitive write is HSET, and it
 -- is the first mutation. HEXISTS performs the same hash-type check before any
--- write; the following SET accepts and replaces a key of every Redis type.
-redis.call('HEXISTS', KEYS[2], ARGV[2])
+-- write, and its result -- together with whether an incarnation id already
+-- exists -- decides incarnation minting: a genuinely NEW membership always
+-- gets a fresh id (overwriting any orphan a failed prior attempt could have
+-- left); an EXISTING membership with no incarnation yet (every agent alive
+-- before this binding shipped) self-heals with one fresh mint; an existing
+-- membership that already has one keeps it -- an idempotent re-enrol of an
+-- already-registered name must not rebind it, or a process restart would
+-- invalidate its own just-established delivery claims. The following SETs
+-- accept and replace a key of every Redis type.
+local already_member = redis.call('HEXISTS', KEYS[2], ARGV[2])
+local has_incarnation = redis.call('EXISTS', KEYS[3])
+if already_member == 0 or has_incarnation == 0 then
+    redis.call('SET', KEYS[3], ARGV[4])
+end
 redis.call('HSET', KEYS[2], ARGV[2], ARGV[3])
 redis.call('SET', KEYS[1], ARGV[1])
 return 1
@@ -45,12 +58,21 @@ return 1
 _PUBLISH_LEAD_MEMBERSHIP_LUA = """
 -- Atomic through preflight, not because EVAL rolls back (it does not).
 -- Registry is the only key whose command can fail with WRONGTYPE; validate it
--- as a hash before the optional cause SET becomes the first mutation. Both SET
--- writes accept and replace keys of every Redis type.
+-- as a hash before the optional cause SET becomes the first mutation. The
+-- same HEXISTS-plus-EXISTS decision as _PUBLISH_WINDOW_CAUSE_LUA decides
+-- incarnation minting -- see that script's comment for the three cases and
+-- why idempotent re-enrols must not rebind it. Lead is claimed dynamically,
+-- not by an explicit flag: the first hire to find KEYS[1] empty becomes
+-- lead, and every later hire of any other name preserves the incumbent.
+-- All SET writes accept and replace keys of every Redis type.
 local current_lead = redis.call('GET', KEYS[1])
-redis.call('HEXISTS', KEYS[2], ARGV[1])
+local already_member = redis.call('HEXISTS', KEYS[2], ARGV[1])
+local has_incarnation = redis.call('EXISTS', KEYS[4])
 if ARGV[3] ~= '' then
     redis.call('SET', KEYS[3], ARGV[3])
+end
+if already_member == 0 or has_incarnation == 0 then
+    redis.call('SET', KEYS[4], ARGV[4])
 end
 redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
 if not current_lead or current_lead == '' then
@@ -60,21 +82,46 @@ end
 return 0
 """
 
+_PUBLISH_MEMBERSHIP_LUA = """
+-- Atomic through preflight, not because EVAL rolls back (it does not).
+-- Same incarnation-minting rule as _PUBLISH_WINDOW_CAUSE_LUA and
+-- _PUBLISH_LEAD_MEMBERSHIP_LUA, for the plain membership-only path (no lead,
+-- no fresh window cause) neither of those two Lua scripts covers.
+local already_member = redis.call('HEXISTS', KEYS[1], ARGV[1])
+local has_incarnation = redis.call('EXISTS', KEYS[2])
+if already_member == 0 or has_incarnation == 0 then
+    redis.call('SET', KEYS[2], ARGV[3])
+end
+redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+return 1
+"""
+
 # tools/conservation_harness.py's retirement-conservation scenario assumes
 # this is one of exactly two scripts (the other is core/channels.py's
-# _TRANSFER_RECEIVE_CUSTODY) that ever move a raw envelope out of
-# processing/opening custody -- a new destination added here needs that
-# instrument's sink list updated too (see tools/conservation_harness.md).
+# _TRANSFER_RECEIVE_CUSTODY) that ever move a raw ENVELOPE (something with
+# a `stream_id`, sourced from KEYS[3]/[4]/[5] processing/opening/ingress)
+# out of custody -- a new envelope-shaped destination added here needs
+# that instrument's sink list updated too (see tools/conservation_harness.md).
+# The inbox-conservation branch below is NOT that: it moves stream ENTRIES
+# (keyed by `entry_id`, sourced from KEYS[20], a disjoint identifier space
+# with no `stream_id` at all) and does not need that instrument's scan to
+# reach it -- see the .md for why that's a real distinction, not a gap.
 _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA = """
 -- Atomic through deterministic preflight, not because EVAL rolls back (it
 -- does not). Validate every type-sensitive source and destination, snapshot
 -- every raw, and encode every evidence record before HDEL is the first write.
+-- Port-type classification for the inbox branch below is read HERE, from
+-- the registry itself, before it is removed -- not trusted from an earlier
+-- Python-side observation, so classification stays at the same
+-- linearization point as the removal it gates.
+local this_port_type = redis.call('HGET', KEYS[1], ARGV[1])
 redis.call('HEXISTS', KEYS[1], ARGV[1])
 local current_lead = redis.call('GET', KEYS[2])
-for _, index in ipairs({3, 4, 5, 17, 18}) do
+for _, spec in ipairs({{3, 'list'}, {4, 'list'}, {5, 'list'}, {17, 'list'}, {18, 'list'}, {20, 'stream'}, {21, 'list'}}) do
+    local index, expected = spec[1], spec[2]
     local kind = redis.call('TYPE', KEYS[index])['ok']
-    if kind ~= 'none' and kind ~= 'list' then
-        return redis.error_reply('lifecycle custody key is not a list: ' .. KEYS[index])
+    if kind ~= 'none' and kind ~= expected then
+        return redis.error_reply('lifecycle custody key is not a ' .. expected .. ': ' .. KEYS[index])
     end
 end
 
@@ -109,6 +156,48 @@ for _, raw in ipairs(opening) do
     }))
 end
 
+-- Inbox conservation: keyed on whether a STREAM actually exists at the
+-- canonical inbox resource, not on what the registry currently says this
+-- agent's port type is. A valid stream there is already-delivered
+-- mailbox content regardless of why it exists -- modules/api is the sole
+-- writer today, but "preserve in place instead of conserving" for a
+-- port-type mismatch was a real bypass in an earlier version: a same-
+-- named successor hired later as an api-type agent would read straight
+-- through to whatever an untouched predecessor inbox still held, the
+-- exact inheritance this whole script exists to close, reached through a
+-- port-type change instead of a same-type stop+rehire. So this always
+-- conserves and always deletes; a non-api port type at retirement only
+-- changes the RECORDED REASON, to make an operator reading retired-inbox
+-- aware the source was not the expected api shape. XRANGE and encode
+-- every entry before HDEL is the first mutation, same discipline as
+-- everything above. Field NAMES and VALUES are hex-encoded -- Redis
+-- permits arbitrary binary in either, including from a manual or legacy
+-- write this script has no way to rule out -- as an ORDERED ARRAY of
+-- [field_hex, value_hex] pairs (a Lua table with sequential integer keys
+-- encodes as a JSON array), not a JSON object, so duplicate field names
+-- and field order are preserved exactly rather than reconstructed. The
+-- stream entry id itself is Redis-generated/validated ASCII
+-- (milliseconds-sequence) and is stored as plain text: a real storage
+-- invariant backs it, unlike the fields.
+local retired_inbox = {}
+local inbox_reason = 'destination retired with unread inbox content'
+if this_port_type ~= 'api' then
+    inbox_reason = 'destination retired with unread inbox content for a non-api port type'
+end
+local entries = redis.call('XRANGE', KEYS[20], '-', '+')
+for _, entry in ipairs(entries) do
+    local entry_id = entry[1]
+    local raw_fields = entry[2]
+    local fields = {}
+    for index = 1, #raw_fields, 2 do
+        table.insert(fields, {hex(raw_fields[index]), hex(raw_fields[index + 1])})
+    end
+    table.insert(retired_inbox, cjson.encode({
+        agent=ARGV[1], reason=inbox_reason,
+        entry_id=entry_id, encoding='hex', fields=fields
+    }))
+end
+
 redis.call('HDEL', KEYS[1], ARGV[1])
 if current_lead == ARGV[1] then
     redis.call('DEL', KEYS[2])
@@ -122,6 +211,12 @@ end
 for _, record in ipairs(unresolved) do
     redis.call('RPUSH', KEYS[18], record)
 end
+for _, record in ipairs(retired_inbox) do
+    redis.call('RPUSH', KEYS[21], record)
+end
+-- Unconditional, matching the unconditional read/conserve above -- a
+-- no-op if no inbox stream ever existed at this key.
+redis.call('DEL', KEYS[20])
 redis.call('DEL', KEYS[3])
 redis.call('DEL', KEYS[4])
 redis.call('DEL', KEYS[5])
@@ -141,7 +236,13 @@ redis.call('DEL', KEYS[13])
 redis.call('DEL', KEYS[14])
 redis.call('DEL', KEYS[15])
 redis.call('DEL', KEYS[16])
-return {#processing, #ingress, #opening}
+-- The incarnation id: deleting it here, rather than at the next hire,
+-- means the id exists for exactly the span between a real stop and that
+-- name's next hire. A later start_agent (genuine re-hire or an ordinary
+-- restart) mints a fresh one only if it finds this key already absent --
+-- see _PUBLISH_MEMBERSHIP_LUA and its siblings.
+redis.call('DEL', KEYS[19])
+return {#processing, #ingress, #opening, #retired_inbox}
 """
 
 
@@ -428,7 +529,15 @@ def start_agent(
                 )
         _write_desired(
             committed, "registry row published", "registry row publish",
-            lambda: r.hset(registry_key, agent, agent_port_type),
+            lambda: r.eval(
+                _PUBLISH_MEMBERSHIP_LUA,
+                2,
+                registry_key,
+                incarnation_key(pod, tenant, agent),
+                agent,
+                agent_port_type,
+                uuid4().hex,
+            ),
         )
         return
 
@@ -512,6 +621,15 @@ def start_agent(
     cause = correlation_id if (
         existing_port_type != "tmux" and isinstance(correlation_id, str) and correlation_id
     ) else ""
+    # Generated unconditionally, written only by whichever Lua branch below
+    # finds this is a genuinely new membership (HEXISTS was false) --
+    # wasted entropy on an idempotent re-enrol costs nothing, and keeping
+    # the mint decision inside the SAME atomic script as the registry
+    # HSET (rather than a separate SETNX call before or after it) is load
+    # -bearing: a start that mints an incarnation and then fails or races
+    # before its OWN registry write must not leave an orphaned id a later,
+    # unrelated hire of the same name could silently inherit.
+    fresh_incarnation = uuid4().hex
     if agent_port_type == "tmux":
         lead_result = _write_desired(
             committed,
@@ -519,14 +637,15 @@ def start_agent(
             "lead and registry row publish",
             lambda: r.eval(
                 _PUBLISH_LEAD_MEMBERSHIP_LUA,
-                3,
+                4,
                 prefix(pod, tenant, resource="lead"),
                 registry_key,
                 prefix(pod, tenant, agent=agent, resource="window.cause"),
+                incarnation_key(pod, tenant, agent),
                 agent,
                 agent_port_type,
                 cause,
-                "0",
+                fresh_incarnation,
             ),
         )
     elif cause:
@@ -540,18 +659,28 @@ def start_agent(
             "window cause and registry row publish",
             lambda: r.eval(
                 _PUBLISH_WINDOW_CAUSE_LUA,
-                2,
+                3,
                 cause_key,
                 registry_key,
+                incarnation_key(pod, tenant, agent),
                 cause,
                 agent,
                 agent_port_type,
+                fresh_incarnation,
             ),
         )
     else:
         _write_desired(
             committed, "registry row published", "registry row publish",
-            lambda: r.hset(registry_key, agent, agent_port_type),
+            lambda: r.eval(
+                _PUBLISH_MEMBERSHIP_LUA,
+                2,
+                registry_key,
+                incarnation_key(pod, tenant, agent),
+                agent,
+                agent_port_type,
+                fresh_incarnation,
+            ),
         )
     if config_changed:
         # Remove only stale actual state. tmuxhost observes the registry row and
@@ -584,7 +713,7 @@ def stop_agent(
         committed, "registry row removed and owned lead cleared", "registry/lead removal",
         lambda: r.eval(
             _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
-            18,
+            21,
             registry_key,
             prefix(pod, tenant, resource="lead"),
             receive_processing_key(pod, tenant, agent),
@@ -603,6 +732,9 @@ def stop_agent(
             prefix(pod, tenant, agent=agent, resource="window.cause"),
             receive_undeliverable_key(pod, tenant),
             receive_unresolved_key(pod, tenant),
+            incarnation_key(pod, tenant, agent),
+            prefix(pod, tenant, agent=agent, resource="inbox"),
+            retired_inbox_key(pod, tenant),
             agent,
         ),
     )

@@ -32,6 +32,14 @@ The external route contract intentionally preserves the predecessor's API so
 Telegram and web clients remain ordinary API consumers. Internally it uses h-mesh names:
 `core.channels`, `core.envelope`, `core.keys`, and `core.registry`.
 
+`GET /agents/{agent}` keeps two independently owned facts separate. The
+`presence.state` value is activity-derived (`working`, `idle`, or `unknown`).
+`delivery_unverified` is either `null` or the retained `since` and `stream_id`
+for a delivery whose result could not be verified. That marker is not proof
+that the agent currently cannot accept a prompt, so clients must not use it as
+an admission gate. They may show it as a warning; the attempted send's own
+result is the evidence for whether new work was admitted.
+
 ## SSE idle keepalive
 
 `/agents/{agent}/activity/stream` and `/alerts/stream` (both routed through

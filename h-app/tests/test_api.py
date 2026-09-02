@@ -17,7 +17,8 @@ if str(H_APP) not in sys.path:
 
 from core.channels import send
 from core.envelope import build, encode, parse
-from core.keys import prefix
+from clients.telegram.bot import TelegramBot
+from core.keys import incarnation_key, prefix
 from modules.api import server as server_module
 from modules.api.port import deliver_api
 from modules.api.server import ApiSettings, create_app
@@ -95,6 +96,13 @@ class FakeRedis:
         argv = args[numkeys:]
         if "LRANGE" in script and "DEL" in script:
             return self.lists.pop(keys[0], [])
+        if "reply_correlation verify delivery" in script:
+            incarnation_key, claim_key = keys
+            expected = argv[0]
+            current = self.get(incarnation_key)
+            if current is None or current != expected:
+                return None
+            return self.get(claim_key)
         return 1
 
     def pipeline(self, transaction=False):
@@ -185,6 +193,72 @@ class ApiTests(unittest.TestCase):
             ("GET", "/openapi.json"),
         }
         self.assertTrue(expected.issubset(routes))
+
+    def test_unverified_delivery_does_not_override_active_presence(self):
+        """A stale observation must not make Telegram refuse the fresh probe
+        that could resolve it; actual inability belongs to that send result."""
+        presence = prefix("test", "office", "alice", "presence")
+        blocked = prefix("test", "office", "alice", "blocked")
+        self.redis.hashes[presence] = {
+            "state": "idle",
+            "since": "2026-09-02T10:00:00Z",
+            "last_activity": "2026-09-02T10:00:08Z",
+        }
+        self.redis.hashes[blocked] = {
+            "since": "2026-09-02T06:00:00Z",
+            "stream_id": "a" * 32,
+        }
+
+        class ApiBackedMesh:
+            def get_presence(inner_self, agent):
+                return request(self.app, "GET", f"/agents/{agent}", token="secret")
+
+            def send_message(inner_self, destination, text):
+                return request(
+                    self.app, "POST", f"/agents/{destination}/envelopes",
+                    token="secret", body={"text": text, "as": "telegram"},
+                )
+
+        class TelegramSink:
+            def __init__(inner_self):
+                inner_self.messages = []
+
+            def send_chat_action(inner_self, chat_id):
+                return None
+
+            def send_message(inner_self, chat_id, text, **kwargs):
+                inner_self.messages.append(text)
+
+        telegram = TelegramSink()
+        bot = TelegramBot(
+            ApiBackedMesh(), telegram, target_agent="alice", no_activity_push=True,
+        )
+
+        reply = bot.handle_user_prompt("operator", "new evidence")
+
+        self.assertEqual(
+            reply,
+            "✅ Sent to alice. A prior delivery remains unverified; this send is fresh evidence.",
+        )
+        self.assertEqual(len(self.redis.lists[prefix("test", "office", "telegram", "egress")]), 1)
+        status, body = request(self.app, "GET", "/agents/alice", token="secret")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["presence"]["state"], "idle")
+        self.assertEqual(body["delivery_unverified"], {
+            "since": "2026-09-02T06:00:00Z",
+            "stream_id": "a" * 32,
+        })
+
+    def test_absent_presence_stays_unknown_with_unverified_delivery(self):
+        """Delivery uncertainty cannot be promoted into either availability or blockage."""
+        blocked = prefix("test", "office", "alice", "blocked")
+        self.redis.hashes[blocked] = {"since": "", "stream_id": ""}
+
+        status, body = request(self.app, "GET", "/agents/alice", token="secret")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["presence"]["state"], "unknown")
+        self.assertEqual(body["delivery_unverified"], {"since": "", "stream_id": ""})
 
     def test_qualified_destination_routes_through_core_channel(self):
         status, body = request(
@@ -487,6 +561,7 @@ class ApiTests(unittest.TestCase):
         from lib.reply_correlation import record_delivered
 
         target = "a" * 32
+        self.redis.set(incarnation_key("test", "office", "alice"), "test-incarnation")
         # alice was really sent `target` by telegram, and is now replying
         # to telegram -- the claimed source matches deliver_api's own agent.
         record_delivered(self.redis, pod="test", tenant="office", agent="alice", stream_id=target, source="telegram")
@@ -531,6 +606,7 @@ class ApiTests(unittest.TestCase):
         from lib.reply_correlation import record_delivered
 
         target = "c" * 32
+        self.redis.set(incarnation_key("test", "office", "alice"), "test-incarnation")
         record_delivered(self.redis, pod="test", tenant="office", agent="alice", stream_id=target, source="telegram")
         ingress = prefix("test", "office", "webconsole", "ingress")
         envelope = build(
@@ -559,6 +635,7 @@ class ApiTests(unittest.TestCase):
         from lib.reply_correlation import record_delivered
 
         target = "e" * 32
+        self.redis.set(incarnation_key("test", "office", "bob"), "test-incarnation")
         record_delivered(self.redis, pod="test", tenant="office", agent="bob", stream_id=target, source="alice")
         ingress = prefix("test", "office", "telegram", "ingress")
         envelope = build(
@@ -581,6 +658,7 @@ class ApiTests(unittest.TestCase):
         from unittest.mock import MagicMock
         from modules.tmux.port import message_opener
 
+        self.redis.set(incarnation_key("test", "office", "bob"), "test-incarnation")
         target = send(
             self.redis, pod="test", tenant="office", source="alice",
             destination="bob", payload={"text": "peer message"},
@@ -614,6 +692,7 @@ class ApiTests(unittest.TestCase):
         # concurrency that motivated it, not just sequentially.
         from modules.tmux.port import message_opener
 
+        self.redis.set(incarnation_key("test", "office", "bob"), "test-incarnation")
         target_a = send(
             self.redis, pod="test", tenant="office", source="telegram",
             destination="bob", payload={"text": "question A"},

@@ -99,6 +99,23 @@ atomically clears the tenant lead key when (and only when) it still names the
 retired agent; all type checks occur before the first removal, so a runtime
 error cannot leave only half of that combined transition applied.
 
+modules/api keeps its own separate delivery path outside the
+ingress/processing/opening model above, so its retirement exposure needed a
+different answer, not the same one applied twice. `office retired-inbox
+[--agent AGENT]` shows an api-type agent's already-delivered mailbox content
+still unread when its destination retired -- conserved into tenant-level,
+read-only evidence rather than left in place (where a same-named successor's
+own client could read it) or bare-deleted (destroying it outright). Same
+posture as `unresolved`/`undeliverable`: no replay, delete, or expiry verb.
+Separately, `lib.reply_correlation`'s delivered.s* provenance keys are now
+bound to the agent's current INCARNATION, not its bare name: a fresh
+incarnation id is minted atomically with registry membership on a genuinely
+new hire (self-healing once for any agent already registered before this
+shipped) and deleted at retirement, so a same-named successor's reply cannot
+validate against provenance the retired predecessor established -- the id
+changes underneath a reused name, not a cleanup step someone has to
+remember to run.
+
 `office send -a AGENT --reply-to STREAM_ID TEXT` opts a reply into exact
 correlation: `STREAM_ID` is the id shown in the `[reply to X: office send -a
 X --reply-to <id> "..."]` hint line a tmux agent gets when the message it's

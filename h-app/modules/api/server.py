@@ -326,7 +326,7 @@ def _render_restdoc_html(app: FastAPI) -> str:
             "curl": 'curl -H "Authorization: Bearer $API_TOKEN" http://localhost:8080/agents',
         },
         "/agents/{agent}": {
-            "desc": "Get queue depths and presence state (working, idle, unknown, blocked) for an agent.",
+            "desc": "Get queue depths, activity-derived presence, and any separate unverified-delivery marker for an agent.",
             "curl": 'curl -H "Authorization: Bearer $API_TOKEN" http://localhost:8080/agents/sme-2',
         },
         "/agents/{agent}/envelopes": {
@@ -841,10 +841,20 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
             raw_blocked = client.hgetall(blocked_key) or None
         except Exception:
             raw_blocked = None
+        # PresenceSampler never emits "blocked": this hash records only a
+        # historical delivery that could not be verified.  Treating it as an
+        # admission gate prevents the new attempt that could supply fresh
+        # evidence and makes the uncertainty self-perpetuating.  A real
+        # inability belongs to the new send's own admission result.
         presence_state = _decode(raw_presence.get(b"state") or raw_presence.get("state")) or "unknown"
-        state = "blocked" if raw_blocked else presence_state
         since = _decode(raw_presence.get(b"since") or raw_presence.get("since")) or ""
         last_activity = _decode(raw_presence.get(b"last_activity") or raw_presence.get("last_activity")) or ""
+        delivery_unverified = None
+        if raw_blocked:
+            delivery_unverified = {
+                "since": _decode(raw_blocked.get(b"since") or raw_blocked.get("since")) or "",
+                "stream_id": _decode(raw_blocked.get(b"stream_id") or raw_blocked.get("stream_id")) or "",
+            }
         agent_port_type = port_type(client, pod=settings.pod, tenant=settings.tenant, agent=agent)
         return {
             "agent": agent,
@@ -855,10 +865,11 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
                 "dead": client.llen(dead),
             },
             "presence": {
-                "state": state,
+                "state": presence_state,
                 "since": since,
                 "last_activity": last_activity,
             },
+            "delivery_unverified": delivery_unverified,
         }
 
     @app.post("/agents/{agent}/envelopes", status_code=status.HTTP_202_ACCEPTED)

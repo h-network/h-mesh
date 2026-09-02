@@ -105,7 +105,8 @@ def test_agent_page_is_a_two_sided_conversation_with_inline_safe_activity():
     assert "event.tool" in messages
     assert "event.payload" not in messages
     assert "this.onEvent(event)" in activity
-    assert "not accepting messages" in messages
+    assert 'const disabled = presence === "pending"' in messages
+    assert "A prior delivery remains unverified" in messages
     assert 'id="messages-view" class="conversation-view"' in html
 
 
@@ -156,7 +157,7 @@ def test_empty_office_and_scaled_roster_are_deliberate_states():
     assert '$("empty-office-hire").onclick' in app
     assert 'detail.port_type === "tmux"' in agents
     assert '["blocked", "unknown", "pending", "working", "idle"]' in agents
-    assert 'presence === "blocked" ? " · action required"' in agents
+    assert 'deliveryUnverified ? " · delivery unverified"' in agents
     assert "position: sticky" in styles
 
 
