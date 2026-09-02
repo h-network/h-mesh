@@ -6,12 +6,11 @@ mechanism (a tmux window, for now) to callbacks the caller supplies. Supports
 `tmux` and `api` port types today; openshell support was removed until that
 module actually exists in h-mesh.
 
-The first tmux hire becomes lead when the registry is empty; later hires
-preserve the incumbent. Registry membership and lead selection are published
-atomically so a reconciler cannot create a new pane with a non-lead guide.
-`StopAgent` uses the same preflight rule, then compare-and-deletes the lead
-selection only when the retired agent still owns it, so retiring the former
-lead cannot undo that transfer.
+The first tmux hire when the lead key is absent or empty becomes lead; later
+hires silently preserve the incumbent. Registry membership and lead selection
+are published atomically so a reconciler cannot create a new pane with a
+non-lead guide. There is currently no supported operation to change the lead;
+retirement behavior for a current lead is intentionally unspecified here.
 
 ## State ownership at stop/re-hire
 

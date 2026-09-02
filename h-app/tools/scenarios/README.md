@@ -203,7 +203,7 @@ window created, `pane_current_command=claude`, connected to
 predates the fix and reflected the documented manual-`PATH`-prepend
 workaround; rerun after the merge to get a clean-install result.
 
-## lead-replacement.sh
+## lead-replacement.sh (retired)
 
 Not a port — no reference implementation exists for this one. Built fresh
 against architect's explicit brief: retire and re-hire the office's *lead*,
@@ -213,16 +213,16 @@ entirely against synthetic leads (`synth-lead`/`synth-lead-2`/
 office this agent runs in.
 
 ```
-TENANT=my-throwaway-tenant ./lead-replacement.sh
+This historical scenario was removed when dynamic lead transfer was removed.
 ```
 
-Same real-hire requirements as `tmux-concurrent-hire.sh` (a provider-backed
-`claude`).
+It is retained here only as historical context; it is not an executable or a
+description of current retirement behavior.
 
-**This scenario is retired.** Dynamic leadership transfer is no longer supported;
-hire flag were removed; the first tmux hire now claims an empty lead and later
-hires preserve it. Use the lifecycle tests for that behavior. The first run
-(2026-09-01) found two real bugs: the `lead`
+**Historical note:** dynamic leadership transfer is no longer supported. The
+first tmux hire when the lead key is absent or empty claims it and later hires
+silently preserve the incumbent. Use lifecycle tests for current behavior. The
+original investigation found bugs in the lead key and alert routing; details
 registry key was never written anywhere in the codebase and `StopAgent`
 never cleared it (dangled at whatever name was last lead), and watchdog's
 `_notify_lead()` returned silently with zero trace when the lead was
@@ -236,9 +236,10 @@ assertions below test the *fixed* behavior; if a future change to
 `lifecycle.py`/`watchdog/service.py` makes one fail, that's the scenario
 doing its job.
 
- Six probes from the removed transfer behavior are no longer applicable.
+The former transfer probes are removed and make no claims about retirement.
 
-1. **Self-retirement circularity (retired).** This transfer probe is retired.
+The former six transfer probes are retained only in git history; they are not
+current behavior specifications, especially for lead retirement.
    sequence, issued from its own pane, survive past the pane's death and
    come back as lead (not just alive)? **Yes** — `hire`/`letGo` are
    fire-and-forget bus sends (`modules/office/cli.py`), not synchronous
@@ -249,13 +250,13 @@ doing its job.
 2. **The lead brief (retired).** Transfer probes are retired; the first hire
    lead-specific paragraph? **Yes, deliberately now** — verified for both a
    now receives the lead guide and later hires preserve the incumbent.
-3. **The lead registry key.** Does `StopAgent` clear it? **It's exactly
+3. **(Historical) The lead registry key.** The old probe asked whether `StopAgent` clear it. **It was
    right now, in both directions** — verified live: retiring a
    *non-current* lead (leadership already transferred elsewhere) leaves the
    key alone; retiring the *current* lead clears it to empty. The Lua
    compare-then-delete (`_REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA`) does exactly
    what its name says.
-4. **Alert routing during the gap.** Two distinct cases. While the lead is
+4. **(Historical) Alert routing during the gap.** The old probe covered two cases. While the lead is
    fully retired (unregistered): `_notify_lead()` now logs a structured
    `lead_alert_no_lead` record with a reason before returning — verified
    live, fix confirmed, no more silent drop. While registered but the
