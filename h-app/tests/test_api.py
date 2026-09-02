@@ -29,6 +29,7 @@ class FakeRedis:
         self.hashes = {}
         self.lists = {}
         self.streams = {}
+        self.counters = {}
 
     def hset(self, key, field, value):
         self.hashes.setdefault(key, {})[field] = value
@@ -91,15 +92,27 @@ class FakeRedis:
         if "LRANGE" in script and "DEL" in script:
             return self.lists.pop(keys[0], [])
         if "reply_correlation record_delivered" in script:
-            (key,) = keys
-            stream_id, source, score, maxlen = argv
+            key, counter_key = keys
+            stream_id, source, maxlen = argv
             maxlen = int(maxlen)
             bucket = self.hashes.setdefault(key, {})
-            bucket[stream_id] = json.dumps({"source": source, "score": float(score)})
-            if len(bucket) > maxlen:
-                ordered = sorted(bucket.items(), key=lambda kv: json.loads(kv[1])["score"])
-                for member, _ in ordered[: len(bucket) - maxlen]:
-                    bucket.pop(member, None)
+            decodable = []
+            for field, raw in bucket.items():
+                try:
+                    decoded = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(decoded, dict) and isinstance(decoded.get("score"), (int, float)):
+                    decodable.append((field, decoded["score"]))
+            self.counters[counter_key] = self.counters.get(counter_key, 0) + 1
+            score = self.counters[counter_key]
+            decodable.append((stream_id, score))
+            decodable.sort(key=lambda item: item[1])
+            to_evict = [f for f, _ in decodable[: len(decodable) - maxlen] if f != stream_id] \
+                if len(decodable) > maxlen else []
+            bucket[stream_id] = json.dumps({"source": source, "score": score})
+            for field in to_evict:
+                bucket.pop(field, None)
             return 1
         return 1
 
