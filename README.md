@@ -31,9 +31,11 @@ On a fresh host, one command clones h-mesh and hands off straight to
 curl -fsSL https://raw.githubusercontent.com/h-network/h-mesh/main/install.sh | sh
 ```
 
-It clones into `~/h-mesh` by default (`H_MESH_INSTALL_DIR` to choose
-another location), or updates an existing checkout there if one already
-exists. Extra arguments pass straight through to `setup.sh` -- e.g. to skip
+It clones into `~/.local/share/h-mesh` by default (`H_MESH_INSTALL_DIR` to
+choose another location), or updates an existing checkout there if one
+already exists. That's a hidden, machine-managed location on purpose --
+`~/h-mesh` itself is reserved for agent working directories (see
+`setup.sh`'s wizard), not the source checkout. Extra arguments pass straight through to `setup.sh` -- e.g. to skip
 the wizard:
 
 ```bash

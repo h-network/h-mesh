@@ -9,6 +9,7 @@ from pathlib import Path
 from core.keys import prefix
 from core.logging import log_record, mirror
 from core.registry import members
+from lib.paths import get_agent_workdir
 
 
 def _now() -> str:
@@ -225,8 +226,11 @@ def _agy_events(record: dict, agent: str) -> list[tuple[str, str | None]]:
     ⚠ `history.jsonl` is one shared, non-relocatable file for every agy agent
     on the host (same limit as the credential check's account lookup) — every
     agent's tailer reads the same bytes and keeps only the lines whose
-    `workspace` is its own `/workdir/<agent>`, the same attribution field
-    codex's `_codex_session_belongs_to` already uses for its `cwd`.
+    `workspace` is its own agent workdir (get_agent_workdir), the same
+    attribution field codex's `_codex_session_belongs_to` already uses for
+    its `cwd` -- through the same function, not a hardcoded path, so both
+    stay correct regardless of which get_workdir_root() branch resolves for
+    this host.
 
     ⚠ Input only. The file records what was submitted, never what the CLI
     produced or ran — there is no agy analogue of `output` or `tool` here.
@@ -234,7 +238,7 @@ def _agy_events(record: dict, agent: str) -> list[tuple[str, str | None]]:
     verification (an `input` after a marker), which is what this exists for;
     it is not a substitute for the richer claude/codex activity feed.
     """
-    if record.get("workspace") != f"/workdir/{agent}":
+    if record.get("workspace") != get_agent_workdir(agent):
         return []
     return [("input", None)]
 
@@ -333,7 +337,7 @@ class ActivityTailer:
         return (
             record.get("type") == "session_meta"
             and isinstance(payload, dict)
-            and payload.get("cwd") == f"/workdir/{agent}"
+            and payload.get("cwd") == get_agent_workdir(agent)
         )
 
     @staticmethod

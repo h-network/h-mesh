@@ -10,5 +10,14 @@ none of them should own it exclusively, it goes here.
 | `agentlifecycle/` | start/stop/pause/resume desired-state logic for a participant, callback-driven, no port of its own |
 | `ingress_snapshot.py` | the atomic "drain everything queued" primitive, used by any port's own delivery handler |
 | `board_interaction.py` | centralized board/ticket operations -- `add_ticket` (write an incoming `AddTicket` to a board), `normalize_ticket`/`serialize_ticket` (the one ticket shape every reader/writer of a board entry uses, including `office`'s own board commands) |
+
+`add_ticket` reports a positive `RPUSH` result as a confirmed board write. An
+exception or impossible nonpositive result after the call is outcome-unknown,
+not proof of rejection: the opener exception remains generic so receive
+custody preserves the exact envelope in the tenant `unresolved` list. Only a
+failure proven before an effect may use the explicit dead-letter path. After a
+positive result proves creation, both success-log and task-audit observations
+are independently best-effort: their failure cannot reclassify the created
+ticket as unresolved, and one observer cannot prevent the other from running.
 | `attachment_schema.py` | attachment wire/schema limits (size, mime type, base64 validation), shared by any port that delivers attachments |
 | `reply_correlation.py` | `record_delivered`/`was_delivered` -- one `SET key source EX DELIVERED_TTL_SECONDS` per (recipient agent, stream_id) backing opt-in reply correlation, so a reply can't claim an id delivered by one API client while answering a different one, and provenance expires (1h) rather than being retained by count. Openers (`modules/tmux/port.py`, `modules/openshell/port.py`) record a delivery; `modules/api/port.py`'s `deliver_api` is the only reader, validating a claimed `in_reply_to` -- including the source it claims -- against it before that claim ever reaches a client |

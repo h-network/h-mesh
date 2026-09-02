@@ -16,7 +16,7 @@ set -eu
 repo=${H_MESH_REPOSITORY:-h-network/h-mesh}
 ref=${H_MESH_VERSION:-main}
 url=${H_MESH_CLONE_URL:-https://github.com/$repo.git}
-dest=${H_MESH_INSTALL_DIR:-$HOME/h-mesh}
+dest=${H_MESH_INSTALL_DIR:-$HOME/.local/share/h-mesh}
 
 if ! command -v git >/dev/null 2>&1; then
     echo "error: installing h-mesh requires git" >&2

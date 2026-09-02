@@ -27,7 +27,6 @@ _START_AGENT_KEYS = frozenset(
     {
         "agent", "port_type", "cli", "profile", "provider", "export", "import", "resume",
         "skip_permissions", "claude_tools", "hmac_secret", "kid", "revoke_kid",
-        "lead",
     }
 )
 _MIN_HMAC_SECRET_LEN = 16
@@ -48,13 +47,17 @@ _PUBLISH_LEAD_MEMBERSHIP_LUA = """
 -- Registry is the only key whose command can fail with WRONGTYPE; validate it
 -- as a hash before the optional cause SET becomes the first mutation. Both SET
 -- writes accept and replace keys of every Redis type.
+local current_lead = redis.call('GET', KEYS[1])
 redis.call('HEXISTS', KEYS[2], ARGV[1])
 if ARGV[3] ~= '' then
     redis.call('SET', KEYS[3], ARGV[3])
 end
 redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
-redis.call('SET', KEYS[1], ARGV[1])
-return 1
+if not current_lead or current_lead == '' then
+    redis.call('SET', KEYS[1], ARGV[1])
+    return 1
+end
+return 0
 """
 
 _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA = """
@@ -192,10 +195,11 @@ def _record_lifecycle(kind: str):
                     reason=str(exc) or type(exc).__name__,
                 )
                 raise
-            _lifecycle_log(
-                f"{kind}_accepted", correlation_id=correlation_id,
-                destination=agent if isinstance(agent, str) else None,
-            )
+            fields = {"correlation_id": correlation_id,
+                      "destination": agent if isinstance(agent, str) else None}
+            if result in ("lead_claimed", "lead_preserved"):
+                fields["lead_outcome"] = result
+            _lifecycle_log(f"{kind}_accepted", **fields)
             return result
         return recorded
     return decorate
@@ -305,11 +309,6 @@ def start_agent(
             f"StartAgent payload.port_type must be one of: {', '.join(sorted(_STARTABLE_VABS))}"
         )
 
-    make_lead = payload.get("lead", False)
-    if not isinstance(make_lead, bool):
-        raise ProvableLifecycleRejection("StartAgent payload.lead must be a boolean")
-    if make_lead and agent_port_type != "tmux":
-        raise ProvableLifecycleRejection("StartAgent payload.lead only applies to port_type 'tmux'")
 
     hmac_secret = payload.get("hmac_secret")
     kid = payload.get("kid")
@@ -508,8 +507,8 @@ def start_agent(
     cause = correlation_id if (
         existing_port_type != "tmux" and isinstance(correlation_id, str) and correlation_id
     ) else ""
-    if make_lead:
-        _write_desired(
+    if agent_port_type == "tmux":
+        lead_result = _write_desired(
             committed,
             "lead and registry row published",
             "lead and registry row publish",
@@ -522,6 +521,7 @@ def start_agent(
                 agent,
                 agent_port_type,
                 cause,
+                "0",
             ),
         )
     elif cause:
@@ -555,6 +555,8 @@ def start_agent(
             replace_window(agent)
         except Exception as exc:
             raise _actual_unknown(committed, "replacing the stale window", exc) from exc
+    if agent_port_type == "tmux":
+        return "lead_claimed" if lead_result == 1 else "lead_preserved"
 
 
 @_record_lifecycle("stop_agent")

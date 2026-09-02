@@ -124,6 +124,16 @@ check, but that only demonstrates the import property for that invocation; the
 documented production-equivalent setup remains an editable install from the
 tree under test.
 
+The complete suite is expected to pass both from an editable install of the
+named tree and when a caller explicitly supplies that tree's `h-app` directory
+on `PYTHONPATH`. These are distinct environment contracts: the latter proves
+only that invocation's first-party import path and may resolve third-party
+dependencies from a different environment. CI uses the editable-install form.
+Use an owned environment installed with `.[test]` when reproducing CI or
+reporting results intended to be comparable with CI; a `PYTHONPATH` run is
+useful source-tree evidence but is not a reproduction of CI's dependency
+environment.
+
 ## There is no enforced merge gate, and that is deliberate
 
 Nothing in the repository prevents a change from reaching `main` without

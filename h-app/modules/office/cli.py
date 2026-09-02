@@ -522,10 +522,6 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
                                  "(default: the tenant's default account)")
         parser.add_argument("--provider", metavar="NAME",
                             help="provider used to start this agent")
-        parser.add_argument(
-            "--lead", action="store_true",
-            help="make this agent the office lead (transfers leadership)",
-        )
         mode_group = parser.add_mutually_exclusive_group()
         mode_group.add_argument("--resume", action="store_true", default=None,
                                 help="resume prior session history (explicit opt-in)")
@@ -601,8 +597,6 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
             payload["profile"] = args.profile
         if args.provider:
             payload["provider"] = args.provider
-        if args.lead:
-            payload["lead"] = True
         # A hire envelope is consumed asynchronously, so it must never leave an
         # interactive choice waiting in the new pane. h-agent's bare --resume
         # can open a picker when this name has multiple prior sessions. Make a
