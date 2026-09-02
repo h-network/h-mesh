@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import redis
+
 H_APP = Path(__file__).resolve().parents[1]
 if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
@@ -533,6 +535,56 @@ class LeadAlertLoggingStructureTests(unittest.TestCase):
             )
 
 
+class AdmissionErrorCategoryTests(unittest.TestCase):
+    """Counterfixtures for _admission_error_category itself -- the closed
+    mapping that replaced `detail=str(exc)` after reviewer's exact
+    reproduction (`_log_lead_alert('unknown', ..., detail='REMOTE_SECRET_
+    EXCEPTION_TEXT')` -> that text landing verbatim in the durable
+    `reason`). Pinned in isolation, no Watchdog/FakeRedis needed, the same
+    reasoning as AdmissionEvidenceContractTests above: the classifier's own
+    correctness should not depend only on which scenario tests happen to
+    exercise it."""
+
+    def test_a_redis_error_is_categorized_as_redis_error(self):
+        self.assertEqual(
+            service.Watchdog._admission_error_category(redis.exceptions.ResponseError("x")),
+            "redis_error",
+        )
+
+    def test_a_builtin_connection_error_is_categorized_as_connection_error(self):
+        self.assertEqual(
+            service.Watchdog._admission_error_category(ConnectionError("x")),
+            "connection_error",
+        )
+
+    def test_a_builtin_timeout_error_is_categorized_as_timeout(self):
+        self.assertEqual(
+            service.Watchdog._admission_error_category(TimeoutError("x")),
+            "timeout",
+        )
+
+    def test_an_unrecognized_exception_falls_back_to_unexpected_error(self):
+        """A closed mapping must fail CLOSED, not open: an exception type
+        nobody has enumerated here yet must still get a safe, generic
+        category rather than falling through to something that exposes its
+        message."""
+        self.assertEqual(
+            service.Watchdog._admission_error_category(ValueError("x")),
+            "unexpected_error",
+        )
+
+    def test_the_categorys_own_message_never_appears_in_the_category_value(self):
+        """The classifier must return a fixed literal from its own closed
+        set -- never anything derived from the exception's message, even
+        indirectly. If this ever changed to build the category FROM
+        `str(exc)` (e.g. a prefix of it), this is the fixture that would
+        catch it."""
+        secret = "REMOTE_SECRET_EXCEPTION_TEXT"
+        category = service.Watchdog._admission_error_category(ConnectionError(secret))
+        self.assertNotIn(secret, category)
+        self.assertEqual(category, "connection_error")
+
+
 def _kicks():
     """Return (list, fake_deliver_tmux) -- records the kicked agent name."""
     kicks = []
@@ -857,6 +909,26 @@ class WatchdogTests(unittest.TestCase):
         events = [json.loads(line) for line in out.splitlines()]
         self.assertTrue(any(event.get("event") == "lead_alert_unknown" for event in events))
         _assert_admission_only_evidence(self, _watchdog_records(out))
+
+    def test_notify_lead_never_logs_the_admission_exceptions_own_message(self):
+        """Reviewer's exact reproduction: an admission-time exception whose
+        MESSAGE carries content nothing here can bound (a connection
+        string, a key name, arbitrary backend text) must never reach the
+        durable record. Only a closed CATEGORY this module names may cross
+        that boundary -- not `str(exc)`, not anywhere in the record."""
+        r = FakeRedis(fails_on={"eval": ConnectionError("REMOTE_SECRET_EXCEPTION_TEXT")})
+        _doing_agent(r)
+        _lead(r)
+        self._set(service, "run_tmux", _quiet_windows())
+        self._set(service, "deliver_tmux", _no_kick())
+
+        out = _capture(lambda: _watchdog(r).poll(now=NOW))
+
+        self.assertNotIn("REMOTE_SECRET_EXCEPTION_TEXT", out)
+        events = [json.loads(line) for line in out.splitlines()]
+        unknown = [event for event in events if event.get("event") == "lead_alert_unknown"]
+        self.assertEqual(len(unknown), 1)
+        self.assertEqual(unknown[0].get("reason"), "admission outcome UNKNOWN after a connection_error")
 
     def test_notify_lead_logs_a_record_when_the_lead_is_not_a_registered_agent(self):
         """A dangling `lead` key pointing at a retired agent must not vanish

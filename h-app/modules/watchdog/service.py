@@ -328,6 +328,32 @@ class Watchdog:
     # caller-supplied string reaches the record at all -- only a `kind` key
     # into this table, and structured values to fill each template's named
     # placeholders.
+    #
+    # ⚠ A fourth leak, found by reviewer AFTER the above closed event/
+    # evidence/reason-wording: closing the SENTENCE FRAME is not the same
+    # as closing its CONTENT. The "unknown" template used to interpolate
+    # `{detail}` from a caller-supplied `detail=str(exc)` -- a fixed
+    # template around free text is still free text reaching the record.
+    # `str(exc)` is remote-influenced BY CONSTRUCTION: a Redis/proxy
+    # exception's message can embed a connection string, a key name, or
+    # arbitrary backend text nothing here can bound, the same content-leak
+    # class the relay branch hit repeatedly the same day. The provenance
+    # question, asked of every placeholder below, not just the one that
+    # already failed it once: *could this value be influenced by anything
+    # outside this process?*
+    #   {lead}         -- a registered agent name, only ever set by an
+    #                      authenticated `office` admin action. Already
+    #                      carried by this same record's `destination`
+    #                      field regardless, so this adds no new exposure.
+    #   {category}     -- see _admission_error_category below: a small,
+    #                      closed set of literals this module hardcodes by
+    #                      isinstance, never the exception's own message or
+    #                      even its own class name (that vocabulary would
+    #                      belong to redis-py, not to this module).
+    #   {depth}        -- a plain int, admit_ingress's own ingress-length
+    #                      count. Never text.
+    #   {ingress_max}  -- a plain int, this instance's own configured
+    #                      constant. Never text.
     _LEAD_ALERT_TEMPLATES: dict[str, tuple[str, str, str | None]] = {
         # kind -> (event, evidence, reason template or None)
         "no_lead_unregistered": (
@@ -338,7 +364,7 @@ class Watchdog:
         ),
         "unknown": (
             "lead_alert_unknown", "unknown",
-            "admission outcome UNKNOWN after {detail}",
+            "admission outcome UNKNOWN after a {category}",
         ),
         "capacity": (
             "lead_alert_capacity", "rejected",
@@ -347,13 +373,38 @@ class Watchdog:
         "admitted": ("lead_alert_admitted", "admitted", None),
     }
 
+    # ⚠ A CLOSED, hardcoded mapping from exception type to a category THIS
+    # MODULE names -- never `type(exc).__name__` (that name belongs to
+    # whichever library raised it, and is not a vocabulary this module has
+    # reviewed for safety to log durably) and never `str(exc)` (that
+    # message can embed arbitrary backend/remote text; see the template
+    # comment above). Checked most-specific-first; anything unrecognized
+    # -- including a non-Redis exception admit_ingress was never expected
+    # to raise -- falls through to "unexpected_error" rather than widening
+    # what gets logged to cover it.
+    _ADMISSION_ERROR_CATEGORIES: tuple[tuple[type[BaseException], str], ...] = (
+        (redis.exceptions.RedisError, "redis_error"),
+        (ConnectionError, "connection_error"),
+        (TimeoutError, "timeout"),
+    )
+
+    @classmethod
+    def _admission_error_category(cls, exc: BaseException) -> str:
+        for exc_type, category in cls._ADMISSION_ERROR_CATEGORIES:
+            if isinstance(exc, exc_type):
+                return category
+        return "unexpected_error"
+
     # ⚠ The ONLY way _notify_lead may log anything about a lead-alert
     # attempt. `kind` is required (no default) and must be a key in
     # _LEAD_ALERT_TEMPLATES -- an unrecognized or omitted `kind` is a
     # KeyError/TypeError at the call, immediately, not a malformed or
     # untagged record reaching the log. `**context` fills the chosen
-    # template's named placeholders with structured values (a lead name, an
-    # exception's text, a queue depth) -- never a caller-composed sentence.
+    # template's named placeholders with structured values (a lead name, a
+    # closed error CATEGORY, a queue depth) -- never a caller-composed
+    # sentence, and never a value with unbounded provenance like an
+    # exception's own message (see the provenance audit above
+    # _LEAD_ALERT_TEMPLATES).
     #
     # This is checked two ways, not one, per the lesson that a guarantee
     # asserted at a boundary wider than the mechanism enforcing it is not a
@@ -460,9 +511,13 @@ class Watchdog:
                 limit=self.ingress_max,
             )
         except Exception as exc:
+            # ⚠ `exc` itself never crosses into _log_lead_alert -- only the
+            # closed category _admission_error_category derives from it.
+            # str(exc) is never a legitimate context value; see the
+            # provenance comment above _LEAD_ALERT_TEMPLATES.
             self._log_lead_alert(
                 "unknown", lead, envelope["stream_id"],
-                detail=str(exc),
+                category=self._admission_error_category(exc),
             )
             return
         if not admitted:
