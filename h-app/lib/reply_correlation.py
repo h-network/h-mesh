@@ -75,6 +75,33 @@ import re
 from core.keys import incarnation_key, prefix
 from core.logging import log_record
 
+# Closes a TOCTOU switch-agent's review found: a naive was_delivered read
+# (GET the current incarnation, THEN separately GET the incarnation-keyed
+# claim) leaves a window between the two round-trips where a stop+rehire
+# can linearize -- capturing the PREDECESSOR's incarnation, having the
+# successor become current, and still validating the predecessor's stale
+# claim as True. That is exactly the confident-wrong-correlation bug this
+# whole binding exists to close, narrowed to a race instead of closed.
+# The FIRST GET (which incarnation does the caller currently believe is
+# active, needed to know which key to even look at) still happens as a
+# plain read outside this script -- there is no way to avoid that without
+# already knowing the key. What this script guarantees is that the FINAL
+# verification -- "is that captured incarnation still current, AND does
+# its claim key hold anything" -- happens as one atomic read, so nothing
+# can change between deciding the claim is trustworthy and reading it.
+# Lua's nil-for-absent and false-for-"stale" both cross the redis-py
+# bridge as Python None, which was_delivered already treats identically
+# (not a match) -- no information the caller needs is lost by collapsing
+# them.
+_VERIFY_DELIVERY_LUA = """
+-- reply_correlation verify delivery v1
+local current = redis.call('GET', KEYS[1])
+if not current or current ~= ARGV[1] then
+    return false
+end
+return redis.call('GET', KEYS[2])
+"""
+
 # Generous relative to any realistic reply latency; small enough that a
 # forgotten reply doesn't linger meaningfully. Not tuned from a measurement
 # -- if a real workflow needs longer (or shorter), change this constant,
@@ -188,11 +215,29 @@ def was_delivered(r, *, pod: str, tenant: str, agent: str, stream_id: str, sourc
     ⚠ ABSENT INCARNATION MEANS "MATCHES NOTHING", NEVER "MATCHES ANYTHING"
     -- the deliberate, explicit choice for every agent alive before this
     binding shipped: its first was_delivered check returns False even for
-    a delivery that just happened, until that agent's next stop+rehire
-    establishes an incarnation id. Bounded to at most DELIVERED_TTL_SECONDS
-    of "reply correlation does not confirm, the field gets dropped" after
-    an upgrade -- failing toward absent, the same posture this feature has
-    held through every prior generation, never toward a wrong confirmation.
+    a delivery that just happened, until an incarnation id is established.
+    lifecycle's publish scripts self-heal this on the very next StartAgent
+    for that name -- an idempotent re-enrol of an already-registered name
+    with no incarnation yet mints one (never rebinding an already-present
+    id, which is what keeps an ordinary restart safe) -- so in practice
+    this is bounded by whenever that agent process next restarts, not by
+    a full stop+rehire. Worst case (an agent that never restarts before
+    someone replies to it) is still bounded to at most
+    DELIVERED_TTL_SECONDS of "reply correlation does not confirm, the
+    field gets dropped" after an upgrade -- failing toward absent, the
+    same posture this feature has held through every prior generation,
+    never toward a wrong confirmation.
+
+    The INITIAL incarnation read (which key to even look at) is a plain
+    GET, outside any script -- there is no way to know which key to check
+    without it. The FINAL verification is not: it re-confirms, atomically
+    with the claim read, that the captured incarnation is STILL current --
+    see _VERIFY_DELIVERY_LUA. Without that, a stop+rehire linearizing
+    between the two separate reads a naive version would do could capture
+    a predecessor's incarnation, let the successor become current, and
+    still validate the predecessor's stale claim as True: the exact
+    confident-wrong-correlation bug this binding exists to close, reduced
+    to a race instead of eliminated.
     """
     if not is_valid_reply_id(stream_id):
         return False
@@ -203,7 +248,13 @@ def was_delivered(r, *, pod: str, tenant: str, agent: str, stream_id: str, sourc
     if incarnation is None:
         return False
     try:
-        stored = r.get(_key(pod, tenant, agent, stream_id, incarnation))
+        stored = r.eval(
+            _VERIFY_DELIVERY_LUA,
+            2,
+            incarnation_key(pod, tenant, agent),
+            _key(pod, tenant, agent, stream_id, incarnation),
+            incarnation,
+        )
     except Exception:
         return None
     if stored is None:

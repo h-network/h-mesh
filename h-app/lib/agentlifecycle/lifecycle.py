@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from core.keys import (
     SEGMENT_REGEX, incarnation_key, prefix, receive_opening_key, receive_processing_key,
-    receive_undeliverable_key, receive_unresolved_key,
+    receive_undeliverable_key, receive_unresolved_key, retired_inbox_key,
 )
 from core.dispatch import delivery_lock_key
 from core.logging import log_record
@@ -37,13 +37,18 @@ _TARGET_ONLY_KEYS = frozenset({"agent"})
 _PUBLISH_WINDOW_CAUSE_LUA = """
 -- Atomic, not merely isolated: the only type-sensitive write is HSET, and it
 -- is the first mutation. HEXISTS performs the same hash-type check before any
--- write, and its result also decides incarnation minting: only a genuinely
--- NEW membership (not yet in the registry) gets a fresh incarnation id --
--- an idempotent re-enrol of an already-registered name must not rebind it,
--- or a process restart would invalidate its own just-established delivery
--- claims. The following SETs accept and replace a key of every Redis type.
+-- write, and its result -- together with whether an incarnation id already
+-- exists -- decides incarnation minting: a genuinely NEW membership always
+-- gets a fresh id (overwriting any orphan a failed prior attempt could have
+-- left); an EXISTING membership with no incarnation yet (every agent alive
+-- before this binding shipped) self-heals with one fresh mint; an existing
+-- membership that already has one keeps it -- an idempotent re-enrol of an
+-- already-registered name must not rebind it, or a process restart would
+-- invalidate its own just-established delivery claims. The following SETs
+-- accept and replace a key of every Redis type.
 local already_member = redis.call('HEXISTS', KEYS[2], ARGV[2])
-if already_member == 0 then
+local has_incarnation = redis.call('EXISTS', KEYS[3])
+if already_member == 0 or has_incarnation == 0 then
     redis.call('SET', KEYS[3], ARGV[4])
 end
 redis.call('HSET', KEYS[2], ARGV[2], ARGV[3])
@@ -55,14 +60,16 @@ _PUBLISH_LEAD_MEMBERSHIP_LUA = """
 -- Atomic through preflight, not because EVAL rolls back (it does not).
 -- Registry is the only key whose command can fail with WRONGTYPE; validate it
 -- as a hash before the optional cause SET becomes the first mutation. The
--- same HEXISTS result decides incarnation minting -- see
--- _PUBLISH_WINDOW_CAUSE_LUA's comment for why idempotent re-enrols must not
--- rebind it. All SET writes accept and replace keys of every Redis type.
+-- same HEXISTS-plus-EXISTS decision as _PUBLISH_WINDOW_CAUSE_LUA decides
+-- incarnation minting -- see that script's comment for the three cases and
+-- why idempotent re-enrols must not rebind it. All SET writes accept and
+-- replace keys of every Redis type.
 local already_member = redis.call('HEXISTS', KEYS[2], ARGV[1])
+local has_incarnation = redis.call('EXISTS', KEYS[4])
 if ARGV[3] ~= '' then
     redis.call('SET', KEYS[3], ARGV[3])
 end
-if already_member == 0 then
+if already_member == 0 or has_incarnation == 0 then
     redis.call('SET', KEYS[4], ARGV[4])
 end
 redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
@@ -76,7 +83,8 @@ _PUBLISH_MEMBERSHIP_LUA = """
 -- _PUBLISH_LEAD_MEMBERSHIP_LUA, for the plain membership-only path (no lead,
 -- no fresh window cause) neither of those two Lua scripts covers.
 local already_member = redis.call('HEXISTS', KEYS[1], ARGV[1])
-if already_member == 0 then
+local has_incarnation = redis.call('EXISTS', KEYS[2])
+if already_member == 0 or has_incarnation == 0 then
     redis.call('SET', KEYS[2], ARGV[3])
 end
 redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
@@ -87,12 +95,18 @@ _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA = """
 -- Atomic through deterministic preflight, not because EVAL rolls back (it
 -- does not). Validate every type-sensitive source and destination, snapshot
 -- every raw, and encode every evidence record before HDEL is the first write.
+-- Port-type classification for the inbox branch below is read HERE, from
+-- the registry itself, before it is removed -- not trusted from an earlier
+-- Python-side observation, so classification stays at the same
+-- linearization point as the removal it gates.
+local this_port_type = redis.call('HGET', KEYS[1], ARGV[1])
 redis.call('HEXISTS', KEYS[1], ARGV[1])
 local current_lead = redis.call('GET', KEYS[2])
-for _, index in ipairs({3, 4, 5, 17, 18}) do
+for _, spec in ipairs({{3, 'list'}, {4, 'list'}, {5, 'list'}, {17, 'list'}, {18, 'list'}, {20, 'stream'}, {21, 'list'}}) do
+    local index, expected = spec[1], spec[2]
     local kind = redis.call('TYPE', KEYS[index])['ok']
-    if kind ~= 'none' and kind ~= 'list' then
-        return redis.error_reply('lifecycle custody key is not a list: ' .. KEYS[index])
+    if kind ~= 'none' and kind ~= expected then
+        return redis.error_reply('lifecycle custody key is not a ' .. expected .. ': ' .. KEYS[index])
     end
 end
 
@@ -127,6 +141,34 @@ for _, raw in ipairs(opening) do
     }))
 end
 
+-- Inbox conservation: api-type agents only, the sole port type that ever
+-- writes an "inbox" key. XRANGE and encode every entry before HDEL is the
+-- first mutation, same discipline as everything above. Field NAMES and
+-- VALUES are hex-encoded -- Redis permits arbitrary binary in either,
+-- including from a manual or legacy write this script has no way to rule
+-- out -- as an ORDERED ARRAY of [field_hex, value_hex] pairs (a Lua table
+-- with sequential integer keys encodes as a JSON array), not a JSON
+-- object, so duplicate field names and field order are preserved exactly
+-- rather than reconstructed. The stream entry id itself is
+-- Redis-generated/validated ASCII (milliseconds-sequence) and is stored
+-- as plain text: a real storage invariant backs it, unlike the fields.
+local retired_inbox = {}
+if this_port_type == 'api' then
+    local entries = redis.call('XRANGE', KEYS[20], '-', '+')
+    for _, entry in ipairs(entries) do
+        local entry_id = entry[1]
+        local raw_fields = entry[2]
+        local fields = {}
+        for index = 1, #raw_fields, 2 do
+            table.insert(fields, {hex(raw_fields[index]), hex(raw_fields[index + 1])})
+        end
+        table.insert(retired_inbox, cjson.encode({
+            agent=ARGV[1], reason='destination retired with unread inbox content',
+            entry_id=entry_id, encoding='hex', fields=fields
+        }))
+    end
+end
+
 redis.call('HDEL', KEYS[1], ARGV[1])
 if current_lead == ARGV[1] then
     redis.call('DEL', KEYS[2])
@@ -140,6 +182,10 @@ end
 for _, record in ipairs(unresolved) do
     redis.call('RPUSH', KEYS[18], record)
 end
+for _, record in ipairs(retired_inbox) do
+    redis.call('RPUSH', KEYS[21], record)
+end
+redis.call('DEL', KEYS[20])
 redis.call('DEL', KEYS[3])
 redis.call('DEL', KEYS[4])
 redis.call('DEL', KEYS[5])
@@ -165,7 +211,7 @@ redis.call('DEL', KEYS[16])
 -- restart) mints a fresh one only if it finds this key already absent --
 -- see _PUBLISH_MEMBERSHIP_LUA and its siblings.
 redis.call('DEL', KEYS[19])
-return {#processing, #ingress, #opening}
+return {#processing, #ingress, #opening, #retired_inbox}
 """
 
 
@@ -638,7 +684,7 @@ def stop_agent(
         committed, "registry row removed and owned lead cleared", "registry/lead removal",
         lambda: r.eval(
             _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
-            19,
+            21,
             registry_key,
             prefix(pod, tenant, resource="lead"),
             receive_processing_key(pod, tenant, agent),
@@ -658,6 +704,8 @@ def stop_agent(
             receive_undeliverable_key(pod, tenant),
             receive_unresolved_key(pod, tenant),
             incarnation_key(pod, tenant, agent),
+            prefix(pod, tenant, agent=agent, resource="inbox"),
+            retired_inbox_key(pod, tenant),
             agent,
         ),
     )

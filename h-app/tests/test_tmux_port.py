@@ -157,6 +157,13 @@ class FakeRedis:
                 value = {"count": 1, "since": since}
             self.hset(key, client, json.dumps(value, separators=(",", ":")))
             return value["count"]
+        if "reply_correlation verify delivery" in script:
+            incarnation_key, claim_key = keys
+            expected = argv[0]
+            current = self.get(incarnation_key)
+            if current is None or current != expected:
+                return None
+            return self.get(claim_key)
         raise AssertionError(f"unexpected Lua script: {script}")
 
 

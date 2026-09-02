@@ -96,12 +96,33 @@ def receive_undeliverable_key(pod: str, tenant: str) -> str:
 
 
 def incarnation_key(pod: str, tenant: str, agent: str) -> str:
-    """One agent's current incarnation id -- minted atomically with registry
-    membership on a genuinely NEW hire (never on an idempotent re-enrol of an
-    already-registered name), deleted at retirement. Absent means no
-    incarnation has been established: a legacy pre-feature agent, or the
-    window between a stop and that name's next hire. Consumers that bind a
-    claim's validity to a specific incarnation (lib/reply_correlation.py)
-    must treat an absent id as "matches nothing", never "matches anything".
+    """One agent's current incarnation id, deleted at retirement. Minted
+    atomically with registry membership by lifecycle's publish scripts:
+    always on a genuinely new hire (even overwriting an orphaned id a
+    failed prior attempt could have left), once as a self-heal on the
+    first StartAgent for an already-registered name that has none yet
+    (every agent alive before this binding shipped), and never rebound
+    while both membership and an incarnation already exist -- an
+    idempotent re-enrol of a still-running agent must not invalidate its
+    own already-established delivery claims. Absent means no incarnation
+    is established yet: a legacy agent that has not restarted since this
+    shipped, or the window between a stop and that name's next hire.
+    Consumers that bind a claim's validity to a specific incarnation
+    (lib/reply_correlation.py) must treat an absent id as "matches
+    nothing", never "matches anything".
     """
     return prefix(pod, tenant, agent=agent, resource="incarnation")
+
+
+def retired_inbox_key(pod: str, tenant: str) -> str:
+    """Tenant evidence for an api-type agent's inbox content still unread
+    when its destination retired -- conserved rather than deleted, same
+    shape as receive_undeliverable_key/receive_unresolved_key: read-only,
+    no replay/delete/expiry verb. Unlike those two, this is not part of
+    core.channels' ingress/processing/opening custody model at all --
+    modules/api retains its own separate delivery path -- so its records
+    describe a different phase: content already admitted into a client-
+    readable mailbox but not provably consumed by anything before the
+    agent name it belonged to was retired.
+    """
+    return prefix(pod, tenant, resource="retired-inbox")

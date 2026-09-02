@@ -46,6 +46,18 @@ class FakeRedis:
             return None
         return value
 
+    def eval(self, script, numkeys, *args):
+        # Generic enough to stand in for _VERIFY_DELIVERY_LUA specifically
+        # (the only script was_delivered ever runs): KEYS[1]/ARGV[1] are
+        # the incarnation key and its expected current value; KEYS[2] is
+        # the claim key returned only if that comparison still holds.
+        keys = args[:numkeys]
+        argv = args[numkeys:]
+        current = self.get(keys[0])
+        if current is None or current != argv[0]:
+            return None
+        return self.get(keys[1])
+
     def ttl(self, key):
         entry = self.store.get(key)
         if entry is None:
@@ -242,6 +254,33 @@ class ReplyCorrelationTests(unittest.TestCase):
         self.assertFalse(
             was_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram")
         )
+
+    def test_race_between_the_two_incarnation_reads_never_validates_as_true(self):
+        # switch-agent's exact finding against the first version of this
+        # fix: was_delivered did two SEPARATE reads (current incarnation,
+        # then the incarnation-qualified claim), leaving a window where a
+        # stop+rehire landing BETWEEN them lets a successor validate a
+        # predecessor's stale claim as True -- the identical inheritance
+        # bug this whole binding exists to close, reduced to a race
+        # instead of eliminated. Deterministic, not timing-dependent:
+        # forces the FIRST read (_incarnation) to return a value that is
+        # already stale by the time the atomic verification actually
+        # runs, simulating the race landing every time rather than
+        # occasionally, so this test cannot flake into a false pass.
+        self._incarnate("bob", value="predecessor-incarnation")
+        record_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram")
+
+        # The successor's hire completes (fresh incarnation minted) AFTER
+        # was_delivered's first read already captured the predecessor's
+        # value -- reproduced by making the first read return the stale
+        # value while the store has already moved on.
+        self._incarnate("bob", value="successor-incarnation")
+        with patch.object(reply_correlation, "_incarnation", return_value="predecessor-incarnation"):
+            result = was_delivered(
+                self.r, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram"
+            )
+        self.assertIn(result, (False, None))
+        self.assertIsNot(result, True)
 
 
 class RealRedisRecordDeliveredTests(unittest.TestCase):

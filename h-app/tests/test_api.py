@@ -95,6 +95,13 @@ class FakeRedis:
         argv = args[numkeys:]
         if "LRANGE" in script and "DEL" in script:
             return self.lists.pop(keys[0], [])
+        if "reply_correlation verify delivery" in script:
+            incarnation_key, claim_key = keys
+            expected = argv[0]
+            current = self.get(incarnation_key)
+            if current is None or current != expected:
+                return None
+            return self.get(claim_key)
         return 1
 
     def pipeline(self, transaction=False):
