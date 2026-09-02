@@ -208,14 +208,14 @@ def _kill_tmux_server_by_socket_path(socket_path: str, log=print) -> None:
     signalling, as a secondary, imperfect confirmation -- NOT the primary
     defense (the cmdline content-match is), and it has its own known blind
     spot: `exe` resolves through wrapper symlinks to whatever binary
-    actually runs, the same class of surprise that made an earlier `exe`
-    check in this ticket's own investigation wrongly resolve
-    `/opt/flock/bin/python` through to `/usr/bin/python3.12`. A real tmux
-    reached through an unusual wrapper chain is a residual, low-probability
-    gap this does not close -- called with `kill-server`'s own attempt
-    already having run and, on this box, having been observed to silently
-    fail under load (see the "kill-server didn't take" note in ticket
-    2198b696's report).
+    actually runs, the same class of surprise that made an earlier
+    installed-interpreter filter in this ticket's own investigation wrongly
+    resolve a wrapped python invocation through to the system interpreter
+    underneath it. A real tmux reached through an unusual wrapper chain is
+    a residual, low-probability gap this does not close -- called with
+    `kill-server`'s own attempt already having run and, on this box, having
+    been observed to silently fail under load (see the "kill-server didn't
+    take" note in ticket 2198b696's report).
     """
     needle = f"-S {socket_path}"
     proc_dir = Path("/proc")
