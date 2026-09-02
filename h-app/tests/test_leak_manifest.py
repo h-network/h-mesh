@@ -39,16 +39,18 @@ from _leak_manifest import _process_start_time, register
 tmpdir = sys.argv[1]
 os.makedirs(os.path.join(tmpdir, "run"), exist_ok=True)
 
-# A real dummy daemon this reaper must kill -- with a real .pid.identity
-# sidecar, the same shape services.daemons.start_daemons() writes, so this
-# proves the AUTHENTICATED kill path, not an artificially-unauthenticated one.
+# A real daemon this reaper must stop, named "switch" -- stop_daemons()
+# only ever looks at pidfiles named after a KNOWN daemon key in
+# ALL_DAEMON_MODULES, not an arbitrary glob, so an invented name here would
+# be silently skipped rather than exercise the real authenticated-stop
+# path. Real .pid.identity sidecar, same shape start_daemons() writes.
 daemon = subprocess.Popen(["sleep", "300"])
-pidfile = os.path.join(tmpdir, "run", "dummy.pid")
+pidfile = os.path.join(tmpdir, "run", "switch.pid")
 with open(pidfile, "w") as f:
     f.write(str(daemon.pid))
 with open(pidfile + ".identity", "w") as f:
     json.dump({{
-        "v": 1, "pid": daemon.pid, "name": "dummy", "module": "dummy.module",
+        "v": 1, "pid": daemon.pid, "name": "switch", "module": "core.service",
         "start_time": _process_start_time(daemon.pid),
     }}, f)
 
@@ -104,11 +106,11 @@ def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_pa
         assert ready, "victim process never signalled readiness"
 
         assert manifest_entry.exists(), "victim never registered before we killed it"
-        daemon_pid = int((victim_tmpdir / "run" / "dummy.pid").read_text().strip())
+        daemon_pid = int((victim_tmpdir / "run" / "switch.pid").read_text().strip())
         socket_path = victim_tmpdir / "isolated.sock"
         assert socket_path.exists(), "victim's tmux server never came up"
         assert _alive(proc.pid), "victim died before we could kill it -- test is not exercising the failure mode"
-        assert _alive(daemon_pid), "victim's dummy daemon is not alive before the kill"
+        assert _alive(daemon_pid), "victim's daemon (switch) is not alive before the kill"
 
         # THE FAILURE MODE: external SIGKILL, no chance for the victim's own
         # cleanup to run -- same as a tool-call timeout or a cancelled job.
@@ -131,7 +133,7 @@ def test_orphan_from_a_killed_process_is_fully_reaped_by_the_next_session(tmp_pa
         deadline = time.monotonic() + 5.0
         while _alive(daemon_pid) and time.monotonic() < deadline:
             time.sleep(0.1)
-        assert not _alive(daemon_pid), "dummy daemon survived the reaper"
+        assert not _alive(daemon_pid), "daemon (switch) survived the reaper"
         assert not victim_tmpdir.exists(), "tmpdir survived the reaper"
         assert not manifest_entry.exists(), "manifest entry survived the reaper"
     finally:
@@ -270,3 +272,101 @@ def test_reaper_leaves_an_unauthenticatable_daemon_pid_running_and_retries_forev
 
 def _leak_manifest_entry_for(tmpdir: Path) -> Path:
     return MANIFEST_DIR / f"{tmpdir.name}.json"
+
+
+def test_unverifiable_owner_at_registration_is_stuck_not_silently_running(tmp_path):
+    """Reviewer's second finding: `register()` persisting `owner_start_time:
+    null` (registration-time authentication failure) used to make
+    `_owner_still_running` return True forever -- indistinguishable from a
+    genuinely live entry, contradicting the mandatory-visibility contract
+    for permanently retained entries. Proves the corrected behavior: an
+    entry whose owner could never be authenticated at registration time is
+    counted as `stuck`, not silently treated as running, and stays on disk
+    (never reaped -- correct, since it genuinely cannot tell if the owner
+    is alive) across repeated attempts."""
+    real_tmpdir = tmp_path / "h_mesh_test_leak_harm_unverifiable_owner"
+    real_tmpdir.mkdir()
+    entry = _leak_manifest_entry_for(real_tmpdir)
+    entry.write_text(json.dumps({
+        "tmpdir": str(real_tmpdir),
+        "owner_pid": 999999999,  # any value; start_time None is what matters
+        "owner_start_time": None,
+        "registered_at": time.time(),
+    }))
+
+    try:
+        for attempt in range(2):
+            reaped, stuck = reap_all_orphans(log=lambda *_: None)
+            assert reaped == 0, f"attempt {attempt}: an unverifiable owner was treated as dead and reaped"
+            assert stuck == 1, f"attempt {attempt}: unverifiable owner was not counted as stuck"
+            assert real_tmpdir.exists(), f"attempt {attempt}: tmpdir removed despite unverifiable owner"
+            assert entry.exists(), f"attempt {attempt}: manifest entry cleared despite unverifiable owner"
+    finally:
+        entry.unlink(missing_ok=True)
+
+
+def test_malformed_manifest_entry_is_left_visible_not_deleted(tmp_path):
+    """Reviewer's third finding: a manifest entry with unreadable/invalid
+    JSON, or missing/wrong-typed required fields, used to be deleted
+    outright by reap_all_orphans -- destroying the only surviving record of
+    whatever it pointed at, the exact evidence-loss problem this module
+    exists to prevent one level earlier. Proves both malformed shapes are
+    now left in place and counted as stuck instead."""
+    bad_json_entry = MANIFEST_DIR / "h_mesh_test_leak_harm_bad_json.json"
+    bad_json_entry.write_text("{not valid json")
+
+    missing_fields_entry = MANIFEST_DIR / "h_mesh_test_leak_harm_missing_fields.json"
+    missing_fields_entry.write_text(json.dumps({"owner_pid": "not-an-int", "tmpdir": None}))
+
+    try:
+        reaped, stuck = reap_all_orphans(log=lambda *_: None)
+
+        assert reaped == 0
+        assert stuck >= 2, "malformed entries were not both counted as stuck"
+        assert bad_json_entry.exists(), "unreadable manifest entry was deleted rather than left visible"
+        assert missing_fields_entry.exists(), "malformed manifest entry was deleted rather than left visible"
+    finally:
+        bad_json_entry.unlink(missing_ok=True)
+        missing_fields_entry.unlink(missing_ok=True)
+
+
+def test_tmux_kill_does_not_match_a_socket_path_that_is_only_a_prefix(tmp_path):
+    """Reviewer's fourth finding: matching was substring membership in a
+    flattened cmdline string, so a manifest socket path that is a PREFIX of
+    a different, unrelated tmux server's actual socket path would also
+    match and get killed. Proves the fix: a real tmux server bound to
+    `<socket>-unrelated-extra` is left alone when reaping is asked to kill
+    the server bound to exactly `<socket>`."""
+    from _leak_manifest import _kill_tmux_server_by_socket_path
+
+    target_socket = str(tmp_path / "isolated.sock")
+    prefix_colliding_socket = target_socket + "-extra"
+
+    real_server = subprocess.Popen(
+        ["tmux", "-S", prefix_colliding_socket, "new-session", "-d", "-s", "sess", "-x", "80", "-y", "24"],
+    )
+    real_server.wait(timeout=5)
+
+    def _tmux_server_pid(socket_path: str) -> int | None:
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                argv = (entry / "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if socket_path.encode() in argv and b"tmux" in argv[0]:
+                return int(entry.name)
+        return None
+
+    try:
+        server_pid = _tmux_server_pid(prefix_colliding_socket)
+        assert server_pid is not None, "test setup: real tmux server for the colliding socket never came up"
+
+        _kill_tmux_server_by_socket_path(target_socket, log=lambda *_: None)
+
+        assert _tmux_server_pid(prefix_colliding_socket) == server_pid, (
+            "a tmux server bound to a DIFFERENT socket path (only a string prefix match) was killed"
+        )
+    finally:
+        subprocess.run(["tmux", "-S", prefix_colliding_socket, "kill-server"], capture_output=True, timeout=5)

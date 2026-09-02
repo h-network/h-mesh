@@ -33,49 +33,62 @@ who or what holds that pid number today. If start-time authentication itself
 is unavailable at registration (e.g. `/proc` unreadable), this fails CLOSED:
 never reap an entry it could not authenticate, rather than guess.
 
-⚠ The same bug, one level down, is worse: authenticating the OWNER pid is not
-enough if the daemon pids reap_orphan() goes on to kill (switch,
-tmux_reconciler, watchdog...) are still signalled by their bare recorded
-number. The owner is typically freshly dead, a narrow reuse window; a daemon
-pid recorded in a manifest entry that's sat orphaned for hours (entries from
-31 August existed) has had an enormous window for its number to be recycled
-by something else on this shared box entirely -- another agent's daemon, or
-the live office. So every daemon pid is authenticated too, via the
-`.pid.identity` sidecar `services.daemons.start_daemons()` already writes
-(same file, same schema -- no separate recording step needed here). If even
-one pidfile under a tmpdir can't be authenticated, `reap_orphan()` does
-NOTHING for that entry: no kill, no tmux-server kill, no directory removal,
-leaving it for a later session to retry. A surviving orphan is visible and
-is the problem this module exists to fix; a wrongly killed unrelated process
-is silent and lands on someone else -- asymmetric costs, so this fails
-closed on the side that stays visible.
+⚠ REVIEWER BLOCKING FAIL, 2026-09-02, against an earlier version of this
+module -- record kept because the failure mode is the point: that version
+*collected* authenticated daemon pids into a list and only signalled them
+afterward, after finishing authentication of every other pidfile. That gap
+between "we read /proc and it matched" and "we actually call kill()" is
+exactly a TOCTOU window a pid could exit and be reused inside, identifying
+by an authenticated-in-the-past number rather than binding through the
+signal itself -- "fresh at the moment of action" was claimed, not
+implemented. Fixed by not reimplementing daemon killing here at all: every
+daemon pid this module ever signals goes through
+`services.daemons.stop_daemons()`, which opens a pidfd BEFORE
+authentication and signals through that fd (`signal.pidfd_send_signal`),
+never a numeric `os.kill(pid, ...)` -- the fd is bound to one specific
+process lifetime the moment it's opened, immune to reuse after that point
+by construction, not by re-checking fast enough. Reusing the already
+-reviewed primitive closes this more reliably than a second, less-reviewed
+implementation of the same delicate mechanism would. The isolated tmux
+server (not a `services.daemons` module, no existing pidfd helper) gets the
+same treatment built locally: `os.pidfd_open` immediately upon a match,
+re-verified while that fd is held, signalled through the fd.
+
+⚠ The same reviewer pass, same reasons, on two smaller gaps: an entry whose
+OWNER authentication itself failed at registration time (`owner_start_time`
+recorded as `None`) was silently treated as "still running" forever --
+correct to never reap on that basis, wrong to make it indistinguishable from
+a live entry; and a manifest entry with malformed/unreadable JSON was
+deleted outright, destroying the only surviving record of whatever it
+pointed at. Both now count as `stuck` and stay on disk, logged, exactly like
+an unauthenticatable daemon pid does -- see `reap_all_orphans`.
 
 ⚠ Two sessions starting and reaping at once: every action taken here
-RE-AUTHENTICATES FRESH at the moment of that action rather than trusting a
-value read earlier in the race, which is what actually makes concurrent
-reaping safe, not just idempotence. Two reapers independently authenticating
-the same genuinely-dead entry reach the same conclusion and do the same
-idempotent work twice (killing an already-dead pid raises and is caught,
-`shutil.rmtree` on an already-removed tree is a no-op, unlinking an
-already-unlinked manifest entry is a no-op) -- safe. In the narrower case
-where a reaper's authentication read lags behind an actual kill-then-reuse
-by a concurrent reaper, the LAGGING reaper's own fresh start-time comparison
-will not match the newly-reused pid's actual start time, so it correctly
-declines to signal it -- the authentication step is what closes this race,
-not merely catching already-dead-pid errors. A registration race (one
-process mid-`register()` while another reaps) cannot produce a corrupt read
-either: `register()` writes to a temp file and `os.replace()`s it into
-place, so a concurrent reader only ever sees the manifest directory either
-without the entry yet, or with it fully written -- never partial.
+RE-AUTHENTICATES FRESH at the moment of that action -- via pidfd, not a
+value read earlier in the race -- which is what actually makes concurrent
+reaping safe. Two reapers independently authenticating the same
+genuinely-dead entry reach the same conclusion and do the same idempotent
+work twice (a pidfd opened against an already-exited pid raises
+`ProcessLookupError`, caught; `shutil.rmtree` on an already-removed tree is
+a no-op; unlinking an already-unlinked manifest entry is a no-op) -- safe. A
+registration race (one process mid-`register()` while another reaps) cannot
+produce a corrupt read either: `register()` writes to a temp file and
+`os.replace()`s it into place, so a concurrent reader only ever sees the
+manifest directory either without the entry yet, or with it fully written --
+never partial.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import select
 import shutil
+import signal
 import time
 from pathlib import Path
+
+from services.daemons import stop_daemons
 
 MANIFEST_DIR = Path("/tmp/h_mesh_test_manifests")
 
@@ -119,163 +132,168 @@ def clear(entry: Path) -> None:
     entry.unlink(missing_ok=True)
 
 
-def _owner_still_running(owner_pid: int, owner_start_time: str | None) -> bool:
-    """True only if `owner_pid` is authenticated as the SAME process that
-    registered this entry -- never true from pid liveness alone.
+def _owner_status(owner_pid: int, owner_start_time: str | None) -> str:
+    """"running", "dead", or "unverifiable" -- never a bare bool, because
+    "we don't know" and "it's still running" must not collapse into the
+    same outcome the way an earlier version of this function did.
 
     `owner_start_time` being `None` means registration itself could not
-    authenticate (fails closed: treated as still running, never reaped on
-    that basis). Otherwise the pid's CURRENT start time must match exactly;
-    any mismatch, or the pid no longer existing at all, means the original
-    owner is provably gone regardless of who holds that pid number now.
+    authenticate (`/proc` unreadable at that moment) -- fails closed (never
+    reaped on that basis, "unverifiable" is not "running") but must also
+    stay VISIBLE as its own distinct case, not silently indistinguishable
+    from a genuinely live entry forever (reviewer's finding: it previously
+    was). Otherwise the pid's CURRENT start time must match exactly for
+    "running"; any mismatch, or the pid no longer existing at all, means the
+    original owner is provably gone ("dead") regardless of who holds that
+    pid number now.
     """
     if owner_start_time is None:
-        return True
+        return "unverifiable"
     current = _process_start_time(owner_pid)
     if current is None:
-        return False
-    return current == owner_start_time
+        return "dead"
+    return "running" if current == owner_start_time else "dead"
 
 
-def _identity_path(pidfile: Path) -> Path:
-    """Same convention as services/daemons.py's own `_identity_path` --
-    `<name>.pid` -> `<name>.pid.identity`. Deliberately the same suffix, not
-    reimplemented differently, so identity files `start_daemons()` already
-    writes for every daemon it starts (current main) are exactly what this
-    reads, with no separate recording step of our own required."""
-    return pidfile.with_suffix(pidfile.suffix + ".identity")
+def _pidfd_kill_if_matches(pid: int, verify, log=print, context: str = "") -> str:
+    """Open a pidfd for `pid` FIRST, then call `verify(pid)` while that fd is
+    held, then SIGKILL through the fd -- never through a bare numeric
+    `os.kill(pid, ...)`. Returns "killed", "no-match", or "stale".
 
-
-def _authenticated_daemon_pid(pidfile: Path) -> tuple[int | None, str]:
-    """(pid, "authenticated") only if `pidfile`'s companion `.identity` file
-    (written by `services.daemons.start_daemons`) proves the recorded pid is
-    still the same process that file was written for -- never the bare
-    recorded pid. Otherwise (None, reason), reason meant to be logged, not
-    just branched on -- see `reap_orphan`'s "cannot ever authenticate" path.
-
-    ⚠ This is the same bug one level down from the owner check above, and
-    the more dangerous instance of it: the owner is typically freshly dead
-    (a narrow reuse window), but a daemon pid recorded in a manifest entry
-    that's sat orphaned for hours -- and entries from 31 August have --
-    has had an enormous window for its number to be recycled by something
-    else entirely: another agent's daemon, or the live office itself.
-    Fails closed (do not kill) whenever authentication is missing,
-    unreadable, or mismatched -- a surviving orphan is visible and was the
-    problem this module exists to fix; a wrongly killed unrelated process
-    is silent and lands on someone else.
+    ⚠ This is the structural fix for the exact gap reviewer found: opening
+    the pidfd before re-verification, and delivering the signal through it,
+    means the kernel resolves the target from the fd's bound lifetime, not
+    from re-resolving the numeric pid at signal time -- so even if `pid` is
+    reused by an unrelated process in between `verify()` returning and the
+    signal being sent, the reused process is never touched. `os.pidfd_open`
+    itself can still race an exit-and-reuse in the brief window before it
+    opens (if `pid` has already been reused by the time this is even
+    called, the fd binds to whatever process holds it NOW, not to the
+    original) -- `verify()` running with that fd already open, plus the
+    `select.select` staleness check right after, is what catches that: a
+    freshly reused pid's own current identity will not satisfy `verify`.
     """
     try:
-        pid = int(pidfile.read_text().strip())
-    except (ValueError, OSError):
-        return None, "pidfile unreadable or non-numeric"
-    identity_path = _identity_path(pidfile)
+        pidfd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return "stale"
+    except (AttributeError, OSError):
+        log(f"  • cannot open pidfd for pid {pid}{(' (' + context + ')') if context else ''}; leaving it")
+        return "no-match"
     try:
-        identity = json.loads(identity_path.read_text())
-    except OSError:
-        return None, f"no {identity_path.name} sidecar"
-    except json.JSONDecodeError:
-        return None, f"{identity_path.name} is not valid JSON"
-    if not isinstance(identity, dict) or identity.get("pid") != pid:
-        return None, f"{identity_path.name} does not name pid {pid}"
-    recorded_start_time = identity.get("start_time")
-    if not isinstance(recorded_start_time, str):
-        return None, f"{identity_path.name} has no recorded start_time"
-    current_start_time = _process_start_time(pid)
-    if current_start_time is None:
-        return None, f"pid {pid} no longer exists"
-    if current_start_time != recorded_start_time:
-        return None, f"pid {pid} start_time does not match -- number was reused"
-    return pid, "authenticated"
+        if not verify(pid):
+            return "no-match"
+        # Already exited between pidfd_open and here, even though the
+        # verify() read above happened to look consistent.
+        readable, _, _ = select.select([pidfd], [], [], 0)
+        if readable:
+            return "stale"
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        except ProcessLookupError:
+            return "stale"
+        except (AttributeError, OSError):
+            log(f"  • cannot safely signal pid {pid}{(' (' + context + ')') if context else ''}; leaving it")
+            return "no-match"
+        return "killed"
+    finally:
+        os.close(pidfd)
 
 
-def _kill_tmux_server_by_socket_path(socket_path: str, log=print) -> None:
-    """Find and SIGKILL the tmux server process bound to `socket_path`.
+def _matching_tmux_pids(socket_path: str) -> list[int]:
+    """Pids whose CURRENT argv contains an exact `-S socket_path` pair.
 
-    ⚠ Not a stored-pid trust in the first place, unlike a bare daemon
-    pidfile -- the target pid is re-derived FRESH at the moment of the kill
-    by scanning every live process's CURRENT cmdline for the exact
-    ` -S <socket_path>` argument, never from a pid recorded earlier. A
-    process that has since exited leaves no live process with that cmdline
-    to match, so an already-dead server's (reused) pid number is never
-    signalled on the strength of a stale recording, which is the actual
-    shape of the pid-reuse bug -- trusting a NUMBER read at one point in
-    time to still identify the same process at a later one. `socket_path`
-    itself is also not a small, quickly-recycled identifier the way a pid
-    is: it is derived from `tempfile.mkdtemp`'s randomness, so an unrelated
-    process coincidentally being invoked with that exact string is not a
-    realistic collision the way pid reuse is. Also checks the matched
-    process's resolved `/proc/<pid>/exe` basename contains "tmux" before
-    signalling, as a secondary, imperfect confirmation -- NOT the primary
-    defense (the cmdline content-match is), and it has its own known blind
-    spot: `exe` resolves through wrapper symlinks to whatever binary
-    actually runs, the same class of surprise that made an earlier
-    installed-interpreter filter in this ticket's own investigation wrongly
-    resolve a wrapped python invocation through to the system interpreter
-    underneath it. A real tmux reached through an unusual wrapper chain is
-    a residual, low-probability gap this does not close -- called with
-    `kill-server`'s own attempt already having run and, on this box, having
-    been observed to silently fail under load (see the "kill-server didn't
-    take" note in ticket 2198b696's report).
+    ⚠ Parses `/proc/<pid>/cmdline` as real argv (split on NUL, drop the
+    trailing empty token), not a flattened-string substring check -- an
+    earlier version matched `-S {socket_path}` as a plain substring of the
+    joined cmdline, which a DIFFERENT socket path that happens to start
+    with this one as a prefix (e.g. `/tmp/x` inside `/tmp/x-extra`) would
+    also satisfy. `socket_path` itself is still not a small, quickly
+    recycled identifier the way a pid is -- it is derived from
+    `tempfile.mkdtemp`'s randomness -- so an unrelated process being
+    invoked with the exact same argument value is not a realistic
+    collision the way pid reuse is, once the comparison is actually exact.
     """
-    needle = f"-S {socket_path}"
     proc_dir = Path("/proc")
     if not proc_dir.is_dir():
-        return
+        return []
+    matches = []
     for entry in proc_dir.iterdir():
         if not entry.name.isdigit():
             continue
         try:
-            cmdline = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            raw = (entry / "cmdline").read_bytes()
         except OSError:
             continue
-        if needle not in cmdline or "tmux" not in cmdline:
-            continue
+        argv = raw.split(b"\0")
+        if argv and argv[-1] == b"":
+            argv = argv[:-1]
         try:
-            exe = os.readlink(f"/proc/{entry.name}/exe")
-        except OSError:
+            flag_index = argv.index(b"-S")
+        except ValueError:
             continue
-        if "tmux" not in os.path.basename(exe):
-            log(f"  • not killing pid {entry.name}: cmdline matched {socket_path} but exe is {exe}, not tmux")
+        if flag_index + 1 >= len(argv):
             continue
+        if argv[flag_index + 1].decode(errors="replace") != socket_path:
+            continue
+        if not any(b"tmux" in part for part in argv[:1]):
+            continue
+        matches.append(int(entry.name))
+    return matches
+
+
+def _kill_tmux_server_by_socket_path(socket_path: str, log=print) -> None:
+    """SIGKILL the tmux server bound to exactly `socket_path`, through a
+    pidfd opened and re-verified at the moment of the kill (see
+    `_pidfd_kill_if_matches`) -- never a numeric `os.kill` resolved from an
+    earlier scan. Also called with `tmux kill-server`'s own attempt already
+    having run and, on this box, having been observed to silently fail
+    under load (see the "kill-server didn't take" note in ticket 2198b696's
+    report), which is why this exists at all rather than trusting that.
+    """
+    def verify(pid: int) -> bool:
+        if pid not in _matching_tmux_pids(socket_path):
+            return False
+        # Secondary, imperfect confirmation beyond the argv match -- exe
+        # resolves through wrapper symlinks to whatever binary actually
+        # runs, a real but low-probability blind spot, not the primary
+        # defense (the exact argv match, re-checked with the pidfd held, is).
         try:
-            os.kill(int(entry.name), 9)
+            exe = os.readlink(f"/proc/{pid}/exe")
         except OSError:
-            pass
+            return False
+        return "tmux" in os.path.basename(exe)
+
+    for pid in _matching_tmux_pids(socket_path):
+        _pidfd_kill_if_matches(pid, verify, log=log, context=f"tmux server for {socket_path}")
 
 
 def reap_orphan(tmpdir: str, log=print) -> bool:
     """The same cleanup every test's own `finally` already does for its own
-    tmpdir -- kill any AUTHENTICATED daemon recorded under
-    `<tmpdir>/run/*.pid`, kill the isolated tmux server bound to
-    `<tmpdir>/isolated.sock`, remove the tree. Safe to call on a tmpdir
-    that's partially or fully gone already.
+    tmpdir -- stop every daemon recorded under `<tmpdir>/run/*.pid` (through
+    `services.daemons.stop_daemons`, the reviewed pidfd-authenticated
+    implementation -- not reimplemented here), kill the isolated tmux
+    server bound to `<tmpdir>/isolated.sock`, remove the tree. Safe to call
+    on a tmpdir that's partially or fully gone already.
 
-    If ANY daemon pidfile cannot be authenticated (missing or mismatched
-    `.identity` -- see `_authenticated_daemon_pid`), this does NOTHING at
-    all: no daemon killed, no tmux server killed, tmpdir NOT removed.
-    Partial reaping -- killing what authenticates and deleting the
-    directory anyway -- would destroy the very evidence (the directory,
-    the manifest entry staying meaningful) that makes an unauthenticatable
-    orphan visible, while leaving whatever it couldn't authenticate running
-    unlabelled. Returns False in that case so the caller leaves the
-    manifest entry in place for a later session to retry, rather than
-    treating a partial, unsafe cleanup as done.
+    If ANY daemon pidfile is still present after `stop_daemons` returns --
+    meaning it could not authenticate that pid and, correctly, left it
+    running rather than guess -- this does NOTHING further: no tmux-server
+    kill, no directory removal. Partial reaping (stopping what authenticates
+    and deleting the directory anyway) would destroy the very evidence that
+    makes an unauthenticatable orphan visible, while leaving whatever
+    couldn't be stopped running unlabelled. Returns False in that case so
+    the caller leaves the manifest entry in place for a later session to
+    retry, rather than treating a partial, unsafe cleanup as done.
     """
     tmpdir_path = Path(tmpdir)
     run_dir = tmpdir_path / "run"
-    to_kill: list[int] = []
     if run_dir.is_dir():
-        for pidfile in run_dir.glob("*.pid"):
-            pid, reason = _authenticated_daemon_pid(pidfile)
-            if pid is None:
-                log(f"  • STUCK, leaving entirely: {tmpdir} -- {pidfile.name} not authenticated ({reason})")
-                return False
-            to_kill.append(pid)
-    for pid in to_kill:
-        try:
-            os.kill(pid, 9)
-        except OSError:
-            pass
+        stop_daemons(run_dir, log=log)
+        remaining = sorted(p.name for p in run_dir.glob("*.pid"))
+        if remaining:
+            log(f"  • STUCK, leaving {tmpdir} entirely: still present after stop_daemons: {remaining}")
+            return False
     socket_path = str(tmpdir_path / "isolated.sock")
     _kill_tmux_server_by_socket_path(socket_path, log=log)
     shutil.rmtree(tmpdir, ignore_errors=True)
@@ -284,23 +302,28 @@ def reap_orphan(tmpdir: str, log=print) -> bool:
 
 def reap_all_orphans(log=print) -> tuple[int, int]:
     """Reap every manifest entry whose registering process is authenticated
-    as no longer running (see `_owner_still_running` -- never bare pid
-    liveness). An entry whose owner IS still the same running process
-    belongs to a test genuinely in progress -- on this shared sandbox that
-    may be a different agent's concurrent pytest invocation, not this one --
-    so it is left alone regardless of age.
+    as no longer running (see `_owner_status` -- never bare pid liveness).
+    An entry whose owner IS still the same running process belongs to a
+    test genuinely in progress -- on this shared sandbox that may be a
+    different agent's concurrent pytest invocation, not this one -- so it
+    is left alone regardless of age.
 
-    Returns `(reaped, stuck)`. `stuck` counts entries whose owner is dead
-    but a daemon pidfile could not be authenticated (see `reap_orphan`) --
-    these are deliberately retried, not aged out, EVERY session, forever,
-    until whatever broke their `.identity` sidecar is fixed. That is a
-    considered choice, not an oversight: an unauthenticatable entry that
-    silently expired after some timeout would be a fail-OPEN path wearing a
-    fail-closed appearance, exactly the class of bug this whole module
-    exists to remove. Permanent retention is only an acceptable answer
-    because it stays VISIBLE -- `reap_orphan` logs the specific pidfile and
-    reason on every attempt, and this count is what a caller (`conftest.py`)
-    reports plainly rather than folding into "reaped" and going quiet.
+    Returns `(reaped, stuck)`. `stuck` counts every entry left in place on
+    purpose rather than silently: a dead owner whose daemon pidfile could
+    not be authenticated (see `reap_orphan`); an owner whose OWN liveness
+    could not be authenticated at registration time (`owner_start_time`
+    recorded as `None` -- reviewer's finding: this used to be silently
+    treated as "running" forever, indistinguishable from a genuinely live
+    entry); and a manifest entry with malformed or unreadable JSON, which
+    used to be deleted outright -- destroying the only surviving record of
+    whatever it pointed at, reviewer's second finding. None of these are
+    aged out: an unauthenticatable entry that silently expired after some
+    timeout would be a fail-OPEN path wearing a fail-closed appearance,
+    exactly the class of bug this whole module exists to remove. Permanent
+    retention is only an acceptable answer because it stays VISIBLE -- a
+    reason is logged on every attempt, and this count is what a caller
+    (`conftest.py`) reports plainly rather than folding into "reaped" and
+    going quiet.
     """
     if not MANIFEST_DIR.is_dir():
         return 0, 0
@@ -311,16 +334,23 @@ def reap_all_orphans(log=print) -> tuple[int, int]:
             continue  # a register() temp file mid-write, not a real entry
         try:
             data = json.loads(entry.read_text())
-        except (OSError, json.JSONDecodeError):
-            entry.unlink(missing_ok=True)
+        except (OSError, json.JSONDecodeError) as exc:
+            log(f"  • STUCK, leaving {entry}: unreadable manifest entry ({exc})")
+            stuck += 1
             continue
         owner_pid = data.get("owner_pid")
         owner_start_time = data.get("owner_start_time")
         tmpdir = data.get("tmpdir")
         if not isinstance(owner_pid, int) or not isinstance(tmpdir, str):
-            entry.unlink(missing_ok=True)
+            log(f"  • STUCK, leaving {entry}: malformed manifest entry (owner_pid={owner_pid!r} tmpdir={tmpdir!r})")
+            stuck += 1
             continue
-        if _owner_still_running(owner_pid, owner_start_time):
+        status = _owner_status(owner_pid, owner_start_time)
+        if status == "running":
+            continue
+        if status == "unverifiable":
+            log(f"  • STUCK, leaving {tmpdir}: owner pid {owner_pid}'s liveness could not be authenticated")
+            stuck += 1
             continue
         log(f"  • reaping orphaned test tmpdir {tmpdir} (owner pid {owner_pid} authenticated dead)")
         if not reap_orphan(tmpdir, log=log):
