@@ -141,32 +141,46 @@ for _, raw in ipairs(opening) do
     }))
 end
 
--- Inbox conservation: api-type agents only, the sole port type that ever
--- writes an "inbox" key. XRANGE and encode every entry before HDEL is the
--- first mutation, same discipline as everything above. Field NAMES and
--- VALUES are hex-encoded -- Redis permits arbitrary binary in either,
--- including from a manual or legacy write this script has no way to rule
--- out -- as an ORDERED ARRAY of [field_hex, value_hex] pairs (a Lua table
--- with sequential integer keys encodes as a JSON array), not a JSON
--- object, so duplicate field names and field order are preserved exactly
--- rather than reconstructed. The stream entry id itself is
--- Redis-generated/validated ASCII (milliseconds-sequence) and is stored
--- as plain text: a real storage invariant backs it, unlike the fields.
+-- Inbox conservation: keyed on whether a STREAM actually exists at the
+-- canonical inbox resource, not on what the registry currently says this
+-- agent's port type is. A valid stream there is already-delivered
+-- mailbox content regardless of why it exists -- modules/api is the sole
+-- writer today, but "preserve in place instead of conserving" for a
+-- port-type mismatch was a real bypass in an earlier version: a same-
+-- named successor hired later as an api-type agent would read straight
+-- through to whatever an untouched predecessor inbox still held, the
+-- exact inheritance this whole script exists to close, reached through a
+-- port-type change instead of a same-type stop+rehire. So this always
+-- conserves and always deletes; a non-api port type at retirement only
+-- changes the RECORDED REASON, to make an operator reading retired-inbox
+-- aware the source was not the expected api shape. XRANGE and encode
+-- every entry before HDEL is the first mutation, same discipline as
+-- everything above. Field NAMES and VALUES are hex-encoded -- Redis
+-- permits arbitrary binary in either, including from a manual or legacy
+-- write this script has no way to rule out -- as an ORDERED ARRAY of
+-- [field_hex, value_hex] pairs (a Lua table with sequential integer keys
+-- encodes as a JSON array), not a JSON object, so duplicate field names
+-- and field order are preserved exactly rather than reconstructed. The
+-- stream entry id itself is Redis-generated/validated ASCII
+-- (milliseconds-sequence) and is stored as plain text: a real storage
+-- invariant backs it, unlike the fields.
 local retired_inbox = {}
-if this_port_type == 'api' then
-    local entries = redis.call('XRANGE', KEYS[20], '-', '+')
-    for _, entry in ipairs(entries) do
-        local entry_id = entry[1]
-        local raw_fields = entry[2]
-        local fields = {}
-        for index = 1, #raw_fields, 2 do
-            table.insert(fields, {hex(raw_fields[index]), hex(raw_fields[index + 1])})
-        end
-        table.insert(retired_inbox, cjson.encode({
-            agent=ARGV[1], reason='destination retired with unread inbox content',
-            entry_id=entry_id, encoding='hex', fields=fields
-        }))
+local inbox_reason = 'destination retired with unread inbox content'
+if this_port_type ~= 'api' then
+    inbox_reason = 'destination retired with unread inbox content for a non-api port type'
+end
+local entries = redis.call('XRANGE', KEYS[20], '-', '+')
+for _, entry in ipairs(entries) do
+    local entry_id = entry[1]
+    local raw_fields = entry[2]
+    local fields = {}
+    for index = 1, #raw_fields, 2 do
+        table.insert(fields, {hex(raw_fields[index]), hex(raw_fields[index + 1])})
     end
+    table.insert(retired_inbox, cjson.encode({
+        agent=ARGV[1], reason=inbox_reason,
+        entry_id=entry_id, encoding='hex', fields=fields
+    }))
 end
 
 redis.call('HDEL', KEYS[1], ARGV[1])
@@ -185,17 +199,9 @@ end
 for _, record in ipairs(retired_inbox) do
     redis.call('RPUSH', KEYS[21], record)
 end
--- Only ever DEL the inbox key on the same condition that reads and
--- conserves it. modules/api is the sole writer of an "inbox" resource
--- today, so a non-api agent should never have one -- but "should never"
--- is not a storage guarantee, and an unconditional DEL here would
--- silently destroy whatever a non-api inbox key held with zero evidence,
--- for a port type this script has no defined conservation semantics for
--- at all. Preserved in place, not conserved: the safer default when the
--- content's shape and meaning are both unknown.
-if this_port_type == 'api' then
-    redis.call('DEL', KEYS[20])
-end
+-- Unconditional, matching the unconditional read/conserve above -- a
+-- no-op if no inbox stream ever existed at this key.
+redis.call('DEL', KEYS[20])
 redis.call('DEL', KEYS[3])
 redis.call('DEL', KEYS[4])
 redis.call('DEL', KEYS[5])

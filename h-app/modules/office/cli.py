@@ -1063,6 +1063,20 @@ def _undeliverable_command(argv: list[str]) -> None:
             print("unparseable undeliverable custody record", file=sys.stderr)
 
 
+def _decoded_component(raw: bytes) -> dict:
+    """One field or value, decoded independently of its pair partner: a
+    duplicate-field or hostile-byte scheme can put a cleanly-decodable
+    name next to an undecodable value (or vice versa), and collapsing
+    them as a matched pair would throw away the half that DID decode.
+    Each component carries its own encoding tag rather than being folded
+    into a shared key -- see _retired_inbox_command's docstring for why a
+    dict was wrong for this."""
+    try:
+        return {"value": raw.decode(), "encoding": "utf8"}
+    except UnicodeDecodeError:
+        return {"value": raw.hex(), "encoding": "hex"}
+
+
 def _retired_inbox_command(argv: list[str]) -> None:
     """Read api-type agents' inbox content conserved at retirement.
 
@@ -1071,14 +1085,20 @@ def _retired_inbox_command(argv: list[str]) -> None:
     conserving, so this exists in the same commit as the write path
     that fills it. Records here are not envelopes (deliver_api's inbox
     entries aren't wire frames), so this decodes each hex field/value
-    pair directly rather than going through core.envelope.parse(); a
-    field or value that isn't valid UTF-8 once decoded from hex is shown
-    as its hex form instead of raising, since the conservation script's
-    whole point is to survive exactly that content. The printed `fields`
-    collapses to a dict for readability -- a duplicate field name would
-    show only its last value here -- but the underlying stored record
-    itself keeps the full ordered pair list; this view simplifies display,
-    it does not lose the durable data.
+    pair directly rather than going through core.envelope.parse().
+
+    ⚠ `fields` PRINTS AS AN ORDERED LIST OF PAIR RECORDS, NEVER A DICT.
+    A first version collapsed it to a dict for readability and broke the
+    one property the stored record exists to preserve: a duplicate field
+    name silently kept only its last value, and two DIFFERENT raw field
+    names could even collide onto the same displayed key under a mixed
+    text/hex fallback scheme (a UTF-8 field literally named "ff" and a
+    binary field whose hex form is "ff" both became key "ff"). The
+    durable record already preserves exact order and duplicates; a
+    reader that cannot show the same is not actually inspectable, it
+    just looks like it is. Each field and value is decoded
+    INDEPENDENTLY (not as a matched pair) via _decoded_component, so an
+    undecodable value never hides an otherwise-readable field name.
     """
     parser = _operation_parser(
         "retired-inbox",
@@ -1093,13 +1113,13 @@ def _retired_inbox_command(argv: list[str]) -> None:
             agent = record["agent"]
             if args.agent and agent != args.agent:
                 continue
-            fields = {}
-            for field_hex, value_hex in record["fields"]:
-                field_raw, value_raw = bytes.fromhex(field_hex), bytes.fromhex(value_hex)
-                try:
-                    fields[field_raw.decode()] = value_raw.decode()
-                except UnicodeDecodeError:
-                    fields[field_raw.hex()] = value_raw.hex()
+            fields = [
+                {
+                    "field": _decoded_component(bytes.fromhex(field_hex)),
+                    "value": _decoded_component(bytes.fromhex(value_hex)),
+                }
+                for field_hex, value_hex in record["fields"]
+            ]
             print(json.dumps({
                 "agent": agent,
                 "entry_id": record["entry_id"],

@@ -326,22 +326,26 @@ def test_stop_conserves_more_than_a_thousand_inbox_entries_by_exact_identity(rea
             real_redis.delete(*keys)
 
 
-def test_stop_preserves_a_non_api_agents_inbox_key_instead_of_silently_deleting_it(real_redis):
-    """switch-agent's exact finding against the first version of this
-    script: the inbox DEL was OUTSIDE the `this_port_type == 'api'`
-    conditional that gates reading and conserving it, so stopping a
-    NON-api name with an inbox stream (something no writer produces
-    today, but not something this script may assume never exists --
-    modules/api is the sole writer of an "inbox" resource, not a
-    guarantee no other one ever will be) deleted every entry while
-    writing zero retired-inbox evidence. That is worse than the original
-    exposure: the original left content for a successor to inherit, this
-    one destroyed it outright, from inside the branch whose entire
-    purpose is conservation. Seeds a tmux-type membership with an inbox
-    stream, stops it, and confirms the content is neither leaked into
-    the retired-inbox evidence stream (this script has no defined
-    conservation semantics for a non-api port type) NOR silently gone --
-    it must still be readable at its original key."""
+def test_stop_conserves_a_non_api_agents_inbox_so_an_api_successor_cannot_inherit_it(real_redis):
+    """switch-agent's second-pass finding: an earlier version of this
+    fix gated the inbox DEL on `this_port_type == 'api'` and left a
+    non-api agent's inbox key untouched ("preserved in place") when one
+    somehow existed. That still permitted the exact successor
+    contamination this whole script exists to close -- the registry's
+    CURRENT port type at retirement says nothing about what a same-named
+    SUCCESSOR will be hired as next. A tmux-type name retired today can
+    be re-hired as an api-type agent tomorrow, and that successor's
+    GET /agents/{agent}/messages reads the same reusable per-name inbox
+    key regardless of what port type used to own it. So conservation and
+    deletion are now unconditional on whether a stream exists at the
+    inbox key at all, never on the registry's current port-type claim --
+    a non-api origin only changes the RECORDED REASON, not whether the
+    content is conserved and removed. Seeds a tmux-type membership with
+    an inbox stream (unexpected, but not something this script may
+    assume never happens), stops it, re-hires the SAME NAME as an
+    api-type agent, and confirms the predecessor's content is visible
+    only through retired-inbox evidence -- never through the successor's
+    own fresh inbox."""
     tenant = f"stop-non-api-inbox-{uuid4().hex[:12]}"
     agent = "worker"
     registry_key = prefix(POD, tenant, resource="registry")
@@ -349,6 +353,7 @@ def test_stop_preserves_a_non_api_agents_inbox_key_instead_of_silently_deleting_
     evidence_key = retired_inbox_key(POD, tenant)
     real_redis.hset(registry_key, agent, "tmux")
     entry_id = real_redis.xadd(inbox_key, {"unexpected": "content"})
+    expected_entry_id = entry_id.decode() if isinstance(entry_id, bytes) else entry_id
     try:
         stop_agent(
             real_redis, pod=POD, tenant=tenant,
@@ -356,9 +361,19 @@ def test_stop_preserves_a_non_api_agents_inbox_key_instead_of_silently_deleting_
             kill_window=lambda _agent: None,
         )
 
-        preserved = real_redis.xrange(inbox_key, "-", "+")
-        assert [entry_id_ for entry_id_, _ in preserved] == [entry_id]
-        assert real_redis.lrange(evidence_key, 0, -1) == []
+        [record_raw] = real_redis.lrange(evidence_key, 0, -1)
+        record = json.loads(record_raw)
+        assert record["entry_id"] == expected_entry_id
+        assert record["reason"] == "destination retired with unread inbox content for a non-api port type"
+        assert real_redis.exists(inbox_key) == 0
+
+        start_agent(
+            real_redis, pod=POD, tenant=tenant,
+            envelope={"payload": {"agent": agent, "port_type": "api"}},
+            replace_window=lambda _agent: None,
+            available_profiles=lambda *_: None,
+        )
+        assert real_redis.xrange(inbox_key, "-", "+") == []
     finally:
         keys = real_redis.keys(prefix(POD, tenant) + ":*")
         if keys:

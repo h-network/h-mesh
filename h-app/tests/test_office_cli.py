@@ -250,7 +250,10 @@ def test_retired_inbox_shows_hex_decoded_fields_without_consuming(monkeypatch, c
         "agent": "worker-1",
         "entry_id": "1700000000000-0",
         "reason": "destination retired with unread inbox content",
-        "fields": {"envelope": '{"text":"hi"}'},
+        "fields": [{
+            "field": {"value": "envelope", "encoding": "utf8"},
+            "value": {"value": '{"text":"hi"}', "encoding": "utf8"},
+        }],
     }
     assert r.lrange(key, 0, -1) == [record]
 
@@ -271,11 +274,44 @@ def test_retired_inbox_shows_non_utf8_fields_as_hex_instead_of_raising(monkeypat
     with patch("modules.office.cli.redis.Redis.from_url", return_value=r):
         office_main(["retired-inbox"])
     shown = json.loads(capsys.readouterr().out)
-    # Field and value decode as a matched pair, not independently -- a
-    # decodable field name next to an undecodable value would be a
-    # confusing partial display, so an undecodable value falls the whole
-    # pair back to hex even though "envelope" alone would decode fine.
-    assert shown["fields"] == {"envelope".encode().hex(): hostile.hex()}
+    # Field and value decode INDEPENDENTLY -- "envelope" stays readable
+    # even though its paired value does not, unlike an earlier version
+    # that fell the whole pair back to hex together.
+    assert shown["fields"] == [{
+        "field": {"value": "envelope", "encoding": "utf8"},
+        "value": {"value": hostile.hex(), "encoding": "hex"},
+    }]
+
+
+def test_retired_inbox_shows_duplicate_field_names_as_distinct_ordered_entries(monkeypatch, capsys):
+    # reviewer's exact ask: the same genuine-duplicate-field fixture
+    # test_agentlifecycle.py proves at the Lua/storage layer, now proven
+    # through the CLI reader too -- a dict would silently keep only the
+    # last "dup" value and lose the ordering; this must not.
+    r = FakeRedis()
+    _env(monkeypatch)
+    record = json.dumps({
+        "agent": "worker-1",
+        "reason": "destination retired with unread inbox content",
+        "entry_id": "1700000000000-0",
+        "encoding": "hex",
+        "fields": [
+            ["dup".encode().hex(), "first".encode().hex()],
+            ["other".encode().hex(), "x".encode().hex()],
+            ["dup".encode().hex(), "second".encode().hex()],
+        ],
+    })
+    key = retired_inbox_key(POD, TENANT)
+    r.rpush(key, record)
+    with patch("modules.office.cli.redis.Redis.from_url", return_value=r):
+        office_main(["retired-inbox"])
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["fields"] == [
+        {"field": {"value": "dup", "encoding": "utf8"}, "value": {"value": "first", "encoding": "utf8"}},
+        {"field": {"value": "other", "encoding": "utf8"}, "value": {"value": "x", "encoding": "utf8"}},
+        {"field": {"value": "dup", "encoding": "utf8"}, "value": {"value": "second", "encoding": "utf8"}},
+    ]
+    assert r.lrange(key, 0, -1) == [record]
 
 
 def test_retired_inbox_malformed_record_is_reported_without_consuming(monkeypatch, capsys):
