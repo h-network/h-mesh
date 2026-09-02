@@ -585,6 +585,154 @@ class AdmissionErrorCategoryTests(unittest.TestCase):
         self.assertEqual(category, "connection_error")
 
 
+class ErrorCategoryTests(unittest.TestCase):
+    """Counterfixtures for _error_category -- the closed classifier that
+    replaced _error()'s f"{type(exc).__name__}: {exc}" across all 14
+    call sites. Architect's exact finding: it emitted BOTH halves of the
+    leak class, the exception's own message (str(exc)) AND its class name
+    (type(exc).__name__), and a dynamically constructed exception type can
+    put attacker-chosen text in its own __name__ -- so neither half was
+    safe to trust. Pinned in isolation, no Watchdog/FakeRedis needed, same
+    reasoning as AdmissionErrorCategoryTests above."""
+
+    def test_a_genuine_internal_bug_reports_its_own_exact_type_name(self):
+        """isinstance decides the branch, exact type identity decides the
+        name -- a real, directly-raised TypeError is exactly one of our
+        own closed literals, so its name is trusted."""
+        self.assertEqual(service._error_category(TypeError("x")), "internal-error (TypeError)")
+
+    def test_every_internal_type_reports_its_own_name(self):
+        for exc_type in service._INTERNAL_ERROR_TYPES:
+            self.assertEqual(
+                service._error_category(exc_type("x")),
+                f"internal-error ({exc_type.__name__})",
+            )
+
+    def test_a_dynamically_constructed_subclass_reports_derived_not_its_own_name(self):
+        """The trap clients-agent hit and warned about: type(sentinel, (Name
+        Error,), {}) is an instance of NameError (isinstance passes, so this
+        still routes to internal-error) but its OWN class name is attacker-
+        chosen -- so the name must not be trusted just because isinstance
+        matched. Only an EXACT type() match may report the real name."""
+        SentinelSubclass = type("REMOTE_SECRET_CLASS_NAME", (NameError,), {})
+        self.assertTrue(issubclass(SentinelSubclass, NameError))
+        self.assertNotIn(SentinelSubclass, service._INTERNAL_ERROR_TYPES)
+        category = service._error_category(SentinelSubclass("x"))
+        self.assertEqual(category, "internal-error (derived)")
+        self.assertNotIn("REMOTE_SECRET_CLASS_NAME", category)
+
+    def test_a_genuine_transport_error_is_not_classified_as_internal(self):
+        """The mirror clients-agent specifically warned not to skip: without
+        this, "ours" could quietly widen until it swallows "theirs", passing
+        every test written for the other direction while the classification
+        stops meaning anything."""
+        for exc in (
+            redis.exceptions.ConnectionError("x"),
+            ConnectionError("x"),
+            TimeoutError("x"),
+            OSError("x"),
+        ):
+            category = service._error_category(exc)
+            self.assertFalse(
+                category.startswith("internal-error"),
+                f"{exc!r} was classified as {category!r}, but this is not our own coding mistake",
+            )
+
+    def test_a_redis_error_is_categorized_as_redis_error(self):
+        self.assertEqual(service._error_category(redis.exceptions.ResponseError("x")), "redis-error")
+
+    def test_a_builtin_connection_error_is_categorized_as_connection_error(self):
+        self.assertEqual(service._error_category(ConnectionError("x")), "connection-error")
+
+    def test_a_builtin_timeout_error_is_categorized_as_timeout(self):
+        self.assertEqual(service._error_category(TimeoutError("x")), "timeout")
+
+    def test_an_os_error_is_categorized_as_os_error(self):
+        """Covers subprocess.run failures from run_tmux -- e.g. FileNotFoundError
+        (a subclass of OSError) when the tmux binary itself is missing."""
+        self.assertEqual(service._error_category(FileNotFoundError("x")), "os-error")
+
+    def test_value_error_and_runtime_error_are_deliberately_not_internal(self):
+        """Both are builtins, and both are routinely raised by libraries for
+        malformed/remote-caused input (json decode, a Redis protocol error)
+        -- classifying either as "ours" would send an operator hunting a
+        defect in this module's code for someone else's bad data."""
+        self.assertEqual(service._error_category(ValueError("x")), "external-error")
+        self.assertEqual(service._error_category(RuntimeError("x")), "external-error")
+
+    def test_an_unrecognized_exception_falls_back_to_external_error(self):
+        self.assertEqual(service._error_category(ArithmeticError("x")), "external-error")
+
+    def test_the_exceptions_own_message_never_appears_in_the_category(self):
+        """Reviewer's exact reproduction shape, reapplied here: plant a
+        secret in the exception MESSAGE and confirm it is absent from the
+        resulting category, for both an internal and an external exception."""
+        secret = "REMOTE_SECRET_EXCEPTION_TEXT"
+        internal_category = service._error_category(TypeError(secret))
+        external_category = service._error_category(ConnectionError(secret))
+        self.assertNotIn(secret, internal_category)
+        self.assertNotIn(secret, external_category)
+        self.assertEqual(internal_category, "internal-error (TypeError)")
+        self.assertEqual(external_category, "connection-error")
+
+
+class ErrorSinkContentTests(unittest.TestCase):
+    """The full _error() sink, not just the classifier -- confirms the
+    JSON record it actually emits carries neither half of the original
+    leak (message or a spoofed class name), for a scenario planting a
+    sentinel in BOTH at once, the combination architect's ticket named
+    explicitly."""
+
+    def test_error_emits_neither_the_message_nor_a_spoofed_class_name(self):
+        """SpoofedClass is a dynamically constructed subclass of NameError
+        (one of our own closed types) -- isinstance passes, so this must
+        still route to internal-error, but its OWN class name is attacker-
+        chosen and must not be trusted."""
+        secret_message = "REMOTE_SECRET_EXCEPTION_TEXT"
+        SpoofedClass = type("REMOTE_SECRET_CLASS_NAME", (NameError,), {})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            service.Watchdog._error("some_job", SpoofedClass(secret_message))
+        record = json.loads(out.getvalue().strip())
+        self.assertNotIn(secret_message, out.getvalue())
+        self.assertNotIn("REMOTE_SECRET_CLASS_NAME", out.getvalue())
+        self.assertEqual(record["job"], "some_job")
+        self.assertEqual(record["reason"], "internal-error (derived)")
+
+    def test_error_category_never_raises_on_hostile_input(self):
+        """A guard's correctness is only a claim until it's proved -- this
+        proves _error_category is TOTAL, not just argued to be. It uses
+        `type(exc) in ...` (tuple membership) and `isinstance`, never a
+        dict/set/frozenset lookup on `exc` itself, so it cannot be crashed
+        by a hostile __eq__/__hash__ the way a membership test on the
+        instance could be. Exercises that directly: a class whose __eq__
+        and __hash__ both raise, plus None and a plain non-exception
+        object, none of which are BaseException instances at all."""
+
+        class Hostile:
+            def __eq__(self, other):
+                raise RuntimeError("hostile __eq__")
+
+            def __hash__(self):
+                raise RuntimeError("hostile __hash__")
+
+        for hostile_input in (None, object(), Hostile(), "not an exception", 42):
+            self.assertEqual(service._error_category(hostile_input), "external-error")
+
+    def test_error_never_raises_even_when_json_dumps_fails(self):
+        """The LAST layer: nothing downstream of _error() catches its own
+        failure, so it must be allowed to fail silently rather than crash
+        whatever called it -- including main()'s own outermost per-phase
+        catch. Forces json.dumps itself to fail (the one step inside
+        _error() that is not already provably total) and confirms _error()
+        absorbs it instead of propagating."""
+        with patch.object(service.json, "dumps", side_effect=RuntimeError("boom")):
+            try:
+                service.Watchdog._error("some_job", ValueError("x"))
+            except Exception as exc:
+                self.fail(f"_error() propagated {exc!r} instead of failing silently")
+
+
 def _kicks():
     """Return (list, fake_deliver_tmux) -- records the kicked agent name."""
     kicks = []
@@ -2013,7 +2161,7 @@ class WatchdogFailureIsolationTests(unittest.TestCase):
             "event": "error",
             "writer": "watchdog",
             "job": "stalls",
-            "reason": "RuntimeError: bad board",
+            "reason": "external-error",
         })
         self.assertTrue(any(record.get("kind") == "blocked" for record in output))
 
@@ -2081,7 +2229,7 @@ class WatchdogMainLoopTests(unittest.TestCase):
         self.assertEqual(calls, ["poll", "credentials"])
         error = json.loads(out)
         self.assertEqual(error["job"], "observations")
-        self.assertEqual(error["reason"], "RuntimeError: bad observations")
+        self.assertEqual(error["reason"], "external-error")
 
     def test_disabled_alerting_still_connects_because_observers_need_redis(self):
         """WATCHDOG_ENABLED=0 must still connect: the observers live in this
