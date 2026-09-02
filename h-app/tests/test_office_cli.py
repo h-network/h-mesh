@@ -495,6 +495,68 @@ def test_retitle_changes_only_title_in_full_stored_object(ticket, monkeypatch):
     }
 
 
+def test_retitle_changes_only_raw_title_token(monkeypatch):
+    _env(monkeypatch)
+    r = FakeRedis()
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    raw = '''{
+  "v": 1,
+  "id": "a1b2c3d4",
+  "title": "stale premise",
+  "description": "literal café",
+  "from": "architect",
+  "status": "doing",
+  "created_at": "2026-08-31T00:00:00.000Z",
+  "extension_number": 1e+00,
+  "future_metadata": {"owner": "ops"},
+  "explicit_null": null
+}'''
+    raw_bytes = raw.encode()
+    expected = raw.replace('"stale premise"', '"corrected premise"', 1).encode()
+    r.lists[doing_key].append(raw_bytes)
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["retitle", "--title", "corrected premise"])
+
+    assert r.lists[doing_key] == [expected]
+
+
+def test_retitle_replaces_escaped_title_token_not_matching_description(monkeypatch):
+    _env(monkeypatch)
+    r = FakeRedis()
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    raw = (
+        '{"id":"a1b2c3d4","description":"stale \\"premise\\"",'
+        '"title":"stale \\"premise\\"","status":"doing"}'
+    )
+    # The first matching token belongs to description; only the parsed title
+    # span may change.
+    expected = raw[: raw.rfind('"stale \\"premise\\""')] + '"corrected premise"' + raw[
+        raw.rfind('"stale \\"premise\\""') + len('"stale \\"premise\\""') :
+    ]
+    r.lists[doing_key].append(raw)
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["retitle", "--title", "corrected premise"])
+
+    assert r.lists[doing_key] == [expected]
+
+
+def test_retitle_refuses_duplicate_top_level_title_without_rewriting(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis()
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    raw = '{"id":"a1b2c3d4","title":"first","title":"effective","status":"doing"}'
+    r.lists[doing_key].append(raw)
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit):
+            office_main(["retitle", "--title", "replacement"])
+
+    assert "exactly one top-level title" in capsys.readouterr().err
+    assert r.lists[doing_key] == [raw]
+
+
 def test_retitle_records_old_and_new_title_in_both_audit_channels(monkeypatch, tmp_path):
     _env(monkeypatch)
     task_record = tmp_path / "tasks.jsonl"

@@ -616,10 +616,73 @@ def _transition_selected(
     raise OfficeError("task changed while the command was running; try again")
 
 
-def _rewrite_selected(r, *, key: str, raw, ticket: dict) -> None:
+def _rewrite_selected(r, *, key: str, raw, replacement) -> None:
     """Atomically rewrite one exact list entry without changing its position."""
-    if not r.eval(_ATOMIC_REWRITE, 1, key, raw, serialize_ticket(ticket)):
+    if not r.eval(_ATOMIC_REWRITE, 1, key, raw, replacement):
         raise OfficeError("task changed while the command was running; try again")
+
+
+def _replace_top_level_title(raw, title: str):
+    """Replace exactly one top-level title token, preserving every other byte."""
+    was_bytes = isinstance(raw, bytes)
+    text = raw.decode() if was_bytes else raw
+    decoder = json.JSONDecoder()
+
+    def skip_space(position: int) -> int:
+        while position < len(text) and text[position].isspace():
+            position += 1
+        return position
+
+    position = skip_space(0)
+    if position >= len(text) or text[position] != "{":
+        raise OfficeError("stored ticket is not a JSON object")
+    position += 1
+    title_spans = []
+    while True:
+        position = skip_space(position)
+        if position < len(text) and text[position] == "}":
+            position += 1
+            break
+        try:
+            key, position = decoder.raw_decode(text, position)
+        except json.JSONDecodeError as exc:
+            raise OfficeError("cannot safely locate stored ticket title") from exc
+        if not isinstance(key, str):
+            raise OfficeError("cannot safely locate stored ticket title")
+        position = skip_space(position)
+        if position >= len(text) or text[position] != ":":
+            raise OfficeError("cannot safely locate stored ticket title")
+        value_start = skip_space(position + 1)
+        try:
+            value, value_end = decoder.raw_decode(text, value_start)
+        except json.JSONDecodeError as exc:
+            raise OfficeError("cannot safely locate stored ticket title") from exc
+        if key == "title":
+            title_spans.append((value_start, value_end, value))
+        position = skip_space(value_end)
+        if position < len(text) and text[position] == ",":
+            position += 1
+            continue
+        if position < len(text) and text[position] == "}":
+            position += 1
+            break
+        raise OfficeError("cannot safely locate stored ticket title")
+
+    if skip_space(position) != len(text) or len(title_spans) != 1:
+        raise OfficeError("stored ticket must contain exactly one top-level title")
+    value_start, value_end, old_title = title_spans[0]
+    if not isinstance(old_title, str):
+        raise OfficeError("stored ticket title is not text")
+    replacement_token = json.dumps(title, ensure_ascii=False)
+    rewritten = text[:value_start] + replacement_token + text[value_end:]
+
+    expected = json.loads(text)
+    expected["title"] = title
+    if json.loads(rewritten) != expected:
+        # Refusal is the safety behavior. Never fall back to re-serializing a
+        # document whose one-field edit could not be proved.
+        raise OfficeError("could not verify title-only ticket rewrite")
+    return rewritten.encode() if was_bytes else rewritten
 
 
 def _entries(r, keys: dict[str, str], states: Sequence[str]):
@@ -902,10 +965,9 @@ def _retitle_command(argv: list[str]) -> None:
     # A targeted edit owns exactly one field. Unknown extensions and legacy
     # spellings are preservation obligations, not migration opportunities, so
     # rewrite the original object rather than normalize_ticket's projection.
-    stored = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-    old_title = stored["title"]
-    stored["title"] = title
-    _rewrite_selected(r, key=keys[state], raw=raw, ticket=stored)
+    old_title = normalized["title"]
+    replacement = _replace_top_level_title(raw, title)
+    _rewrite_selected(r, key=keys[state], raw=raw, replacement=replacement)
     record_task_event(
         "retitle",
         id=normalized["id"],
@@ -922,7 +984,7 @@ def _retitle_command(argv: list[str]) -> None:
         title=title,
         old_title=old_title,
     )
-    print(serialize_ticket(stored))
+    print(replacement.decode() if isinstance(replacement, bytes) else replacement)
 
 
 def _hold_command(argv: list[str]) -> None:
