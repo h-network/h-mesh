@@ -85,6 +85,10 @@ class ProvableActualFailure(RuntimeError):
     """An actual-state action was observably rejected and did not occur."""
 
 
+class ProvableLifecycleRejection(ValueError):
+    """Lifecycle validation rejected the request before any mutation began."""
+
+
 class _PartialLifecycle(RuntimeError):
     """Some work was acknowledged before a later action provably failed."""
 
@@ -105,20 +109,22 @@ def _record_lifecycle(kind: str):
                     destination=agent if isinstance(agent, str) else None,
                     reason=str(exc),
                 )
-                raise exc.__cause__ from exc
+                raise
             except _IncompleteLifecycle as exc:
                 log_record(
                     "agentlifecycle", f"{kind}_incomplete", correlation_id=correlation_id,
                     destination=agent if isinstance(agent, str) else None,
                     reason=str(exc),
                 )
-                raise exc.__cause__ from exc
+                raise
             except Exception as exc:
                 log_record(
                     "agentlifecycle", f"{kind}_failed", correlation_id=correlation_id,
                     destination=agent if isinstance(agent, str) else None,
                     reason=str(exc) or type(exc).__name__,
                 )
+                if isinstance(exc, (KeyError, ValueError)):
+                    raise ProvableLifecycleRejection(str(exc)) from exc
                 raise
             log_record(
                 "agentlifecycle", f"{kind}_accepted", correlation_id=correlation_id,

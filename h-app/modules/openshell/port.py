@@ -244,36 +244,21 @@ def deliver_openshell(
     owns_client = client is None
     client = client or OpenShellClient(workspace_name(pod, tenant))
 
-    def guarded(opener):
-        def run(envelope: dict) -> None:
-            try:
-                opener(envelope)
-            except OpenShellUnavailable as exc:
-                raise DeadLetter(f"gateway_unavailable: {exc}") from exc
-
-        return run
-
     openers = {
-        "Message": guarded(
-            lambda env: _deliver_text(
+        "Message": lambda env: _deliver_text(
                 r, pod, tenant, agent, env, client, sbx_name, cli, profile,
                 is_message=True,
-            )
-        ),
-        "Command": guarded(
-            lambda env: _deliver_text(
+            ),
+        "Command": lambda env: _deliver_text(
                 r, pod, tenant, agent, env, client, sbx_name, cli, profile,
                 is_message=False,
-            )
-        ),
+            ),
         "AddTicket": lambda env: add_ticket(
             r=r, pod=pod, tenant=tenant, agent=agent, envelope=env
         ),
-        "Attachment": guarded(
-            lambda env: _deliver_attachment(
+        "Attachment": lambda env: _deliver_attachment(
                 r, pod, tenant, agent, env, client, sbx_name, cli, profile
-            )
-        ),
+            ),
     }
     try:
         receive(

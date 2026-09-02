@@ -11,7 +11,9 @@ from core.channels import DeadLetter, receive
 from core.dispatch import delivery_lock
 from core.keys import prefix
 from core.logging import configure_logging
-from lib.agentlifecycle.lifecycle import pause_agent, resume_agent, start_agent, stop_agent
+from lib.agentlifecycle.lifecycle import (
+    ProvableLifecycleRejection, pause_agent, resume_agent, start_agent, stop_agent,
+)
 from modules.tmux.ops import kill_window, run_tmux
 
 
@@ -49,7 +51,7 @@ def _lifecycle_opener(operation, **kwargs):
     """
     try:
         return operation(**kwargs)
-    except (KeyError, ValueError) as exc:
+    except ProvableLifecycleRejection as exc:
         raise DeadLetter(str(exc)) from exc
 
 

@@ -1,4 +1,5 @@
 import base64
+import json
 import os
 import sys
 import unittest
@@ -19,6 +20,7 @@ from core.channels import send
 from core.envelope import parse
 from core.keys import prefix
 from modules.openshell.headless import headless_command
+from modules.openshell.client import OpenShellUnavailable
 from modules.openshell.naming import sandbox_name, short_name, workspace_name
 from modules.openshell.port import _exec_headless, deliver_openshell
 from test_tmux_port import FakeRedis
@@ -111,6 +113,19 @@ class OpenShellPortTests(unittest.TestCase):
         self.queue("Command", {"text": "git status"})
         deliver_openshell(self.redis, pod=POD, tenant=TENANT, agent="bob", client=self.client)
         self.assertEqual(self.client.exec_sandbox.call_args.kwargs["stdin"], b"git status")
+
+    def test_remote_outcome_failure_is_unresolved_not_dead(self):
+        stream_id = self.queue("Command", {"text": "may have executed"})
+        self.client.exec_sandbox.side_effect = OpenShellUnavailable("response lost")
+
+        deliver_openshell(self.redis, pod=POD, tenant=TENANT, agent="bob", client=self.client)
+
+        unresolved = self.redis.lists[prefix(POD, TENANT, resource="unresolved")]
+        self.assertEqual(
+            [parse(json.loads(record)["envelope"])["stream_id"] for record in unresolved],
+            [stream_id],
+        )
+        self.assertEqual(list(self.redis.lists[prefix(POD, TENANT, "bob", "dead")]), [])
 
     def test_attachment_writes_atomically_then_notifies(self):
         stream_id = self.queue(

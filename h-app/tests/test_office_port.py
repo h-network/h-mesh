@@ -7,6 +7,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.channels import DeadLetter
+from lib.agentlifecycle.lifecycle import _IncompleteLifecycle
 from modules.office import port
 
 
@@ -15,21 +16,23 @@ TENANT = "testtenant"
 
 
 def test_lifecycle_validation_failure_is_explicit_rejection():
-    for failure in (ValueError("invalid payload"), KeyError("bad profile")):
-        def reject(**_kwargs):
-            raise failure
-        with pytest.raises(DeadLetter) as raised:
-            port._lifecycle_opener(reject)
-        assert raised.value.__cause__ is failure
+    with pytest.raises(DeadLetter):
+        port._lifecycle_opener(
+            port.start_agent, r=MagicMock(), pod=POD, tenant=TENANT,
+            envelope={"payload": {"agent": "worker", "profile": "bad profile!"}},
+            replace_window=MagicMock(), available_profiles=lambda *_: None,
+        )
 
 
 def test_lifecycle_unknown_failure_is_not_misclassified_as_rejection():
-    failure = RuntimeError("redis outcome unknown")
-    def fail(**_kwargs):
-        raise failure
-    with pytest.raises(RuntimeError) as raised:
-        port._lifecycle_opener(fail)
-    assert raised.value is failure
+    r = MagicMock()
+    r.set.side_effect = ValueError("redis encoder rejected after write attempt")
+    with pytest.raises(_IncompleteLifecycle, match="outcome UNKNOWN"):
+        port._lifecycle_opener(
+            port.start_agent, r=r, pod=POD, tenant=TENANT,
+            envelope={"payload": {"agent": "worker"}},
+            replace_window=MagicMock(), available_profiles=lambda *_: None,
+        )
 
 
 @patch("modules.office.port.receive")

@@ -337,6 +337,7 @@ h-app/tests/test_openshell_port.py::OpenShellPortTests::test_command_has_no_mess
 h-app/tests/test_openshell_port.py::OpenShellPortTests::test_headless_commands_and_names
 h-app/tests/test_openshell_port.py::OpenShellPortTests::test_main_contract
 h-app/tests/test_openshell_port.py::OpenShellPortTests::test_message_executes_and_replies
+h-app/tests/test_openshell_port.py::OpenShellPortTests::test_remote_outcome_failure_is_unresolved_not_dead
 h-app/tests/test_openshell_port.py::OpenShellPortTests::test_reply_correlation_records_delivery_for_validation
 h-app/tests/test_paths.py::PathsTests::test_build_pane_path_deduplication_and_order
 h-app/tests/test_paths.py::PathsTests::test_build_pane_path_includes_venv_and_user_and_system_locations

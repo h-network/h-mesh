@@ -351,8 +351,8 @@ def receive(
     Each envelope moves atomically from ingress to a per-agent processing list
     before it is opened. A dead process therefore leaves durable work for its
     successor; a rejected envelope moves from processing to dead in one
-    preflighted Redis execution. Successful external opening is at-least-once:
-    death before acknowledgement can replay it, but cannot erase it.
+    preflighted Redis execution. Once custody enters `opening`, a death or
+    ambiguous opener failure is surfaced as unresolved and never replayed.
     """
     ingress_key = prefix(pod, tenant, agent, "ingress")
     processing_key = receive_processing_key(pod, tenant, agent)
