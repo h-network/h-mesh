@@ -29,7 +29,7 @@ class FakeRedis:
         self.hashes = {}
         self.lists = {}
         self.streams = {}
-        self.counters = {}
+        self.kv = {}
 
     def hset(self, key, field, value):
         self.hashes.setdefault(key, {})[field] = value
@@ -58,7 +58,11 @@ class FakeRedis:
         return count
 
     def get(self, key):
-        return None
+        return self.kv.get(key)
+
+    def set(self, key, value, ex=None):
+        self.kv[key] = value
+        return True
 
     def llen(self, key):
         return len(self.lists.get(key, []))
@@ -91,29 +95,6 @@ class FakeRedis:
         argv = args[numkeys:]
         if "LRANGE" in script and "DEL" in script:
             return self.lists.pop(keys[0], [])
-        if "reply_correlation record_delivered" in script:
-            key, counter_key = keys
-            stream_id, source, maxlen = argv
-            maxlen = int(maxlen)
-            bucket = self.hashes.setdefault(key, {})
-            decodable = []
-            for field, raw in bucket.items():
-                try:
-                    decoded = json.loads(raw)
-                except (TypeError, ValueError):
-                    continue
-                if isinstance(decoded, dict) and isinstance(decoded.get("score"), (int, float)):
-                    decodable.append((field, decoded["score"]))
-            self.counters[counter_key] = self.counters.get(counter_key, 0) + 1
-            score = self.counters[counter_key]
-            decodable.append((stream_id, score))
-            decodable.sort(key=lambda item: item[1])
-            to_evict = [f for f, _ in decodable[: len(decodable) - maxlen] if f != stream_id] \
-                if len(decodable) > maxlen else []
-            bucket[stream_id] = json.dumps({"source": source, "score": score})
-            for field in to_evict:
-                bucket.pop(field, None)
-            return 1
         return 1
 
     def pipeline(self, transaction=False):
@@ -432,11 +413,11 @@ class ApiTests(unittest.TestCase):
         )
         self.redis.lists[ingress] = [encode(envelope)]
 
-        def broken_hget(key, field):
+        def broken_get(key):
             raise ConnectionError("redis unavailable")
 
         captured = io.StringIO()
-        with patch.object(self.redis, "hget", side_effect=broken_hget), \
+        with patch.object(self.redis, "get", side_effect=broken_get), \
              redirect_stdout(captured):
             deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
 

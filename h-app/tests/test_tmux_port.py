@@ -80,7 +80,7 @@ class FakeRedis:
     def get(self, key):
         return self.kv.get(key)
 
-    def set(self, key, value, nx=False, px=None):
+    def set(self, key, value, nx=False, px=None, ex=None):
         if nx and key in self.kv:
             return False
         self.kv[key] = value
@@ -117,29 +117,6 @@ class FakeRedis:
                 value = {"count": 1, "since": since}
             self.hset(key, client, json.dumps(value, separators=(",", ":")))
             return value["count"]
-        if "reply_correlation record_delivered" in script:
-            key, counter_key = keys
-            stream_id, source, maxlen = argv
-            maxlen = int(maxlen)
-            bucket = self.hashes[key]
-            decodable = []
-            for field, raw in bucket.items():
-                try:
-                    decoded = json.loads(raw)
-                except (TypeError, ValueError):
-                    continue
-                if isinstance(decoded, dict) and isinstance(decoded.get("score"), (int, float)):
-                    decodable.append((field, decoded["score"]))
-            self.kv[counter_key] = int(self.kv.get(counter_key, 0)) + 1
-            score = self.kv[counter_key]
-            decodable.append((stream_id, score))
-            decodable.sort(key=lambda item: item[1])
-            to_evict = [f for f, _ in decodable[: len(decodable) - maxlen] if f != stream_id] \
-                if len(decodable) > maxlen else []
-            bucket[stream_id] = json.dumps({"source": source, "score": score})
-            for field in to_evict:
-                bucket.pop(field, None)
-            return 1
         raise AssertionError(f"unexpected Lua script: {script}")
 
 

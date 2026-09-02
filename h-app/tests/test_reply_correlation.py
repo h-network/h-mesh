@@ -1,8 +1,9 @@
-import json
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import redis
 
@@ -11,8 +12,9 @@ if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
 from core.keys import prefix
+from lib import reply_correlation
 from lib.reply_correlation import (
-    DELIVERED_MAXLEN,
+    DELIVERED_TTL_SECONDS,
     is_valid_reply_id,
     record_delivered,
     was_delivered,
@@ -20,54 +22,42 @@ from lib.reply_correlation import (
 
 
 class FakeRedis:
-    """Executes the real _RECORD_DELIVERED Lua script's externally visible
-    effect for well-typed keys -- one hash plus an INCR counter, HSET +
-    bounded trim in a single eval() call. This fake has no notion of
-    Redis's own per-key type system, so it cannot reproduce the
-    WRONGTYPE-preflight scenario; that regression lives in
-    RealRedisRecordDeliveredTests below, against actual Redis,
-    deliberately."""
+    """A plain string keyspace with TTLs -- SET/GET/DELETE/TTL, nothing
+    else. There is no eviction, ordering, or type-contract machinery left
+    to fake; this fake exists only so the fast in-memory tests don't need
+    real Redis for the cases that don't specifically require it (TTL
+    behavior, WRONGTYPE self-healing, digit-only ids)."""
 
     def __init__(self):
-        self.hashes = {}
-        self.counters = {}
+        self.store = {}  # key -> (value, expires_at or None)
 
-    def hget(self, key, field):
-        return self.hashes.get(key, {}).get(field)
+    def set(self, key, value, ex=None):
+        expires_at = (time.monotonic() + ex) if ex is not None else None
+        self.store[key] = (value, expires_at)
+        return True
 
-    def eval(self, script, numkeys, *args):
-        keys = args[:numkeys]
-        argv = args[numkeys:]
-        if "reply_correlation record_delivered" in script:
-            key, counter_key = keys
-            stream_id, source, maxlen = argv
-            maxlen = int(maxlen)
-            bucket = self.hashes.setdefault(key, {})
-            # Mirrors the real script's ordering: decode and validate every
-            # existing entry (excluding, not failing on, an undecodable or
-            # non-numeric score) before deciding what to evict, then write.
-            decodable = []
-            for field, raw in bucket.items():
-                try:
-                    decoded = json.loads(raw)
-                except (TypeError, ValueError):
-                    continue
-                if isinstance(decoded, dict) and isinstance(decoded.get("score"), (int, float)):
-                    decodable.append((field, decoded["score"]))
-            self.counters[counter_key] = self.counters.get(counter_key, 0) + 1
-            score = self.counters[counter_key]
-            decodable.append((stream_id, score))
-            decodable.sort(key=lambda item: item[1])
-            to_evict = [field for field, _ in decodable[: len(decodable) - maxlen] if field != stream_id] \
-                if len(decodable) > maxlen else []
-            bucket[stream_id] = json.dumps({"source": source, "score": score})
-            for field in to_evict:
-                bucket.pop(field, None)
-            return 1
-        raise AssertionError(f"unexpected eval script: {script[:60]!r}")
+    def get(self, key):
+        entry = self.store.get(key)
+        if entry is None:
+            return None
+        value, expires_at = entry
+        if expires_at is not None and time.monotonic() >= expires_at:
+            self.store.pop(key, None)
+            return None
+        return value
+
+    def ttl(self, key):
+        entry = self.store.get(key)
+        if entry is None:
+            return -2
+        _, expires_at = entry
+        if expires_at is None:
+            return -1
+        return max(0, round(expires_at - time.monotonic()))
 
 
 VALID_ID = "a" * 32
+DIGIT_ONLY_ID = "1" * 32  # all-digit but still a valid 32-hex-char id
 
 
 class ReplyCorrelationTests(unittest.TestCase):
@@ -103,7 +93,9 @@ class ReplyCorrelationTests(unittest.TestCase):
     def test_delivered_from_one_source_does_not_validate_a_different_source(self):
         # The cross-client case: bob was really sent this id by telegram.
         # A claim that it came from webconsole must not validate, even
-        # though the id really was delivered to bob.
+        # though the id really was delivered to bob. This binding is the
+        # entire point of storing source as the value rather than just
+        # recording membership.
         record_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram")
         self.assertFalse(
             was_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="webconsole")
@@ -114,28 +106,65 @@ class ReplyCorrelationTests(unittest.TestCase):
         self.assertFalse(
             was_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id="not-an-id", source="telegram")
         )
-        self.assertEqual(self.r.hashes, {})
+        self.assertEqual(self.r.store, {})
 
-    def test_bounded_to_maxlen_oldest_evicted_first(self):
-        ids = [format(i, "032x") for i in range(DELIVERED_MAXLEN + 5)]
-        for stream_id in ids:
-            record_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=stream_id, source="telegram")
-        self.assertFalse(was_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=ids[0], source="telegram"))
-        self.assertTrue(was_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=ids[-1], source="telegram"))
-
-    def test_redelivery_of_the_same_id_does_not_create_a_duplicate_that_mishandles_trim(self):
-        record_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram")
-        record_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram")
-        others = [format(i, "032x") for i in range(1, DELIVERED_MAXLEN)]
-        for stream_id in others:
-            record_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=stream_id, source="telegram")
+    def test_digit_only_stream_id_can_still_be_recorded(self):
+        # core.keys rejects an all-digit dotted-resource segment (tmux
+        # resolves an all-digit agent name as a window index, an
+        # unrelated module's concern using the same shared validator). A
+        # 32-hex-char stream_id that happens to contain no a-f characters
+        # is all-digits, and without the "s" prefix in _key(), this would
+        # silently and permanently fail to record for exactly those ids.
+        record_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=DIGIT_ONLY_ID, source="telegram")
         self.assertTrue(
-            was_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram")
+            was_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=DIGIT_ONLY_ID, source="telegram")
         )
 
-    def test_record_delivered_swallows_eval_errors_and_logs(self):
+    def test_ttl_is_set_to_the_configured_window(self):
+        record_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram")
+        key = prefix("p", "t", agent="bob", resource=f"delivered.s{VALID_ID}")
+        ttl = self.r.ttl(key)
+        self.assertGreater(ttl, 0)
+        self.assertLessEqual(ttl, DELIVERED_TTL_SECONDS)
+
+    def test_redelivery_resets_the_ttl(self):
+        with patch.object(reply_correlation, "DELIVERED_TTL_SECONDS", 100):
+            record_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram")
+            key = prefix("p", "t", agent="bob", resource=f"delivered.s{VALID_ID}")
+            self.r.store[key] = (self.r.store[key][0], time.monotonic() + 1)  # simulate near-expiry
+            record_delivered(self.r, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram")
+            self.assertGreater(self.r.ttl(key), 1)
+
+    def test_a_wrong_typed_existing_key_is_healed_by_the_next_record_not_left_broken(self):
+        # SET overwrites a key unconditionally regardless of its prior
+        # type -- unlike the deleted hash+zset/hash+counter designs,
+        # there is no WRONGTYPE failure mode for the write side at all.
+        class TypedRedis(FakeRedis):
+            def __init__(self):
+                super().__init__()
+                self.wrong_typed = set()
+
+            def set(self, key, value, ex=None):
+                self.wrong_typed.discard(key)
+                return super().set(key, value, ex=ex)
+
+            def get(self, key):
+                if key in self.wrong_typed:
+                    raise redis.exceptions.ResponseError("WRONGTYPE Operation against a key holding the wrong kind of value")
+                return super().get(key)
+
+        r = TypedRedis()
+        key = prefix("p", "t", agent="bob", resource=f"delivered.s{VALID_ID}")
+        r.wrong_typed.add(key)
+        # Before any record_delivered call, reading is a verified failure
+        # (could not check), not a false negative.
+        self.assertIsNone(was_delivered(r, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram"))
+        record_delivered(r, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram")
+        self.assertTrue(was_delivered(r, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram"))
+
+    def test_record_delivered_swallows_write_errors_and_logs(self):
         class BrokenRedis(FakeRedis):
-            def eval(self, script, numkeys, *args):
+            def set(self, key, value, ex=None):
                 raise ConnectionError("redis unavailable")
 
         broken = BrokenRedis()
@@ -146,45 +175,18 @@ class ReplyCorrelationTests(unittest.TestCase):
 
     def test_was_delivered_returns_none_not_false_on_redis_error(self):
         class BrokenRedis(FakeRedis):
-            def hget(self, key, field):
+            def get(self, key):
                 raise ConnectionError("redis unavailable")
 
         broken = BrokenRedis()
         result = was_delivered(broken, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram")
         self.assertIsNone(result)
 
-    def test_record_delivered_calls_eval_exactly_once(self):
-        # Necessary, not sufficient: this only proves record_delivered
-        # issues one Redis command rather than several. It does NOT by
-        # itself prove that command can't half-apply -- Redis Lua provides
-        # isolation, not transactional rollback, so a runtime error partway
-        # through a script can still leave earlier writes in that same
-        # script applied (see RealRedisRecordDeliveredTests below, and the
-        # module docstring). The type preflight is what actually closes
-        # that gap for this script's specific single-key design.
-        calls = []
-
-        class CountingRedis(FakeRedis):
-            def eval(self, script, numkeys, *args):
-                calls.append((script, numkeys, args))
-                return super().eval(script, numkeys, *args)
-
-        counting = CountingRedis()
-        record_delivered(counting, pod="p", tenant="t", agent="bob", stream_id=VALID_ID, source="telegram")
-        self.assertEqual(len(calls), 1)
-
 
 class RealRedisRecordDeliveredTests(unittest.TestCase):
-    """Exercises real Redis, not a fake. The regression below reproduces a
-    genuine bug found on real Redis: a Lua script's redis.call()s are not
-    rolled back on a later runtime error within the same script, so a
-    two-key version of this script (HSET a provenance hash, then ZADD a
-    separate eviction-order zset) left permanent, unindexed, always-valid
-    provenance if the second key ever held the wrong type -- reproduced by
-    seeding that key as a plain string before calling record_delivered. No
-    in-memory fake enforces Redis's own per-key type system, so this cannot
-    be exercised any other way.
-    """
+    """Exercises real Redis, not a fake -- TTL expiry and Redis's own
+    WRONGTYPE enforcement are both things no in-memory double can prove on
+    its own."""
 
     def setUp(self):
         self.redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
@@ -198,63 +200,7 @@ class RealRedisRecordDeliveredTests(unittest.TestCase):
         if keys:
             self.r.delete(*keys)
 
-    def test_eviction_boundary_is_exact_against_real_redis(self):
-        # The collapse from hash+zset to a single hash moved recency
-        # entirely into HGETALL + Lua table.sort, run fresh on every write
-        # once the hash is at capacity -- a materially different mechanism
-        # from a maintained sorted-set index, worth confirming precisely
-        # against the real interpreter rather than trusting it generalizes
-        # from the fake's separate Python reimplementation of the same
-        # intent (FakeRedis.eval() cannot prove what the actual Lua does).
-        ids = [format(i, "032x") for i in range(DELIVERED_MAXLEN + 3)]
-        for stream_id in ids:
-            record_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=stream_id, source="telegram")
-
-        # Exactly the 3 oldest are gone; everything from index 3 onward,
-        # including the boundary entries immediately on either side of the
-        # cut, survives.
-        for stream_id in ids[:3]:
-            self.assertFalse(
-                was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=stream_id, source="telegram"),
-                f"{stream_id} should have been evicted",
-            )
-        for stream_id in ids[3:]:
-            self.assertTrue(
-                was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=stream_id, source="telegram"),
-                f"{stream_id} should still be present",
-            )
-        key = prefix(self.pod, self.tenant, agent="bob", resource="delivered")
-        self.assertEqual(self.r.hlen(key), DELIVERED_MAXLEN)
-
-    def test_redelivery_refreshes_recency_against_real_redis(self):
-        # Recording the same id again must move it to the "most recent"
-        # end, protecting it from eviction it would otherwise be due for --
-        # confirmed against real Redis, not the fake's own bookkeeping.
-        # Enough total distinct ids are recorded to force eviction (unlike
-        # a run that never exceeds the cap, which would pass this
-        # assertion regardless of whether refresh actually works).
-        record_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
-        others = [format(i, "032x") for i in range(1, DELIVERED_MAXLEN + 6)]
-        for i, stream_id in enumerate(others):
-            record_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=stream_id, source="telegram")
-            if i == 5:
-                # Re-deliver VALID_ID right after the 6 oldest "others" --
-                # its refreshed recency should now rank it ahead of all 6
-                # of them, so when the 6 oldest are eventually evicted,
-                # they (not VALID_ID) are the ones that go.
-                record_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
-
-        self.assertTrue(
-            was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
-        )
-        # The 6 recorded immediately before the refresh, never themselves
-        # re-recorded, should have aged out in its place.
-        for stream_id in others[:6]:
-            self.assertFalse(
-                was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=stream_id, source="telegram")
-            )
-
-    def test_delivered_id_is_later_found_with_matching_source(self):
+    def test_delivered_id_is_later_found_with_matching_source_only(self):
         record_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
         self.assertTrue(
             was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
@@ -262,86 +208,63 @@ class RealRedisRecordDeliveredTests(unittest.TestCase):
         self.assertFalse(
             was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="webconsole")
         )
+        self.assertFalse(
+            was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="alice", stream_id=VALID_ID, source="telegram")
+        )
 
-    def test_wrong_type_key_is_rejected_before_any_write_not_after(self):
-        # The exact reviewer reproduction, against the CURRENT single-key
-        # design: seed the one key this script would use as a plain
-        # string (simulating the class of key-collision/corruption that
-        # produced the original bug), then call record_delivered.
-        key = prefix(self.pod, self.tenant, agent="bob", resource="delivered")
-        self.r.set(key, "not-a-hash")
+    def test_digit_only_stream_id_round_trips_against_real_redis(self):
+        record_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=DIGIT_ONLY_ID, source="telegram")
+        self.assertTrue(
+            was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=DIGIT_ONLY_ID, source="telegram")
+        )
 
+    def test_ttl_is_set_against_real_redis(self):
         record_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
+        key = prefix(self.pod, self.tenant, agent="bob", resource=f"delivered.s{VALID_ID}")
+        ttl = self.r.ttl(key)
+        self.assertGreater(ttl, 0)
+        self.assertLessEqual(ttl, DELIVERED_TTL_SECONDS)
 
-        # The preflight must reject this before the script's first
-        # mutation -- the key must be untouched (still the string we
-        # seeded, not partially overwritten), and the id must not be
-        # trusted afterward.
-        self.assertEqual(self.r.type(key), b"string")
-        self.assertEqual(self.r.get(key), b"not-a-hash")
-        result = was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
-        # was_delivered's own HGET against a string-typed key also raises
-        # WRONGTYPE -- correctly reported as "could not verify" (None),
-        # not a confirmed negative, since the true cause is a corrupted
-        # key, not an absence of provenance.
-        self.assertIsNone(result)
-
-    def test_wrong_type_key_failure_is_logged(self):
-        import contextlib
-        import io
-
-        key = prefix(self.pod, self.tenant, agent="bob", resource="delivered")
-        self.r.set(key, "not-a-hash")
-
-        captured = io.StringIO()
-        with contextlib.redirect_stdout(captured):
+    def test_expiry_actually_removes_the_entry(self):
+        # A short real TTL, waited out -- not a simulation of expiry, the
+        # real thing, so this is evidence the mechanism actually forgets,
+        # not just that it claims a TTL was requested.
+        with patch.object(reply_correlation, "DELIVERED_TTL_SECONDS", 1):
             record_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
-
-        lines = [json.loads(line) for line in captured.getvalue().splitlines()]
-        failures = [line for line in lines if line.get("event") == "record_delivered_failed"]
-        self.assertEqual(len(failures), 1)
-        self.assertIn("wrong type", failures[0]["reason"])
-
-    def test_a_nonnumeric_score_among_existing_entries_does_not_abort_after_writing(self):
-        # openshell-agent's follow-up audit: an earlier version of the
-        # script decoded and sorted existing entries AFTER already writing
-        # the new one, so a legacy/corrupted entry with a non-numeric
-        # score reached the sort comparator and raised there -- with the
-        # write already committed. The write succeeding either way means
-        # asserting only "was_delivered is True afterward" does not
-        # distinguish old from new behavior (confirmed: it passes against
-        # both). What actually differs is whether a real, successful write
-        # gets reported as a failure -- the old code logged
-        # record_delivered_failed for a call whose HSET had, in fact,
-        # already landed. That false failure report is what this asserts
-        # against, captured directly rather than inferred from end state.
-        import contextlib
-        import io
-
-        key = prefix(self.pod, self.tenant, agent="bob", resource="delivered")
-        self.r.hset(key, "b" * 32, json.dumps({"source": "telegram", "score": "oops"}))
-        for i in range(DELIVERED_MAXLEN - 1):
-            record_delivered(
-                self.r, pod=self.pod, tenant=self.tenant, agent="bob",
-                stream_id=format(i, "032x"), source="telegram",
-            )
-
-        captured = io.StringIO()
-        with contextlib.redirect_stdout(captured):
-            record_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
-
-        failures = [
-            json.loads(line) for line in captured.getvalue().splitlines()
-            if json.loads(line).get("event") == "record_delivered_failed"
-        ]
-        self.assertEqual(failures, [], f"record_delivered reported failure for a write that succeeded: {failures}")
         self.assertTrue(
             was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
         )
-        # The undecodable entry is excluded from eviction targeting (never
-        # selected for removal, since its recency can't be determined) --
-        # it should still be sitting there, untouched, not silently lost.
-        self.assertIsNotNone(self.r.hget(key, "b" * 32))
+        time.sleep(1.5)
+        self.assertFalse(
+            was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
+        )
+
+    def test_redelivery_resets_ttl_against_real_redis(self):
+        with patch.object(reply_correlation, "DELIVERED_TTL_SECONDS", 1):
+            record_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
+            time.sleep(0.7)
+            # Re-deliver right before the original TTL would have expired.
+            record_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
+            time.sleep(0.7)
+            # 1.4s have passed since the ORIGINAL record; it would already
+            # be gone if the TTL hadn't been reset by the redelivery.
+            self.assertTrue(
+                was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
+            )
+
+    def test_a_wrong_typed_existing_key_does_not_break_the_write_and_self_heals(self):
+        # SET overwrites unconditionally -- confirm against real Redis's
+        # own type enforcement, not just the fake's simulation of it.
+        key = prefix(self.pod, self.tenant, agent="bob", resource=f"delivered.s{VALID_ID}")
+        self.r.rpush(key, "unrelated-list-value")
+        self.assertEqual(self.r.type(key), b"list")
+
+        record_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
+
+        self.assertEqual(self.r.type(key), b"string")
+        self.assertTrue(
+            was_delivered(self.r, pod=self.pod, tenant=self.tenant, agent="bob", stream_id=VALID_ID, source="telegram")
+        )
 
 
 if __name__ == "__main__":
