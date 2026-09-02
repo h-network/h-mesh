@@ -316,6 +316,8 @@ h-app/tests/test_office_cli.py::test_peers_verbose_reads_launch_profile_and_curr
 h-app/tests/test_office_cli.py::test_peers_interfaces_labels_api_and_office_separately
 h-app/tests/test_office_cli.py::test_status_reports_unknown_with_no_activity_feed
 h-app/tests/test_office_cli.py::test_broadcast_resolves_tmux_peers_without_self
+h-app/tests/test_office_port.py::test_lifecycle_validation_failure_is_explicit_rejection
+h-app/tests/test_office_port.py::test_lifecycle_unknown_failure_is_not_misclassified_as_rejection
 h-app/tests/test_office_port.py::test_deliver_office_registers_all_lifecycle_openers
 h-app/tests/test_office_port.py::test_start_opener_injects_catalog_and_replace_window
 h-app/tests/test_office_port.py::test_resume_opener_injects_tmux_resume_and_kick

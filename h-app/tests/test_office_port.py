@@ -6,11 +6,28 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from core.channels import DeadLetter
 from modules.office import port
 
 
 POD = "testpod"
 TENANT = "testtenant"
+
+
+def test_lifecycle_validation_failure_is_explicit_rejection():
+    def reject(**_kwargs):
+        raise ValueError("invalid profile")
+    with pytest.raises(DeadLetter, match="invalid profile"):
+        port._lifecycle_opener(reject)
+
+
+def test_lifecycle_unknown_failure_is_not_misclassified_as_rejection():
+    failure = RuntimeError("redis outcome unknown")
+    def fail(**_kwargs):
+        raise failure
+    with pytest.raises(RuntimeError) as raised:
+        port._lifecycle_opener(fail)
+    assert raised.value is failure
 
 
 @patch("modules.office.port.receive")

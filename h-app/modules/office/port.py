@@ -7,7 +7,7 @@ import sys
 
 import redis
 
-from core.channels import receive
+from core.channels import DeadLetter, receive
 from core.dispatch import delivery_lock
 from core.keys import prefix
 from core.logging import configure_logging
@@ -38,6 +38,19 @@ def _kick(agent: str) -> None:
             # the child can write to the H_MESH_LOG_FILE it inherited.
             kwargs["pass_fds"] = (custody_fd,)
     subprocess.Popen([sys.executable, "-m", "modules.tmux.port", agent], **kwargs)
+
+
+def _lifecycle_opener(operation, **kwargs):
+    """Make only pre-mutation validation rejection explicit to receive().
+
+    Lifecycle validates payload shape before its first desired-state write.
+    ValueError therefore proves the effect did not begin; every other exception
+    retains its UNKNOWN semantics and must reach receive() unchanged.
+    """
+    try:
+        return operation(**kwargs)
+    except ValueError as exc:
+        raise DeadLetter(str(exc)) from exc
 
 
 def deliver_office(
@@ -84,22 +97,22 @@ def deliver_office(
         return None
 
     openers = {
-        "StartAgent": lambda envelope: start_agent(
-            r,
+        "StartAgent": lambda envelope: _lifecycle_opener(
+            start_agent, r=r,
             pod=pod,
             tenant=tenant,
             envelope=envelope,
             replace_window=kill,
             available_profiles=unavailable_profiles,
         ),
-        "StopAgent": lambda envelope: stop_agent(
-            r, pod=pod, tenant=tenant, envelope=envelope, kill_window=kill
+        "StopAgent": lambda envelope: _lifecycle_opener(
+            stop_agent, r=r, pod=pod, tenant=tenant, envelope=envelope, kill_window=kill
         ),
-        "PauseAgent": lambda envelope: pause_agent(
-            r, pod=pod, tenant=tenant, envelope=envelope, interrupt_window=interrupt
+        "PauseAgent": lambda envelope: _lifecycle_opener(
+            pause_agent, r=r, pod=pod, tenant=tenant, envelope=envelope, interrupt_window=interrupt
         ),
-        "ResumeAgent": lambda envelope: resume_agent(
-            r,
+        "ResumeAgent": lambda envelope: _lifecycle_opener(
+            resume_agent, r=r,
             pod=pod,
             tenant=tenant,
             envelope=envelope,
