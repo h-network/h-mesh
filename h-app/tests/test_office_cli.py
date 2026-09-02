@@ -819,15 +819,26 @@ def test_concurrent_takes_leave_exactly_one_doing_ticket(monkeypatch):
 
 
 @patch("modules.office.cli.send")
-def test_add_sends_envelope_and_never_writes_recipient_board(mock_send, monkeypatch):
+def test_add_sends_envelope_and_prints_the_ticket_id(mock_send, monkeypatch, capsys):
     _env(monkeypatch)
     mock_send.return_value = "stream-1"
     r = FakeRedis(registry={"backend": "tmux"})
-    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+    allocated_bytes = bytes.fromhex("0123456789abcdef" * 2)
+    with (
+        patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")),
+        patch("modules.office.cli.os.urandom", return_value=allocated_bytes) as urandom,
+    ):
         office_main(["add", "-a", "backend", "-t", "title", "-d", "desc"])
     kwargs = mock_send.call_args[1]
     assert kwargs["kind"] == "AddTicket"
     assert kwargs["payload"]["title"] == "title"
+    ticket_id = kwargs["payload"]["id"]
+    urandom.assert_called_once_with(16)
+    assert ticket_id == "0123456789abcdef" * 2
+    assert len(ticket_id) == 32
+    assert all(character in "0123456789abcdef" for character in ticket_id)
+    assert capsys.readouterr().out.strip() == ticket_id
+    assert ticket_id != "stream-1"
     todo_key = prefix(POD, TENANT, "backend", "tasks.todo")
     assert r.lists[todo_key] == []
 
