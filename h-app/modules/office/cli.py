@@ -562,6 +562,17 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
         if args.claude_tools is not None:
             payload["claude_tools"] = args.claude_tools
 
+    # ⚠ Captured BEFORE send(), not after -- this is the baseline
+    # _await_hire_confirmation needs to tell "this request caused the
+    # agent to register" apart from "the agent was already registered for
+    # an unrelated reason". Checking it after send() would race: the
+    # request could already have been processed by the time this line
+    # runs, making an attributable transition look like pre-existing
+    # membership.
+    already_registered = (
+        command == "hire" and args.wait is not None
+        and port_type(r, pod=pod, tenant=tenant, agent=args.agent) == "tmux"
+    )
     stream_id = send(
         r,
         pod=pod,
@@ -575,6 +586,7 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
     if command == "hire" and args.wait is not None:
         outcome, detail = _await_hire_confirmation(
             r, pod=pod, tenant=tenant, agent=args.agent, stream_id=stream_id, timeout=args.wait,
+            already_registered=already_registered,
         )
         if outcome == "confirmed":
             print(f"confirmed: {args.agent} registered")
@@ -597,17 +609,40 @@ _HIRE_CONFIRMATION_POLL_INTERVAL_S = 0.5
 
 def _await_hire_confirmation(
     r, *, pod: str, tenant: str, agent: str, stream_id: str, timeout: float,
+    already_registered: bool,
 ) -> tuple[str, str | None]:
-    """Poll for the two states this CLI can actually observe -- CREATED
-    (registry membership) or FAILED (dead-lettered by the recipient) -- and
-    return "unknown" if neither happens before timeout. Never "failed" on a
-    bare timeout: see the --wait help text and switch-agent's drain/recovery
-    fix for why a stranded request can still complete after this returns.
+    """Poll for evidence attributable to THIS request -- not just evidence
+    about the world. Reviewer FAILED an earlier version of this function on
+    exactly the gap that distinction closes: registry port_type()=="tmux"
+    was checked as confirmation with no regard for whether the agent was
+    *already* tmux before this request was ever sent. For an agent hired
+    for the first time, "absent, then tmux" is unambiguous -- nothing else
+    could have caused that transition. For an agent that already existed
+    (a re-hire / config-change request), bare membership proves nothing
+    about whether THIS request succeeded or was rejected: the row would
+    look identical either way, since lib.agentlifecycle.start_agent
+    deliberately does not publish any new marker for an idempotent-looking
+    hire of an already-registered agent ("idempotent starts do not replace
+    this marker: their envelope did not cause a new window" -- see its own
+    comment). So an already-registered agent can only ever resolve to
+    "failed" (a real, stream_id-matched rejection) or "unknown" here --
+    never "confirmed" -- because there is no request-attributable success
+    signal available to observe. UNKNOWN staying UNKNOWN, not silently
+    becoming a false CONFIRMED, is the entire point of the three-state
+    design; a wait that cannot tell the difference must time out, not lie.
 
-    ⚠ Registry port_type=="tmux" is CREATED *identity* only -- it does not
-    prove the tmux window/pane is actually ready to receive input. Window
-    readiness is a separate, later state and must be checked separately by
-    a caller that needs it (per switch-agent).
+    Dead-letter evidence is checked every iteration BEFORE the registry, and
+    reversing that order alone was considered and rejected (per reviewer):
+    it would only convert a reliable wrong answer into an intermittent
+    race, where the poll can still resolve "confirmed" a moment before a
+    slightly-delayed rejection lands. The already_registered gate is what
+    actually closes it, not the check ordering by itself.
+
+    ⚠ Registry port_type=="tmux" is CREATED *identity* only, even in the
+    unambiguous never-before-registered case -- it does not prove the tmux
+    window/pane is actually ready to receive input. Window readiness is a
+    separate, later state and must be checked separately by a caller that
+    needs it (per switch-agent).
 
     ⚠ Read-only against the dead-letter list (LRANGE, never pop) -- popping
     it here would consume evidence a human or another tool still needs to
@@ -623,8 +658,6 @@ def _await_hire_confirmation(
     dead_key = prefix(pod, tenant, agent="host", resource="dead")
     deadline = time.monotonic() + timeout
     while True:
-        if port_type(r, pod=pod, tenant=tenant, agent=agent) == "tmux":
-            return "confirmed", None
         for raw in r.lrange(dead_key, 0, -1):
             try:
                 envelope = parse(raw)
@@ -632,6 +665,8 @@ def _await_hire_confirmation(
                 continue
             if envelope.get("stream_id") == stream_id:
                 return "failed", "rejected by host -- see host's activity log for the reason"
+        if not already_registered and port_type(r, pod=pod, tenant=tenant, agent=agent) == "tmux":
+            return "confirmed", None
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return "unknown", None

@@ -145,3 +145,67 @@ def test_hire_wait_fails_end_to_end_on_a_real_rejection_not_a_timeout():
         except Exception:
             pass
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_hire_wait_never_confirms_a_rejected_rehire_of_an_already_registered_agent_end_to_end():
+    # Reviewer FAILED an earlier version of this branch on exactly this,
+    # reproduced against real FakeRedis-seeded state; this proves the same
+    # harm is closed against the real switch/lifecycle pipeline, not just a
+    # mocked one. Hire worker1 for real first (so it's genuinely
+    # registered), then re-hire the SAME agent with a malformed --profile
+    # -- a real rejection -- and confirm the second call is never told
+    # "confirmed" despite the agent still being tmux-registered throughout
+    # (from the first, successful hire).
+    _skip_unless_redis()
+    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_hire_wait_")
+    run_dir = Path(tmpdir) / "run"
+    pod = f"testpod-{os.urandom(4).hex()}"
+    tenant = f"testtenant-{os.urandom(4).hex()}"
+    python = Path(sys.executable)
+    env = _office_env(tmpdir, pod, tenant)
+    r = redis.Redis.from_url(env["REDIS_URL"])
+
+    try:
+        pids = start_daemons(python=python, run_dir=run_dir, env=env)
+        assert set(pids) == set(DAEMON_MODULES)
+
+        registry_key = prefix(pod, tenant, resource="registry")
+        r.hset(registry_key, mapping={"host": "office"})
+
+        hire_env = dict(env)
+        hire_env["AGENT_NAME"] = "host"
+        first = subprocess.run(
+            [str(python), "-m", "modules.office.cli", "hire", "worker1", "--cli", "claude", "--wait"],
+            env=hire_env, capture_output=True, text=True, timeout=40,
+        )
+        assert first.returncode == 0, f"stdout: {first.stdout}\nstderr: {first.stderr}"
+        assert "confirmed: worker1 registered" in first.stdout
+
+        second = subprocess.run(
+            [str(python), "-m", "modules.office.cli", "hire", "worker1", "--cli", "claude",
+             "--profile", "bad profile!", "--wait", "15"],
+            env=hire_env, capture_output=True, text=True, timeout=40,
+        )
+        assert "confirmed" not in second.stdout, (
+            f"told confirmed for a rejected re-hire of an already-registered agent:\n{second.stdout}"
+        )
+        assert second.returncode == 1, f"stdout: {second.stdout}\nstderr: {second.stderr}"
+        assert "failed: worker1 was not registered" in second.stderr
+    finally:
+        for pidfile in run_dir.glob("*.pid") if run_dir.is_dir() else []:
+            try:
+                os.kill(int(pidfile.read_text().strip()), 9)
+            except (ValueError, OSError):
+                pass
+        try:
+            subprocess.run(["tmux", "-S", env["TMUX_SOCKET"], "kill-server"],
+                            capture_output=True, timeout=5)
+        except Exception:
+            pass
+        try:
+            keys = r.keys(f"pod:{pod}:tenant:{tenant}:*") or []
+            if keys:
+                r.delete(*keys)
+        except Exception:
+            pass
+        shutil.rmtree(tmpdir, ignore_errors=True)

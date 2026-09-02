@@ -1,6 +1,7 @@
 import json
 import sys
 import threading
+import time
 from collections import defaultdict
 from pathlib import Path
 from unittest.mock import patch
@@ -264,12 +265,17 @@ def _dead_letter_envelope() -> tuple[bytes, str]:
     return encode(envelope).encode(), envelope["stream_id"]
 
 
+@patch("modules.office.cli.port_type")
 @patch("modules.office.cli.send")
-def test_hire_wait_confirms_once_the_registry_shows_the_agent_as_tmux(mock_send, monkeypatch, capsys):
+def test_hire_wait_confirms_a_genuinely_new_registration(mock_send, mock_port_type, monkeypatch, capsys):
+    # Attributable: the agent was NOT registered at the pre-send baseline
+    # (first port_type call), then IS registered by the time the poll loop
+    # checks (second call) -- a real transition this request could only
+    # have caused, unlike a bare pre-existing row (see the tests below).
     _env(monkeypatch)
     mock_send.return_value = "stream-1"
+    mock_port_type.side_effect = [None, "tmux"]
     r = FakeRedis()
-    _member(r, "worker-1", "tmux")  # already registered -- simulates a fast, real confirmation
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
         office_main(["hire", "worker-1", "--cli", "claude", "--wait", "1"])
     assert "confirmed: worker-1 registered" in capsys.readouterr().out
@@ -291,6 +297,89 @@ def test_hire_wait_fails_on_a_matching_dead_letter_not_on_a_bare_timeout(mock_se
     # Read-only: the evidence must still be there for a human or another
     # tool to see afterward, not consumed by this check.
     assert r.lists[dead_key] == [raw]
+
+
+# ── Reviewer FAILED an earlier version of --wait on exactly this. Real
+# harm, quoting the operator's own words that started this whole chain:
+# "It said it created but didnt." A registry row that already existed
+# before this request was ever sent is evidence about the WORLD, not
+# evidence about THIS request -- lib.agentlifecycle.start_agent itself
+# deliberately does not publish any new marker for an already-registered
+# agent's hire ("idempotent starts do not replace this marker: their
+# envelope did not cause a new window"), so bare membership cannot tell a
+# successful re-hire apart from a rejected one. These three tests assert
+# the harm directly -- the caller must never be told "confirmed" here,
+# whatever the internal mechanism -- not a specific code path.
+
+@patch("modules.office.cli.send")
+def test_hire_wait_never_confirms_an_already_registered_agent_that_was_actually_rejected(
+    mock_send, monkeypatch, capsys,
+):
+    raw, real_stream_id = _dead_letter_envelope()
+    mock_send.return_value = real_stream_id
+    r = FakeRedis()
+    _member(r, "worker-1", "tmux")  # pre-existing, unrelated to this request
+    dead_key = prefix(POD, TENANT, agent="host", resource="dead")
+    r.lists[dead_key].append(raw)
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit) as exc_info:
+            office_main(["hire", "worker-1", "--cli", "claude", "--wait", "1"])
+    out = capsys.readouterr()
+    assert "confirmed" not in out.out, (
+        "the caller was told confirmed for a request that was actually rejected"
+    )
+    assert exc_info.value.code == 1
+
+
+@patch("modules.office.cli.send")
+def test_hire_wait_never_confirms_an_already_registered_agent_with_no_evidence_either_way(
+    mock_send, monkeypatch, capsys,
+):
+    # The more basic case, needing no dead-letter at all: a bare
+    # pre-existing registry row, on its own, is not proof this specific
+    # request succeeded. Reviewer's exact repro (_await_hire_confirmation
+    # returning ('confirmed', None) for this state) -- confirmed as
+    # 'unknown' now, never 'confirmed', for the identical seeded state.
+    mock_send.return_value = "stream-1"
+    r = FakeRedis()
+    _member(r, "worker-1", "tmux")
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit) as exc_info:
+            office_main(["hire", "worker-1", "--cli", "claude", "--wait", "0.2"])
+    out = capsys.readouterr()
+    assert "confirmed" not in out.out
+    assert exc_info.value.code == 2
+
+
+@patch("modules.office.cli.send")
+def test_hire_wait_still_catches_a_delayed_rejection_for_an_already_registered_agent(
+    mock_send, monkeypatch, capsys,
+):
+    # A rejection that lands mid-poll, not before the first check -- proves
+    # this isn't just a first-iteration ordering trick; the poll loop must
+    # keep checking dead-letter evidence on every pass for the whole
+    # already-registered lifetime of the wait, not only once at the start.
+    raw, real_stream_id = _dead_letter_envelope()
+    mock_send.return_value = real_stream_id
+    r = FakeRedis()
+    _member(r, "worker-1", "tmux")
+    dead_key = prefix(POD, TENANT, agent="host", resource="dead")
+
+    def _append_dead_letter_late():
+        time.sleep(0.3)
+        r.lists[dead_key].append(raw)
+
+    thread = threading.Thread(target=_append_dead_letter_late)
+    thread.start()
+    try:
+        with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+            with pytest.raises(SystemExit) as exc_info:
+                office_main(["hire", "worker-1", "--cli", "claude", "--wait", "2"])
+    finally:
+        thread.join()
+    out = capsys.readouterr()
+    assert "confirmed" not in out.out
+    assert exc_info.value.code == 1
 
 
 @patch("modules.office.cli.send")
@@ -338,15 +427,18 @@ def test_hire_wait_rejects_non_finite_and_negative_values_before_any_send(mock_s
     mock_send.assert_not_called()
 
 
+@patch("modules.office.cli.port_type")
 @patch("modules.office.cli.send")
-def test_hire_wait_accepts_zero_as_an_immediate_single_check(mock_send, monkeypatch, capsys):
+def test_hire_wait_accepts_zero_as_an_immediate_single_check(mock_send, mock_port_type, monkeypatch, capsys):
     # 0 is finite and non-negative -- a legitimate "check once now, don't
     # actually wait" mode, not something the nan/inf/negative fix should
-    # also reject.
+    # also reject. Same attributable-transition shape as the genuinely-new
+    # registration test above: not registered at the pre-send baseline,
+    # registered by the single check the loop still performs at wait=0.
     _env(monkeypatch)
     mock_send.return_value = "stream-1"
+    mock_port_type.side_effect = [None, "tmux"]
     r = FakeRedis()
-    _member(r, "worker-1", "tmux")
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
         office_main(["hire", "worker-1", "--cli", "claude", "--wait", "0"])
     mock_send.assert_called_once()
