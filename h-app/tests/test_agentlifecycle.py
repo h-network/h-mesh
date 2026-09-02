@@ -10,6 +10,7 @@ import redis
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.channels import receive
+from core.dispatch import delivery_lock_key
 from core.envelope import build, encode
 from core.keys import prefix, receive_opened_key, receive_opening_key, receive_processing_key, receive_unresolved_key
 from lib.agentlifecycle.lifecycle import (
@@ -70,25 +71,45 @@ def test_lead_removal_wrongtype_is_no_write(real_redis):
     lead_key = prefix(POD, tenant, resource="lead")
     registry_key = prefix(POD, tenant, resource="registry")
     processing_key = receive_processing_key(POD, tenant, "old-lead")
+    opening_key = receive_opening_key(POD, tenant, "old-lead")
+    opened_key = receive_opened_key(POD, tenant, "old-lead")
+    ingress_key = prefix(POD, tenant, agent="old-lead", resource="ingress")
+    paused_key = prefix(POD, tenant, agent="old-lead", resource="paused")
+    lock_key = delivery_lock_key(POD, tenant, "old-lead")
     real_redis.hset(registry_key, "old-lead", "tmux")
     real_redis.hset(lead_key, "wrong", "type")
+    cleanup_keys = [processing_key, opening_key, opened_key, ingress_key]
+    for key in cleanup_keys:
+        real_redis.rpush(key, f"identity:{key}")
+    real_redis.set(paused_key, "paused-identity")
+    real_redis.set(lock_key, "lock-identity")
     try:
         with pytest.raises(redis.ResponseError, match="WRONGTYPE"):
             real_redis.eval(
                 _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
-                3,
+                8,
                 registry_key,
                 lead_key,
                 processing_key,
-                receive_opening_key(POD, tenant, "old-lead"),
-                receive_opened_key(POD, tenant, "old-lead"),
+                opening_key,
+                opened_key,
+                ingress_key,
+                paused_key,
+                lock_key,
                 "old-lead",
             )
 
         assert real_redis.hget(registry_key, "old-lead") == b"tmux"
         assert real_redis.hget(lead_key, "wrong") == b"type"
+        for key in cleanup_keys:
+            assert real_redis.lrange(key, 0, -1) == [f"identity:{key}".encode()]
+        assert real_redis.get(paused_key) == b"paused-identity"
+        assert real_redis.get(lock_key) == b"lock-identity"
     finally:
-        real_redis.delete(lead_key, registry_key, processing_key)
+        real_redis.delete(
+            lead_key, registry_key, processing_key, opening_key, opened_key,
+            ingress_key, paused_key, lock_key,
+        )
 
 
 @patch("lib.agentlifecycle.lifecycle.log_record")
@@ -110,19 +131,64 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
     assert r.method_calls == [
         call.eval(
             ANY,
-            5,
+            8,
             prefix(POD, TENANT, resource="registry"),
             prefix(POD, TENANT, resource="lead"),
             receive_processing_key(POD, TENANT, "worker-1"),
             receive_opening_key(POD, TENANT, "worker-1"),
             receive_opened_key(POD, TENANT, "worker-1"),
+            prefix(POD, TENANT, agent="worker-1", resource="ingress"),
+            prefix(POD, TENANT, agent="worker-1", resource="paused"),
+            delivery_lock_key(POD, TENANT, "worker-1"),
             "worker-1",
         ),
-        call.delete(prefix(POD, TENANT, agent="worker-1", resource="ingress")),
-        call.delete(prefix(POD, TENANT, agent="worker-1", resource="paused")),
-        call.delete(prefix(POD, TENANT, agent="worker-1", resource="delivering")),
     ]
     kill_window.assert_called_once_with("worker-1")
+
+
+def test_stop_cleanup_cannot_erase_successor_delivery_identity(real_redis):
+    tenant = f"stop-reuse-{uuid4().hex[:12]}"
+    agent = "reused-worker"
+    registry_key = prefix(POD, tenant, resource="registry")
+    ingress_key = prefix(POD, tenant, agent=agent, resource="ingress")
+    paused_key = prefix(POD, tenant, agent=agent, resource="paused")
+    lock_key = delivery_lock_key(POD, tenant, agent)
+    successor = build(
+        "Message", "sender", agent, {"text": "successor"}, pod=POD, tenant=tenant
+    )
+    successor_raw = encode(successor)
+
+    class SuccessorAfterRemoval:
+        """Install successor state after the stop script's linearization point."""
+
+        def __getattr__(self, name):
+            return getattr(real_redis, name)
+
+        def eval(self, *args, **kwargs):
+            result = real_redis.eval(*args, **kwargs)
+            real_redis.hset(registry_key, agent, "tmux")
+            real_redis.rpush(ingress_key, successor_raw)
+            real_redis.set(paused_key, "successor-paused")
+            real_redis.set(lock_key, "successor-lock")
+            return result
+
+    real_redis.hset(registry_key, agent, "tmux")
+    try:
+        stop_agent(
+            SuccessorAfterRemoval(),
+            pod=POD,
+            tenant=tenant,
+            envelope={"payload": {"agent": agent}},
+            kill_window=lambda _agent: None,
+        )
+
+        assert real_redis.lrange(ingress_key, 0, -1) == [successor_raw.encode()]
+        assert real_redis.get(paused_key) == b"successor-paused"
+        assert real_redis.get(lock_key) == b"successor-lock"
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
 
 
 def test_stop_and_rehire_cannot_open_predecessor_processing_custody(real_redis):
@@ -134,12 +200,17 @@ def test_stop_and_rehire_cannot_open_predecessor_processing_custody(real_redis):
     opened_key = receive_opened_key(POD, tenant, agent)
     unresolved_key = receive_unresolved_key(POD, tenant)
     ingress_key = prefix(POD, tenant, agent=agent, resource="ingress")
+    paused_key = prefix(POD, tenant, agent=agent, resource="paused")
+    lock_key = delivery_lock_key(POD, tenant, agent)
     old = build("Message", "sender", agent, {"text": "predecessor"}, pod=POD, tenant=tenant)
     new = build("Message", "sender", agent, {"text": "successor"}, pod=POD, tenant=tenant)
     real_redis.hset(registry_key, agent, "tmux")
     real_redis.rpush(processing_key, encode(old))
     real_redis.rpush(opening_key, encode(old))
     real_redis.rpush(opened_key, encode(old))
+    real_redis.rpush(ingress_key, encode(old))
+    real_redis.set(paused_key, "predecessor-paused")
+    real_redis.set(lock_key, "predecessor-lock")
     unresolved_record = json.dumps({"agent": agent, "envelope": encode(old), "reason": "unknown"})
     real_redis.rpush(unresolved_key, unresolved_record)
     try:
@@ -150,6 +221,12 @@ def test_stop_and_rehire_cannot_open_predecessor_processing_custody(real_redis):
             envelope={"payload": {"agent": agent}},
             kill_window=lambda _agent: None,
         )
+        assert real_redis.lrange(processing_key, 0, -1) == []
+        assert real_redis.lrange(opening_key, 0, -1) == []
+        assert real_redis.lrange(opened_key, 0, -1) == []
+        assert real_redis.lrange(ingress_key, 0, -1) == []
+        assert real_redis.get(paused_key) is None
+        assert real_redis.get(lock_key) is None
         real_redis.hset(registry_key, agent, "tmux")
         real_redis.rpush(ingress_key, encode(new))
         opened = []

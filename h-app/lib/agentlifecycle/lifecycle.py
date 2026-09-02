@@ -73,6 +73,14 @@ end
 redis.call('DEL', KEYS[3])
 redis.call('DEL', KEYS[4])
 redis.call('DEL', KEYS[5])
+-- Ingress, pause state, and the delivery lease belong to the same removed
+-- membership. Deleting them inside this isolated script prevents cleanup for
+-- the predecessor from racing a successor published after this script.
+-- DEL accepts keys of every Redis type, so the two reads above are the full
+-- runtime-error preflight before HDEL becomes the first mutation.
+redis.call('DEL', KEYS[6])
+redis.call('DEL', KEYS[7])
+redis.call('DEL', KEYS[8])
 return 1
 """
 
@@ -517,30 +525,17 @@ def stop_agent(
         committed, "registry row removed and owned lead cleared", "registry/lead removal",
         lambda: r.eval(
             _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
-            5,
+            8,
             registry_key,
             prefix(pod, tenant, resource="lead"),
             receive_processing_key(pod, tenant, agent),
             receive_opening_key(pod, tenant, agent),
             receive_opened_key(pod, tenant, agent),
+            prefix(pod, tenant, agent=agent, resource="ingress"),
+            prefix(pod, tenant, agent=agent, resource="paused"),
+            delivery_lock_key(pod, tenant, agent),
             agent,
         ),
-    )
-    # Per-agent delivery state belongs to this lifecycle instance, not to the
-    # reusable name. Purge it after removing registry visibility so a later
-    # hire cannot inherit a paused marker or messages addressed to the retired
-    # instance.
-    _write_desired(
-        committed, "ingress queue cleared", "ingress queue clear",
-        lambda: r.delete(prefix(pod, tenant, agent=agent, resource="ingress")),
-    )
-    _write_desired(
-        committed, "paused marker cleared", "paused marker clear",
-        lambda: r.delete(prefix(pod, tenant, agent=agent, resource="paused")),
-    )
-    _write_desired(
-        committed, "delivery lock cleared", "delivery lock clear",
-        lambda: r.delete(delivery_lock_key(pod, tenant, agent)),
     )
     if agent_port_type != "api":
         try:

@@ -18,6 +18,15 @@ reassigns leadership if another lead is configured: hire the replacement with
 selection only when the retired agent still owns it, so retiring the former
 lead cannot undo that transfer.
 
+The stop linearization script touches every Redis key that `stop_agent` cleans:
+the registry row, an owned tenant lead, and the retired name's `processing`,
+`opening`, `opened`, `ingress`, `paused`, and `delivering` keys. All eight keys
+are handled inside that one isolated, preflighted operation; no by-name Redis
+cleanup runs afterward where it could erase a successor published in the gap.
+The tenant-level `unresolved` list is deliberately not touched because it is
+durable evidence that survives name reuse. Actual window teardown remains an
+external callback after the Redis transition, not another Redis key mutation.
+
 | file | what it holds |
 |---|---|
 | `lifecycle.py` | `start_agent`/`stop_agent`/`pause_agent`/`resume_agent`, callback-driven, no port of its own |
