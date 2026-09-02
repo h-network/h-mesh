@@ -43,6 +43,29 @@ class FakeRedis:
     def lpop(self, key):
         return self.lists[key].popleft() if self.lists[key] else None
 
+    def lindex(self, key, index):
+        try:
+            return self.lists[key][index]
+        except IndexError:
+            return None
+
+    def lmove(self, source, destination, src="LEFT", dest="RIGHT"):
+        if not self.lists[source]:
+            return None
+        value = self.lists[source].popleft()
+        self.lists[destination].append(value)
+        return value
+
+    def blmove(self, source, destination, timeout, src="LEFT", dest="RIGHT"):
+        return self.lmove(source, destination, src=src, dest=dest)
+
+    def lrem(self, key, count, value):
+        try:
+            self.lists[key].remove(value)
+        except ValueError:
+            return 0
+        return 1
+
     def llen(self, key):
         return len(self.lists[key])
 
@@ -98,6 +121,23 @@ class FakeRedis:
             if self.kv.get(key) != token:
                 return 0
             self.kv.pop(key, None)
+            return 1
+        if "core receive processing-to-dead" in script:
+            processing, dead = keys
+            raw = argv[0]
+            if self.lrem(processing, 1, raw) != 1:
+                return 0
+            self.rpush(dead, raw)
+            return 1
+        if "core receive custody transfer" in script:
+            source, destination = keys
+            old, new = argv[0], argv[1]
+            if self.lrem(source, 1, old) != 1:
+                return 0
+            self.rpush(destination, new)
+            cap = int(argv[2])
+            while cap > 0 and len(self.lists[destination]) > cap:
+                self.lists[destination].popleft()
             return 1
         if "core delivery lock renew" in script:
             key, token = keys[0], argv[0]
@@ -168,11 +208,15 @@ class TmuxPortTests(unittest.TestCase):
         self.redis.rpush(prefix(POD, TENANT, "bob", "ingress"), raw)
         mock_submit.side_effect = RuntimeError("tmux paste failed")
 
-        # receive() converts an opener exception into a dead-letter rather
-        # than propagating it -- confirm that happened, then check the
-        # thing this test is actually about.
+        # A generic opener exception cannot prove whether an external paste
+        # happened, so receive preserves it as unresolved rather than falsely
+        # dead-lettering or replaying it.
         deliver_tmux(self.redis, pod=POD, tenant=TENANT, agent="bob", session_name="testtenant")
-        self.assertEqual(len(self.redis.lists[prefix(POD, TENANT, "bob", "dead")]), 1)
+        unresolved = self.redis.lists[prefix(POD, TENANT, resource="unresolved")]
+        self.assertEqual(
+            [parse(json.loads(record)["envelope"])["stream_id"] for record in unresolved],
+            [stream_id],
+        )
 
         self.assertFalse(
             was_delivered(self.redis, pod=POD, tenant=TENANT, agent="bob", stream_id=stream_id, source="alice")

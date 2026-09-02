@@ -87,6 +87,23 @@ class FakeRedis:
             return lst[index]
         return None
 
+    def lmove(self, source, destination, src="LEFT", dest="RIGHT"):
+        if not self.lists.get(source):
+            return None
+        value = self.lists[source].pop(0)
+        self.lists[destination].append(value)
+        return value
+
+    def blmove(self, source, destination, timeout, src="LEFT", dest="RIGHT"):
+        return self.lmove(source, destination, src=src, dest=dest)
+
+    def lrem(self, key, count, value):
+        try:
+            self.lists[key].remove(value)
+        except (KeyError, ValueError):
+            return 0
+        return 1
+
     def hget(self, key, field):
         return self.hashes.get(key, {}).get(field)
 
@@ -141,6 +158,23 @@ class FakeRedis:
                 self.lists.setdefault(key, []).append(raw)
                 result.append(len(self.lists[key]))
             return result
+        if "core receive processing-to-dead" in script:
+            processing, dead = keys
+            raw = rest[0]
+            if self.lrem(processing, 1, raw) != 1:
+                return 0
+            self.rpush(dead, raw)
+            return 1
+        if "core receive custody transfer" in script:
+            source, destination = keys
+            old, new = rest[0], rest[1]
+            if self.lrem(source, 1, old) != 1:
+                return 0
+            self.rpush(destination, new)
+            cap = int(rest[2])
+            while cap > 0 and len(self.lists[destination]) > cap:
+                self.lists[destination].pop(0)
+            return 1
         raise AssertionError(f"unexpected Lua script: {script}")
 
 

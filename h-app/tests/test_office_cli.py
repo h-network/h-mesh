@@ -14,7 +14,8 @@ H_APP = Path(__file__).resolve().parents[1]
 if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
-from core.keys import prefix
+from core.envelope import build, encode
+from core.keys import prefix, receive_unresolved_key
 from modules.office import cli as office_cli
 from modules.office.cli import main as office_main
 
@@ -165,6 +166,25 @@ def test_root_help_lists_every_command_without_environment_or_redis(capsys):
     out = capsys.readouterr().out
     for name in office_cli._COMMANDS:
         assert name in out
+
+
+def test_unresolved_names_exact_identity_without_consuming(monkeypatch, capsys):
+    r = FakeRedis()
+    _env(monkeypatch)
+    envelope = build("Command", "alice", "worker-1", {"text": "danger"}, pod=POD, tenant=TENANT)
+    record = json.dumps({
+        "agent": "worker-1", "reason": "ack outcome unknown", "envelope": encode(envelope),
+    })
+    key = receive_unresolved_key(POD, TENANT)
+    r.rpush(key, record)
+    with patch("modules.office.cli.redis.Redis.from_url", return_value=r):
+        office_main(["unresolved", "--agent", "worker-1"])
+    shown = json.loads(capsys.readouterr().out)
+    assert shown == {
+        "agent": "worker-1", "stream_id": envelope["stream_id"],
+        "kind": "Command", "source": "alice", "reason": "ack outcome unknown",
+    }
+    assert r.lrange(key, 0, -1) == [record]
 
 
 # ---------------------------------------------------------------------------

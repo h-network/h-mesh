@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from unittest.mock import ANY, MagicMock, call, patch
@@ -8,10 +9,17 @@ import redis
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core.keys import prefix
+from core.channels import receive
+from core.envelope import build, encode
+from core.keys import prefix, receive_opened_key, receive_opening_key, receive_processing_key, receive_unresolved_key
 from lib.agentlifecycle.lifecycle import (
+    ProvableActualFailure,
+    ProvableLifecycleRejection,
+    _IncompleteLifecycle,
     _PUBLISH_LEAD_MEMBERSHIP_LUA,
     _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
+    _PartialLifecycle,
+    resume_agent,
     start_agent,
     stop_agent,
 )
@@ -41,7 +49,7 @@ def test_lead_publish_wrongtype_is_no_write(real_redis):
         with pytest.raises(redis.ResponseError, match="WRONGTYPE"):
             real_redis.eval(
                 _PUBLISH_LEAD_MEMBERSHIP_LUA,
-                3,
+                5,
                 lead_key,
                 registry_key,
                 cause_key,
@@ -61,22 +69,26 @@ def test_lead_removal_wrongtype_is_no_write(real_redis):
     tenant = f"lua-{uuid4().hex[:12]}"
     lead_key = prefix(POD, tenant, resource="lead")
     registry_key = prefix(POD, tenant, resource="registry")
+    processing_key = receive_processing_key(POD, tenant, "old-lead")
     real_redis.hset(registry_key, "old-lead", "tmux")
     real_redis.hset(lead_key, "wrong", "type")
     try:
         with pytest.raises(redis.ResponseError, match="WRONGTYPE"):
             real_redis.eval(
                 _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
-                2,
+                3,
                 registry_key,
                 lead_key,
+                processing_key,
+                receive_opening_key(POD, tenant, "old-lead"),
+                receive_opened_key(POD, tenant, "old-lead"),
                 "old-lead",
             )
 
         assert real_redis.hget(registry_key, "old-lead") == b"tmux"
         assert real_redis.hget(lead_key, "wrong") == b"type"
     finally:
-        real_redis.delete(lead_key, registry_key)
+        real_redis.delete(lead_key, registry_key, processing_key)
 
 
 @patch("lib.agentlifecycle.lifecycle.log_record")
@@ -98,9 +110,12 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
     assert r.method_calls == [
         call.eval(
             ANY,
-            2,
+            5,
             prefix(POD, TENANT, resource="registry"),
             prefix(POD, TENANT, resource="lead"),
+            receive_processing_key(POD, TENANT, "worker-1"),
+            receive_opening_key(POD, TENANT, "worker-1"),
+            receive_opened_key(POD, TENANT, "worker-1"),
             "worker-1",
         ),
         call.delete(prefix(POD, TENANT, agent="worker-1", resource="ingress")),
@@ -108,6 +123,54 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
         call.delete(prefix(POD, TENANT, agent="worker-1", resource="delivering")),
     ]
     kill_window.assert_called_once_with("worker-1")
+
+
+def test_stop_and_rehire_cannot_open_predecessor_processing_custody(real_redis):
+    tenant = f"reuse-{uuid4().hex[:12]}"
+    agent = "reused-worker"
+    registry_key = prefix(POD, tenant, resource="registry")
+    processing_key = receive_processing_key(POD, tenant, agent)
+    opening_key = receive_opening_key(POD, tenant, agent)
+    opened_key = receive_opened_key(POD, tenant, agent)
+    unresolved_key = receive_unresolved_key(POD, tenant)
+    ingress_key = prefix(POD, tenant, agent=agent, resource="ingress")
+    old = build("Message", "sender", agent, {"text": "predecessor"}, pod=POD, tenant=tenant)
+    new = build("Message", "sender", agent, {"text": "successor"}, pod=POD, tenant=tenant)
+    real_redis.hset(registry_key, agent, "tmux")
+    real_redis.rpush(processing_key, encode(old))
+    real_redis.rpush(opening_key, encode(old))
+    real_redis.rpush(opened_key, encode(old))
+    unresolved_record = json.dumps({"agent": agent, "envelope": encode(old), "reason": "unknown"})
+    real_redis.rpush(unresolved_key, unresolved_record)
+    try:
+        stop_agent(
+            real_redis,
+            pod=POD,
+            tenant=tenant,
+            envelope={"payload": {"agent": agent}},
+            kill_window=lambda _agent: None,
+        )
+        real_redis.hset(registry_key, agent, "tmux")
+        real_redis.rpush(ingress_key, encode(new))
+        opened = []
+
+        receive(
+            real_redis,
+            pod=POD,
+            tenant=tenant,
+            agent=agent,
+            openers={"Message": opened.append},
+            timeout=0,
+            blocking=False,
+        )
+
+        assert [envelope["stream_id"] for envelope in opened] == [new["stream_id"]]
+        assert old["stream_id"] not in [envelope["stream_id"] for envelope in opened]
+        assert real_redis.lrange(unresolved_key, 0, -1) == [unresolved_record.encode()]
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
 
 
 @patch("lib.agentlifecycle.lifecycle.log_record")
@@ -161,3 +224,86 @@ def test_start_agent_rejects_api_lead_before_mutation(_mock_log_record):
     else:
         raise AssertionError("api lead was accepted")
     assert r.method_calls == []
+
+
+@patch("lib.agentlifecycle.lifecycle.log_record", side_effect=RuntimeError("log unavailable"))
+def test_logging_failure_does_not_replace_proven_rejection(_mock_log_record):
+    r = MagicMock()
+    with pytest.raises(ProvableLifecycleRejection, match="payload.resume must be a boolean"):
+        start_agent(
+            r,
+            pod=POD,
+            tenant=TENANT,
+            envelope={"payload": {"agent": "worker", "resume": "yes"}},
+            replace_window=MagicMock(),
+            available_profiles=lambda *_: None,
+        )
+    assert r.method_calls == []
+
+
+@pytest.mark.parametrize("payload", [None, [], "agent=worker"])
+def test_hostile_payload_shape_is_proven_rejection_without_writes(payload):
+    r = MagicMock()
+    with pytest.raises(ProvableLifecycleRejection, match="payload must be an object"):
+        start_agent(
+            r,
+            pod=POD,
+            tenant=TENANT,
+            envelope={"payload": payload},
+            replace_window=MagicMock(),
+            available_profiles=lambda *_: None,
+        )
+    assert r.method_calls == []
+
+
+@patch("lib.agentlifecycle.lifecycle.log_record", side_effect=RuntimeError("log unavailable"))
+def test_logging_failure_does_not_replace_unknown_write_outcome(_mock_log_record):
+    r = MagicMock()
+    r.set.side_effect = ValueError("encoder failed after submission")
+    with pytest.raises(_IncompleteLifecycle, match="outcome UNKNOWN"):
+        start_agent(
+            r,
+            pod=POD,
+            tenant=TENANT,
+            envelope={"payload": {"agent": "worker"}},
+            replace_window=MagicMock(),
+            available_profiles=lambda *_: None,
+        )
+
+
+@patch("lib.agentlifecycle.lifecycle.log_record", side_effect=RuntimeError("log unavailable"))
+@patch("lib.agentlifecycle.lifecycle.port_type", return_value="tmux")
+def test_logging_failure_does_not_replace_partial_actual_failure(
+    _mock_port_type, _mock_log_record
+):
+    r = MagicMock()
+    r.llen.return_value = 1
+    with pytest.raises(_PartialLifecycle, match="kick 1 failed"):
+        resume_agent(
+            r,
+            pod=POD,
+            tenant=TENANT,
+            envelope={"payload": {"agent": "worker"}},
+            resume_window=lambda _agent: None,
+            kick_agent=lambda _agent: (_ for _ in ()).throw(
+                ProvableActualFailure("not started")
+            ),
+        )
+    r.delete.assert_called_once()
+
+
+@patch("lib.agentlifecycle.lifecycle.log_record", side_effect=RuntimeError("log unavailable"))
+@patch("lib.agentlifecycle.lifecycle.port_type", return_value=None)
+def test_logging_failure_does_not_replace_success(_mock_port_type, _mock_log_record):
+    r = MagicMock()
+    start_agent(
+        r,
+        pod=POD,
+        tenant=TENANT,
+        envelope={"payload": {"agent": "worker"}},
+        replace_window=MagicMock(),
+        available_profiles=lambda *_: None,
+    )
+    r.hset.assert_called_once_with(
+        prefix(POD, TENANT, resource="registry"), "worker", "tmux"
+    )

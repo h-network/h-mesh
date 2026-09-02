@@ -28,7 +28,7 @@ import redis
 
 from core.channels import send
 from core.envelope import EnvelopeError, parse
-from core.keys import prefix
+from core.keys import prefix, receive_unresolved_key
 from core.logging import log_record, record_task_event
 from core.registry import is_member, members, port_type
 from lib.attachment_schema import ATTACHMENT_MAX_BYTES, MIME_TYPE_REGEX
@@ -1003,6 +1003,32 @@ def _list_command(argv: list[str]) -> None:
         _list_one(r, pod=pod, tenant=tenant, agent=agent, heading=args.all, now=now)
 
 
+def _unresolved_command(argv: list[str]) -> None:
+    parser = _operation_parser(
+        "unresolved",
+        "Read unresolved delivery outcomes without changing or retrying them.",
+    )
+    parser.add_argument("-a", "--agent", metavar="AGENT")
+    args = parser.parse_args(argv)
+    r, pod, tenant, _ = _context()
+    for stored in r.lrange(receive_unresolved_key(pod, tenant), 0, -1):
+        try:
+            record = json.loads(_text(stored))
+            envelope = parse(record["envelope"])
+            agent = record["agent"]
+            if args.agent and agent != args.agent:
+                continue
+            print(json.dumps({
+                "agent": agent,
+                "stream_id": envelope["stream_id"],
+                "kind": envelope["kind"],
+                "source": envelope["l2"]["source"],
+                "reason": record.get("reason", "open outcome unknown"),
+            }, separators=(",", ":")))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, EnvelopeError):
+            print("unparseable unresolved custody record", file=sys.stderr)
+
+
 def _take_command(argv: list[str]) -> None:
     parser = _operation_parser("take", "Move a todo or held task into doing.")
     parser.add_argument("id", nargs="?", help="ticket id or unique prefix")
@@ -1580,6 +1606,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("pause",), "pause an agent's CLI", lambda argv: _lifecycle_command("pause", argv)),
     (("resume",), "resume an agent's CLI and inbox", lambda argv: _lifecycle_command("resume", argv)),
     (("list",), "show a task board", _list_command),
+    (("unresolved",), "show unresolved delivery outcomes", _unresolved_command),
     (("take",), "take your next todo task", _take_command),
     (("done",), "finish your open task and record its outcome", _done_command),
     (("cancel",), "cancel your open task", _cancel_command),

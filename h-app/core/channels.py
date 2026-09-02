@@ -1,5 +1,6 @@
 """Agent/port-facing channels: send into own egress, receive from own ingress."""
 
+import json
 from collections.abc import Callable
 from datetime import datetime, timezone
 
@@ -12,7 +13,10 @@ from .envelope import (
     resolve_destination,
     resolve_source,
 )
-from .keys import prefix
+from .keys import (
+    prefix, receive_opened_key, receive_opening_key, receive_processing_key,
+    receive_unresolved_key,
+)
 from .logging import emit, log_record
 from .policy import require_allowed
 from .registry import port_type
@@ -41,6 +45,23 @@ end
 redis.call('HSET', KEYS[1], ARGV[1], cjson.encode({count=count, since=since}))
 return count
 """
+
+_TRANSFER_RECEIVE_CUSTODY = """
+-- core receive custody transfer v1
+for _, key in ipairs(KEYS) do
+    local kind = redis.call('TYPE', key)['ok']
+    if kind ~= 'none' and kind ~= 'list' then
+        return redis.error_reply('receive custody key is not a list: ' .. key)
+    end
+end
+if redis.call('LREM', KEYS[1], 1, ARGV[1]) ~= 1 then return 0 end
+redis.call('RPUSH', KEYS[2], ARGV[2])
+local cap = tonumber(ARGV[3])
+if cap and cap > 0 then redis.call('LTRIM', KEYS[2], -cap, -1) end
+return 1
+"""
+
+_OPENED_RECEIPT_MAX = 1000
 
 def _unreplied_key(pod: str, tenant: str, agent: str) -> str:
     return prefix(pod, tenant, agent=agent, resource="unreplied")
@@ -241,13 +262,35 @@ def _open_received(
     agent: str,
     openers: dict[str, Callable[[dict], None]],
     raw,
+    processing_key: str,
+    opening_key: str,
+    opened_key: str,
+    unresolved_key: str,
     module: str,
 ) -> None:
-    """Parse and open one raw envelope already removed from ingress."""
+    """Open one claim through the not-started/possibly-started boundary."""
+    dead_key = prefix(pod, tenant, agent, "dead")
+
+    def transfer(source: str, destination: str, value=raw, cap: int = 0) -> None:
+        moved = r.eval(
+            _TRANSFER_RECEIVE_CUSTODY, 2, source, destination, raw, value, cap
+        )
+        if moved != 1:
+            raise RuntimeError("receive lost ownership before custody transfer")
+
+    def unresolved(reason: str) -> None:
+        raw_text = raw.decode() if isinstance(raw, bytes) else str(raw)
+        record = json.dumps(
+            {"agent": agent, "reason": reason, "envelope": raw_text},
+            separators=(",", ":"),
+        )
+        transfer(opening_key, unresolved_key, record)
+        _emit_for_recipient(module, "open_unresolved", envelope, agent, reason)
+
     try:
         envelope = parse(raw)
     except EnvelopeError as exc:
-        r.rpush(prefix(pod, tenant, agent, "dead"), raw)
+        transfer(processing_key, dead_key)
         # A valid v4 header remains joinable when its corrupt body is rejected
         # here. A malformed header has no trustworthy custody identifiers.
         try:
@@ -260,18 +303,21 @@ def _open_received(
     opener = openers.get(envelope["kind"])
     if opener is None:
         reason = f"unknown kind: {envelope['kind']}"
-        r.rpush(prefix(pod, tenant, agent, "dead"), raw)
+        transfer(processing_key, dead_key)
         _emit_for_recipient(module, "dead_lettered", envelope, agent, reason)
         _notify_dead_letter_sender(
             r, pod=pod, tenant=tenant, recipient=agent,
             envelope=envelope, reason=reason, module=module,
         )
         return
+    # This is the critical truth boundary: processing is safe to replay because
+    # no effect began; opening is never replayed because one may have begun.
+    transfer(processing_key, opening_key)
     try:
         opener(envelope)
     except DeadLetter as exc:
         reason = str(exc)
-        r.rpush(prefix(pod, tenant, agent, "dead"), raw)
+        transfer(opening_key, dead_key)
         _emit_for_recipient(module, "dead_lettered", envelope, agent, reason)
         _notify_dead_letter_sender(
             r, pod=pod, tenant=tenant, recipient=agent,
@@ -280,13 +326,9 @@ def _open_received(
         return
     except Exception as exc:
         reason = f"opener failed: {exc}"
-        r.rpush(prefix(pod, tenant, agent, "dead"), raw)
-        _emit_for_recipient(module, "dead_lettered", envelope, agent, reason)
-        _notify_dead_letter_sender(
-            r, pod=pod, tenant=tenant, recipient=agent,
-            envelope=envelope, reason=reason, module=module,
-        )
+        unresolved(reason)
         return
+    transfer(opening_key, opened_key, cap=_OPENED_RECEIPT_MAX)
     _emit_for_recipient(module, "opened", envelope, agent)
 
 
@@ -306,15 +348,50 @@ def receive(
     A switch kick means work is available, not that exactly one queue entry is
     paired with this process. Draining prevents an older entry left by a missed
     or crashed kick from consuming the only attempt for the request behind it.
-    Each envelope is removed immediately before it is opened, so a process
-    failure cannot discard an unprocessed batch.
+    Each envelope moves atomically from ingress to a per-agent processing list
+    before it is opened. A dead process therefore leaves durable work for its
+    successor; a rejected envelope moves from processing to dead in one
+    preflighted Redis execution. Once custody enters `opening`, a death or
+    ambiguous opener failure is surfaced as unresolved and never replayed.
     """
     ingress_key = prefix(pod, tenant, agent, "ingress")
-    if blocking:
-        item = r.blpop(ingress_key, timeout=timeout)
-        raw = None if item is None else item[1]
-    else:
-        raw = r.lpop(ingress_key)
+    processing_key = receive_processing_key(pod, tenant, agent)
+    opening_key = receive_opening_key(pod, tenant, agent)
+    opened_key = receive_opened_key(pod, tenant, agent)
+    unresolved_key = receive_unresolved_key(pod, tenant)
+
+    # A predecessor crossed the effect boundary. Preserve and surface that
+    # uncertainty before considering safely replayable processing custody.
+    while (uncertain := r.lindex(opening_key, 0)) is not None:
+        raw_text = uncertain.decode() if isinstance(uncertain, bytes) else str(uncertain)
+        record = json.dumps(
+            {"agent": agent, "reason": "opener outcome unknown after process exit", "envelope": raw_text},
+            separators=(",", ":"),
+        )
+        moved = r.eval(
+            _TRANSFER_RECEIVE_CUSTODY, 2,
+            opening_key, unresolved_key, uncertain, record, 0,
+        )
+        if moved != 1:
+            raise RuntimeError("receive lost ownership while surfacing unresolved custody")
+        try:
+            uncertain_envelope = parse(uncertain)
+        except EnvelopeError:
+            uncertain_envelope = {}
+        _emit_for_recipient(
+            module, "open_unresolved", uncertain_envelope, agent,
+            "opener outcome unknown after process exit",
+        )
+
+    # Recover a predecessor's claimed raw before admitting newer ingress. The
+    # delivery lease serializes real port processes, so there is one owner of
+    # this per-agent processing head at a time.
+    raw = r.lindex(processing_key, 0)
+    if raw is None:
+        if blocking:
+            raw = r.blmove(ingress_key, processing_key, timeout, "LEFT", "RIGHT")
+        else:
+            raw = r.lmove(ingress_key, processing_key, "LEFT", "RIGHT")
 
     while raw is not None:
         _open_received(
@@ -324,6 +401,10 @@ def receive(
             agent=agent,
             openers=openers,
             raw=raw,
+            processing_key=processing_key,
+            opening_key=opening_key,
+            opened_key=opened_key,
+            unresolved_key=unresolved_key,
             module=module,
         )
-        raw = r.lpop(ingress_key)
+        raw = r.lmove(ingress_key, processing_key, "LEFT", "RIGHT")

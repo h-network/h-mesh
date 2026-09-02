@@ -48,6 +48,14 @@ def _profile_env_suffix(profile: str | None) -> str:
     return (profile or "default").upper().replace("-", "_")
 
 
+def _sandbox_before_effect(client: OpenShellClient, sbx_name: str):
+    """Resolve the sandbox before submission; failure here proves no effect began."""
+    try:
+        return client.get_sandbox(sbx_name)
+    except OpenShellUnavailable as exc:
+        raise DeadLetter(f"gateway_unavailable_before_submission: {exc}") from exc
+
+
 def _write_credential_file(
     client: OpenShellClient, sandbox_id: str, path: str, content: bytes
 ) -> None:
@@ -88,8 +96,11 @@ def _exec_headless(
     written immediately before exec and wiped in a finally immediately after.
     Credentials must never be persisted in the sandbox creation environment.
     """
-    ref = client.get_sandbox(sbx_name)
-    command = headless_command(cli, resume=True)
+    try:
+        command = headless_command(cli, resume=True)
+    except ValueError as exc:
+        raise DeadLetter(str(exc)) from exc
+    ref = _sandbox_before_effect(client, sbx_name)
     stdin = stdin_text.encode("utf-8")
 
     if cli == "claude":
@@ -180,7 +191,7 @@ def _write_attachment(
     `/sandbox` is the sandbox home; h-mesh's host `/workdir` does not exist
     there and may not be writable.
     """
-    ref = client.get_sandbox(sbx_name)
+    ref = _sandbox_before_effect(client, sbx_name)
     target_dir = f"/sandbox/attachments/{stream_id}"
     final_path = f"{target_dir}/{filename}"
     temp_path = f"{target_dir}/.tmp.{os.urandom(8).hex()}"
@@ -244,36 +255,21 @@ def deliver_openshell(
     owns_client = client is None
     client = client or OpenShellClient(workspace_name(pod, tenant))
 
-    def guarded(opener):
-        def run(envelope: dict) -> None:
-            try:
-                opener(envelope)
-            except OpenShellUnavailable as exc:
-                raise DeadLetter(f"gateway_unavailable: {exc}") from exc
-
-        return run
-
     openers = {
-        "Message": guarded(
-            lambda env: _deliver_text(
+        "Message": lambda env: _deliver_text(
                 r, pod, tenant, agent, env, client, sbx_name, cli, profile,
                 is_message=True,
-            )
-        ),
-        "Command": guarded(
-            lambda env: _deliver_text(
+            ),
+        "Command": lambda env: _deliver_text(
                 r, pod, tenant, agent, env, client, sbx_name, cli, profile,
                 is_message=False,
-            )
-        ),
+            ),
         "AddTicket": lambda env: add_ticket(
             r=r, pod=pod, tenant=tenant, agent=agent, envelope=env
         ),
-        "Attachment": guarded(
-            lambda env: _deliver_attachment(
+        "Attachment": lambda env: _deliver_attachment(
                 r, pod, tenant, agent, env, client, sbx_name, cli, profile
-            )
-        ),
+            ),
     }
     try:
         receive(

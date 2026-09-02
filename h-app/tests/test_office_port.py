@@ -6,11 +6,47 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from core.channels import DeadLetter
+from lib.agentlifecycle.lifecycle import _IncompleteLifecycle
 from modules.office import port
 
 
 POD = "testpod"
 TENANT = "testtenant"
+
+
+def test_lifecycle_validation_failure_is_explicit_rejection():
+    with pytest.raises(DeadLetter):
+        port._lifecycle_opener(
+            port.start_agent, r=MagicMock(), pod=POD, tenant=TENANT,
+            envelope={"payload": {"agent": "worker", "profile": "bad profile!"}},
+            replace_window=MagicMock(), available_profiles=lambda *_: None,
+        )
+
+
+def test_lifecycle_unknown_failure_is_not_misclassified_as_rejection():
+    r = MagicMock()
+    r.set.side_effect = ValueError("redis encoder rejected after write attempt")
+    with pytest.raises(_IncompleteLifecycle, match="outcome UNKNOWN"):
+        port._lifecycle_opener(
+            port.start_agent, r=r, pod=POD, tenant=TENANT,
+            envelope={"payload": {"agent": "worker"}},
+            replace_window=MagicMock(), available_profiles=lambda *_: None,
+        )
+
+
+def test_late_validation_rejection_writes_nothing_and_is_dead_letterable():
+    r = MagicMock()
+    with pytest.raises(DeadLetter, match="payload.resume must be a boolean"):
+        port._lifecycle_opener(
+            port.start_agent, r=r, pod=POD, tenant=TENANT,
+            envelope={"payload": {"agent": "worker", "resume": "yes"}},
+            replace_window=MagicMock(), available_profiles=lambda *_: None,
+        )
+
+    # The harm is partial desired state followed by a dead-letter verdict.
+    # A proven rejection must reach the dead path with no lifecycle writes.
+    assert r.method_calls == []
 
 
 @patch("modules.office.port.receive")
