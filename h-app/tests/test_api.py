@@ -23,6 +23,8 @@ from modules.api import server as server_module
 from modules.api.port import deliver_api
 from modules.api.server import ApiSettings, create_app
 
+_UNMODELLED_CLASS_BODY = object()
+
 
 def _reason_argument_violations(source: str) -> list[str]:
     """Syntactic invariant, not a runtime one: every `reason` argument at
@@ -43,9 +45,20 @@ def _reason_argument_violations(source: str) -> list[str]:
     exactly that and produced a false positive against the real,
     correctly-written production file the moment function-parameter
     bindings were tracked at all. Resolution is local-scope-first, then
-    module scope, matching ordinary Python name resolution (no closures
-    over intermediate nested-function scopes, since none exist in this
-    file; a future one would need this extended).
+    module scope, matching ordinary Python name resolution -- but ONLY at
+    depth 0 (module level) or depth 1 (a function directly under module),
+    where those are the only two scopes that can possibly be involved. A
+    `_record` call found inside a closure nested two or more levels deep
+    is rejected OUTRIGHT, unconditionally, before its reason argument is
+    even inspected -- reviewer's exact finding: a name referenced from
+    such a closure can require walking through an INTERMEDIATE enclosing-
+    function scope, and resolving straight from the innermost scope to
+    module (skipping that middle scope) can certify the wrong binding.
+    Rather than build and separately re-verify a full lexical parent-chain
+    resolver with nonlocal/global semantics -- a fifth mechanism to get
+    wrong after four rounds of exactly that shape of bug -- refusing to
+    certify what isn't modelled closes the entire class at once: there is
+    no partial chain-walk left in this design to be incomplete.
 
     "Every binding form" is exhaustive, not just `Assign`: `AnnAssign`,
     `AugAssign` (always dynamic -- a mutation is never trusted regardless
@@ -57,7 +70,26 @@ def _reason_argument_violations(source: str) -> list[str]:
     -- the later definition is the one that actually binds at call time,
     so every definition sharing a name must independently qualify. A
     `_record` call using `**kwargs`/`*args` expansion is rejected outright:
-    its keyword contents cannot be verified by this analysis at all.
+    its keyword contents cannot be verified by this analysis at all. A
+    class body is not a real closure scope in Python either (a method
+    cannot see a class-body local unqualified) and gets the identical
+    treatment: any `_record` call reachable from inside one, at any depth,
+    is rejected outright rather than resolved against the wrong scope.
+
+    ⚠ STOPPING CONDITION, stated here so it survives past the conversation
+    that produced it: this checker has been wrong about scope twice --
+    once a false positive (parameter tracking without scoping), once a
+    false negative (an unmodelled intermediate closure scope). Both were
+    fixed by making the model's boundary EXPLICIT and refusing everything
+    outside it, not by extending an open-ended enumeration. If a review
+    ever finds ANOTHER shape this checker gets wrong that the depth
+    boundary and the class-body rejection do not already cover -- a
+    genuinely new category, not another instance of one already named
+    above -- that is the signal to stop patching this checker and fall
+    back to the weaker, honest claim: the runtime fuzz test above pins
+    today's known branches, and module-wide coverage rests on manual
+    enumeration. Do not ship a further round of case-by-case patches to
+    this function past that point.
     """
     tree = ast.parse(source)
 
@@ -105,18 +137,35 @@ def _reason_argument_violations(source: str) -> list[str]:
     # bindings[scope_key] -> (literal_only_names, dynamic_names) owned
     # DIRECTLY by that scope -- module level uses key None.
     bindings: dict[object, tuple[set, set]] = {}
+    # parent_of[scope_key] -> the scope_key of its immediately enclosing
+    # scope (module's own parent is never present -- depth stops there).
+    parent_of: dict[object, object] = {}
     record_calls: list[ast.Call] = []
 
     def scope_key(scope_node) -> object:
         return None if scope_node is None else id(scope_node)
 
-    def collect(scope_node, stmts, seed_dynamic: list[str] = ()) -> None:
+    def depth(scope_node) -> int:
+        """0 = module level, 1 = a function directly under module, 2+ = a
+        closure nested inside another function. Only depth 0 and 1 are
+        ever fully resolved (at most one hop to module); depth 2+ is
+        rejected outright rather than partially modelled -- see
+        `_reason_argument_violations`'s docstring."""
+        d = 0
+        key = scope_key(scope_node)
+        while key is not None:
+            key = parent_of.get(key)
+            d += 1
+        return d
+
+    def collect(scope_node, stmts, seed_dynamic: list[str] = (), parent=None) -> None:
         """Populate bindings[scope_key(scope_node)] from the statements
         directly in this scope's own body (not descending into nested
         function/lambda scopes, which get their own `collect` call).
         `seed_dynamic` pre-marks this scope's own parameters dynamic
         before any body statement is examined, so a parameter's identity
         is fixed at scope creation, never inferred from an outer scope."""
+        parent_of[scope_key(scope_node)] = scope_key(parent)
         literal_only: set[str] = set()
         dynamic: set[str] = set(seed_dynamic)
         bindings[scope_key(scope_node)] = (literal_only, dynamic)
@@ -130,18 +179,34 @@ def _reason_argument_violations(source: str) -> list[str]:
         class _Binder(ast.NodeVisitor):
             def visit_FunctionDef(self, node):
                 functions_by_name.setdefault(node.name, []).append(node)
-                collect(node, node.body, params_of(node))
+                collect(node, node.body, params_of(node), parent=scope_node)
 
             def visit_AsyncFunctionDef(self, node):
                 self.visit_FunctionDef(node)
 
             def visit_Lambda(self, node):
-                collect(node, [], params_of(node))
+                collect(node, [], params_of(node), parent=scope_node)
                 self.visit(node.body)  # a lambda body is one expression, may hold a call
 
             def visit_ClassDef(self, node):
                 mark_dynamic(node.name)
-                self.generic_visit(node)
+                # Class bodies are a distinct scoping regime this checker
+                # does not model: their own locals are NOT visible to
+                # methods defined inside them (unlike a real closure), so
+                # neither the depth-based closure gate nor ordinary
+                # local/module resolution describes them correctly. Any
+                # `_record` call anywhere inside a class body -- at class
+                # level or inside any of its methods, at any nesting depth
+                # -- is captured here and rejected outright, the same
+                # "refuse what isn't modelled" rule applied to closures.
+                for inner in ast.walk(node):
+                    if (
+                        isinstance(inner, ast.Call)
+                        and isinstance(inner.func, ast.Name)
+                        and inner.func.id == "_record"
+                    ):
+                        scope_of[id(inner)] = _UNMODELLED_CLASS_BODY
+                        record_calls.append(inner)
 
             def visit_Assign(self, node):
                 for target in node.targets:
@@ -253,7 +318,15 @@ def _reason_argument_violations(source: str) -> list[str]:
             and not any(isinstance(a, ast.Starred) for a in node.args)
             and not any(kw.arg is None for kw in node.keywords)
         ):
-            return node.func.id in literal_only_functions
+            called_name = node.func.id
+            local_literal, local_dynamic = bindings.get(scope_key(scope_node), (set(), set()))
+            if called_name in local_literal or called_name in local_dynamic:
+                # Locally rebound in the call site's own scope -- ordinary
+                # Python name resolution would use THAT binding, not the
+                # module-level function of the same name, so trusting
+                # literal_only_functions here would resolve the wrong one.
+                return False
+            return called_name in literal_only_functions
         if isinstance(node, ast.IfExp):
             return is_safe(node.body, scope_node) and is_safe(node.orelse, scope_node)
         return False
@@ -261,6 +334,23 @@ def _reason_argument_violations(source: str) -> list[str]:
     violations = []
     for node in record_calls:
         scope_node = scope_of[id(node)]
+        if scope_node is _UNMODELLED_CLASS_BODY:
+            violations.append(f"line {node.lineno}: _record call inside a class body is not modelled")
+            continue
+        if depth(scope_node) >= 2:
+            # A closure nested inside another function: reviewer's exact
+            # finding. Resolving a name here can require walking through
+            # an intermediate enclosing-function scope this checker does
+            # not model at all -- `resolve` only ever tries the call's own
+            # immediate scope and then module scope directly, which
+            # silently skips any scope in between and can certify the
+            # wrong binding. Rather than build and re-verify a full
+            # lexical parent chain (a fifth thing to get wrong after four
+            # rounds of exactly that), refuse to certify anything at this
+            # depth at all: unconditional violation, checked before even
+            # looking at what the reason argument is.
+            violations.append(f"line {node.lineno}: _record call inside a nested closure scope is not modelled")
+            continue
         if any(kw.arg is None for kw in node.keywords) or any(isinstance(a, ast.Starred) for a in node.args):
             violations.append(f"line {node.lineno}: unverifiable *args/**kwargs expansion in _record call")
             continue
@@ -716,14 +806,24 @@ class ApiTests(unittest.TestCase):
             "the checker must flag reviewer's exact counterexample -- it did not",
         )
 
-    def test_reason_argument_checker_rejects_reviewers_three_binding_shape_counterexamples(self):
-        """Reviewer's second blocker, verbatim: the first version of the
-        checker returned `[]` (no violations) for all three of these --
-        allow-by-default wearing a deny-by-default docstring. Each is
-        committed here exactly as reviewer supplied it, per their explicit
-        instruction ("they are the test suite"), so a regression in any of
-        these three binding shapes is caught by name, not by re-deriving
-        the counterexample from a changelog."""
+    def test_reason_argument_checker_rejects_reviewers_binding_shape_counterexamples(self):
+        """Reviewer's second and third blockers, verbatim. The first four
+        cases are exactly as reviewer supplied them -- three from round
+        two (allow-by-default wearing a deny-by-default docstring: **kwargs
+        expansion, AugAssign not invalidating a name, and same-named
+        function definitions unioned instead of all required to qualify),
+        plus round three's intermediate-closure-scope false negative
+        (resolving straight from an inner closure to module level, skipping
+        the enclosing function scope in between, certifies the wrong
+        binding). The last two are proactive: found while verifying the
+        closure fix converges rather than reported by reviewer, covering
+        the same "scope this checker does not model" shape applied to a
+        locally-shadowed helper name and to class bodies (which are not
+        real closures in Python -- methods cannot see class-body locals
+        unqualified -- and were falling through to the enclosing scope
+        untouched before this). Committed per reviewer's instruction that
+        counterexamples are the test suite, so a regression in any of
+        these shapes is caught by name, not by re-deriving it later."""
         preamble = "def _record(event, envelope, agent, reason=None):\n    pass\n\n"
 
         expanded_kwargs = preamble + (
@@ -758,6 +858,52 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(
             _reason_argument_violations(redefined_function),
             "one unsafe definition among same-named functions must fail the whole name, not be unioned away",
+        )
+
+        intermediate_closure = preamble + (
+            'reason = "safe"\n'
+            "def outer(remote):\n"
+            '    reason = f"leak {remote}"\n'
+            "    def inner():\n"
+            '        _record("x", {}, "a", reason=reason)\n'
+            "    inner()\n"
+        )
+        self.assertTrue(
+            _reason_argument_violations(intermediate_closure),
+            "a closure must not resolve straight past its enclosing function scope to module level",
+        )
+
+        locally_shadowed_helper = preamble + (
+            "def helper():\n"
+            '    return "safe"\n'
+            "def f(remote):\n"
+            '    helper = lambda: f"leak {remote}"\n'
+            '    _record("x", {}, "api", reason=helper())\n'
+        )
+        self.assertTrue(
+            _reason_argument_violations(locally_shadowed_helper),
+            "a same-named local rebinding must not let a module-level function's safety apply",
+        )
+
+        class_body_direct = preamble + (
+            "class X:\n"
+            '    reason = f"leak"\n'
+            '    _record("x", {}, "a", reason=reason)\n'
+        )
+        self.assertTrue(
+            _reason_argument_violations(class_body_direct),
+            "a class body is not a closure scope this checker models -- must be rejected, not resolved",
+        )
+
+        class_method = preamble + (
+            "class X:\n"
+            '    reason = "safe"\n'
+            "    def f(self):\n"
+            '        _record("x", {}, "a", reason=reason)\n'
+        )
+        self.assertTrue(
+            _reason_argument_violations(class_method),
+            "a method does not see class-body locals unqualified -- must be rejected, not resolved",
         )
 
     def _tamper_in_reply_to(self, envelope, value):
