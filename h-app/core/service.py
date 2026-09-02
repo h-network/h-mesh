@@ -11,11 +11,19 @@ from collections.abc import Callable
 
 import redis
 
-from .envelope import EnvelopeError, advance_hop, header_record_fields, parse_for_switch, stamp_source
-from .keys import prefix
+from .envelope import (
+    EnvelopeError,
+    advance_hop,
+    build,
+    encode,
+    header_record_fields,
+    parse_for_switch,
+    stamp_source,
+)
+from .keys import delivery_lock_key, prefix
 from .logging import configure_logging, emit, log_record, publish
 from .queues import admit_ingress
-from .registry import members, port_type
+from .registry import member_types, members, port_type
 from .retention import RetentionTrimmer
 from .windowlog import WindowLogTailer
 
@@ -184,27 +192,35 @@ class Switch:
             limit=self.ingress_max,
         )
 
-    def _kick(self, agent: str, port_type_name: str | None, envelope: dict) -> None:
+    def _kick(
+        self,
+        agent: str,
+        port_type_name: str | None,
+        envelope: dict,
+        *,
+        started_event: str = "kick_started",
+        started_reason: str | None = None,
+    ) -> bool:
         if port_type_name is None:
             _log_observation(
-                "kick_deferred",
+                "kick_skipped",
                 stream_id=envelope.get("stream_id"),
                 correlation_id=envelope.get("correlation_id"),
                 source=envelope.get("l2", {}).get("source"),
                 destination=agent,
-                reason="broadcast port_type is unresolved; delivery kick deferred",
+                reason="port_type is unresolved; no delivery attempt started",
             )
-            return
+            return False
         if self.kick is None:
             _log_observation(
-                "kick_deferred",
+                "kick_skipped",
                 stream_id=envelope.get("stream_id"),
                 correlation_id=envelope.get("correlation_id"),
                 source=envelope.get("l2", {}).get("source"),
                 destination=agent,
                 reason="no delivery kick callback configured",
             )
-            return
+            return False
         try:
             self.kick(agent, port_type_name, envelope)
         except Exception as exc:
@@ -216,16 +232,84 @@ class Switch:
                 destination=agent,
                 reason=f"delivery kick outcome UNKNOWN after {exc}",
             )
-            return
+            return True
         # A callback return proves only that the switch started a delivery
         # attempt; it does not claim that the edge reached or popped ingress.
-        _log_observation(
-            "kick_started",
+        fields = dict(
             stream_id=envelope.get("stream_id"),
             correlation_id=envelope.get("correlation_id"),
             source=envelope.get("l2", {}).get("source"),
             destination=agent,
         )
+        if started_reason is not None:
+            fields["reason"] = started_reason
+        _log_observation(started_event, **fields)
+        return True
+
+    def _reconcile_ingress(self) -> None:
+        """Restart abandoned ingress once its prior delivery lease is gone."""
+        for agent, port_type_name in sorted(
+            member_types(self.r, pod=self.pod, tenant=self.tenant).items()
+        ):
+            if self.r.get(prefix(self.pod, self.tenant, agent, "paused")) is not None:
+                continue
+            ingress_key = prefix(self.pod, self.tenant, agent, "ingress")
+            if self.r.llen(ingress_key) < 1:
+                continue
+            if self.r.get(delivery_lock_key(self.pod, self.tenant, agent)) is not None:
+                continue
+            raw = self.r.lindex(ingress_key, 0)
+            if raw is None:
+                continue
+            try:
+                envelope = parse_for_switch(raw)
+            except EnvelopeError:
+                envelope = {}
+            self._kick(
+                agent,
+                port_type_name or None,
+                envelope,
+                started_event="kick_restarted",
+                started_reason="non-empty ingress found without a delivery lease",
+            )
+
+    def _notify_broadcast_sender(
+        self, *, sender: str, sender_type: str | None,
+        envelope: dict, skipped: list[str],
+    ) -> None:
+        """Best-effort fact-only feedback at the initiating participant."""
+        notice = build(
+            "Message",
+            "switch",
+            sender,
+            {
+                "text": (
+                    "Broadcast notice: no delivery attempt was started for "
+                    + ", ".join(skipped)
+                    + "."
+                )
+            },
+            envelope.get("stream_id"),
+            pod=self.pod,
+            tenant=self.tenant,
+        )
+        raw = encode(notice)
+        try:
+            admitted, _, depth = self._admit([sender], raw)
+        except Exception as exc:
+            _emit_observation(
+                "forward_unknown", notice,
+                f"broadcast notice ingress write outcome UNKNOWN after {exc}",
+            )
+            return
+        if not admitted:
+            _emit_observation(
+                "dead_lettered", notice,
+                f"broadcast notice ingress full at depth {depth}",
+            )
+            return
+        _emit_observation("forwarded", notice)
+        self._kick(sender, sender_type, notice)
 
     def step(self, timeout: float | None = None) -> bool:
         agents = sorted(self._agents())
@@ -280,7 +364,9 @@ class Switch:
             return True
         destination = envelope["l2"]["destination"]
         if destination == "all":
-            recipients = sorted(self._agents() - {sender})
+            recipient_types = member_types(self.r, pod=self.pod, tenant=self.tenant)
+            sender_type = recipient_types.pop(sender, None)
+            recipients = sorted(recipient_types)
             if not recipients:
                 _emit_observation("forwarded", envelope, count=0)
                 return True
@@ -296,10 +382,15 @@ class Switch:
                 self._dead_letter_full(sender, "all", raw, envelope, depth)
                 return True
             _emit_observation("forwarded", envelope, count=len(recipients))
+            skipped = []
             for agent in recipients:
-                # Broadcast enumeration remains membership-only until its own
-                # HGETALL-vs-per-recipient-HGET design is decided.
-                self._kick(agent, None, envelope)
+                if not self._kick(agent, recipient_types[agent] or None, envelope):
+                    skipped.append(agent)
+            if skipped:
+                self._notify_broadcast_sender(
+                    sender=sender, sender_type=sender_type,
+                    envelope=envelope, skipped=skipped,
+                )
             return True
         destination_type = port_type(
             self.r, pod=self.pod, tenant=self.tenant, agent=destination
@@ -340,6 +431,13 @@ class Switch:
             now = time.monotonic()
             if now >= next_maintenance:
                 agents = None
+                try:
+                    self._reconcile_ingress()
+                except Exception as exc:
+                    _emit_observation(
+                        "error", {},
+                        reason=f"ingress recovery pass failed: {type(exc).__name__}: {exc}",
+                    )
                 if retention_trimmer is not None:
                     try:
                         agents = self._agents()

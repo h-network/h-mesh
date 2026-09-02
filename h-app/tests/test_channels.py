@@ -11,8 +11,8 @@ if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
 from core.channels import DeadLetter, receive, send
-from core.envelope import parse
-from core.keys import prefix
+from core.envelope import build, encode, parse
+from core.keys import delivery_lock_key, prefix
 from core.service import Switch
 
 
@@ -26,7 +26,9 @@ class FakeRedis:
     def __init__(self):
         self.lists = defaultdict(deque)
         self.hashes = defaultdict(dict)
+        self.values = {}
         self.hget_calls = []
+        self.hgetall_calls = []
         self.hexists_calls = []
 
     def rpush(self, key, *values):
@@ -35,6 +37,18 @@ class FakeRedis:
 
     def lpop(self, key):
         return self.lists[key].popleft() if self.lists[key] else None
+
+    def llen(self, key):
+        return len(self.lists[key])
+
+    def lindex(self, key, index):
+        try:
+            return self.lists[key][index]
+        except IndexError:
+            return None
+
+    def get(self, key):
+        return self.values.get(key)
 
     def blpop(self, keys, timeout=0):
         if isinstance(keys, str):
@@ -51,6 +65,10 @@ class FakeRedis:
     def hget(self, key, field):
         self.hget_calls.append((key, field))
         return self.hashes[key].get(field)
+
+    def hgetall(self, key):
+        self.hgetall_calls.append(key)
+        return dict(self.hashes[key])
 
     def hdel(self, key, field):
         return int(self.hashes[key].pop(field, None) is not None)
@@ -207,6 +225,34 @@ class ChannelTests(unittest.TestCase):
             f"Delivery to host failed for message {envelope_id}: unknown kind: Message",
         )
 
+    def test_one_receive_drains_valid_request_behind_stale_rejected_entry(self):
+        self.register(alice="tmux", host="office")
+        stale_id = send(
+            self.redis, pod=POD, tenant=TENANT, source="alice",
+            destination="host", payload={"text": "stale broadcast"},
+        )
+        request_id = send(
+            self.redis, pod=POD, tenant=TENANT, source="alice",
+            destination="host", kind="StartAgent", payload={"agent": "worker"},
+        )
+        ingress = prefix(POD, TENANT, "host", "ingress")
+        for _ in range(2):
+            self.redis.rpush(
+                ingress,
+                self.redis.lpop(prefix(POD, TENANT, "alice", "egress")),
+            )
+        opened = []
+
+        receive(
+            self.redis, pod=POD, tenant=TENANT, agent="host",
+            openers={"StartAgent": opened.append}, timeout=0, blocking=False,
+        )
+
+        self.assertEqual([envelope["stream_id"] for envelope in opened], [request_id])
+        self.assertIsNone(self.redis.lpop(ingress))
+        dead = parse(self.redis.lpop(prefix(POD, TENANT, "host", "dead")))
+        self.assertEqual(dead["stream_id"], stale_id)
+
     def test_receive_does_not_notify_non_tmux_sender(self):
         self.register(client="api", host="control")
         send(
@@ -259,7 +305,7 @@ class ChannelTests(unittest.TestCase):
         self.assertEqual(opened[0]["ttl"], 15)
         self.assertEqual(opened[0]["hops"], 1)
 
-    def test_broadcast_keeps_membership_only_kick_path(self):
+    def test_broadcast_resolves_each_member_type_and_kicks_all(self):
         self.register(alice="tmux", bob="tmux", carol="api")
         stream_id = send(
             self.redis, pod=POD, tenant=TENANT, source="alice",
@@ -275,11 +321,46 @@ class ChannelTests(unittest.TestCase):
         )
         with patch("core.service._emit_observation"), patch("core.service._log_observation") as log:
             self.assertTrue(switch.step(timeout=0))
-        self.assertEqual(kicks, [])
-        deferred = [call for call in log.call_args_list if call.args == ("kick_deferred",)]
-        self.assertEqual([call.kwargs["destination"] for call in deferred], ["bob", "carol"])
+        self.assertEqual(kicks, [
+            ("bob", "tmux", stream_id),
+            ("carol", "api", stream_id),
+        ])
+        skipped = [call for call in log.call_args_list if call.args == ("kick_skipped",)]
+        self.assertEqual(skipped, [])
         self.assertEqual(self.redis.hget_calls[hgets_before_step:], [])
+        self.assertEqual(self.redis.hgetall_calls, [self.registry])
         self.assertEqual(self.redis.hexists_calls, [])
+
+    def test_broadcast_kicks_resolved_members_and_records_unresolved_member(self):
+        self.register(alice="tmux", bob="tmux", unresolved="")
+        stream_id = send(
+            self.redis, pod=POD, tenant=TENANT, source="alice",
+            destination="all", payload={"text": "broadcast"},
+        )
+        kicks = []
+        switch = Switch(
+            self.redis, pod=POD, tenant=TENANT,
+            kick=lambda agent, port_type, envelope: kicks.append(
+                (agent, port_type, envelope["stream_id"])
+            ),
+        )
+
+        with patch("core.service._emit_observation"), patch("core.service._log_observation") as log:
+            self.assertTrue(switch.step(timeout=0))
+
+        self.assertEqual(kicks[0], ("bob", "tmux", stream_id))
+        self.assertEqual(kicks[1][0:2], ("alice", "tmux"))
+        skipped = [call for call in log.call_args_list if call.args == ("kick_skipped",)]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0].kwargs["destination"], "unresolved")
+        self.assertIn("no delivery attempt started", skipped[0].kwargs["reason"])
+        notice = parse(self.redis.lists[prefix(POD, TENANT, "alice", "ingress")][0])
+        self.assertEqual(notice["l2"], {"source": "switch", "destination": "alice"})
+        self.assertEqual(
+            notice["payload"]["text"],
+            "Broadcast notice: no delivery attempt was started for unresolved.",
+        )
+        self.assertEqual(notice["correlation_id"], stream_id)
 
     def test_unicast_missing_hget_value_dead_letters_without_kick(self):
         self.register(alice="tmux")
@@ -305,6 +386,59 @@ class ChannelTests(unittest.TestCase):
             [(self.registry, "ghost")],
         )
         self.assertEqual(self.redis.hexists_calls, [])
+
+    def test_backlog_reconciliation_rekicks_queue_after_delivery_lease_is_gone(self):
+        self.register(host="office")
+        stream_id = send(
+            self.redis, pod=POD, tenant=TENANT, source="host",
+            destination="host", kind="StartAgent", payload={"agent": "worker"},
+        )
+        raw = self.redis.lpop(prefix(POD, TENANT, "host", "egress"))
+        self.redis.rpush(prefix(POD, TENANT, "host", "ingress"), raw)
+        kicks = []
+        switch = Switch(
+            self.redis, pod=POD, tenant=TENANT,
+            kick=lambda agent, port_type, envelope: kicks.append(
+                (agent, port_type, envelope["stream_id"])
+            ),
+        )
+
+        with patch("core.service._log_observation") as log:
+            switch._reconcile_ingress()
+
+        self.assertEqual(kicks, [("host", "office", stream_id)])
+        self.assertEqual(log.call_args.args, ("kick_restarted",))
+        self.assertIn("non-empty ingress", log.call_args.kwargs["reason"])
+
+    def test_backlog_reconciliation_waits_for_live_delivery_lease(self):
+        self.register(host="office")
+        raw = encode(build(
+            "StartAgent", "host", "host", {"agent": "worker"},
+            pod=POD, tenant=TENANT,
+        ))
+        self.redis.rpush(prefix(POD, TENANT, "host", "ingress"), raw)
+        self.redis.values[delivery_lock_key(POD, TENANT, "host")] = "live-holder"
+        kicks = []
+
+        Switch(
+            self.redis, pod=POD, tenant=TENANT,
+            kick=lambda *args: kicks.append(args),
+        )._reconcile_ingress()
+
+        self.assertEqual(kicks, [])
+
+    def test_backlog_reconciliation_leaves_paused_agent_queued(self):
+        self.register(host="office")
+        self.redis.rpush(prefix(POD, TENANT, "host", "ingress"), "queued")
+        self.redis.values[prefix(POD, TENANT, "host", "paused")] = "1"
+        kicks = []
+
+        Switch(
+            self.redis, pod=POD, tenant=TENANT,
+            kick=lambda *args: kicks.append(args),
+        )._reconcile_ingress()
+
+        self.assertEqual(kicks, [])
 
 
 if __name__ == "__main__":

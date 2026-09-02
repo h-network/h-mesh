@@ -1,15 +1,82 @@
 import os
 import sys
 from unittest.mock import ANY, MagicMock, call, patch
+from uuid import uuid4
+
+import pytest
+import redis
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core.keys import prefix
-from lib.agentlifecycle.lifecycle import start_agent, stop_agent
+from lib.agentlifecycle.lifecycle import (
+    _PUBLISH_LEAD_MEMBERSHIP_LUA,
+    _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
+    start_agent,
+    stop_agent,
+)
 
 
 POD = "testpod"
 TENANT = "testtenant"
+
+
+@pytest.fixture
+def real_redis():
+    r = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"))
+    try:
+        r.ping()
+    except Exception:
+        pytest.skip("real Redis server not available at REDIS_URL")
+    return r
+
+
+def test_lead_publish_wrongtype_is_no_write(real_redis):
+    tenant = f"lua-{uuid4().hex[:12]}"
+    lead_key = prefix(POD, tenant, resource="lead")
+    registry_key = prefix(POD, tenant, resource="registry")
+    cause_key = prefix(POD, tenant, agent="new-lead", resource="window.cause")
+    real_redis.set(registry_key, "wrong-type")
+    try:
+        with pytest.raises(redis.ResponseError, match="WRONGTYPE"):
+            real_redis.eval(
+                _PUBLISH_LEAD_MEMBERSHIP_LUA,
+                3,
+                lead_key,
+                registry_key,
+                cause_key,
+                "new-lead",
+                "tmux",
+                "a" * 32,
+            )
+
+        assert real_redis.get(cause_key) is None
+        assert real_redis.get(lead_key) is None
+        assert real_redis.get(registry_key) == b"wrong-type"
+    finally:
+        real_redis.delete(lead_key, registry_key, cause_key)
+
+
+def test_lead_removal_wrongtype_is_no_write(real_redis):
+    tenant = f"lua-{uuid4().hex[:12]}"
+    lead_key = prefix(POD, tenant, resource="lead")
+    registry_key = prefix(POD, tenant, resource="registry")
+    real_redis.hset(registry_key, "old-lead", "tmux")
+    real_redis.hset(lead_key, "wrong", "type")
+    try:
+        with pytest.raises(redis.ResponseError, match="WRONGTYPE"):
+            real_redis.eval(
+                _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
+                2,
+                registry_key,
+                lead_key,
+                "old-lead",
+            )
+
+        assert real_redis.hget(registry_key, "old-lead") == b"tmux"
+        assert real_redis.hget(lead_key, "wrong") == b"type"
+    finally:
+        real_redis.delete(lead_key, registry_key)
 
 
 @patch("lib.agentlifecycle.lifecycle.log_record")

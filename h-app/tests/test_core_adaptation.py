@@ -17,7 +17,7 @@ if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
 from core.config import state_dir, state_path
-from core.registry import is_member, members, port_type
+from core.registry import is_member, member_types, members, port_type
 from core.service import Switch, _forward_port_custody, main, transmission
 from core.windowlog import WindowLogTailer
 
@@ -37,6 +37,10 @@ class RegistryRedis:
     def hget(self, key, agent):
         self.calls.append(("hget", key, agent))
         return b"tmux"
+
+    def hgetall(self, key):
+        self.calls.append(("hgetall", key))
+        return {b"alice": b"tmux"}
 
 
 class CoreAdaptationTests(unittest.TestCase):
@@ -80,6 +84,7 @@ class CoreAdaptationTests(unittest.TestCase):
     def test_registry_uses_registry_wire_resource(self):
         client = RegistryRedis()
         self.assertEqual(members(client, pod="mesh", tenant="office"), {"alice"})
+        self.assertEqual(member_types(client, pod="mesh", tenant="office"), {"alice": "tmux"})
         self.assertTrue(is_member(client, pod="mesh", tenant="office", agent="alice"))
         self.assertEqual(port_type(client, pod="mesh", tenant="office", agent="alice"), "tmux")
         self.assertTrue(
@@ -106,16 +111,17 @@ class CoreAdaptationTests(unittest.TestCase):
         self.assertEqual(log.call_args.args, ("kick_unknown",))
         self.assertIn("edge unavailable", log.call_args.kwargs["reason"])
 
-    def test_switch_without_kick_records_deferred(self):
+    def test_switch_without_kick_records_terminal_skip(self):
         switch = Switch(object(), pod="mesh", tenant="office")
         envelope = {"stream_id": "stream", "l2": {"source": "alice"}}
         with patch("core.service._log_observation") as log:
             switch._kick("bob", "tmux", envelope)
-        self.assertEqual(log.call_args.args, ("kick_deferred",))
+        self.assertEqual(log.call_args.args, ("kick_skipped",))
         self.assertEqual(log.call_args.kwargs["destination"], "bob")
 
     def test_switch_run_retries_after_redis_connection_error(self):
         switch = Switch(object(), pod="mesh", tenant="office", poll_seconds=5)
+        switch._reconcile_ingress = MagicMock()
         switch.step = MagicMock(
             side_effect=[redis.exceptions.ConnectionError("redis restarting"), KeyboardInterrupt]
         )
@@ -128,21 +134,22 @@ class CoreAdaptationTests(unittest.TestCase):
             switch.run()
 
         self.assertEqual(switch.step.call_count, 2)
+        switch._reconcile_ingress.assert_called_once_with()
         sleep.assert_called_once_with(2.0)
         emit.assert_called_once_with(
             "error", {},
             reason="forwarding pass failed: ConnectionError: redis restarting",
         )
 
-    def test_broadcast_without_resolved_type_defers_before_callback(self):
+    def test_broadcast_without_resolved_type_records_terminal_skip(self):
         kick = MagicMock()
         switch = Switch(object(), pod="mesh", tenant="office", kick=kick)
         envelope = {"stream_id": "stream", "l2": {"source": "alice"}}
         with patch("core.service._log_observation") as log:
             switch._kick("bob", None, envelope)
         kick.assert_not_called()
-        self.assertEqual(log.call_args.args, ("kick_deferred",))
-        self.assertIn("broadcast port_type is unresolved", log.call_args.kwargs["reason"])
+        self.assertEqual(log.call_args.args, ("kick_skipped",))
+        self.assertIn("no delivery attempt started", log.call_args.kwargs["reason"])
 
     def test_transmission_spawns_module_port_without_envelope_in_argv(self):
         envelope = {"stream_id": "secret", "payload": {"text": "not argv"}}

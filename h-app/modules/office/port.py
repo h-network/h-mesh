@@ -1,4 +1,4 @@
-"""Office port: receive lifecycle envelopes and apply them once per kick."""
+"""Office port: drain lifecycle envelopes made available by each kick."""
 
 import os
 import signal
@@ -51,7 +51,7 @@ def deliver_office(
     blocking: bool = False,
     **kwargs,
 ) -> None:
-    """Pop and open one lifecycle envelope addressed to the office port."""
+    """Drain lifecycle envelopes addressed to the office port."""
     session_name = session_name or os.environ.get("TMUX_SESSION") or tenant
     socket = socket or os.environ.get("TMUX_SOCKET")
 
