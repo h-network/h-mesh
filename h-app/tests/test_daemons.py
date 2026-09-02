@@ -112,6 +112,76 @@ def test_stop_daemons_removes_stale_pidfile_without_error(managed_tmpdir):
     assert not (run_dir / "switch.pid").exists()
 
 
+def test_stop_daemons_survives_a_pidfile_vanishing_mid_read(tmp_path, monkeypatch):
+    """Reproduces ticket a347bf8d's real TOCTOU, found by watchdog-agent under
+    concurrent stress and hit live: a switch.pid deleted by one process's
+    reap right as another process's stop_daemons() was reading it raised an
+    uncaught FileNotFoundError out of _read_pid, aborting stop_daemons()
+    part-way through a teardown (some daemons stopped, some not).
+
+    Constructs the actual interleaving -- deletes the file out from under
+    the read the first time anything tries to read *this* path -- rather
+    than just calling _read_pid on an already-missing file, which would
+    only prove the catch exists, not that the race that produced the
+    traceback is actually closed. Patches read_text() rather than exists()
+    so this stays a real regression test regardless of which internal
+    check the fix ends up using to notice the file is gone.
+
+    A second, corrupt pidfile (tmux_reconciler.pid, the next name
+    stop_daemons() visits after switch) pins the secondary consequence
+    reviewer asked to strengthen: not just "no crash", but that the
+    teardown actually continued past the raced entry rather than
+    silently stopping there.
+    """
+    pidfile = tmp_path / "switch.pid"
+    pidfile.write_text("999999999\n")
+    later_entry = tmp_path / "tmux_reconciler.pid"
+    later_entry.write_text("not-a-pid\n")
+
+    real_read_text = Path.read_text
+    vanished = []
+
+    def vanish_then_read(self, *args, **kwargs):
+        if self == pidfile and not vanished:
+            vanished.append(True)
+            pidfile.unlink()
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", vanish_then_read)
+
+    logs: list[str] = []
+    stop_daemons(tmp_path, log=logs.append)  # must not raise FileNotFoundError
+
+    assert vanished, "the race was never actually constructed -- test proves nothing"
+    assert not pidfile.exists()
+    assert not later_entry.exists(), (
+        "teardown aborted at the raced entry instead of continuing to "
+        "later roster entries"
+    )
+    assert any("tmux_reconciler" in line and "did not contain a pid" in line for line in logs), logs
+
+
+def test_stop_daemons_distinguishes_a_corrupt_pidfile_from_an_absent_one(tmp_path):
+    """A vanished pidfile and a corrupt one are different facts (ticket
+    a347bf8d): one means the daemon is already gone, the other means the
+    file is malformed and worth actively removing. Never directly tested
+    before -- PidRead.corrupt existed only as an assumption, not a proven
+    guard."""
+    logs: list[str] = []
+    corrupt = tmp_path / "switch.pid"
+    corrupt.write_text("not-a-pid\n")
+    stop_daemons(tmp_path, log=logs.append)
+    assert not corrupt.exists()
+    assert any("did not contain a pid, removing" in line for line in logs), logs
+
+    logs.clear()
+    absent = tmp_path / "tmux_reconciler.pid"
+    assert not absent.exists()
+    stop_daemons(tmp_path, log=logs.append)
+    assert any("not running (no pidfile)" in line for line in logs), logs
+    assert not any("did not contain a pid" in line for line in logs), logs
+
+
 def test_stop_daemons_does_not_signal_an_unrelated_live_process(tmp_path):
     unrelated = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"],
