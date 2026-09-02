@@ -17,6 +17,28 @@ from lib.reply_correlation import is_valid_reply_id, was_delivered
 MAILBOX_MAXLEN = 1000
 
 
+def _dead_letter_reason(exc: EnvelopeError) -> str:
+    """A safe, closed reason for a rejected envelope -- never str(exc).
+
+    core/envelope.py's parse() raises exactly one exception class,
+    EnvelopeError, for every rejection reason -- but several of its raise
+    sites (_segment, _address) interpolate the remote value itself
+    (`{value!r}`) directly into the message, e.g. "invalid agent name:
+    'whatever the wire said'". str(exc) is therefore remote-influenced by
+    construction, same shape as the telegram client and Watchdog leaks:
+    neither an exception's message nor a hostile class's own __name__ can
+    be trusted just because it reached a `raise` our code wrote. Nothing
+    here is derived from the exception object; "malformed envelope" is the
+    only category, because parse() gives us no safe, closed set of
+    sub-types to branch on the way Watchdog's caught exceptions did -- one
+    literal is the correct amount of information to carry when the object
+    itself cannot be trusted for more. The rejected raw bytes are still
+    preserved verbatim in the dead-letter queue for anyone who deliberately
+    goes looking; only the passive log line is closed to this content.
+    """
+    return "malformed envelope"
+
+
 def _record(event: str, envelope: dict, agent: str, reason: str | None = None) -> None:
     """Keep observation failures from changing mailbox custody."""
     try:
@@ -106,7 +128,7 @@ def deliver_api(*, r, pod: str, tenant: str, agent: str) -> None:
                 header = parse_for_switch(raw)
             except EnvelopeError:
                 header = {}
-            _record("dead_lettered", header, agent, str(exc))
+            _record("dead_lettered", header, agent, _dead_letter_reason(exc))
             continue
 
         _drop_untrustworthy_reply_correlation(r, pod=pod, tenant=tenant, agent=agent, envelope=envelope)

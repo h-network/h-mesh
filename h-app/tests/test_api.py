@@ -200,6 +200,32 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(queued["l2"]["destination"], "alice")
         self.assertEqual(queued["l3"]["destination"], "test:office:alice")
 
+    def test_post_envelope_does_not_report_a_write_failure_as_a_rejection(self):
+        """CLASS 2, architect's provenance audit (ticket 51caad5f): the
+        only except clause converting a post_envelope failure into an
+        explicit HTTP 422 rejection catches EnvelopeError specifically --
+        and core.channels.send()'s own contract (its comment above the
+        rpush call: "Only RPUSH belongs inside the outcome-unknown
+        window") proves EnvelopeError is raised only by validation that
+        completes BEFORE the egress write. A failure from the write step
+        itself must never be classified as a proven rejection: the caller
+        cannot tell from a 422 whether their message was actually queued,
+        so reporting a write failure that way would be a confident, wrong
+        claim -- the exact harm this ticket's Class 2 predicate names.
+        Simulates the write step itself failing with a plain exception
+        (never EnvelopeError -- send() cannot raise that type from within
+        the rpush try) and confirms it does NOT come back as this
+        endpoint's 422 rejection status."""
+        def failing_rpush(*args, **kwargs):
+            raise ConnectionError("redis unreachable")
+
+        with patch.object(self.redis, "rpush", side_effect=failing_rpush):
+            with self.assertRaises(ConnectionError):
+                request(
+                    self.app, "POST", "/agents/test:office:alice/envelopes",
+                    token="secret", body={"text": "hello"},
+                )
+
     def test_nonlocal_and_malformed_destination_statuses(self):
         status, _ = request(
             self.app, "POST", "/agents/other:office:alice/envelopes",
@@ -224,6 +250,61 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(self.redis.streams[inbox]), 1)
         self.assertEqual(json.loads(self.redis.streams[inbox][0][1]["envelope"])["payload"], {"text": "reply"})
         self.assertEqual(self.redis.lists[dead], ["not an envelope"])
+
+    def test_deliver_api_does_not_dead_letter_an_envelope_after_a_failed_inbox_write(self):
+        """CLASS 2, architect's provenance audit (ticket 51caad5f), second
+        candidate site: deliver_api's only except clause that classifies a
+        rejection wraps parse(raw) alone, never the r.xadd inbox write that
+        follows it -- parse() takes no Redis handle at all, so it cannot
+        have touched storage, which is a stronger guarantee than an
+        in-function comment (core.channels.send()'s case) because it holds
+        structurally, by parse()'s own signature. The fragile part is the
+        SHAPE of the try/except, not parse()'s purity: if a later change
+        widened that except to also cover the xadd call, a write failure
+        would be misclassified as a proven rejection (dead-lettered) when
+        the caller cannot actually tell whether inbox storage received it.
+        Simulates the write step failing and confirms it propagates
+        uncaught -- never silently classified into the dead-letter queue."""
+        ingress = prefix("test", "office", "telegram", "ingress")
+        valid = encode(build("Message", "alice", "telegram", {"text": "reply"}, pod="test", tenant="office"))
+        self.redis.lists[ingress] = [valid]
+
+        def failing_xadd(*args, **kwargs):
+            raise ConnectionError("redis unreachable")
+
+        with patch.object(self.redis, "xadd", side_effect=failing_xadd):
+            with self.assertRaises(ConnectionError):
+                deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+
+        dead = prefix("test", "office", "telegram", "dead")
+        self.assertEqual(self.redis.lists.get(dead, []), [])
+
+    def test_deliver_api_never_logs_the_raw_content_of_a_rejected_envelope(self):
+        """CLASS 1, architect's provenance audit (ticket 51caad5f):
+        parse()'s EnvelopeError messages are constructed in core/envelope.py
+        from whatever the wire said -- _address/_segment interpolate the
+        remote value itself (`{value!r}`) into several of them -- so
+        str(exc) is remote-influenced by construction, exactly like the
+        telegram client and watchdog leaks this ticket cites. Craft a wire
+        frame with a VALID L2 header (parse_for_switch succeeds) but an L3
+        source that fails segment validation, carrying a marker that must
+        never reach the durable custody log deliver_api writes."""
+        valid = encode(build("Message", "alice", "telegram", {"text": "hi"}, pod="test", tenant="office"))
+        header, body = valid[:256], valid[256:]
+        body_dict = json.loads(body)
+        marker = "UNTRUSTED_REMOTE_MARKER_should_never_reach_logs"
+        body_dict["l3"]["source"] = f"test:office:{marker}"
+        tampered = header + json.dumps(body_dict, separators=(",", ":"))
+        ingress = prefix("test", "office", "telegram", "ingress")
+        self.redis.lists[ingress] = [tampered]
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+
+        self.assertNotIn(marker, out.getvalue())
+        dead = prefix("test", "office", "telegram", "dead")
+        self.assertEqual(self.redis.lists[dead], [tampered])
 
     def _tamper_in_reply_to(self, envelope, value):
         """Bypass build()/encode()'s strict validation to simulate an
