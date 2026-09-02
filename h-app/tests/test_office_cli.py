@@ -113,6 +113,15 @@ class FakeRedis:
             self.lists[source_key].remove(raw)
             self.lists[doing_key].append(serialized)
             return [1, "ok"]
+        if "office atomic task rewrite" in script:
+            key = keys[0]
+            raw, serialized = argv
+            try:
+                index = self.lists[key].index(raw)
+            except ValueError:
+                return 0
+            self.lists[key][index] = serialized
+            return 1
         raise AssertionError("unexpected Lua script")
 
     # --- streams (usage) ---
@@ -429,6 +438,112 @@ def test_plain_done_prompts_for_outcome_in_legacy_interactive_guides(monkeypatch
         office_main(["done"])
 
     assert json.loads(r.lists[done_key][0])["outcome"] == "completed"
+
+
+def test_retitle_rewrites_open_ticket_in_place_and_preserves_position(monkeypatch):
+    _env(monkeypatch)
+    r = FakeRedis()
+    todo_key = prefix(POD, TENANT, "architect", "tasks.todo")
+    first = json.dumps(_ticket("architect", task_id="first", title="stale premise"))
+    second = json.dumps(_ticket("architect", task_id="second", title="next work"))
+    r.lists[todo_key].extend([first, second])
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["retitle", "first", "--title", "corrected premise"])
+
+    rewritten = json.loads(r.lists[todo_key][0])
+    assert rewritten["id"] == "first"
+    assert rewritten["title"] == "corrected premise"
+    assert json.loads(r.lists[todo_key][1])["id"] == "second"
+
+
+def test_retitle_records_old_and_new_title_in_both_audit_channels(monkeypatch, tmp_path):
+    _env(monkeypatch)
+    task_record = tmp_path / "tasks.jsonl"
+    window_log = tmp_path / "window.jsonl"
+    monkeypatch.setenv("TASK_RECORD", str(task_record))
+    monkeypatch.setenv("H_MESH_LOG_FILE", str(window_log))
+    monkeypatch.setenv("H_MESH_LOG_QUIET", "1")
+    r = FakeRedis()
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    r.lists[doing_key].append(
+        json.dumps(_ticket("architect", status="doing", title="stale premise"))
+    )
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["retitle", "--title", "corrected premise"])
+
+    task_event = json.loads(task_record.read_text().splitlines()[-1])
+    log_event = json.loads(window_log.read_text().splitlines()[-1])
+    for event in (task_event, log_event):
+        assert event["old_title"] == "stale premise"
+        assert event["title"] == "corrected premise"
+
+
+def test_retitle_preserves_old_title_when_rewrite_fails_before_execution(monkeypatch):
+    _env(monkeypatch)
+    r = FakeRedis()
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    original = json.dumps(_ticket("architect", status="doing", title="stale premise"))
+    r.lists[doing_key].append(original)
+    r.eval = lambda *args: (_ for _ in ()).throw(ConnectionError("injected pre-execution failure"))
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(ConnectionError, match="injected pre-execution failure"):
+            office_main(["retitle", "--title", "corrected premise"])
+
+    assert r.lists[doing_key] == [original]
+
+
+def test_retitle_does_not_edit_closed_ticket(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis()
+    done_key = prefix(POD, TENANT, "architect", "tasks.done")
+    original = json.dumps(_ticket("architect", status="done", title="closed title"))
+    r.lists[done_key].append(original)
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit):
+            office_main(["retitle", "a1b2", "--title", "replacement"])
+
+    assert "no task matches" in capsys.readouterr().err
+    assert r.lists[done_key] == [original]
+
+
+def test_show_prints_full_ticket_without_mutating_board(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis()
+    todo_key = prefix(POD, TENANT, "architect", "tasks.todo")
+    raw = json.dumps(
+        _ticket("architect", description="full constraints and context", priority="high")
+    )
+    r.lists[todo_key].append(raw)
+    before = list(r.lists[todo_key])
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["show", "a1b2"])
+
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["description"] == "full constraints and context"
+    assert r.lists[todo_key] == before
+    assert shown["started_ts"] is None
+
+
+def test_show_can_read_another_enrolled_agents_ticket(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis(registry={"worker": "tmux"})
+    hold_key = prefix(POD, TENANT, "worker", "tasks.hold")
+    raw = json.dumps(
+        _ticket("worker", status="hold", description="waiting on credentials")
+    )
+    r.lists[hold_key].append(raw)
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["show", "a1b2", "-a", "worker"])
+
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["description"] == "waiting on credentials"
+    assert r.lists[hold_key] == [raw]
 
 
 def test_done_writes_outcome_to_both_audit_channels(monkeypatch, tmp_path):

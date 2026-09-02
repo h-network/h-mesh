@@ -554,6 +554,18 @@ redis.call('RPUSH', KEYS[2], ARGV[2])
 return {1, 'ok'}
 """
 
+_ATOMIC_REWRITE = """
+-- office atomic task rewrite v1
+local entries = redis.call('LRANGE', KEYS[1], 0, -1)
+for index, value in ipairs(entries) do
+    if value == ARGV[1] then
+        redis.call('LSET', KEYS[1], index - 1, ARGV[2])
+        return 1
+    end
+end
+return 0
+"""
+
 def _quarantine_invalid(r, *, source_key: str, invalid_key: str, raw) -> None:
     """Atomically preserve an unreadable entry off the actionable queues."""
     _transition_selected(
@@ -602,6 +614,12 @@ def _transition_selected(
     if reason == "busy":
         raise OfficeError("you already have one open task")
     raise OfficeError("task changed while the command was running; try again")
+
+
+def _rewrite_selected(r, *, key: str, raw, ticket: dict) -> None:
+    """Atomically rewrite one exact list entry without changing its position."""
+    if not r.eval(_ATOMIC_REWRITE, 1, key, raw, serialize_ticket(ticket)):
+        raise OfficeError("task changed while the command was running; try again")
 
 
 def _entries(r, keys: dict[str, str], states: Sequence[str]):
@@ -853,6 +871,53 @@ def _return_command(argv: list[str]) -> None:
         "return", id=ticket["id"], title=ticket["title"], agent=source, actor=source
     )
     _log_task("task_returned", agent=source, ticket=ticket)
+    print(serialize_ticket(ticket))
+
+
+def _show_command(argv: list[str]) -> None:
+    parser = _operation_parser("show", "Read one ticket without changing its board state.")
+    parser.add_argument("id", help="ticket id or unique prefix")
+    parser.add_argument("-a", "--agent", metavar="AGENT", help="board owner (default: you)")
+    args = parser.parse_args(argv)
+    r, pod, tenant, source = _context()
+    agent = args.agent or source
+    if agent != source and not is_member(r, pod=pod, tenant=tenant, agent=agent):
+        raise OfficeError(f"unknown board owner {agent!r}")
+    keys = _task_keys(pod, tenant, agent)
+    _, raw, _ = _select(r, keys, ("todo", "doing", "hold", "done"), args.id)
+    print(raw.decode() if isinstance(raw, bytes) else raw)
+
+
+def _retitle_command(argv: list[str]) -> None:
+    parser = _operation_parser("retitle", "Correct the title of your open task.")
+    parser.add_argument("id", nargs="?", help="ticket id or unique prefix")
+    parser.add_argument("--title", required=True, help="replacement title")
+    args = parser.parse_args(argv)
+    title = args.title.strip()
+    if not title:
+        raise OfficeError("replacement title cannot be empty")
+    r, pod, tenant, source = _context()
+    keys = _task_keys(pod, tenant, source)
+    state, raw, ticket = _select(r, keys, ("todo", "doing", "hold"), args.id)
+    old_title = ticket["title"]
+    ticket["title"] = title
+    _rewrite_selected(r, key=keys[state], raw=raw, ticket=ticket)
+    record_task_event(
+        "retitle",
+        id=ticket["id"],
+        title=title,
+        old_title=old_title,
+        agent=source,
+        actor=source,
+    )
+    log_record(
+        "office",
+        "task_retitled",
+        destination=source,
+        task_id=ticket["id"],
+        title=title,
+        old_title=old_title,
+    )
     print(serialize_ticket(ticket))
 
 
@@ -1229,6 +1294,8 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("done",), "finish your open task and record its outcome", _done_command),
     (("cancel",), "cancel your open task", _cancel_command),
     (("return",), "return your open task to todo", _return_command),
+    (("show",), "read one ticket without changing it", _show_command),
+    (("retitle",), "correct the title of your open task", _retitle_command),
     (("hold",), "put your open task on hold", _hold_command),
     (("delete",), "permanently remove a task", _delete_command),
     (("add",), "add a task to another agent's board", _add_command),
