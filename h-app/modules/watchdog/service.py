@@ -419,7 +419,24 @@ class Watchdog:
                 reason=f"lead ingress full: depth {depth} has reached INGRESS_MAX {self.ingress_max}",
             )
             return
-        log_record("watchdog", "lead_alert_sent", stream_id=envelope["stream_id"], destination=lead)
+        # ⚠ ADMITTED, not sent/delivered: this only proves the envelope was
+        # durably written to the lead's ingress list. deliver_tmux has not
+        # been called yet, let alone confirmed -- admission and delivery are
+        # different facts, and this event must not be read as the second one.
+        #
+        # ⚠ No second "attempted"/"delivered" event is logged here on purpose.
+        # deliver_tmux -> core.channels.receive() catches DeadLetter INSIDE
+        # itself (window_missing, unknown kind, opener failure) and returns
+        # normally either way -- a plain "no exception raised" cannot tell
+        # "submit_text ran" apart from "never reached submit_text, dead-
+        # lettered instead." Inventing an `attempted` claim on that signal
+        # would be exactly the ADMITTED-reported-as-CREATED mistake this
+        # rename exists to fix, just moved one line down. The real record of
+        # what happened already exists: `received`/`dead_lettered`/`opened`,
+        # logged by channels.receive() itself under module="tmux", each
+        # backed by an actual distinguishing fact instead of an absence of
+        # exception.
+        log_record("watchdog", "lead_alert_admitted", stream_id=envelope["stream_id"], destination=lead)
         try:
             deliver_tmux(
                 self.r, self.pod, self.tenant, lead,

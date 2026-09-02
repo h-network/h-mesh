@@ -536,7 +536,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(len(r.lists[_key("architect", "ingress")]), 300)
         events = [json.loads(line) for line in out.splitlines()]
         self.assertTrue(any(event.get("event") == "lead_alert_capacity" for event in events))
-        self.assertFalse(any(event.get("event") == "lead_alert_sent" for event in events))
+        self.assertFalse(any(event.get("event") == "lead_alert_admitted" for event in events))
 
     def test_notify_lead_logs_unknown_and_does_not_kick_on_a_redis_fault(self):
         r = FakeRedis(fails_on={"eval": ConnectionError})
@@ -549,7 +549,7 @@ class WatchdogTests(unittest.TestCase):
 
         events = [json.loads(line) for line in out.splitlines()]
         self.assertTrue(any(event.get("event") == "lead_alert_unknown" for event in events))
-        self.assertFalse(any(event.get("event") == "lead_alert_sent" for event in events))
+        self.assertFalse(any(event.get("event") == "lead_alert_admitted" for event in events))
 
     def test_notify_lead_logs_a_record_when_the_lead_is_not_a_registered_agent(self):
         """A dangling `lead` key pointing at a retired agent must not vanish
@@ -570,7 +570,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(no_lead[0]["destination"], "retired-lead")
         self.assertIn("not a registered agent", no_lead[0]["reason"])
         self.assertTrue(no_lead[0].get("stream_id"))
-        self.assertFalse(any(e.get("event") == "lead_alert_sent" for e in events))
+        self.assertFalse(any(e.get("event") == "lead_alert_admitted" for e in events))
 
     def test_notify_lead_logs_a_record_when_the_lead_is_not_a_tmux_agent(self):
         r = FakeRedis()
@@ -588,7 +588,7 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(len(no_lead), 1)
         self.assertEqual(no_lead[0]["destination"], "api")
         self.assertIn("port_type is not tmux", no_lead[0]["reason"])
-        self.assertFalse(any(e.get("event") == "lead_alert_sent" for e in events))
+        self.assertFalse(any(e.get("event") == "lead_alert_admitted" for e in events))
 
     def test_lead_window_missing_dead_letters_with_a_real_record_not_replayed(self):
         """A registered tmux lead whose window is merely missing right now
@@ -611,7 +611,66 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(len(dead_lettered), 1)
         self.assertEqual(dead_lettered[0]["reason"], "window_missing")
         self.assertEqual(dead_lettered[0]["destination"], "architect")
-        self.assertTrue(any(e.get("event") == "lead_alert_sent" for e in events))
+        self.assertTrue(any(e.get("event") == "lead_alert_admitted" for e in events))
+
+    def test_admission_only_logs_as_admitted_never_as_sent_or_delivered(self):
+        """ALLOCATED/ADMITTED/CREATED discipline: at the point admit_ingress
+        succeeds, only ADMITTED (durably queued) is known -- deliver_tmux
+        has not even been called yet, let alone confirmed. The log at that
+        site must not claim more than that, and no other event in the same
+        pass may claim delivery succeeded when it did not.
+
+        Same window-missing scenario as the dead-letter test above -- this
+        one exists specifically to pin the naming/claim discipline, not the
+        dead-letter mechanics."""
+        r = FakeRedis()
+        _doing_agent(r)
+        _lead(r)
+        self._set(service, "run_tmux", _quiet_windows())
+        with patch("modules.tmux.port.list_windows", return_value=set()):
+            out = _capture(lambda: _watchdog(r).poll(now=NOW))
+
+        events = [json.loads(line).get("event") for line in out.splitlines()]
+        self.assertIn("lead_alert_admitted", events)
+        self.assertNotIn("lead_alert_sent", events)
+        self.assertNotIn("lead_alert_delivered", events)
+
+    def test_admission_is_the_only_lead_alert_event_logged_on_success(self):
+        """No second, stronger-sounding event follows a successful
+        deliver_tmux call. deliver_tmux -> core.channels.receive() catches
+        DeadLetter internally and returns normally either way, so "no
+        exception raised" cannot distinguish a real delivery from an
+        internal dead-letter -- there is no honest claim to make beyond
+        ADMITTED at this call site. What actually happened during delivery
+        is already recorded by channels.receive() itself
+        (received/dead_lettered/opened, under module="tmux")."""
+        r = FakeRedis()
+        _doing_agent(r)
+        _lead(r)
+        kicks, fake = _kicks()
+        self._set(service, "run_tmux", _quiet_windows())
+        self._set(service, "deliver_tmux", fake)
+
+        out = _capture(lambda: _watchdog(r).poll(now=NOW))
+
+        events = [json.loads(line).get("event") for line in out.splitlines()]
+        self.assertEqual(
+            [e for e in events if e and e.startswith("lead_alert_")],
+            ["lead_alert_admitted"],
+        )
+
+    def test_admitted_does_not_log_when_the_lead_ingress_is_full(self):
+        r = FakeRedis()
+        _doing_agent(r)
+        _lead(r)
+        r.lists[_key("architect", "ingress")] = ["x"] * 300  # INGRESS_MAX default
+        self._set(service, "run_tmux", _quiet_windows())
+        self._set(service, "deliver_tmux", _no_kick())
+
+        out = _capture(lambda: _watchdog(r).poll(now=NOW))
+
+        events = [json.loads(line).get("event") for line in out.splitlines()]
+        self.assertNotIn("lead_alert_admitted", events)
 
     # -- ack loop -------------------------------------------------------------
 
