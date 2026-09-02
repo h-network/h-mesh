@@ -66,3 +66,8 @@ def prefix(
     if resource is not None:
         parts.append(_validate_resource(resource))
     return ":".join(parts)
+
+
+def delivery_lock_key(pod: str, tenant: str, agent: str) -> str:
+    """Canonical Redis key for one destination's delivery lease."""
+    return prefix(pod, tenant, agent=agent, resource="delivering")

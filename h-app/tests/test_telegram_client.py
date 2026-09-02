@@ -1331,7 +1331,7 @@ def test_hire_full_flow_via_sticky_button_and_text():
         }
 
         reply = bot_instance.handle_text_message(12345, "-")
-        assert "Hire accepted for sme-9" in reply
+        assert reply == "⏳ Hire request admitted for sme-9 · agent creation is not yet confirmed."
         assert 12345 not in bot_instance.pending
         assert mesh.hired == [{"agent": "sme-9", "cli": "claude", "profile": None, "provider": None}]
         assert telegram.sent_messages[-1]["reply_markup"] == {
@@ -1370,7 +1370,10 @@ def test_hire_with_a_profile_and_provider():
         bot_instance.handle_text_message(12345, "work")
         reply = bot_instance.handle_text_message(12345, "gpu-a")
 
-        assert "Hire accepted for sme-9 (profile work, provider gpu-a)" in reply
+        assert reply == (
+            "⏳ Hire request admitted for sme-9 (profile work, provider gpu-a) "
+            "· agent creation is not yet confirmed."
+        )
         assert mesh.hired == [{"agent": "sme-9", "cli": "claude", "profile": "work", "provider": "gpu-a"}]
 
 
@@ -1592,7 +1595,7 @@ def test_hire_completes_when_the_anchor_can_never_be_edited():
         reply = bot_instance.handle_text_message(12345, "-")
 
         assert mesh.hired == [{"agent": "sme-9", "cli": "claude", "profile": None, "provider": None}]
-        assert "Hire accepted for sme-9" in reply
+        assert reply == "⏳ Hire request admitted for sme-9 · agent creation is not yet confirmed."
         assert "12345" not in bot_instance.pending
         # every failed edit fell back to a fresh send, so the operator sees
         # each question as a new message rather than a silent in-place update

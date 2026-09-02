@@ -196,8 +196,10 @@ own (narrower) argparse surface, per office-sme:
   button, that id is the tapped menu message, and editing it in place
   silently dropped the `ForceReply` on the only path an operator actually
   uses. The menu message is left where it is rather than overwritten. A
-  successful hire's result carries a
-  **📋 Copy name** button for the agent name that was just created.
+  A `202` result is labelled **admitted**, not created: it proves the request
+  reached the source egress queue, while downstream lifecycle custody is what
+  proves the agent exists. The admitted result carries a **📋 Copy name**
+  button for the requested agent name.
   ⚠ **No profile picker**: `office profiles` reads Redis directly and has no
   REST equivalent, so this client cannot list valid accounts ahead of time. A
   bad profile name still comes back as a clear `422` — and the api's error
