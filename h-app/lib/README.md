@@ -11,3 +11,4 @@ none of them should own it exclusively, it goes here.
 | `ingress_snapshot.py` | the atomic "drain everything queued" primitive, used by any port's own delivery handler |
 | `board_interaction.py` | centralized board/ticket operations -- `add_ticket` (write an incoming `AddTicket` to a board), `normalize_ticket`/`serialize_ticket` (the one ticket shape every reader/writer of a board entry uses, including `office`'s own board commands) |
 | `attachment_schema.py` | attachment wire/schema limits (size, mime type, base64 validation), shared by any port that delivers attachments |
+| `reply_correlation.py` | `record_delivered`/`was_delivered` -- per-agent, bounded delivery provenance backing opt-in reply correlation. Openers (`modules/tmux/port.py`, `modules/openshell/port.py`) record a delivery; `modules/api/port.py`'s `deliver_api` is the only reader, validating a claimed `in_reply_to` against it before that claim ever reaches a client |

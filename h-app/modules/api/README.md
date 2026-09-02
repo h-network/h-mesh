@@ -66,3 +66,47 @@ regardless of whether anything is queued -- measured at exactly ~10
 `XRANGE`/s per idle stream against a real Redis. This is not addressed
 here; see the commit that added this section for the measurement and why
 it was left alone.
+
+## Reply correlation (`in_reply_to`)
+
+A mailbox message read from `GET /agents/{agent}/messages` (or its SSE
+stream) may carry a top-level `in_reply_to` field: the `stream_id` of the
+envelope it answers. **Absent means genuinely absent, not `null` and not
+`""`** -- a reply that isn't correlated simply doesn't have the key, so
+`"in_reply_to" in message` is the right presence check, not a truthiness
+check on its value.
+
+There are exactly three states, not two, and the third is permanent, not
+transitional:
+
+- **correlated** -- the replying agent passed a real, previously-delivered
+  id (`office send --reply-to STREAM_ID`, or automatically for OpenShell
+  agents, whose reply is generated mechanically from the envelope that
+  triggered it). `in_reply_to` is present and trustworthy.
+- **uncorrelated (the permanent fallback)** -- the replying agent didn't opt
+  in, can't opt in (an older CLI, a route that doesn't go through `office
+  send`), or is talking on a route this feature doesn't cover. `in_reply_to`
+  is absent. This is not a bug and not going away: correlation is opt-in by
+  design (see the design note below), so every client that reads mailbox
+  messages must keep working for this case indefinitely, not treat it as a
+  gap to be closed later.
+- **malformed or unverifiable, dropped before storage** -- a claimed
+  `in_reply_to` that isn't a well-formed 32-character lowercase hex id, or
+  is well-formed but was never actually delivered to the agent claiming to
+  answer it, is stripped by `modules/api/port.py`'s `deliver_api` before the
+  envelope is ever written to a mailbox. This state is never visible on the
+  wire -- from a client's perspective it is indistinguishable from
+  uncorrelated. It exists so a confidently wrong pointer can never reach a
+  client; see `lib/reply_correlation.py` for the validation itself, and its
+  own module docstring for why this key is deliberately not the same one
+  `modules/tmux/port.py`'s `mark_delivery_pending` writes for watchdog.
+
+Design note, in the words of the client this shipped for: **correlated when
+the replying agent passes it, accepted behaviour when not.** An earlier
+design considered inferring correlation automatically from delivery order
+(first-delivered, first-replied); it was rejected because that's exactly
+backwards in the overlapping-turn case that motivated this feature, and a
+fix that only narrows a bug without resolving the case that prompted it is
+worse than an honestly absent field. `office send --reply-to` is exact
+because the replying agent (or OpenShell's automatic reply path) states
+which envelope it means, rather than something else guessing.
