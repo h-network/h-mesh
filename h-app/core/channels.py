@@ -12,7 +12,7 @@ from .envelope import (
     resolve_destination,
     resolve_source,
 )
-from .keys import prefix
+from .keys import prefix, receive_processing_key
 from .logging import emit, log_record
 from .policy import require_allowed
 from .registry import port_type
@@ -40,6 +40,22 @@ if existing then
 end
 redis.call('HSET', KEYS[1], ARGV[1], cjson.encode({count=count, since=since}))
 return count
+"""
+
+_MOVE_PROCESSING_TO_DEAD = """
+-- core receive processing-to-dead v1
+for _, key in ipairs(KEYS) do
+    local kind = redis.call('TYPE', key)['ok']
+    if kind ~= 'none' and kind ~= 'list' then
+        return redis.error_reply('receive custody key is not a list: ' .. key)
+    end
+end
+local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
+if removed ~= 1 then
+    return 0
+end
+redis.call('RPUSH', KEYS[2], ARGV[1])
+return 1
 """
 
 def _unreplied_key(pod: str, tenant: str, agent: str) -> str:
@@ -241,13 +257,21 @@ def _open_received(
     agent: str,
     openers: dict[str, Callable[[dict], None]],
     raw,
+    processing_key: str,
     module: str,
-) -> None:
-    """Parse and open one raw envelope already removed from ingress."""
+) -> bool:
+    """Open one durably claimed raw; return whether it should be acknowledged."""
+    dead_key = prefix(pod, tenant, agent, "dead")
+
+    def dead_letter() -> None:
+        moved = r.eval(_MOVE_PROCESSING_TO_DEAD, 2, processing_key, dead_key, raw)
+        if moved != 1:
+            raise RuntimeError("receive lost ownership before dead-letter handoff")
+
     try:
         envelope = parse(raw)
     except EnvelopeError as exc:
-        r.rpush(prefix(pod, tenant, agent, "dead"), raw)
+        dead_letter()
         # A valid v4 header remains joinable when its corrupt body is rejected
         # here. A malformed header has no trustworthy custody identifiers.
         try:
@@ -255,39 +279,40 @@ def _open_received(
         except EnvelopeError:
             header = {}
         _emit_for_recipient(module, "dead_lettered", header, agent, str(exc))
-        return
+        return False
     _emit_for_recipient(module, "received", envelope, agent)
     opener = openers.get(envelope["kind"])
     if opener is None:
         reason = f"unknown kind: {envelope['kind']}"
-        r.rpush(prefix(pod, tenant, agent, "dead"), raw)
+        dead_letter()
         _emit_for_recipient(module, "dead_lettered", envelope, agent, reason)
         _notify_dead_letter_sender(
             r, pod=pod, tenant=tenant, recipient=agent,
             envelope=envelope, reason=reason, module=module,
         )
-        return
+        return False
     try:
         opener(envelope)
     except DeadLetter as exc:
         reason = str(exc)
-        r.rpush(prefix(pod, tenant, agent, "dead"), raw)
+        dead_letter()
         _emit_for_recipient(module, "dead_lettered", envelope, agent, reason)
         _notify_dead_letter_sender(
             r, pod=pod, tenant=tenant, recipient=agent,
             envelope=envelope, reason=reason, module=module,
         )
-        return
+        return False
     except Exception as exc:
         reason = f"opener failed: {exc}"
-        r.rpush(prefix(pod, tenant, agent, "dead"), raw)
+        dead_letter()
         _emit_for_recipient(module, "dead_lettered", envelope, agent, reason)
         _notify_dead_letter_sender(
             r, pod=pod, tenant=tenant, recipient=agent,
             envelope=envelope, reason=reason, module=module,
         )
-        return
+        return False
     _emit_for_recipient(module, "opened", envelope, agent)
+    return True
 
 
 def receive(
@@ -306,24 +331,38 @@ def receive(
     A switch kick means work is available, not that exactly one queue entry is
     paired with this process. Draining prevents an older entry left by a missed
     or crashed kick from consuming the only attempt for the request behind it.
-    Each envelope is removed immediately before it is opened, so a process
-    failure cannot discard an unprocessed batch.
+    Each envelope moves atomically from ingress to a per-agent processing list
+    before it is opened. A dead process therefore leaves durable work for its
+    successor; a rejected envelope moves from processing to dead in one
+    preflighted Redis execution. Successful external opening is at-least-once:
+    death before acknowledgement can replay it, but cannot erase it.
     """
     ingress_key = prefix(pod, tenant, agent, "ingress")
-    if blocking:
-        item = r.blpop(ingress_key, timeout=timeout)
-        raw = None if item is None else item[1]
-    else:
-        raw = r.lpop(ingress_key)
+    processing_key = receive_processing_key(pod, tenant, agent)
+
+    # Recover a predecessor's claimed raw before admitting newer ingress. The
+    # delivery lease serializes real port processes, so there is one owner of
+    # this per-agent processing head at a time.
+    raw = r.lindex(processing_key, 0)
+    if raw is None:
+        if blocking:
+            raw = r.blmove(ingress_key, processing_key, timeout, "LEFT", "RIGHT")
+        else:
+            raw = r.lmove(ingress_key, processing_key, "LEFT", "RIGHT")
 
     while raw is not None:
-        _open_received(
+        opened = _open_received(
             r,
             pod=pod,
             tenant=tenant,
             agent=agent,
             openers=openers,
             raw=raw,
+            processing_key=processing_key,
             module=module,
         )
-        raw = r.lpop(ingress_key)
+        if opened:
+            removed = r.lrem(processing_key, 1, raw)
+            if removed != 1:
+                raise RuntimeError("receive lost ownership before acknowledgement")
+        raw = r.lmove(ingress_key, processing_key, "LEFT", "RIGHT")

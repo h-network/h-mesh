@@ -43,6 +43,29 @@ class FakeRedis:
     def lpop(self, key):
         return self.lists[key].popleft() if self.lists[key] else None
 
+    def lindex(self, key, index):
+        try:
+            return self.lists[key][index]
+        except IndexError:
+            return None
+
+    def lmove(self, source, destination, src="LEFT", dest="RIGHT"):
+        if not self.lists[source]:
+            return None
+        value = self.lists[source].popleft()
+        self.lists[destination].append(value)
+        return value
+
+    def blmove(self, source, destination, timeout, src="LEFT", dest="RIGHT"):
+        return self.lmove(source, destination, src=src, dest=dest)
+
+    def lrem(self, key, count, value):
+        try:
+            self.lists[key].remove(value)
+        except ValueError:
+            return 0
+        return 1
+
     def llen(self, key):
         return len(self.lists[key])
 
@@ -98,6 +121,13 @@ class FakeRedis:
             if self.kv.get(key) != token:
                 return 0
             self.kv.pop(key, None)
+            return 1
+        if "core receive processing-to-dead" in script:
+            processing, dead = keys
+            raw = argv[0]
+            if self.lrem(processing, 1, raw) != 1:
+                return 0
+            self.rpush(dead, raw)
             return 1
         if "core delivery lock renew" in script:
             key, token = keys[0], argv[0]

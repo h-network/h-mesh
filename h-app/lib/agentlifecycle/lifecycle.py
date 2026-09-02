@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable
 from functools import wraps
 
-from core.keys import SEGMENT_REGEX, prefix
+from core.keys import SEGMENT_REGEX, prefix, receive_processing_key
 from core.dispatch import delivery_lock_key
 from core.logging import log_record
 from core.policy import tags_key
@@ -64,6 +64,10 @@ redis.call('HDEL', KEYS[1], ARGV[1])
 if current_lead == ARGV[1] then
     redis.call('DEL', KEYS[2])
 end
+-- Processing custody belongs to the membership removed at this linearization
+-- point. Keeping this DEL in the same isolated script prevents a later hire
+-- reusing ARGV[1] from having its new claim deleted by predecessor cleanup.
+redis.call('DEL', KEYS[3])
 return 1
 """
 
@@ -463,9 +467,10 @@ def stop_agent(
         committed, "registry row removed and owned lead cleared", "registry/lead removal",
         lambda: r.eval(
             _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
-            2,
+            3,
             registry_key,
             prefix(pod, tenant, resource="lead"),
+            receive_processing_key(pod, tenant, agent),
             agent,
         ),
     )

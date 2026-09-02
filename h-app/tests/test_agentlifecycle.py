@@ -8,7 +8,9 @@ import redis
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core.keys import prefix
+from core.channels import receive
+from core.envelope import build, encode
+from core.keys import prefix, receive_processing_key
 from lib.agentlifecycle.lifecycle import (
     _PUBLISH_LEAD_MEMBERSHIP_LUA,
     _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
@@ -61,22 +63,24 @@ def test_lead_removal_wrongtype_is_no_write(real_redis):
     tenant = f"lua-{uuid4().hex[:12]}"
     lead_key = prefix(POD, tenant, resource="lead")
     registry_key = prefix(POD, tenant, resource="registry")
+    processing_key = receive_processing_key(POD, tenant, "old-lead")
     real_redis.hset(registry_key, "old-lead", "tmux")
     real_redis.hset(lead_key, "wrong", "type")
     try:
         with pytest.raises(redis.ResponseError, match="WRONGTYPE"):
             real_redis.eval(
                 _REMOVE_MEMBERSHIP_AND_OWN_LEAD_LUA,
-                2,
+                3,
                 registry_key,
                 lead_key,
+                processing_key,
                 "old-lead",
             )
 
         assert real_redis.hget(registry_key, "old-lead") == b"tmux"
         assert real_redis.hget(lead_key, "wrong") == b"type"
     finally:
-        real_redis.delete(lead_key, registry_key)
+        real_redis.delete(lead_key, registry_key, processing_key)
 
 
 @patch("lib.agentlifecycle.lifecycle.log_record")
@@ -98,9 +102,10 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
     assert r.method_calls == [
         call.eval(
             ANY,
-            2,
+            3,
             prefix(POD, TENANT, resource="registry"),
             prefix(POD, TENANT, resource="lead"),
+            receive_processing_key(POD, TENANT, "worker-1"),
             "worker-1",
         ),
         call.delete(prefix(POD, TENANT, agent="worker-1", resource="ingress")),
@@ -108,6 +113,46 @@ def test_stop_agent_purges_instance_delivery_state_before_killing_window(
         call.delete(prefix(POD, TENANT, agent="worker-1", resource="delivering")),
     ]
     kill_window.assert_called_once_with("worker-1")
+
+
+def test_stop_and_rehire_cannot_open_predecessor_processing_custody(real_redis):
+    tenant = f"reuse-{uuid4().hex[:12]}"
+    agent = "reused-worker"
+    registry_key = prefix(POD, tenant, resource="registry")
+    processing_key = receive_processing_key(POD, tenant, agent)
+    ingress_key = prefix(POD, tenant, agent=agent, resource="ingress")
+    old = build("Message", "sender", agent, {"text": "predecessor"}, pod=POD, tenant=tenant)
+    new = build("Message", "sender", agent, {"text": "successor"}, pod=POD, tenant=tenant)
+    real_redis.hset(registry_key, agent, "tmux")
+    real_redis.rpush(processing_key, encode(old))
+    try:
+        stop_agent(
+            real_redis,
+            pod=POD,
+            tenant=tenant,
+            envelope={"payload": {"agent": agent}},
+            kill_window=lambda _agent: None,
+        )
+        real_redis.hset(registry_key, agent, "tmux")
+        real_redis.rpush(ingress_key, encode(new))
+        opened = []
+
+        receive(
+            real_redis,
+            pod=POD,
+            tenant=tenant,
+            agent=agent,
+            openers={"Message": opened.append},
+            timeout=0,
+            blocking=False,
+        )
+
+        assert [envelope["stream_id"] for envelope in opened] == [new["stream_id"]]
+        assert old["stream_id"] not in [envelope["stream_id"] for envelope in opened]
+    finally:
+        keys = real_redis.keys(prefix(POD, tenant) + ":*")
+        if keys:
+            real_redis.delete(*keys)
 
 
 @patch("lib.agentlifecycle.lifecycle.log_record")

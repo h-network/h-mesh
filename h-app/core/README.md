@@ -33,10 +33,17 @@ Kicked ports do not inherit the switch's structured stdout: their custody
 records return over a dedicated validated pipe, while arbitrary stdout/stderr
 and crash tracebacks go to `ports.log` beside the daemon logs.
 For tmux, office, and openshell ports, one kick drains ingress until empty,
-removing and opening one envelope at a time. Kicks are availability hints, not
+atomically claiming one envelope at a time into the participant's durable
+`processing` list before opening it. Successful opening acknowledges the claim;
+rejection moves it directly from `processing` to `dead` after validating both
+Redis key types. A killed worker leaves its claimed identity in `processing`,
+and its successor recovers that identity before newer ingress. This provides
+at-least-once external opening: a death after the external effect but before
+acknowledgement may replay it, while no death can make the envelope disappear.
+Kicks are availability hints, not
 tokens paired one-to-one with envelopes: an older entry left by a missed or
 crashed kick therefore cannot consume the only attempt for the request behind
-it, while an opener crash leaves every not-yet-popped envelope queued.
+it, while an opener crash leaves every not-yet-claimed envelope queued.
 Broadcast fan-out reads one registry snapshot containing both participant names
 and port types, admits every recipient atomically, then starts each recipient's
 delivery port. Each resolvable recipient therefore records `kick_started` or

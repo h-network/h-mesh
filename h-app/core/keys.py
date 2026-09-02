@@ -71,3 +71,8 @@ def prefix(
 def delivery_lock_key(pod: str, tenant: str, agent: str) -> str:
     """Canonical Redis key for one destination's delivery lease."""
     return prefix(pod, tenant, agent=agent, resource="delivering")
+
+
+def receive_processing_key(pod: str, tenant: str, agent: str) -> str:
+    """Canonical Redis key for one destination's durably claimed envelope."""
+    return prefix(pod, tenant, agent=agent, resource="processing")
