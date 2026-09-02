@@ -162,6 +162,9 @@ You have a task board. Nothing will notify you about it — check it yourself:
                       when ordinary work is finished; use passed or failed
                       for a review verdict
     {cmd} return      put the open ticket back in todo without cancelling it
+    {cmd} show ID     read a ticket in full without taking or changing it
+    {cmd} retitle --title TEXT [ID]
+                      correct your own open ticket without changing its identity
 
 Take a ticket *before* you start work, not after. `doing` is how the office
 knows what you are on.
