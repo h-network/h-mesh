@@ -305,6 +305,65 @@ class ApiTests(unittest.TestCase):
         stored = json.loads(self.redis.streams[inbox][0][1]["envelope"])
         self.assertNotIn("in_reply_to", stored)
 
+    def test_deliver_api_drops_a_peer_tmux_originated_id_toward_any_api_client(self):
+        # The second direction of the cross-client fix, distinct from the
+        # test above: `target` was never sent by ANY api client -- alice
+        # sent it to bob, tmux-to-tmux, entirely off the api door's radar.
+        # bob must not be able to launder that peer message into a
+        # validated correlation by naming it in a reply to telegram (or any
+        # other api client). This is not "wrong client", it's "no client at
+        # all originated it" -- a distinct case from the one above, and the
+        # one this fix is most likely to have missed if the binding were
+        # only checked against a specific known-wrong client rather than
+        # against the true recorded source in general.
+        from lib.reply_correlation import record_delivered
+
+        target = "e" * 32
+        record_delivered(self.redis, pod="test", tenant="office", agent="bob", stream_id=target, source="alice")
+        ingress = prefix("test", "office", "telegram", "ingress")
+        envelope = build(
+            "Message", "bob", "telegram", {"text": "reply"},
+            pod="test", tenant="office", in_reply_to=target,
+        )
+        self.redis.lists[ingress] = [encode(envelope)]
+
+        deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+
+        inbox = prefix("test", "office", "telegram", "inbox")
+        stored = json.loads(self.redis.streams[inbox][0][1]["envelope"])
+        self.assertNotIn("in_reply_to", stored)
+
+    def test_real_tmux_delivery_then_deliver_api_rejects_peer_originated_correlation(self):
+        # Same case as above, but through the actual delivery path rather
+        # than calling record_delivered directly -- removes any doubt that
+        # this only holds because the unit test constructed the provenance
+        # record by hand rather than the way message_opener really would.
+        from unittest.mock import MagicMock
+        from modules.tmux.port import message_opener
+
+        target = send(
+            self.redis, pod="test", tenant="office", source="alice",
+            destination="bob", payload={"text": "peer message"},
+        )
+        raw = self.redis.lpop(prefix("test", "office", "alice", "egress"))
+        envelope = parse(raw)
+        with patch("modules.tmux.port.list_windows", return_value={"bob"}), \
+             patch("modules.tmux.port.submit_text"):
+            message_opener(self.redis, "test", "office", "bob", envelope, "sess", socket=None)
+
+        reply_ingress = prefix("test", "office", "telegram", "ingress")
+        reply_envelope = build(
+            "Message", "bob", "telegram", {"text": "claiming the peer message"},
+            pod="test", tenant="office", in_reply_to=target,
+        )
+        self.redis.lists[reply_ingress] = [encode(reply_envelope)]
+
+        deliver_api(r=self.redis, pod="test", tenant="office", agent="telegram")
+
+        inbox = prefix("test", "office", "telegram", "inbox")
+        stored = json.loads(self.redis.streams[inbox][0][1]["envelope"])
+        self.assertNotIn("in_reply_to", stored)
+
     def test_deliver_api_drops_malformed_in_reply_to(self):
         ingress = prefix("test", "office", "telegram", "ingress")
         envelope = build("Message", "alice", "telegram", {"text": "reply"}, pod="test", tenant="office")
