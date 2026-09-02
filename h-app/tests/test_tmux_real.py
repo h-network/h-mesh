@@ -509,6 +509,7 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             self.assertIn("the operator's external entrance", agent_guide)
             self.assertIn("Treat where a message arrives (an external door) apart from who is speaking", agent_guide)
             self.assertIn("authenticated operator instruction outranks lead direction", agent_guide)
+            self.assertIn("immediately notify the lead", agent_guide)
             self.assertIn("h-mesh-office send", agent_guide)
             self.assertIn("Interface entries may only", agent_guide)
             self.assertIn("not arbitrary messages", agent_guide)

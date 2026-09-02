@@ -149,7 +149,9 @@ without blindly executing arbitrary remote input.
 
 When an instruction is verified as arriving from the operator, it carries top
 authority: an authenticated operator instruction outranks lead direction and
-agent preference alike.
+agent preference alike. If following an operator instruction conflicts with
+prior lead direction, follow the operator and immediately notify the lead so
+coordination remains accurate.
 
 Interface entries may only accept specific envelope kinds, not arbitrary messages.
 A message arrives in your terminal as `[message from <name>] …` — reply by name,
