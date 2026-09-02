@@ -108,6 +108,7 @@ never partial.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import select
@@ -539,43 +540,131 @@ def _open_verified_directory_fd(path: Path) -> tuple[int, os.stat_result] | None
     return fd, st
 
 
-def _remove_tree_via_fd(dir_fd: int) -> None:
+def _remove_tree_via_fd(dir_fd: int, log=print) -> bool:
     """Recursively remove everything reachable from `dir_fd`, entirely
     through `os.*at()`-style fd-relative calls (`dir_fd=...`) -- never by
     re-resolving a pathname from the top. Does NOT remove `dir_fd`'s own
     directory entry; a directory cannot rmdir itself, the caller does that
-    via the PARENT's fd once this returns. Best-effort per-entry (a
-    concurrent reaper's own idempotent pass over the same genuinely-dead
-    tree is expected, per this module's own concurrency contract) -- an
-    OSError on any one entry is caught and skipped rather than aborting
-    the whole walk."""
+    via the PARENT's fd once this returns.
+
+    ⚠ REVIEWER BLOCKING FAIL, 2026-09-02: an earlier version caught and
+    silently discarded every error at every level (`listdir`, `stat`,
+    child `open`, `unlink`, `rmdir`) and returned nothing -- the caller had
+    no way to know whether the tree was actually fully removed, and went
+    on to report success regardless. "Cleanup becoming hiding": a
+    permission error, an unexpected I/O error, or a concurrent mutation
+    could leave part of the tree behind while the manifest entry -- the
+    only surviving record of it -- got cleared anyway. Returns `True` ONLY
+    if every entry was confirmed removed (or was confirmed already gone,
+    `FileNotFoundError` specifically -- the same "confirmed absent, not
+    merely unreadable" distinction as `_pid_confirmed_gone`); `False` if
+    anything could not be removed, and the caller MUST treat that as "stop,
+    do not finalize, leave this stuck and visible" rather than assume the
+    directory is actually empty.
+
+    Each child directory's removal also re-verifies, via a fresh
+    `os.stat(name, dir_fd=dir_fd)` immediately before its own `rmdir`, that
+    the name still identifies the SAME inode this function just finished
+    recursing into and emptying -- narrowing (not eliminating; see
+    `_fd_safe_remove_owned_tmpdir`'s own docstring on the residual) the
+    window for a concurrent same-uid rename to substitute a different
+    directory into that name while this was still working underneath it.
+
+    ⚠ A KNOWN, BENIGN, RECURRING CAUSE OF "Directory not empty" specifically
+    (`errno.ENOTEMPTY`) on this rmdir, found the same day this
+    error-propagation fix landed and worth naming explicitly rather than
+    re-derived by whoever sees it next: a test tmux pane's fake-agent shell
+    (`bash -il`) survives its own tmux SERVER being killed -- SIGKILLing
+    the server does not SIGKILL its child shell, the kernel delivers SIGHUP
+    to the pty's foreground process instead, and that shell's own
+    SIGHUP-triggered exit sequence can write a fresh `.bash_history` a few
+    milliseconds AFTER this function's own recursive pass already found
+    that directory empty, landing in the gap before the parent's `rmdir`
+    call. This is not a defect in this deletion logic -- it is a real race
+    this fix made OBSERVABLE for the first time (the previous,
+    error-swallowing version silently hid it, the exact "cleanup becoming
+    hiding" shape this whole fix exists to close) rather than one this fix
+    introduced. Architect's explicit call: do not add a settle/retry here
+    to paper over it -- a timeout against an unbounded event (how long a
+    shell takes to flush history under load) is a fail-open path wearing a
+    fail-closed appearance, the same class removed elsewhere tonight, and
+    it would be indistinguishable at this layer from a directory that is
+    genuinely, permanently not empty. The correct behavior is exactly what
+    already happens: detected, retained (not falsely reported clean),
+    counted stuck with this reason, and cleanly reaped on the NEXT session
+    once the shell's own SIGHUP handling has finished -- self-resolving by
+    design, not a bug needing a fix at this layer.
+    """
+    ok = True
     try:
         names = os.listdir(dir_fd)
-    except OSError:
-        return
+    except OSError as exc:
+        log(f"  • could not list directory contents ({exc}) -- treating as incomplete")
+        return False
     for name in names:
         try:
             entry_st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-        except OSError:
+        except FileNotFoundError:
+            continue  # confirmed already gone -- a concurrent idempotent pass, fine
+        except OSError as exc:
+            log(f"  • could not stat {name!r} ({exc}) -- treating as incomplete")
+            ok = False
             continue
         if stat.S_ISDIR(entry_st.st_mode):
             try:
                 child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
-            except OSError:
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                log(f"  • could not open child directory {name!r} ({exc}) -- treating as incomplete")
+                ok = False
                 continue
             try:
-                _remove_tree_via_fd(child_fd)
+                child_st = os.fstat(child_fd)
+                if (child_st.st_dev, child_st.st_ino) != (entry_st.st_dev, entry_st.st_ino):
+                    log(f"  • {name!r} changed between stat and open -- not descending, treating as incomplete")
+                    ok = False
+                    continue
+                if not _remove_tree_via_fd(child_fd, log=log):
+                    ok = False
+                    continue
             finally:
                 os.close(child_fd)
             try:
+                recheck_st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                log(f"  • could not re-verify {name!r} before removing it ({exc}) -- treating as incomplete")
+                ok = False
+                continue
+            if (recheck_st.st_dev, recheck_st.st_ino) != (entry_st.st_dev, entry_st.st_ino):
+                log(f"  • {name!r} no longer identifies the directory just emptied -- not removing it")
+                ok = False
+                continue
+            try:
                 os.rmdir(name, dir_fd=dir_fd)
-            except OSError:
-                pass
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                hint = ""
+                if getattr(exc, "errno", None) == errno.ENOTEMPTY:
+                    hint = (
+                        " -- KNOWN BENIGN CLASS: a killed tmux pane's shell can flush "
+                        "history via SIGHUP after the server itself is confirmed dead; "
+                        "see this function's own docstring. Retries cleanly next session."
+                    )
+                log(f"  • could not remove directory {name!r} ({exc}){hint} -- treating as incomplete")
+                ok = False
         else:
             try:
                 os.unlink(name, dir_fd=dir_fd)
-            except OSError:
-                pass
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                log(f"  • could not remove {name!r} ({exc}) -- treating as incomplete")
+                ok = False
+    return ok
 
 
 def _fd_safe_remove_owned_tmpdir(tmpdir: Path, log=print) -> bool:
@@ -598,20 +687,33 @@ def _fd_safe_remove_owned_tmpdir(tmpdir: Path, log=print) -> bool:
     shared box, same-uid concurrency is not a hypothetical, it is the
     actual deployment model.
 
-    Fixed by binding the entire deletion to one inode: open with
+    Fixed by binding the TOP-LEVEL deletion to one inode: open with
     `O_NOFOLLOW` (refuses a symlink substituted in), confirm the
     freshly-opened fd's own `fstat` is still a real directory owned by this
-    uid, then walk and delete everything beneath it entirely through
-    `*at()`-family calls relative to that fd -- never by re-resolving a
-    name from `/tmp` downward for anything under the top level. The one
-    step that cannot be fd-relative -- removing `tmpdir`'s own directory
-    entry, since a directory cannot rmdir itself and the PARENT's fd + name
-    must be used -- re-verifies the name still refers to the SAME inode
-    immediately before that single syscall. That final gap (between the
-    re-check and the syscall) is the narrowest this can be reduced to
-    without the kernel offering an atomic "remove this exact inode,
-    wherever its name currently points" primitive; stated here rather than
-    implied closed.
+    uid, then walk and delete everything beneath it via `os.*at()`-family
+    calls relative to that fd rather than re-resolving a name from `/tmp`
+    downward. This is the fix for the arbitrary-tree escape specifically:
+    traversal is CONFINED beneath the opened root fd, full stop -- nothing
+    reachable from here can redirect outside the validated tree.
+
+    ⚠ NARROWER CLAIM THAN "everything is inode-bound," per reviewer's
+    follow-up: descending through the fd confines WHERE deletion can reach,
+    it does not by itself bind every individual descendant ACTION to the
+    inode inspected for it. `_remove_tree_via_fd` adds an explicit
+    inode-recheck immediately before each child DIRECTORY's own `rmdir`
+    (narrows, does not eliminate, the same class of gap this function's
+    own final step has). A leaf (non-directory) entry gets a plain
+    stat-then-unlink by name -- POSIX has no fd-bound unlink, so there is
+    no stronger primitive available for that case; concurrent replacement
+    of a single file within the already-confined, owned tree remains
+    possible, and it says so rather than implying otherwise. The one step
+    that cannot be fd-relative at all -- removing `tmpdir`'s own top-level
+    directory entry, since a directory cannot rmdir itself and the
+    PARENT's fd + name must be used -- gets the same recheck-immediately-
+    before-the-syscall treatment. Every one of these final gaps (between a
+    recheck and its syscall) is the narrowest achievable without the
+    kernel offering an atomic "remove this exact inode, wherever its name
+    currently points" primitive; stated here rather than implied closed.
     """
     verified = _open_verified_directory_fd(tmpdir)
     if verified is None:
@@ -619,9 +721,12 @@ def _fd_safe_remove_owned_tmpdir(tmpdir: Path, log=print) -> bool:
         return False
     dir_fd, expected_st = verified
     try:
-        _remove_tree_via_fd(dir_fd)
+        contents_removed = _remove_tree_via_fd(dir_fd, log=log)
     finally:
         os.close(dir_fd)
+    if not contents_removed:
+        log(f"  • STUCK, leaving {tmpdir}: contents were not fully removed -- not attempting to remove the directory itself")
+        return False
 
     return _finalize_directory_removal(tmpdir, expected_st, log=log)
 
@@ -640,26 +745,46 @@ def _finalize_directory_removal(tmpdir: Path, expected_st: os.stat_result, log=p
     same-uid process renamed the original away and renamed a different,
     real directory into this exact name in the meantime, this refuses
     rather than remove the substitute.
+
+    ⚠ REVIEWER BLOCKING FAIL, 2026-09-02: an earlier version caught EVERY
+    `OSError` from the pre-check stat and from the final `rmdir` itself and
+    returned `True` regardless -- so a permission error, the directory
+    turning out non-empty (contents that failed to remove upstream), or
+    any other real failure at the FINAL syscall was reported as success.
+    `reap_all_orphans` then unlinked the manifest entry -- the only
+    surviving record -- while the directory could still be sitting there
+    on disk: cleanup silently becoming hiding. Only a CONFIRMED-gone
+    pre-check stat (`FileNotFoundError` specifically -- the same
+    "confirmed absent, not merely unreadable" distinction used elsewhere in
+    this module) is treated as the safe "already removed" case; every
+    other stat failure, and any failure from the `rmdir` call itself, now
+    returns `False` and is logged, not swallowed.
     """
     try:
         parent_fd = os.open(str(_OWNED_ROOT), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-    except OSError:
-        log(f"  • STUCK, leaving {tmpdir}: could not open {_OWNED_ROOT} to remove its own directory entry")
+    except OSError as exc:
+        log(f"  • STUCK, leaving {tmpdir}: could not open {_OWNED_ROOT} to remove its own directory entry ({exc})")
         return False
     try:
         try:
             current_st = os.stat(tmpdir.name, dir_fd=parent_fd, follow_symlinks=False)
-        except OSError:
-            # Already gone -- a concurrent reaper finished this same,
-            # genuinely dead entry first; idempotent, not an error.
+        except FileNotFoundError:
+            # Confirmed already gone -- a concurrent reaper finished this
+            # same, genuinely dead entry first; idempotent, not an error.
             return True
+        except OSError as exc:
+            log(f"  • STUCK, leaving {tmpdir}: could not stat it before the final removal ({exc})")
+            return False
         if (current_st.st_dev, current_st.st_ino) != (expected_st.st_dev, expected_st.st_ino):
             log(f"  • STUCK, leaving {tmpdir}: the name now refers to a different inode than the one just emptied -- not removing it")
             return False
         try:
             os.rmdir(tmpdir.name, dir_fd=parent_fd)
-        except OSError:
-            pass
+        except FileNotFoundError:
+            return True  # confirmed already gone, e.g. a concurrent reaper won the race
+        except OSError as exc:
+            log(f"  • STUCK, leaving {tmpdir}: final rmdir failed ({exc}) -- NOT reporting success")
+            return False
         return True
     finally:
         os.close(parent_fd)

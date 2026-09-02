@@ -14,6 +14,7 @@ DIFFERENT process (this test's own), matching how it actually runs in
 practice: at the start of the NEXT pytest session, not the one that died.
 """
 
+import errno
 import json
 import os
 import shutil
@@ -869,4 +870,145 @@ def test_an_unreadable_but_not_confirmed_gone_pid_is_unverifiable_not_stale(monk
             f"an ambiguous (not confirmed-gone) read classified as {outcome!r} instead of unverifiable"
         )
     finally:
+        shutil.rmtree(real_tmpdir, ignore_errors=True)
+
+
+def test_a_failed_nested_removal_does_not_report_success_or_lose_content(monkeypatch):
+    """Reviewer's finding: _remove_tree_via_fd used to catch and discard
+    every error at every level (listdir, stat, child open, unlink, rmdir)
+    and return nothing -- so a permission error, an unexpected I/O error,
+    or a concurrent mutation deep in the tree could leave part of it
+    behind while the caller went on to report success anyway. "Cleanup
+    becoming hiding": the only surviving record (the manifest entry) would
+    get cleared while real content survived, invisible from a bare
+    directory-existence check. Proves the fix directly on the function
+    that actually walks the tree: a nested file that cannot be removed
+    makes the whole removal report failure, and the file survives."""
+    import _leak_manifest
+
+    real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_failed_unlink_")
+    subdir = real_tmpdir / "subdir"
+    subdir.mkdir()
+    leaf = subdir / "leaf.txt"
+    leaf.write_text("must survive a failed removal")
+
+    real_unlink = os.unlink
+
+    def failing_unlink(*args, **kwargs):
+        raise PermissionError("simulated: cannot remove this entry")
+
+    monkeypatch.setattr(_leak_manifest.os, "unlink", failing_unlink)
+
+    try:
+        result = _leak_manifest._fd_safe_remove_owned_tmpdir(real_tmpdir, log=lambda *_: None)
+
+        assert result is False, "a failed nested unlink was reported as successful removal"
+        assert real_tmpdir.exists(), "the tmpdir was removed despite a failed nested unlink"
+        assert leaf.exists(), "content that failed to unlink was lost anyway"
+    finally:
+        monkeypatch.setattr(_leak_manifest.os, "unlink", real_unlink)
+        shutil.rmtree(real_tmpdir, ignore_errors=True)
+
+
+def test_a_failed_top_level_rmdir_does_not_report_success_or_lose_the_directory(monkeypatch):
+    """Reviewer's finding, mirror of the one above at the top level:
+    _finalize_directory_removal used to catch every OSError from the final
+    os.rmdir and return True regardless -- so a permission error, or the
+    directory turning out non-empty because contents failed to remove
+    upstream, was reported as success, and the manifest entry (the only
+    surviving record) got cleared while the directory itself was still
+    there. Proves the fix directly: a failing top-level rmdir makes the
+    whole operation report failure, and the directory survives."""
+    import _leak_manifest
+    from _leak_manifest import _finalize_directory_removal, _open_verified_directory_fd
+
+    real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_failed_rmdir_")
+    verified = _open_verified_directory_fd(real_tmpdir)
+    assert verified is not None, "test setup: could not open/verify the directory"
+    fd, st = verified
+    os.close(fd)
+
+    real_rmdir = os.rmdir
+
+    def failing_rmdir(*args, **kwargs):
+        raise PermissionError("simulated: cannot remove this directory")
+
+    monkeypatch.setattr(_leak_manifest.os, "rmdir", failing_rmdir)
+
+    try:
+        result = _finalize_directory_removal(real_tmpdir, st, log=lambda *_: None)
+
+        assert result is False, "a failed top-level rmdir was reported as successful removal"
+        assert real_tmpdir.exists(), "the directory was removed despite a failed rmdir call"
+    finally:
+        monkeypatch.setattr(_leak_manifest.os, "rmdir", real_rmdir)
+        shutil.rmtree(real_tmpdir, ignore_errors=True)
+
+
+def test_a_transient_nonempty_directory_is_stuck_then_cleanly_reaped_next_session(monkeypatch):
+    """Architect's explicit ask, following the ENOTEMPTY investigation:
+    the stuck-then-reaped-next-session cycle IS the mechanism now (not a
+    settle/retry, which would be a fail-open timeout against an unbounded
+    event -- see this behavior's own known-benign-class documentation in
+    _remove_tree_via_fd). Proves the full cycle deterministically, the
+    same structural-proof-over-race precedent as the earlier TOCTOU test:
+    a monkeypatched os.rmdir simulates something writing a new file into a
+    subdirectory exactly once (matching a killed pane's shell finishing
+    its SIGHUP-triggered history flush a few milliseconds late), then
+    behaves normally on every later call -- so the FIRST reap attempt must
+    leave the entry stuck with surviving content, and a SECOND, later
+    attempt (nothing new races the second time) must fully reap it."""
+    import _leak_manifest
+
+    real_tmpdir = _owned_scratch_tmpdir("h_mesh_test_leak_harm_transient_race_")
+    subdir = real_tmpdir / "home"
+    subdir.mkdir()
+
+    dead_owner = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_owner.wait()
+    entry = register(str(real_tmpdir))
+    data = json.loads(entry.read_text())
+    data["owner_pid"] = dead_owner.pid
+    data["owner_start_time"] = "0"
+    entry.write_text(json.dumps(data))
+
+    real_rmdir = os.rmdir
+    raced_once = {"done": False}
+
+    def racing_rmdir(name, *args, dir_fd=None, **kwargs):
+        if not raced_once["done"] and name == "home":
+            raced_once["done"] = True
+            # Simulate a process still writing into this directory a few
+            # milliseconds after it was found empty -- exactly the shape
+            # of a killed pane's shell finishing its SIGHUP-triggered
+            # history flush. Open "home" itself (not its parent, which is
+            # what dir_fd refers to here) to create the file INSIDE it.
+            home_fd = os.open(name, os.O_DIRECTORY, dir_fd=dir_fd)
+            try:
+                fd = os.open("race-injected.txt", os.O_CREAT | os.O_WRONLY, dir_fd=home_fd)
+                os.close(fd)
+            finally:
+                os.close(home_fd)
+            raise OSError(errno.ENOTEMPTY, "Directory not empty", name)
+        return real_rmdir(name, *args, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(_leak_manifest.os, "rmdir", racing_rmdir)
+
+    try:
+        reaped_1, stuck_1 = reap_all_orphans(log=lambda *_: None)
+        assert reaped_1 == 0, "the raced entry was reaped on the first attempt anyway"
+        assert stuck_1 == 1, "the raced entry was not counted stuck on the first attempt"
+        assert real_tmpdir.exists(), "the tmpdir was removed despite the transient race"
+        assert (subdir / "race-injected.txt").exists(), "the injected content was lost anyway"
+        assert entry.exists(), "the manifest entry was cleared despite the transient race"
+
+        # Second attempt, later "session" -- nothing races this time.
+        reaped_2, stuck_2 = reap_all_orphans(log=lambda *_: None)
+        assert reaped_2 == 1, "the entry was not cleanly reaped once the race had passed"
+        assert stuck_2 == 0
+        assert not real_tmpdir.exists(), "the tmpdir survived the second, unraced attempt"
+        assert not entry.exists(), "the manifest entry survived the second, unraced attempt"
+    finally:
+        monkeypatch.setattr(_leak_manifest.os, "rmdir", real_rmdir)
+        entry.unlink(missing_ok=True)
         shutil.rmtree(real_tmpdir, ignore_errors=True)
