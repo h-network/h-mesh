@@ -212,6 +212,8 @@ h-app/tests/test_core_primitives.py::QueueTests::test_rejects_empty_destinations
 h-app/tests/test_daemons.py::test_start_daemons_then_stop_daemons_cleanly
 h-app/tests/test_daemons.py::test_start_daemons_is_duplicate_safe_against_an_already_running_pair
 h-app/tests/test_daemons.py::test_stop_daemons_removes_stale_pidfile_without_error
+h-app/tests/test_daemons.py::test_stop_daemons_survives_a_pidfile_vanishing_mid_read
+h-app/tests/test_daemons.py::test_stop_daemons_distinguishes_a_corrupt_pidfile_from_an_absent_one
 h-app/tests/test_daemons.py::test_stop_daemons_does_not_signal_an_unrelated_live_process
 h-app/tests/test_daemons.py::test_legacy_daemon_is_authenticated_then_stopped_during_first_upgrade
 h-app/tests/test_daemons.py::test_stop_daemons_fails_closed_when_process_identity_cannot_be_read
