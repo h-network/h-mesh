@@ -51,10 +51,10 @@ That visibility depends on the reader as well as the stored record. h-mesh
 stores `hold_reason` and its CLI renders it, but a reader running an older CLI
 can show the ticket's held state, title, and age without showing the reason.
 A guarantee that depends on what the reader is running is not a guarantee
-about the record. In a mixed-version office, communicate the reason through a
-channel every intended reader can consume until their CLI deployment supports
-it; otherwise the work is visibly parked but its explanation is effectively
-hidden.
+about what every intended reader can observe. In a mixed-version office,
+communicate the reason through a channel every intended reader can consume
+until their CLI deployment supports it; otherwise the work is visibly parked
+but its explanation is effectively hidden.
 
 Use `office return [ID]` to put work back in `todo`; `cancel` remains a terminal,
 auditable state and `delete` is the explicit permanent-removal operation.
