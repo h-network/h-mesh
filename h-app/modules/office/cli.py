@@ -571,11 +571,12 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
         # writes a signal tying a *successful* StartAgent back to the
         # specific stream_id that caused it, for either case -- so
         # neither can be safely confirmed, only proven failed or left
-        # unknown. See held ticket 74f1edf3 for the attributable-completion
-        # signal (success AND failure, keyed by stream_id, covering both
-        # operations) this would need to safely report a real success --
-        # 1s/5s make the cost of checking bearable, they do not make
-        # success provable.
+        # unknown. Safely reporting a real success needs a stream-id-keyed
+        # attributable-completion signal (both success AND failure, and
+        # covering identity-creation and idempotent-reconfiguration
+        # separately) that nothing in this codebase writes today -- 1s/5s
+        # make the cost of checking bearable, they do not make success
+        # provable.
         parser.add_argument(
             "--wait", nargs="?", const=5.0, type=_wait_seconds, default=None, metavar="SECONDS",
             help="wait up to SECONDS (default 5; a bare hire with no --wait at all "
