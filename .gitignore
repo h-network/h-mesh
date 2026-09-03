@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 *.egg-info/
 .venv/
+
+# Per-office deployment config and secrets (container/bootstrap.sh writes
+# these; container/.env.example is the only tracked file in this area).
+offices/
+container/.env

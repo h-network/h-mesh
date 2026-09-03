@@ -1,12 +1,25 @@
-# Brings up one h-mesh tenant. One container is one pod/tenant -- Redis,
-# every h-mesh daemon, and every hired agent's tmux pane live inside it;
-# reaching a different tenant means running a different container, not a
-# flag on this one.
+# Brings up one h-mesh office (one pod/tenant) -- Redis, every h-mesh
+# daemon, and every hired agent's tmux pane live inside it; reaching a
+# different office means running a different container, not a flag on
+# this one.
 #
-#   cd container && cp .env.example .env   # edit POD/TENANT/AGENTS/API_TOKEN
-#   docker compose -f container/compose.yaml --env-file container/.env up -d --build
-#   docker compose -f container/compose.yaml --env-file container/.env down       # keeps the state volume
-#   docker compose -f container/compose.yaml --env-file container/.env down -v    # also drops it
+# Use ./setup.sh --container (or container/bootstrap.sh directly), not this
+# file by hand -- it resolves each office to its own
+# offices/<pod>/<tenant>/.env and always passes an explicit
+# `-p h-mesh-<pod>-<tenant>` project name. Compose's own default project
+# name is the containing folder's name ("container"), identical for every
+# checkout regardless of pod/tenant -- two offices (or two checkouts of
+# this repo) sharing a host WILL collide on that default and one `up`
+# silently recreates the other's live office. Measured live, not
+# theorized. If you drive this file directly anyway (advanced/testing),
+# always pass your own `-p`:
+#
+#   docker compose -p h-mesh-<pod>-<tenant> -f container/compose.yaml \
+#     --env-file offices/<pod>/<tenant>/.env up -d --build
+#   docker compose -p h-mesh-<pod>-<tenant> -f container/compose.yaml \
+#     --env-file offices/<pod>/<tenant>/.env down       # keeps the state volume
+#   docker compose -p h-mesh-<pod>-<tenant> -f container/compose.yaml \
+#     --env-file offices/<pod>/<tenant>/.env down -v    # also drops it
 services:
   h-mesh:
     build:

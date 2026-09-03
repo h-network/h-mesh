@@ -132,42 +132,73 @@ local session history. Pass `--resume` to opt into restoring prior history.
 ## Container
 
 `container/Dockerfile` and `container/compose.yaml` are the supported way to
-run h-mesh entirely in Docker -- one container per pod/tenant, nothing
-assumed to exist outside the image. The container's `entrypoint.sh` starts
-Redis (loopback-only, AOF-persisted under the state volume) and then calls
-this same `setup.sh --non-interactive` -- the roster, hire, and daemon-start
-steps are exactly the ones described above, not a separate implementation.
+run h-mesh entirely in Docker -- one container per office (pod/tenant),
+nothing assumed to exist outside the image. The container's `entrypoint.sh`
+starts Redis (loopback-only, AOF-persisted under a state volume) and then
+calls this same `setup.sh --non-interactive` -- the roster, hire, and
+daemon-start steps are exactly the ones described above, not a separate
+implementation.
 
 ```bash
-cd container
-cp .env.example .env   # set POD/TENANT/AGENTS/CLAUDE_OAUTH_TOKEN_DEFAULT/...
-docker compose -f compose.yaml --env-file .env up -d --build
+./setup.sh --container                          # interactive wizard, at a terminal
+./setup.sh --container --non-interactive         # scripted, flags/env only (or H_MESH_INSTALL_MODE=container ./setup.sh)
 ```
 
-Every non-interactive env var above (`AGENTS`, `DEFAULT_CLI`, `ACCOUNTS`,
-`AGENT_CLIS`/`AGENT_PROFILES`/`AGENT_PROVIDERS`, `CLAUDE_OAUTH_TOKEN_<PROFILE>`,
-`PROVIDER_LOCAL_*`, `TELEGRAM_*`, `API_TOKEN`) applies unchanged -- set them in
-`container/.env`, not on the image. `API_PORT`/`SESSION_PORT` choose the
-**host** side of the port mapping only; the api and session doors always bind
-`0.0.0.0:8080`/`0.0.0.0:8081` inside the container (see the Dockerfile's own
-comment on why), so publishing them is compose's decision, not the process's.
-As on a bare host, the api/session/Telegram-bot daemons only start once
-`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are both set -- but because
-those doors bind `0.0.0.0` inside the container unconditionally, enabling
-them here also requires either `API_TLS_CERT`/`API_TLS_KEY` or an explicit
-`H_MESH_ALLOW_PLAINTEXT=1` in `container/.env` (see `.env.example`'s own
-comment on the tradeoff); the entrypoint refuses to start at all with a
-single clear message if neither is set, rather than crash-looping the
-container with the real reason buried in a per-daemon log.
+At a real terminal with no `--host`/`--container` flag, `./setup.sh` asks
+which you want before anything else -- see "Bootstrap script" above. Either
+form hands off entirely to `container/bootstrap.sh`, a much smaller wizard
+that only collects `POD`/`TENANT`/`AGENTS`/`DEFAULT_CLI`, writes them to
+`offices/<pod>/<tenant>/.env`, and runs `docker compose up --build`. Run
+`./container/bootstrap.sh --help` for its full flag/env surface.
 
-A single named volume (`$HOME/.h-mesh` inside the container) carries Redis's
-AOF file, the persisted tenant config, and daemon logs/pidfiles -- `docker
-compose down` keeps it, `down -v` drops it. `docker compose logs -f` shows
-the same daemon logs `$H_MESH_RUN_DIR` would on a bare host, tailed by the
-entrypoint. `h-agent` and h-mesh's own package are both installed at image
-build time (`h-agent`'s own installer, the same one setup.sh's dependency
-step would otherwise run on a bare VM missing it) so a running container
-never needs outbound network just to boot.
+**One office, one directory, one explicit Compose project.** Docker
+Compose's own project-name default is the *containing folder's* name
+(`container`), identical for every checkout of this repo regardless of
+pod/tenant -- two offices sharing a host, or even two checkouts of the same
+repo, collide on that default, and one `docker compose up` silently
+recreates the other's live office (measured, not theorized). `bootstrap.sh`
+always resolves an office to `offices/<pod>/<tenant>/.env` and always passes
+`docker compose -p h-mesh-<pod>-<tenant>` explicitly, so multiple offices
+are isolated by construction. `offices/` is gitignored -- it holds live
+credentials (`CLAUDE_OAUTH_TOKEN_<PROFILE>`, `API_TOKEN`, etc.), the same as
+`container/.env` (kept as a single-office convenience default) always was.
+Two offices whose `API_PORT`/`SESSION_PORT` doors are both enabled and both
+default to `8080`/`8081` still need distinct host ports set explicitly --
+Compose project isolation doesn't free up an OS-level port collision.
+
+Every non-interactive env var from "Bootstrap script" above (`AGENTS`,
+`DEFAULT_CLI`, `ACCOUNTS`, `AGENT_CLIS`/`AGENT_PROFILES`/`AGENT_PROVIDERS`,
+`CLAUDE_OAUTH_TOKEN_<PROFILE>`, `PROVIDER_LOCAL_*`, `TELEGRAM_*`,
+`API_TOKEN`) applies unchanged -- set the advanced ones directly in the
+office's env file; `bootstrap.sh` doesn't prompt for them. `API_PORT`/
+`SESSION_PORT` choose the **host** side of the port mapping only; the api
+and session doors always bind `0.0.0.0:8080`/`0.0.0.0:8081` inside the
+container (see the Dockerfile's own comment on why), so publishing them is
+compose's decision, not the process's. As on a bare host, the api/session/
+Telegram-bot daemons only start once `TELEGRAM_BOT_TOKEN` and
+`TELEGRAM_CHAT_ID` are both set -- but because those doors bind `0.0.0.0`
+inside the container unconditionally, enabling them here also requires
+either `API_TLS_CERT`/`API_TLS_KEY` or an explicit `H_MESH_ALLOW_PLAINTEXT=1`
+in the office's env file (see `container/.env.example`'s own comment on the
+tradeoff); the entrypoint refuses to start at all with a single clear
+message if neither is set, rather than crash-looping the container with the
+real reason buried in a per-daemon log.
+
+Three named volumes per office carry state that must survive a container
+recreate: Redis's AOF file, the persisted tenant config, and daemon
+logs/pidfiles (`$HOME/.h-mesh`); and claude's and codex's own local state,
+notably `--continue`/`--resume` session history (`$HOME/.claude`,
+`$HOME/.codex`) -- without the latter two, that history lived only in the
+old container's writable layer and was gone the moment `up` replaced it.
+`docker compose down` keeps all three, `down -v` drops them. `docker compose
+logs -f` shows the same daemon logs `$H_MESH_RUN_DIR` would on a bare host,
+tailed by the entrypoint. `h-agent`, its CLIs, and h-mesh's own package are
+all installed at image build time (`h-agent`'s own installer, the same one
+setup.sh's dependency step would otherwise run on a bare VM missing it, plus
+`jq` so it can actually apply its own onboarding defaults -- without it,
+every agent's first launch hits claude's full interactive first-run tour
+instead of a working prompt) so a running container never needs outbound
+network just to boot.
 
 `clients/web` (the browser console) is not part of this image -- it has its
 own separate container path; see `clients/web/README.md`.

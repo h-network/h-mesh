@@ -9,6 +9,13 @@
 # configured -- h-mesh-api, the Telegram bot, and h-mesh-session), and
 # hires any agent from the wizard's roster that isn't already running.
 #
+# At a terminal, before anything else, this asks host or container --
+# --container (or H_MESH_INSTALL_MODE=container for a scripted caller) skips
+# the prompt and hands off entirely to container/bootstrap.sh, a separate,
+# much smaller wizard for that path (see README.md's "Container" section, or
+# --container --help). Everything below this point is the host path; --host explicitly
+# selects it and skips the prompt the same way.
+#
 # Without a terminal (or with --non-interactive), every wizard setting is
 # instead read from a live env var of the same name if set (AGENTS,
 # DEFAULT_CLI, ACCOUNTS, AGENT_CLIS/AGENT_PROFILES/AGENT_PROVIDERS,
@@ -28,6 +35,63 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# ── Host-vs-container picker ───────────────────────────────────────────────
+# Decided before anything else below reads a single flag or env var, so this
+# script's own flag surface (host installs: --skip-deps, --venv, etc.) never
+# has to understand container-mode concerns, and container/bootstrap.sh's own
+# flag surface never has to understand host ones. --container/--host on the
+# command line win; H_MESH_INSTALL_MODE covers a scripted/non-interactive
+# caller that can't pass a flag; blank at a terminal prompts once. Default is
+# host -- unchanged behavior for every existing caller that has never heard
+# of this.
+INSTALL_MODE="${H_MESH_INSTALL_MODE:-}"
+_help_requested=0
+for _arg in "$@"; do
+    case "$_arg" in
+        --container) INSTALL_MODE="container" ;;
+        --host) INSTALL_MODE="host" ;;
+        -h|--help) _help_requested=1 ;;
+    esac
+done
+if [ "$_help_requested" -eq 1 ] && [ -z "$INSTALL_MODE" ]; then
+    # -h/--help with no explicit mode: show the host path's own usage()
+    # rather than prompting first -- `./setup.sh --help` must not block on
+    # a question nobody asked. `--container --help` still reaches
+    # bootstrap.sh's own help, since INSTALL_MODE is already set by then.
+    INSTALL_MODE="host"
+fi
+if [ -z "$INSTALL_MODE" ]; then
+    _noninteractive=0
+    for _arg in "$@"; do
+        [ "$_arg" = "--non-interactive" ] && _noninteractive=1
+    done
+    if [ "$_noninteractive" -eq 0 ] && [ -t 0 ]; then
+        read -rp "Install on this host, or run in a Docker container? [host/container] (host): " _mode_answer
+        case "$_mode_answer" in
+            [Cc]*) INSTALL_MODE="container" ;;
+            *) INSTALL_MODE="host" ;;
+        esac
+    else
+        INSTALL_MODE="host"
+    fi
+fi
+# Stripped from "$@" either way -- neither this script's own option loop
+# below (host path) nor bootstrap.sh's (container path) needs to recognize
+# --container/--host, only this block does.
+_passthrough=()
+for _arg in "$@"; do
+    case "$_arg" in
+        --container|--host) ;;
+        *) _passthrough+=("$_arg") ;;
+    esac
+done
+set -- "${_passthrough[@]}"
+unset _arg _passthrough _help_requested _noninteractive _mode_answer
+
+if [ "$INSTALL_MODE" = "container" ]; then
+    exec "$SCRIPT_DIR/container/bootstrap.sh" "$@"
+fi
 
 POD="${POD:-default}"
 TENANT="${TENANT:-default}"
@@ -59,6 +123,10 @@ Options:
   --skip-deps             Skip system dependency checks/auto-install (redis-server, python3-venv, h-agent)
   --no-daemons            Seed registry only, do not start background daemons
   --non-interactive       Never prompt, even at a terminal; use flags/env/persisted config only
+  --host                  Install on this host (default; skips the host-vs-container prompt)
+  --container             Run in a Docker container instead -- hands off entirely to
+                          container/bootstrap.sh, which has its own flag surface (--help there
+                          for its options); every option above is host-only and does not apply
   -h, --help              Show this help message
 
 With no flags, at a terminal, this runs an interactive wizard (agent
