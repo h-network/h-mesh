@@ -38,13 +38,8 @@ from core.channels import DeadLetter, receive, send
 from core.dispatch import delivery_lock
 from core.keys import prefix
 from core.logging import configure_logging, log_record
-from lib.profile_env import resolve_claude_profile_env
+from lib.profile_env import read_agent_profile, resolve_cli_profile_env
 from lib.reply_correlation import record_delivered
-
-
-def _agent_profile(r, pod: str, tenant: str, agent: str) -> str | None:
-    raw = r.get(prefix(pod, tenant, agent=agent, resource="profile"))
-    return raw.decode() if isinstance(raw, bytes) else raw
 
 
 def _log_hop(
@@ -203,8 +198,8 @@ def deliver_claude_sdk(
     **kwargs,
 ) -> None:
     """Drain one agent's ingress, running one query() call per Message."""
-    profile = _agent_profile(r, pod, tenant, agent)
-    profile_env = resolve_claude_profile_env(profile)
+    profile = read_agent_profile(r, pod=pod, tenant=tenant, agent=agent)
+    profile_env = resolve_cli_profile_env(profile)
 
     openers = {
         "Message": lambda env: _deliver_message(

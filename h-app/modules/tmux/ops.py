@@ -8,7 +8,7 @@ from typing import Set
 from core.config import state_path
 from core.logging import log_record
 from lib.paths import build_pane_path, get_agent_workdir, get_workdir_root, resolve_venv_bin
-from lib.profile_env import resolve_claude_profile_env
+from lib.profile_env import resolve_cli_profile_env
 from services.claude_statusline import install_statusline
 
 
@@ -481,9 +481,9 @@ def window_env(
     # here means the profile decides both which config dir and which
     # credential, so the two compose instead of competing. See
     # lib/profile_env.py for the shared resolution logic (also used by the
-    # claude_sdk port, which needs the same mapping for its own one-off SDK
-    # calls).
-    profile_env = resolve_claude_profile_env(profile)
+    # claude_sdk/codex_sdk ports, which need the same mapping for their own
+    # one-off SDK calls).
+    profile_env = resolve_cli_profile_env(profile)
     env_vars.extend(f"{key}={value}" for key, value in profile_env.items())
 
     # ⚠ Both are `h-agent`'s own knobs (base image, not h-mesh's), threaded

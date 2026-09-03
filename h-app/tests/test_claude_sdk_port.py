@@ -15,7 +15,7 @@ from core.channels import DeadLetter, send
 from core.envelope import parse
 from core.keys import prefix
 from core.registry import port_type
-from lib.profile_env import resolve_claude_profile_env
+from lib.profile_env import resolve_cli_profile_env
 from modules.claude_sdk.port import deliver_claude_sdk
 from test_tmux_port import FakeRedis
 
@@ -163,10 +163,10 @@ class ProfileEnvTests(unittest.TestCase):
         self.addCleanup(self.no_ambient_tokens.stop)
 
     def test_unprofiled_agent_gets_no_config_dir_override(self):
-        self.assertEqual(resolve_claude_profile_env(None), {})
+        self.assertEqual(resolve_cli_profile_env(None), {})
 
     def test_profiled_agent_gets_config_dirs(self):
-        env = resolve_claude_profile_env("work", home_dir="/home/test")
+        env = resolve_cli_profile_env("work", home_dir="/home/test")
         self.assertEqual(
             env,
             {
@@ -176,17 +176,17 @@ class ProfileEnvTests(unittest.TestCase):
         )
 
     def test_token_absent_is_omitted_not_empty(self):
-        env = resolve_claude_profile_env("work", home_dir="/home/test")
+        env = resolve_cli_profile_env("work", home_dir="/home/test")
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
 
     def test_token_present_is_included(self):
         with patch.dict(os.environ, {"CLAUDE_OAUTH_TOKEN_WORK": "tok-work"}):
-            env = resolve_claude_profile_env("work", home_dir="/home/test")
+            env = resolve_cli_profile_env("work", home_dir="/home/test")
         self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "tok-work")
 
     def test_unprofiled_agent_still_resolves_the_default_token(self):
         with patch.dict(os.environ, {"CLAUDE_OAUTH_TOKEN_DEFAULT": "tok-default"}):
-            env = resolve_claude_profile_env(None, home_dir="/home/test")
+            env = resolve_cli_profile_env(None, home_dir="/home/test")
         self.assertEqual(env, {"CLAUDE_CODE_OAUTH_TOKEN": "tok-default"})
 
 
