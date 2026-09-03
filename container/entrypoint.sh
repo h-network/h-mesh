@@ -18,6 +18,38 @@ set -euo pipefail
 : "${POD:?POD is required (see README.md's non-interactive env vars)}"
 : "${TENANT:?TENANT is required (see README.md's non-interactive env vars)}"
 
+log() { printf '[entrypoint] %s\n' "$1"; }
+
+# TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID enable the api and session daemons
+# too (see services.daemons.enabled_daemon_modules) -- both bind 0.0.0.0
+# *inside* this container unconditionally (Dockerfile's API_BIND/
+# SESSION_BIND), and modules/api/server.py + modules/session/app.py both
+# refuse to start non-loopback without either real TLS certs or an
+# explicit H_MESH_ALLOW_PLAINTEXT=1 -- the app's own documented escape
+# hatch for exactly this "a bind is not an exposure inside a container"
+# case (see _plaintext_allowed()'s docstring in both files). Checked here,
+# up front, so a tenant missing this gets ONE clear, actionable line
+# before Redis and every daemon even start -- not six identical tracebacks
+# split across api.log/session.log, a rollback of every daemon this
+# invocation just started, setup.sh exiting 1, and the container
+# restart-looping under `restart: unless-stopped` with no top-level
+# explanation. Measured live: that was the actual failure mode before this
+# check existed.
+if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ] \
+    && [ "${H_MESH_ALLOW_PLAINTEXT:-0}" != "1" ]; then
+    api_tls_ok=0
+    [ -n "${API_TLS_CERT:-}" ] && [ -n "${API_TLS_KEY:-}" ] && api_tls_ok=1
+    # session falls back to API_TLS_CERT/KEY when its own aren't set (see
+    # SessionSettings.from_env) -- so api_tls_ok alone already covers it
+    # unless only SESSION_TLS_CERT/KEY were set instead.
+    session_tls_ok=$api_tls_ok
+    [ -n "${SESSION_TLS_CERT:-}" ] && [ -n "${SESSION_TLS_KEY:-}" ] && session_tls_ok=1
+    if [ "$api_tls_ok" -eq 0 ] || [ "$session_tls_ok" -eq 0 ]; then
+        log "refusing to start: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID enable the api and session doors, both bound 0.0.0.0 inside this container. Set API_TLS_CERT/API_TLS_KEY (covers both doors unless SESSION_TLS_CERT/SESSION_TLS_KEY differ), or set H_MESH_ALLOW_PLAINTEXT=1 in the tenant .env to explicitly accept the bearer token crossing the wire in clear text."
+        exit 1
+    fi
+fi
+
 # Not operator-configurable: Redis lives inside this container, loopback
 # only, started a few lines down -- an externally supplied REDIS_URL
 # pointing anywhere else would leave setup.sh talking to a server that
@@ -25,8 +57,6 @@ set -euo pipefail
 REDIS_URL="redis://127.0.0.1:6379/0"
 REDIS_DATA_DIR="${REDIS_DATA_DIR:-$HOME/.h-mesh/redis}"
 mkdir -p "$REDIS_DATA_DIR"
-
-log() { printf '[entrypoint] %s\n' "$1"; }
 
 redis_pid=""
 tail_pid=""

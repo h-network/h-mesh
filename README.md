@@ -152,7 +152,13 @@ Every non-interactive env var above (`AGENTS`, `DEFAULT_CLI`, `ACCOUNTS`,
 `0.0.0.0:8080`/`0.0.0.0:8081` inside the container (see the Dockerfile's own
 comment on why), so publishing them is compose's decision, not the process's.
 As on a bare host, the api/session/Telegram-bot daemons only start once
-`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are both set.
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are both set -- but because
+those doors bind `0.0.0.0` inside the container unconditionally, enabling
+them here also requires either `API_TLS_CERT`/`API_TLS_KEY` or an explicit
+`H_MESH_ALLOW_PLAINTEXT=1` in `container/.env` (see `.env.example`'s own
+comment on the tradeoff); the entrypoint refuses to start at all with a
+single clear message if neither is set, rather than crash-looping the
+container with the real reason buried in a per-daemon log.
 
 A single named volume (`$HOME/.h-mesh` inside the container) carries Redis's
 AOF file, the persisted tenant config, and daemon logs/pidfiles -- `docker
