@@ -390,7 +390,9 @@ h-app/tests/test_office_cli.py::test_malformed_board_entry_raises_office_error_n
 h-app/tests/test_office_cli.py::test_take_by_id_quarantines_malformed_entries_without_blocking_valid_match
 h-app/tests/test_office_cli.py::test_take_quarantines_invalid_utf8_bytes
 h-app/tests/test_office_cli.py::test_concurrent_takes_leave_exactly_one_doing_ticket
+h-app/tests/test_office_cli.py::test_delete_miss_names_own_board_scope_and_preserves_assignees_ticket
 h-app/tests/test_office_cli.py::test_add_sends_envelope_and_prints_the_ticket_id
+h-app/tests/test_office_cli.py::test_add_printed_id_is_created_and_takeable_on_assignees_board
 h-app/tests/test_office_cli.py::test_clone_to_all_dry_run_reports_without_writing
 h-app/tests/test_office_cli.py::test_clone_to_all_uses_host_workdir_fallback
 h-app/tests/test_office_cli.py::test_camel_case_command_aliases_are_rejected[cloneToAll]
