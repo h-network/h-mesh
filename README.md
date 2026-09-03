@@ -129,6 +129,43 @@ h-mesh-office hire <agent-name>
 Hiring starts a fresh CLI session by default, even when that agent name has
 local session history. Pass `--resume` to opt into restoring prior history.
 
+## Container
+
+`container/Dockerfile` and `container/compose.yaml` are the supported way to
+run h-mesh entirely in Docker -- one container per pod/tenant, nothing
+assumed to exist outside the image. The container's `entrypoint.sh` starts
+Redis (loopback-only, AOF-persisted under the state volume) and then calls
+this same `setup.sh --non-interactive` -- the roster, hire, and daemon-start
+steps are exactly the ones described above, not a separate implementation.
+
+```bash
+cd container
+cp .env.example .env   # set POD/TENANT/AGENTS/CLAUDE_OAUTH_TOKEN_DEFAULT/...
+docker compose -f compose.yaml --env-file .env up -d --build
+```
+
+Every non-interactive env var above (`AGENTS`, `DEFAULT_CLI`, `ACCOUNTS`,
+`AGENT_CLIS`/`AGENT_PROFILES`/`AGENT_PROVIDERS`, `CLAUDE_OAUTH_TOKEN_<PROFILE>`,
+`PROVIDER_LOCAL_*`, `TELEGRAM_*`, `API_TOKEN`) applies unchanged -- set them in
+`container/.env`, not on the image. `API_PORT`/`SESSION_PORT` choose the
+**host** side of the port mapping only; the api and session doors always bind
+`0.0.0.0:8080`/`0.0.0.0:8081` inside the container (see the Dockerfile's own
+comment on why), so publishing them is compose's decision, not the process's.
+As on a bare host, the api/session/Telegram-bot daemons only start once
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are both set.
+
+A single named volume (`$HOME/.h-mesh` inside the container) carries Redis's
+AOF file, the persisted tenant config, and daemon logs/pidfiles -- `docker
+compose down` keeps it, `down -v` drops it. `docker compose logs -f` shows
+the same daemon logs `$H_MESH_RUN_DIR` would on a bare host, tailed by the
+entrypoint. `h-agent` and h-mesh's own package are both installed at image
+build time (`h-agent`'s own installer, the same one setup.sh's dependency
+step would otherwise run on a bare VM missing it) so a running container
+never needs outbound network just to boot.
+
+`clients/web` (the browser console) is not part of this image -- it has its
+own separate container path; see `clients/web/README.md`.
+
 ## Upgrading and restarting daemons
 
 `h-mesh-upgrade` (`services.upgrade`) updates an existing install in place --

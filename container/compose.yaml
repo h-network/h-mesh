@@ -1,0 +1,46 @@
+# Brings up one h-mesh tenant. One container is one pod/tenant -- Redis,
+# every h-mesh daemon, and every hired agent's tmux pane live inside it;
+# reaching a different tenant means running a different container, not a
+# flag on this one.
+#
+#   cd container && cp .env.example .env   # edit POD/TENANT/AGENTS/API_TOKEN
+#   docker compose -f container/compose.yaml --env-file container/.env up -d --build
+#   docker compose -f container/compose.yaml --env-file container/.env down       # keeps the state volume
+#   docker compose -f container/compose.yaml --env-file container/.env down -v    # also drops it
+services:
+  h-mesh:
+    build:
+      context: ..
+      dockerfile: container/Dockerfile
+    image: ${H_MESH_IMAGE:-h-mesh:latest}
+    env_file:
+      - ${H_MESH_TENANT_ENV_FILE:-.env}
+    environment:
+      POD: "${POD:-default}"
+      TENANT: "${TENANT:-default}"
+    ports:
+      - "${API_PORT:-8080}:8080"
+      - "${SESSION_PORT:-8081}:8081"
+    volumes:
+      # Redis's AOF, the tenant's persisted wizard config, and daemon
+      # pidfiles/logs all live under $HOME/.h-mesh -- one volume, so a
+      # container restart resumes the same registry/boards/message history
+      # instead of a purged-transport, empty-roster restart.
+      - h-mesh-state:/home/ubuntu/.h-mesh
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      # The switch is the one daemon h-mesh cannot deliver without --
+      # always-on regardless of which optional daemons this tenant enabled
+      # (see services/daemons.py's own DAEMON_MODULES). Redis is checked
+      # alongside it because a switch that's alive but has lost its
+      # backing store is not a healthy tenant either.
+      test: ["CMD-SHELL", "pgrep -f 'python.* -m core.service' >/dev/null && redis-cli -u redis://127.0.0.1:6379/0 ping >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  h-mesh-state:
+    name: "${COMPOSE_PROJECT_NAME:-h-mesh}-state"
