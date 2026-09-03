@@ -11,6 +11,7 @@ license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
+  "claude-agent-sdk>=0.2,<1",
   "edge-tts>=6,<8",
   "fastapi>=0.115,<1",
   "openshell>=0.0.116,<1",
@@ -26,6 +27,7 @@ test = ["pytest>=8,<9"]
 h-mesh = "modules.office.dispatcher:main"
 h-mesh-api = "services.api:main"
 h-mesh-openshell-port = "modules.openshell.port:main"
+h-mesh-sdk-port = "modules.sdk.port:main"
 h-mesh-session = "services.session:main"
 h-mesh-switch = "core.service:main"
 h-mesh-tmux-port = "modules.tmux.port:main"
