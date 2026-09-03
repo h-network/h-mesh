@@ -1,5 +1,21 @@
 # CI authority and local verification
 
+## Legacy-name guard
+
+CI scans every tracked file as raw bytes and rejects an unreviewed reference to
+the predecessor project's ASCII identity. It does not classify or exclude
+files by encoding or content type. A matched reference prints the file, line
+number, and complete offending line, rendering non-UTF-8 bytes as escapes, so
+it can be corrected without reproducing CI locally.
+
+A required compatibility identifier may be allowed on its own line by adding a
+source comment containing `legacy-name-allow`, then a colon and the exact
+uppercase identifier. The marker must name an identifier present on that line;
+it does not allow other occurrences or longer identifiers containing the same
+text. Use it only where removing the legacy identifier would remove
+compatibility coverage, and treat every new marker as a reviewed policy
+exception rather than a general suppression.
+
 The authoritative GitHub Actions workflow is `.github/workflows/ci.yml` from
 `main`. It runs for pull requests, merge groups, and pushes to `main`. New topic
 branches do not run push CI: a green branch-push check is not evidence that the

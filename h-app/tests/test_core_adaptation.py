@@ -20,98 +20,16 @@ from core.config import state_dir, state_path
 from core.registry import is_member, member_types, members, port_type
 from core.service import Switch, _forward_port_custody, main, transmission
 from core.windowlog import WindowLogTailer
-
-
-LEGACY_BANNED_NAMES = (
-    "f" + "lock",
-    "f" + "lock_",
-    "f" + "lockclient",
-    "h" + "f" + "lock_",
-    "h" + "f" + "lock_session",
+from tools.legacy_names import (
+    LEGACY_ALLOW_MARKER,
+    legacy_name_violations,
+    main as legacy_name_guard_main,
+    tracked_blobs,
 )
-# An allowance is deliberately attached to the violating line and names the
-# exact legacy identifier it permits. Position changes cannot transfer it.
-LEGACY_ALLOW_MARKER = "# legacy-name-" + "allow:"
 
 
-def _identifier_spans(text: str, identifier: str) -> list[tuple[int, int]]:
-    """Find exact identifier occurrences using Python continuation semantics."""
-    spans = []
-    start = 0
-    while (found := text.find(identifier, start)) != -1:
-        end = found + len(identifier)
-        preceding_continues = found > 0 and ("a" + text[found - 1]).isidentifier()
-        following_continues = end < len(text) and ("a" + text[end]).isidentifier()
-        if not preceding_continues and not following_continues:
-            spans.append((found, end))
-        start = found + 1
-    return spans
-
-
-def _remove_exact_identifiers(text: str, identifiers: list[str]) -> str:
-    # Resolve every span against the original text. Sequential substitution
-    # must not create a new occurrence eligible for a later allowance.
-    spans = sorted(
-        {
-            span
-            for identifier in identifiers
-            for span in _identifier_spans(text, identifier)
-        }
-    )
-    pieces = []
-    cursor = 0
-    for start, end in spans:
-        pieces.append(text[cursor:start])
-        cursor = end
-    pieces.append(text[cursor:])
-    return "".join(pieces)
-
-
-def legacy_name_violations(root: Path) -> tuple[int, list[str]]:
-    checked = 0
-    violations = []
-    excluded_dirs = {".git", ".pytest_cache", "__pycache__"}
-
-    for path in root.rglob("*"):
-        if (
-            not path.is_file()
-            or any(part in excluded_dirs or part.endswith(".egg-info") for part in path.parts)
-        ):
-            continue
-        relative = path.relative_to(root)
-        checked += 1
-        for line_number, line in enumerate(
-            path.read_text(encoding="utf-8").splitlines(), start=1
-        ):
-            code, marker, allowance_text = line.partition(LEGACY_ALLOW_MARKER)
-            folded = code.casefold()
-            if marker:
-                allowance_values = [
-                    value.strip()
-                    for value in allowance_text.split(",")
-                    if value.strip()
-                ]
-                allowed_literals = [value.casefold() for value in allowance_values]
-                invalid = [
-                    value
-                    for value in allowance_values
-                    if not value.isidentifier()
-                    or value != value.upper()
-                    or not _identifier_spans(code, value)
-                ]
-                if not allowed_literals or invalid:
-                    violations.append(
-                        f"{relative}:{line_number}: invalid legacy allowance"
-                    )
-                folded = _remove_exact_identifiers(
-                    code,
-                    [value for value in allowance_values if value not in invalid],
-                ).casefold()
-            matches = [name for name in LEGACY_BANNED_NAMES if name in folded]
-            if matches:
-                violations.append(f"{relative}:{line_number}: {', '.join(matches)}")
-
-    return checked, violations
+def _fixture_blobs(root: Path):
+    return [(path, path.read_bytes()) for path in root.rglob("*") if path.is_file()]
 
 
 def test_legacy_name_allowance_follows_content_not_line_position(tmp_path: Path):
@@ -131,7 +49,7 @@ def test_legacy_name_allowance_follows_content_not_line_position(tmp_path: Path)
     )
     session_test.write_text("\n".join(lines) + "\n")
 
-    _, violations = legacy_name_violations(tmp_path)
+    _, violations = legacy_name_violations(tmp_path, _fixture_blobs(tmp_path))
 
     assert any("tests/test_session.py:371:" in item for item in violations), (
         "a new legacy reference must fail even when it lands on an old exempt line; "
@@ -152,7 +70,7 @@ def test_legacy_name_allowance_cannot_hide_an_unlisted_reference(tmp_path: Path)
         f"{LEGACY_ALLOW_MARKER} {allowed_name}\n"
     )
 
-    _, violations = legacy_name_violations(tmp_path)
+    _, violations = legacy_name_violations(tmp_path, _fixture_blobs(tmp_path))
 
     banned_fragment = "f" + "lock"
     assert any(
@@ -172,10 +90,10 @@ def test_legacy_name_allowance_does_not_apply_inside_longer_identifier(tmp_path:
         f"{LEGACY_ALLOW_MARKER} {allowed_name}\n"
     )
 
-    _, violations = legacy_name_violations(tmp_path)
+    _, violations = legacy_name_violations(tmp_path, _fixture_blobs(tmp_path))
 
     banned_match = "f" + "lock"
-    assert violations == [f"module.py:1: {banned_match}, {banned_match}_"], (
+    assert violations == [f"module.py:1: {banned_match}"], (
         "an allowance for one identifier must not erase the same substring "
         f"inside an unlisted longer identifier; observed {violations}"
     )
@@ -190,7 +108,7 @@ def test_legacy_name_allowance_respects_unicode_identifier_boundaries(tmp_path: 
         f"{LEGACY_ALLOW_MARKER} {allowed_name}\n"
     )
 
-    _, violations = legacy_name_violations(tmp_path)
+    _, violations = legacy_name_violations(tmp_path, _fixture_blobs(tmp_path))
 
     banned_match = "f" + "lock"
     assert violations == [f"module.py:1: {banned_match}"], (
@@ -209,16 +127,54 @@ def test_legacy_name_allowance_must_name_a_literal_on_its_line(tmp_path: Path):
         f"VALUE = {absent_name!r}  {LEGACY_ALLOW_MARKER} F, LOCK_ALLOW_PLAINTEXT\n"
     )
 
-    _, violations = legacy_name_violations(tmp_path)
+    _, violations = legacy_name_violations(tmp_path, _fixture_blobs(tmp_path))
 
     banned_match = "f" + "lock"
     assert violations == [
         "module.py:1: invalid legacy allowance",
         "module.py:2: invalid legacy allowance",
-        f"module.py:2: {banned_match}, {banned_match}_",
+        f"module.py:2: {banned_match}",
         "module.py:3: invalid legacy allowance",
-        f"module.py:3: {banned_match}, {banned_match}_",
+        f"module.py:3: {banned_match}",
     ]
+
+
+def test_legacy_name_guard_reports_source_and_markdown_text(
+    tmp_path: Path, capsys
+):
+    banned_name = "f" + "lock"
+    source = tmp_path / "module:part.py"
+    documentation = tmp_path / "guide.md"
+    source.write_text(f'VALUE = "{banned_name}_source"\n')
+    documentation.write_text(f"Do not add {banned_name} documentation.\n")
+
+    result = legacy_name_guard_main(
+        tmp_path, [(source, source.read_bytes()), (documentation, documentation.read_bytes())]
+    )
+    output = capsys.readouterr().out
+
+    assert result == 1
+    assert f"guide.md:1: Do not add {banned_name} documentation." in output
+    assert f'module:part.py:1: VALUE = "{banned_name}_source"' in output, (
+        "a contributor must see the file, line, and offending text for both "
+        f"source and documentation violations; observed {output!r}"
+    )
+
+
+def test_legacy_name_guard_scans_dangling_symlink_payload(tmp_path: Path, capsys):
+    banned_name = "f" + "lock"
+    link = tmp_path / "legacy-link"
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["ln", "-s", f"{banned_name}_predecessor", str(link)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "legacy-link"], check=True)
+
+    result = legacy_name_guard_main(tmp_path)
+    output = capsys.readouterr().out
+
+    assert result == 1, (
+        "a tracked link payload must not disappear because its target is absent"
+    )
+    assert f"legacy-link:1: {banned_name}_predecessor" in output
 
 
 class RegistryRedis:
@@ -244,9 +200,10 @@ class RegistryRedis:
 
 class CoreAdaptationTests(unittest.TestCase):
     def test_tree_contains_no_old_project_names(self):
-        checked, violations = legacy_name_violations(H_APP)
+        repo_root = H_APP.parent
+        checked, violations = legacy_name_violations(repo_root, tracked_blobs(repo_root))
 
-        self.assertGreater(checked, 100, "Expected to scan the complete h-app tree")
+        self.assertGreater(checked, 100, "Expected to scan the complete repository")
         self.assertEqual(violations, [], "Old project names found:\n" + "\n".join(violations))
 
     def test_registry_uses_registry_wire_resource(self):
