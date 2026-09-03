@@ -27,7 +27,7 @@ import redis
 from core.channels import DeadLetter, receive, send
 from core.dispatch import delivery_lock
 from core.keys import prefix
-from core.logging import configure_logging
+from core.logging import configure_logging, log_record
 from lib.profile_env import resolve_claude_profile_env
 from lib.reply_correlation import record_delivered
 
@@ -37,7 +37,64 @@ def _agent_profile(r, pod: str, tenant: str, agent: str) -> str | None:
     return raw.decode() if isinstance(raw, bytes) else raw
 
 
-def _run_query(prompt: str, profile_env: dict[str, str]) -> str:
+def _log_hop(
+    message,
+    *,
+    stream_id: str | None,
+    correlation_id: str | None,
+    source: str,
+    destination: str,
+) -> None:
+    """Log one message the query() stream yields -- every hop from pickup to
+    result, not just the two endpoints a naive implementation would keep.
+
+    The first hop is always a ``SystemMessage`` with ``subtype="init"``,
+    emitted as soon as the CLI subprocess actually starts -- this port's
+    equivalent of tmux's ``mark_delivery_pending`` + ``ActivityTailer`` pair:
+    proof the query was picked up, logged before anything else and well
+    before the final ``ResultMessage`` that proves it finished. Every
+    ``AssistantMessage`` turn in between stays visible too.
+    """
+    from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage, ToolUseBlock
+
+    common = dict(
+        stream_id=stream_id, correlation_id=correlation_id,
+        source=source, destination=destination,
+    )
+    if isinstance(message, SystemMessage):
+        log_record("sdk", "sdk_query_started", evidence=message.subtype, **common)
+    elif isinstance(message, AssistantMessage):
+        tool_names = sorted(
+            {block.name for block in message.content if isinstance(block, ToolUseBlock)}
+        )
+        reason = f"stop_reason={message.stop_reason}"
+        if tool_names:
+            reason += f" tools={','.join(tool_names)}"
+        log_record("sdk", "sdk_turn", reason=reason, **common)
+    elif isinstance(message, ResultMessage):
+        log_record(
+            "sdk", "sdk_query_finished",
+            evidence=message.subtype,
+            reason=f"is_error={message.is_error} num_turns={message.num_turns}",
+            **common,
+        )
+    else:
+        # Defensive: query() doesn't yield StreamEvent/RateLimitEvent/
+        # ConversationResetMessage without include_partial_messages, but the
+        # Message union can grow -- an unrecognized hop is still logged, not
+        # silently dropped.
+        log_record("sdk", "sdk_hop", evidence=type(message).__name__, **common)
+
+
+def _run_query(
+    prompt: str,
+    profile_env: dict[str, str],
+    *,
+    stream_id: str | None,
+    correlation_id: str | None,
+    source: str,
+    destination: str,
+) -> str:
     """Run exactly one query() call against the Claude Agent SDK.
 
     Returns the final ``ResultMessage.result`` text, or ``""`` if the query
@@ -53,6 +110,9 @@ def _run_query(prompt: str, profile_env: dict[str, str]) -> str:
     nothing to gain from persisting one, and every agent sharing a
     ``CLAUDE_CONFIG_DIR`` would otherwise accumulate transcripts that no port
     here will ever read back.
+
+    Every message the stream yields is logged via ``_log_hop`` as it arrives,
+    not just the final result -- see that function's docstring.
     """
     from claude_agent_sdk import ClaudeAgentOptions, ResultMessage
     from claude_agent_sdk import query as claude_query
@@ -62,10 +122,16 @@ def _run_query(prompt: str, profile_env: dict[str, str]) -> str:
     options = ClaudeAgentOptions(env=env)
 
     async def _collect() -> str:
+        result_text = ""
         async for message in claude_query(prompt=prompt, options=options):
+            _log_hop(
+                message,
+                stream_id=stream_id, correlation_id=correlation_id,
+                source=source, destination=destination,
+            )
             if isinstance(message, ResultMessage):
-                return message.result or ""
-        return ""
+                result_text = message.result or ""
+        return result_text
 
     return asyncio.run(_collect())
 
@@ -82,7 +148,14 @@ def _deliver_message(
         raise DeadLetter("empty message text")
 
     stream_id = envelope.get("stream_id")
-    result_text = _run_query(f"[message from {source}] {text}", profile_env)
+    result_text = _run_query(
+        f"[message from {source}] {text}",
+        profile_env,
+        stream_id=stream_id,
+        correlation_id=envelope.get("correlation_id"),
+        source=source,
+        destination=agent,
+    )
 
     # Recorded only after the query call returns: an in_reply_to claim must
     # not validate for a delivery whose model call never actually completed.

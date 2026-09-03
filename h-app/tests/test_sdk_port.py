@@ -2,7 +2,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 H_APP = Path(__file__).resolve().parents[1]
 if str(H_APP) not in sys.path:
@@ -60,7 +60,14 @@ class SdkPortTests(unittest.TestCase):
         with patch("modules.sdk.port._run_query", return_value="4") as mock_query:
             deliver_sdk(self.redis, pod=POD, tenant=TENANT, agent="bob")
 
-        mock_query.assert_called_once_with("[message from alice] what's 2+2", {})
+        mock_query.assert_called_once_with(
+            "[message from alice] what's 2+2",
+            {},
+            stream_id=stream_id,
+            correlation_id=ANY,
+            source="alice",
+            destination="bob",
+        )
 
         raw = self.redis.lpop(prefix(POD, TENANT, "bob", "egress"))
         reply = parse(raw)
@@ -124,6 +131,10 @@ class SdkPortTests(unittest.TestCase):
                 "CODEX_HOME": f"{home_dir}/.codex-work",
                 "CLAUDE_CODE_OAUTH_TOKEN": "tok-work",
             },
+            stream_id=ANY,
+            correlation_id=ANY,
+            source="alice",
+            destination="bob",
         )
 
     def test_drains_multiple_queued_messages_independently(self):
@@ -177,6 +188,106 @@ class ProfileEnvTests(unittest.TestCase):
         with patch.dict(os.environ, {"CLAUDE_OAUTH_TOKEN_DEFAULT": "tok-default"}):
             env = resolve_claude_profile_env(None, home_dir="/home/test")
         self.assertEqual(env, {"CLAUDE_CODE_OAUTH_TOKEN": "tok-default"})
+
+
+class LogHopTests(unittest.TestCase):
+    """Exercise _run_query/_log_hop against a stubbed claude_agent_sdk.query --
+    no live model call, just the real SDK dataclasses standing in for what a
+    real stream would yield, so the hop-logging shape is verified against the
+    actual Message union rather than a hand-rolled fake."""
+
+    def setUp(self):
+        self.no_ambient_claude_token = patch.dict(
+            os.environ, {"CLAUDE_OAUTH_TOKEN_DEFAULT": ""}, clear=False
+        )
+        self.no_ambient_claude_token.start()
+        self.addCleanup(self.no_ambient_claude_token.stop)
+
+    def test_every_hop_is_logged_in_order_before_the_result_returns(self):
+        import claude_agent_sdk as sdk
+
+        started = sdk.SystemMessage(subtype="init", data={"session_id": "s1"})
+        turn = sdk.AssistantMessage(
+            content=[
+                sdk.ToolUseBlock(id="t1", name="Read", input={}),
+                sdk.TextBlock(text="looking"),
+            ],
+            model="claude-x",
+            stop_reason="tool_use",
+        )
+        finished = sdk.ResultMessage(
+            subtype="success",
+            duration_ms=10,
+            duration_api_ms=8,
+            is_error=False,
+            num_turns=2,
+            session_id="s1",
+            result="done",
+        )
+
+        async def fake_query(*, prompt, options=None):
+            for message in (started, turn, finished):
+                yield message
+
+        from modules.sdk.port import _run_query
+
+        with patch("claude_agent_sdk.query", new=fake_query), patch(
+            "modules.sdk.port.log_record"
+        ) as mock_log:
+            text = _run_query(
+                "prompt",
+                {},
+                stream_id="sid",
+                correlation_id="cid",
+                source="alice",
+                destination="bob",
+            )
+
+        self.assertEqual(text, "done")
+
+        events = [call.args[1] for call in mock_log.call_args_list]
+        self.assertEqual(events, ["sdk_query_started", "sdk_turn", "sdk_query_finished"])
+
+        for call in mock_log.call_args_list:
+            self.assertEqual(call.args[0], "sdk")
+            self.assertEqual(call.kwargs["stream_id"], "sid")
+            self.assertEqual(call.kwargs["correlation_id"], "cid")
+            self.assertEqual(call.kwargs["source"], "alice")
+            self.assertEqual(call.kwargs["destination"], "bob")
+
+        started_kwargs = mock_log.call_args_list[0].kwargs
+        self.assertEqual(started_kwargs["evidence"], "init")
+
+        turn_kwargs = mock_log.call_args_list[1].kwargs
+        self.assertIn("stop_reason=tool_use", turn_kwargs["reason"])
+        self.assertIn("tools=Read", turn_kwargs["reason"])
+
+        finished_kwargs = mock_log.call_args_list[2].kwargs
+        self.assertEqual(finished_kwargs["evidence"], "success")
+        self.assertIn("is_error=False", finished_kwargs["reason"])
+        self.assertIn("num_turns=2", finished_kwargs["reason"])
+
+    def test_unrecognized_message_type_is_logged_not_dropped(self):
+        sentinel = object()
+
+        async def fake_query(*, prompt, options=None):
+            yield sentinel
+
+        from modules.sdk.port import _run_query
+
+        with patch("claude_agent_sdk.query", new=fake_query), patch(
+            "modules.sdk.port.log_record"
+        ) as mock_log:
+            text = _run_query(
+                "prompt", {},
+                stream_id="sid", correlation_id="cid",
+                source="alice", destination="bob",
+            )
+
+        self.assertEqual(text, "")
+        mock_log.assert_called_once()
+        self.assertEqual(mock_log.call_args.args[1], "sdk_hop")
+        self.assertEqual(mock_log.call_args.kwargs["evidence"], "object")
 
 
 if __name__ == "__main__":

@@ -507,6 +507,8 @@ h-app/tests/test_sdk_port.py::ProfileEnvTests::test_token_absent_is_omitted_not_
 h-app/tests/test_sdk_port.py::ProfileEnvTests::test_token_present_is_included
 h-app/tests/test_sdk_port.py::ProfileEnvTests::test_unprofiled_agent_gets_no_config_dir_override
 h-app/tests/test_sdk_port.py::ProfileEnvTests::test_unprofiled_agent_still_resolves_the_default_token
+h-app/tests/test_sdk_port.py::LogHopTests::test_every_hop_is_logged_in_order_before_the_result_returns
+h-app/tests/test_sdk_port.py::LogHopTests::test_unrecognized_message_type_is_logged_not_dropped
 h-app/tests/test_session.py::SessionTests::test_bad_token_is_closed_before_accept
 h-app/tests/test_session.py::SessionTests::test_bearer_auth_is_exact_and_constant_scheme_insensitive
 h-app/tests/test_session.py::SessionTests::test_keystrokes_are_hex_encoded_for_control_protocol
