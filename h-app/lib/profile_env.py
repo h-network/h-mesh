@@ -3,10 +3,15 @@ registry read that names which profile an agent uses.
 
 A hired tmux agent's window environment (``modules/tmux/ops.py::window_env``)
 and the one-shot SDK ports (``modules/claude_sdk/port.py``,
-``modules/codex_sdk/port.py``, ...) all need the same mapping from an
-account profile to ``CLAUDE_CONFIG_DIR``/``CODEX_HOME`` and a profile-scoped
-OAuth token. This is the one place that owns it, so a third (and fourth)
-caller never has to re-derive it independently.
+``modules/codex_sdk/port.py``) all need the same mapping from an account
+profile to ``CLAUDE_CONFIG_DIR``/``CODEX_HOME`` and a profile-scoped OAuth
+token -- ``resolve_cli_profile_env`` owns that, so a third caller never has
+to re-derive it independently. ``modules/agy_sdk/port.py`` needs a
+differently-shaped credential (a plain API key, not a config directory) so
+it gets its own function, ``resolve_agy_api_key``, rather than being forced
+into the same shape -- but it still lives here, since this is the one place
+that owns profile-scoped credential resolution regardless of which vendor's
+shape a given caller needs.
 """
 
 import os
@@ -54,3 +59,23 @@ def read_agent_profile(r, *, pod: str, tenant: str, agent: str) -> str | None:
     """Read the account profile an agent was hired against, or None (default)."""
     raw = r.get(prefix(pod, tenant, agent=agent, resource="profile"))
     return raw.decode() if isinstance(raw, bytes) else raw
+
+
+def resolve_agy_api_key(profile: str | None) -> str | None:
+    """Resolve a profile-scoped Agy/Antigravity API key, or None.
+
+    Agy's auth model isn't the ``CLAUDE_CONFIG_DIR``/``CODEX_HOME`` directory
+    convention ``resolve_cli_profile_env`` covers -- it's a plain API key
+    (``google.antigravity.LocalAgentConfig(api_key=...)``), so this is its
+    own function rather than folded into that one. Same naming convention as
+    ``CLAUDE_OAUTH_TOKEN_<PROFILE-OR-DEFAULT>``:
+    ``AGY_API_KEY_<PROFILE-OR-DEFAULT>``.
+
+    Returns None (not "") when unset, so a caller can tell "no key configured
+    here, let the SDK fall back to its own resolution" apart from "use this
+    empty string as a key" -- the same absent-is-not-empty rule
+    ``resolve_cli_profile_env`` follows.
+    """
+    return os.environ.get(
+        f"AGY_API_KEY_{(profile or 'default').upper().replace('-', '_')}"
+    ) or None
