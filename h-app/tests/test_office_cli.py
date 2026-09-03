@@ -145,6 +145,16 @@ def _env(monkeypatch, agent="architect"):
     monkeypatch.setenv("AGENT_NAME", agent)
     monkeypatch.setenv("POD", POD)
     monkeypatch.setenv("TENANT", TENANT)
+    # ⚠ Bare hire (no --wait) now runs a real, short attributable-completion
+    # check before returning (operator's call, restoring --wait after its
+    # removal) -- a real time.sleep in that poll loop, unaffected by
+    # FakeRedis being fake. 0.0 still resolves correctly (the dead-letter
+    # scan runs before the deadline check, so a pre-seeded rejection is
+    # still caught -- see test_hire_wait_accepts_zero_as_an_immediate_
+    # single_check's identical reasoning for --wait=0), it just does it
+    # without spending a real second per call across this whole file.
+    # Tests of the real 1s ceiling itself override this back explicitly.
+    monkeypatch.setattr(office_cli, "_BARE_HIRE_CHECK_TIMEOUT_S", 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -705,14 +715,167 @@ def test_hire_wait_accepts_zero_as_an_immediate_single_check(mock_send, monkeypa
 
 @patch("modules.office.cli.send")
 def test_hire_without_wait_stays_fire_and_forget(mock_send, monkeypatch, capsys):
-    # The default, unflagged path must be unchanged -- callers that want
-    # fire-and-forget still get it.
+    # No --wait flag still runs the short, silent bare-hire check
+    # internally (see _BARE_HIRE_CHECK_TIMEOUT_S) -- but it must stay
+    # observably fire-and-forget when unresolved: only the stream_id on
+    # stdout, nothing on stderr, no nonzero exit. _env() patches the
+    # timeout to 0 so this doesn't spend a real second finding that out.
     _env(monkeypatch)
     mock_send.return_value = "stream-1"
     r = FakeRedis()
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
         office_main(["hire", "worker-1", "--cli", "claude"])
     assert capsys.readouterr().out.strip() == "stream-1"
+
+
+@patch("modules.office.cli.send")
+def test_hire_bare_check_read_failure_still_prints_the_admitted_stream_id(mock_send, monkeypatch, capsys):
+    # Reviewer's exact harm test, this branch's own principle inverted: the
+    # check must not imply success it cannot prove, but it must equally
+    # not DENY an admission that was already proven. send() has already
+    # durably enqueued the envelope and returned a real stream_id before
+    # _await_hire_confirmation is ever called -- a Redis error reading the
+    # dead-letter list is a failure to CHECK, not evidence the hire
+    # failed, and it must not destroy the one thing already known. Before
+    # this branch a bare hire touched Redis only once (inside send());
+    # this proves the NEW post-admission check degrades to best-effort
+    # instead of raising and losing that result (empty stdout AND empty
+    # stderr, the exact shape reviewer reproduced).
+    _env(monkeypatch)
+    mock_send.return_value = "1712345678901-0"
+    r = FakeRedis()
+
+    def _raise_connection_error(*args, **kwargs):
+        raise redis.exceptions.ConnectionError("simulated: dead-letter read failed")
+
+    monkeypatch.setattr(r, "lrange", _raise_connection_error)
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["hire", "worker-1", "--cli", "claude"])
+    out = capsys.readouterr()
+    assert out.out.strip() == "1712345678901-0", (
+        f"a read failure during the optional check destroyed the admitted "
+        f"stream_id -- stdout:{out.out!r} stderr:{out.err!r}"
+    )
+    assert out.err == ""
+
+
+@patch("modules.office.cli.send")
+def test_hire_wait_explicit_read_failure_is_reported_as_unknown_not_a_real_timeout(mock_send, monkeypatch, capsys):
+    # The deliberate decision for the OTHER path: asking for --wait means
+    # wanting to know either way, so a read failure there is reported
+    # explicitly (not silently, unlike bare hire) -- but it still resolves
+    # to the same "unknown" outcome as a timeout, and the message says
+    # the check itself could not run rather than falsely claiming a real
+    # SECONDS-long wait happened. Both paths return the identical outcome
+    # classification ("unknown") so they cannot diverge in what they
+    # believe happened -- only the message differs, and only because
+    # bare hire never distinguishes any flavor of "unknown" in its
+    # silence to begin with.
+    mock_send.return_value = "1712345678901-0"
+    r = FakeRedis()
+
+    def _raise_connection_error(*args, **kwargs):
+        raise redis.exceptions.ConnectionError("simulated: dead-letter read failed")
+
+    monkeypatch.setattr(r, "lrange", _raise_connection_error)
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit) as exc_info:
+            office_main(["hire", "worker-1", "--cli", "claude", "--wait", "5"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "could not check" in err
+    assert "no proof of failure for worker-1 within 5s" not in err, (
+        "must not claim a real 5s wait happened when the check never ran"
+    )
+
+
+@patch("modules.office.cli.send")
+def test_hire_without_wait_still_speaks_on_a_proven_rejection(mock_send, monkeypatch, capsys):
+    # The other half of the same contract: bare hire must not go so quiet
+    # that it hides a rejection it can actually prove within its short
+    # internal check -- silence is for "unknown", not for "failed". Same
+    # dead-letter-seeded setup as the explicit --wait failure tests above,
+    # just with no --wait flag at all.
+    _env(monkeypatch)
+    raw, real_stream_id = _dead_letter_envelope()
+    mock_send.return_value = real_stream_id
+    r = FakeRedis()
+    dead_key = prefix(POD, TENANT, agent="host", resource="dead")
+    r.lists[dead_key].append(raw)
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit) as exc_info:
+            office_main(["hire", "worker-1", "--cli", "claude"])
+    assert exc_info.value.code == 1
+    assert "failed: worker-1 was not registered" in capsys.readouterr().err
+
+
+@patch("modules.office.cli.send")
+def test_hire_bare_check_polls_again_and_catches_a_rejection_landing_after_the_first_scan(
+    mock_send, monkeypatch, capsys,
+):
+    # Reviewer's exact counterexample: the pre-seeded-rejection test above
+    # only proves the FIRST scan works -- a one-scan-then-sleep-to-deadline
+    # implementation would pass it identically and still keep every other
+    # committed test (including the 1.19s/0.09s timing experiment) green.
+    # This proves the window genuinely loops: lrange returns EMPTY on its
+    # first call, then the matching dead-letter on a later call, with a
+    # real nonzero deadline (not _env()'s 0.0) -- so this can only pass if
+    # _await_hire_confirmation actually re-scans, not just sleeps once.
+    # time.sleep is mocked to a no-op so the real poll-interval sleeps
+    # between iterations cost no wall-clock time -- deterministic and
+    # fast, not a timing race against a real background thread.
+    monkeypatch.setattr(office_cli, "_BARE_HIRE_CHECK_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(office_cli.time, "sleep", lambda seconds: None)
+    raw, real_stream_id = _dead_letter_envelope()
+    mock_send.return_value = real_stream_id
+    r = FakeRedis()
+    dead_key = prefix(POD, TENANT, agent="host", resource="dead")
+    real_lrange = r.lrange
+    calls = []
+
+    def _lrange_empty_then_matching(key, start, end):
+        calls.append(1)
+        if len(calls) == 1:
+            return []
+        return real_lrange(key, start, end)
+
+    r.lists[dead_key].append(raw)
+    monkeypatch.setattr(r, "lrange", _lrange_empty_then_matching)
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        # The wrapper above returns [] on the very first lrange call
+        # regardless of the real underlying list contents (already
+        # populated), simulating a rejection that lands after the first
+        # scan rather than being visible from the start.
+        with pytest.raises(SystemExit) as exc_info:
+            office_main(["hire", "worker-1", "--cli", "claude"])
+    assert len(calls) >= 2, (
+        f"only {len(calls)} scan(s) happened -- the window never polled a "
+        "second time, so this cannot distinguish a real loop from a "
+        "single scan followed by sleeping to the deadline"
+    )
+    assert exc_info.value.code == 1
+    assert "failed: worker-1 was not registered" in capsys.readouterr().err
+
+
+def test_hire_wait_bare_flag_defaults_to_five_seconds_not_thirty(monkeypatch, capsys):
+    # Pin the operator's actual number, not just its shape -- --wait with
+    # no value used to default to 30s (and was in --help as such, which is
+    # part of why agents used it and burned that much time per hire).
+    # Restored --wait defaults to 5s; a bare hire (no --wait at all) still
+    # only ever waits 1s (_BARE_HIRE_CHECK_TIMEOUT_S), tested separately.
+    with pytest.raises(SystemExit):
+        office_main(["hire", "--help"])
+    out = capsys.readouterr().out
+    assert "default 5" in out
+    assert "default 30" not in out
+
+
+def test_bare_hire_check_timeout_is_exactly_one_second():
+    # The real module constant, not a docstring's claim about it -- _env()
+    # patches this to 0 everywhere else in this file for speed, so nothing
+    # else in this file would catch it drifting from what the operator
+    # actually asked for.
+    assert office_cli._BARE_HIRE_CHECK_TIMEOUT_S == 1.0
 
 
 def test_peers_warns_when_configured_lead_is_not_enrolled(monkeypatch, capsys):
