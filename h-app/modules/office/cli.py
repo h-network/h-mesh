@@ -641,16 +641,31 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
             raise SystemExit(1)
         # outcome == "unknown" -- explicit --wait always speaks (that's what
         # asking for it means); bare hire stays silent and falls through to
-        # the same plain stream_id print it always had, unchanged.
+        # the same plain stream_id print it always had, unchanged, whether
+        # "unknown" means a genuine timeout OR the check itself couldn't
+        # run (a Redis read failure) -- bare hire never distinguished those
+        # in its silence to begin with, so neither needs special handling
+        # here; only explicit --wait's message needs to say which one it
+        # was, so it doesn't claim a real SECONDS-long wait ran when the
+        # check never got to run at all.
         if explicit_wait:
-            print(
-                f"unknown: no proof of failure for {args.agent} within {timeout:.0f}s -- "
-                "this does NOT mean it failed, it may well have succeeded; there is "
-                "currently no way to prove success for this request, only to disprove "
-                "it. Check 'office status' or the registry directly if you want to "
-                "look for yourself.",
-                file=sys.stderr,
-            )
+            if detail is not None:
+                print(
+                    f"unknown: could not check {args.agent}'s hire status -- {detail} -- "
+                    "the request was admitted, but whether it succeeded or failed could "
+                    "not be checked. Check 'office status' or the registry directly if "
+                    "you want to look for yourself.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"unknown: no proof of failure for {args.agent} within {timeout:.0f}s -- "
+                    "this does NOT mean it failed, it may well have succeeded; there is "
+                    "currently no way to prove success for this request, only to disprove "
+                    "it. Check 'office status' or the registry directly if you want to "
+                    "look for yourself.",
+                    file=sys.stderr,
+                )
             raise SystemExit(2)
     print(stream_id)
 
@@ -699,10 +714,11 @@ def _await_hire_confirmation(
     since a different request is observationally identical). Neither
     currently has a success signal keyed by stream_id anywhere in this
     codebase, so neither can be safely confirmed -- only proven failed,
-    or left honestly unknown. See ticket ff53e7e9 for the real fix shape:
-    stream-id-attributable lifecycle completion, covering explicit
-    idempotent-success and reconfiguration-success signals, not just a
-    reordered or better-gated registry check.
+    or left honestly unknown. The real fix would be a stream-id-
+    attributable lifecycle completion signal, covering explicit
+    idempotent-success and reconfiguration-success cases, not just a
+    reordered or better-gated registry check -- nothing in this codebase
+    writes that signal today.
 
     ⚠ Read-only against the dead-letter list (LRANGE, never pop) -- popping
     it here would consume evidence a human or another tool still needs to
@@ -714,11 +730,28 @@ def _await_hire_confirmation(
     like this one (source is usually "host" itself, not a tmux agent), so
     this reads the recipient's dead list directly instead of waiting for a
     reply message that would never arrive.
+
+    ⚠ Best-effort against a read failure, not fail-closed -- reviewer
+    FAILED an earlier version of this branch for the inverse of its own
+    principle: send() had already ADMITTED the request and returned a
+    real stream_id before this function is ever called, so a Redis error
+    reading the dead-letter list must not destroy that proven result by
+    propagating as an uncaught exception (empty stdout, empty stderr, the
+    one thing the caller already knew gone). A failure to CHECK is not
+    evidence of failure -- it collapses to the same "unknown" outcome a
+    timeout does, carrying `detail` so callers that print an explicit
+    message (an actual --wait, not a bare hire) can say honestly that the
+    check itself didn't run, rather than implying a real SECONDS-long
+    wait happened when it didn't.
     """
     dead_key = prefix(pod, tenant, agent="host", resource="dead")
     deadline = time.monotonic() + timeout
     while True:
-        for raw in r.lrange(dead_key, 0, -1):
+        try:
+            raw_entries = r.lrange(dead_key, 0, -1)
+        except redis.RedisError as exc:
+            return "unknown", f"could not check -- {exc}"
+        for raw in raw_entries:
             try:
                 envelope = parse(raw)
             except EnvelopeError:
