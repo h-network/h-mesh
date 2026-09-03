@@ -75,8 +75,6 @@ asynchronous envelope, includes that id in the payload, and prints it—not the
 transport stream id—after the envelope is admitted. This is the allocated
 identity the board will use if downstream creation succeeds, not proof that a
 ticket was created. Transport and custody logs establish later delivery states.
-The deployed predecessor may still print an unrelated transport identity; that
-is deployment lag, not the h-mesh contract above.
 
 `office delete ID` is deliberately scoped to the caller's own board. Delegated
 creation is not authority to destroy another agent's queued or in-flight work,
