@@ -8,6 +8,7 @@ from typing import Set
 from core.config import state_path
 from core.logging import log_record
 from lib.paths import build_pane_path, get_agent_workdir, get_workdir_root, resolve_venv_bin
+from lib.profile_env import resolve_claude_profile_env
 from services.claude_statusline import install_statusline
 
 
@@ -472,29 +473,18 @@ def window_env(
         f"AGENT_GUIDE={guide_path}",
         f"PATH={constructed_path}",
     ]
-    if profile:
-        home_dir = os.environ.get("HOME", os.path.expanduser("~"))
-        env_vars.extend([
-            f"CLAUDE_CONFIG_DIR={home_dir}/.claude-{profile}",
-            f"CODEX_HOME={home_dir}/.codex-{profile}",
-        ])
-
     # ⚠ PER WINDOW, KEYED TO THE PROFILE — never one token for the tenant.
     # A token in the container environment is inherited by EVERY window, which
     # is a single-account mechanism bolted onto a multi-account design: with two
     # accounts it either overrides both profiles with one identity or is ignored
-    # where a profile already has credentials. Injecting it here means the
-    # profile decides both which config dir and which credential, so the two
-    # compose instead of competing.
-    #
-    # ⚠ Absent is not empty. No token means the variable is not set at all, and
-    # the agent logs in interactively as it always has — an empty string would
-    # look to the CLI like a credential that fails.
-    token = os.environ.get(
-        f"CLAUDE_OAUTH_TOKEN_{(profile or 'default').upper().replace('-', '_')}"
-    )
-    if token:
-        env_vars.append(f"CLAUDE_CODE_OAUTH_TOKEN={token}")
+    # where a profile already has credentials. Resolving it from the profile
+    # here means the profile decides both which config dir and which
+    # credential, so the two compose instead of competing. See
+    # lib/profile_env.py for the shared resolution logic (also used by the
+    # claude_sdk port, which needs the same mapping for its own one-off SDK
+    # calls).
+    profile_env = resolve_claude_profile_env(profile)
+    env_vars.extend(f"{key}={value}" for key, value in profile_env.items())
 
     # ⚠ Both are `h-agent`'s own knobs (base image, not h-mesh's), threaded
     # through per window rather than left tenant-wide. Absent is not the same
