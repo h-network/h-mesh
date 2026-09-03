@@ -7,11 +7,9 @@ LEGACY_NAME = ("f" + "lock").encode()
 LEGACY_ALLOW_MARKER = "# legacy-name-" + "allow:"
 MARKER_BYTES = LEGACY_ALLOW_MARKER.encode()
 ALLOW_NAME = re.compile(rb"[A-Z_][A-Z0-9_]*\Z")
-
+Blob = tuple[Path, bytes]
 def _continues_identifier(value: int) -> bool:
-    return value >= 128 or value == 95 or 48 <= value <= 57 or 65 <= value <= 90 or 97 <= value <= 122
-
-
+    return value >= 128 or value == 95 or chr(value).isalnum()
 def _identifier_spans(text: bytes, identifier: bytes) -> list[tuple[int, int]]:
     spans, start = [], 0
     while (found := text.find(identifier, start)) != -1:
@@ -22,8 +20,6 @@ def _identifier_spans(text: bytes, identifier: bytes) -> list[tuple[int, int]]:
             spans.append((found, end))
         start = found + 1
     return spans
-
-
 def _remove_allowed(text: bytes, identifiers: list[bytes]) -> bytes:
     spans = sorted({span for name in identifiers for span in _identifier_spans(text, name)})
     output, cursor = [], 0
@@ -31,21 +27,24 @@ def _remove_allowed(text: bytes, identifiers: list[bytes]) -> bytes:
         output.append(text[cursor:start])
         cursor = end
     return b"".join((*output, text[cursor:]))
-
-def tracked_files(root: Path) -> list[Path]:
-    names = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "-z"], check=True, capture_output=True
-    ).stdout
-    return [root / name.decode("utf-8") for name in names.split(b"\0") if name]
-
-
-def legacy_name_violations(root: Path, paths: Iterable[Path] | None = None) -> tuple[int, list[str]]:
-    violations, checked = [], 0
-    for path in sorted(paths if paths is not None else root.rglob("*")):
-        if not path.is_file():
-            continue
-        relative, checked = path.relative_to(root), checked + 1
-        for number, line in enumerate(path.read_bytes().splitlines(), 1):
+def tracked_blobs(root: Path) -> list[Blob]:
+    records = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-s", "-z"], check=True, capture_output=True
+    ).stdout.split(b"\0")
+    blobs = []
+    for record in filter(None, records):
+        metadata, name = record.split(b"\t", 1)
+        content = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "blob", metadata.split()[1].decode()],
+            check=True, capture_output=True,
+        ).stdout
+        blobs.append((root / name.decode(), content))
+    return blobs
+def legacy_name_violations(root: Path, blobs: Iterable[Blob]) -> tuple[int, list[str]]:
+    blobs, violations = list(blobs), []
+    for path, content in sorted(blobs):
+        relative = path.relative_to(root)
+        for number, line in enumerate(content.splitlines(), 1):
             code, marker, allowance = line.partition(MARKER_BYTES)
             folded = code.lower()
             if marker:
@@ -56,28 +55,26 @@ def legacy_name_violations(root: Path, paths: Iterable[Path] | None = None) -> t
                 folded = _remove_allowed(code, [value for value in values if value not in invalid]).lower()
             if LEGACY_NAME in folded:
                 violations.append(f"{relative}:{number}: {LEGACY_NAME.decode()}")
-    return checked, violations
-
-def legacy_name_diagnostics(root: Path, paths: Iterable[Path] | None = None) -> list[str]:
-    _, violations = legacy_name_violations(root, paths)
+    return len(blobs), violations
+def legacy_name_diagnostics(root: Path, blobs: Iterable[Blob]) -> list[str]:
+    blobs = list(blobs)
+    content = {str(path.relative_to(root)): value for path, value in blobs}
+    _, violations = legacy_name_violations(root, blobs)
     diagnostics = []
     for violation in violations:
         relative, number, _ = violation.rsplit(":", 2)
-        line = (root / relative).read_bytes().splitlines()[int(number) - 1]
-        rendered = line.decode("utf-8", errors="backslashreplace")
-        diagnostics.append(f"{relative}:{number}: {rendered}")
+        line = content[relative].splitlines()[int(number) - 1]
+        diagnostics.append(
+            f"{relative}:{number}: {line.decode('utf-8', errors='backslashreplace')}"
+        )
     return list(dict.fromkeys(diagnostics))
-
-
-def main(root: Path | None = None, paths: Iterable[Path] | None = None) -> int:
+def main(root: Path | None = None, blobs: Iterable[Blob] | None = None) -> int:
     root = root or Path(__file__).resolve().parents[2]
-    diagnostics = legacy_name_diagnostics(root, paths or tracked_files(root))
+    diagnostics = legacy_name_diagnostics(root, blobs or tracked_blobs(root))
     if diagnostics:
         print("Unreviewed legacy-name references found:\n" + "\n".join(diagnostics))
         return 1
     print("Legacy-name guard passed: no unreviewed references found.")
     return 0
-
-
 if __name__ == "__main__":
     raise SystemExit(main())

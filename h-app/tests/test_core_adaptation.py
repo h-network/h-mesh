@@ -24,8 +24,12 @@ from tools.legacy_names import (
     LEGACY_ALLOW_MARKER,
     legacy_name_violations,
     main as legacy_name_guard_main,
-    tracked_files,
+    tracked_blobs,
 )
+
+
+def _fixture_blobs(root: Path):
+    return [(path, path.read_bytes()) for path in root.rglob("*") if path.is_file()]
 
 
 def test_legacy_name_allowance_follows_content_not_line_position(tmp_path: Path):
@@ -45,7 +49,7 @@ def test_legacy_name_allowance_follows_content_not_line_position(tmp_path: Path)
     )
     session_test.write_text("\n".join(lines) + "\n")
 
-    _, violations = legacy_name_violations(tmp_path)
+    _, violations = legacy_name_violations(tmp_path, _fixture_blobs(tmp_path))
 
     assert any("tests/test_session.py:371:" in item for item in violations), (
         "a new legacy reference must fail even when it lands on an old exempt line; "
@@ -66,7 +70,7 @@ def test_legacy_name_allowance_cannot_hide_an_unlisted_reference(tmp_path: Path)
         f"{LEGACY_ALLOW_MARKER} {allowed_name}\n"
     )
 
-    _, violations = legacy_name_violations(tmp_path)
+    _, violations = legacy_name_violations(tmp_path, _fixture_blobs(tmp_path))
 
     banned_fragment = "f" + "lock"
     assert any(
@@ -86,7 +90,7 @@ def test_legacy_name_allowance_does_not_apply_inside_longer_identifier(tmp_path:
         f"{LEGACY_ALLOW_MARKER} {allowed_name}\n"
     )
 
-    _, violations = legacy_name_violations(tmp_path)
+    _, violations = legacy_name_violations(tmp_path, _fixture_blobs(tmp_path))
 
     banned_match = "f" + "lock"
     assert violations == [f"module.py:1: {banned_match}"], (
@@ -104,7 +108,7 @@ def test_legacy_name_allowance_respects_unicode_identifier_boundaries(tmp_path: 
         f"{LEGACY_ALLOW_MARKER} {allowed_name}\n"
     )
 
-    _, violations = legacy_name_violations(tmp_path)
+    _, violations = legacy_name_violations(tmp_path, _fixture_blobs(tmp_path))
 
     banned_match = "f" + "lock"
     assert violations == [f"module.py:1: {banned_match}"], (
@@ -123,7 +127,7 @@ def test_legacy_name_allowance_must_name_a_literal_on_its_line(tmp_path: Path):
         f"VALUE = {absent_name!r}  {LEGACY_ALLOW_MARKER} F, LOCK_ALLOW_PLAINTEXT\n"
     )
 
-    _, violations = legacy_name_violations(tmp_path)
+    _, violations = legacy_name_violations(tmp_path, _fixture_blobs(tmp_path))
 
     banned_match = "f" + "lock"
     assert violations == [
@@ -144,7 +148,9 @@ def test_legacy_name_guard_reports_source_and_markdown_text(
     source.write_text(f'VALUE = "{banned_name}_source"\n')
     documentation.write_text(f"Do not add {banned_name} documentation.\n")
 
-    result = legacy_name_guard_main(tmp_path, [source, documentation])
+    result = legacy_name_guard_main(
+        tmp_path, [(source, source.read_bytes()), (documentation, documentation.read_bytes())]
+    )
     output = capsys.readouterr().out
 
     assert result == 1
@@ -153,6 +159,22 @@ def test_legacy_name_guard_reports_source_and_markdown_text(
         "a contributor must see the file, line, and offending text for both "
         f"source and documentation violations; observed {output!r}"
     )
+
+
+def test_legacy_name_guard_scans_dangling_symlink_payload(tmp_path: Path, capsys):
+    banned_name = "f" + "lock"
+    link = tmp_path / "legacy-link"
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(["ln", "-s", f"{banned_name}_predecessor", str(link)], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "add", "legacy-link"], check=True)
+
+    result = legacy_name_guard_main(tmp_path)
+    output = capsys.readouterr().out
+
+    assert result == 1, (
+        "a tracked link payload must not disappear because its target is absent"
+    )
+    assert f"legacy-link:1: {banned_name}_predecessor" in output
 
 
 class RegistryRedis:
@@ -179,9 +201,7 @@ class RegistryRedis:
 class CoreAdaptationTests(unittest.TestCase):
     def test_tree_contains_no_old_project_names(self):
         repo_root = H_APP.parent
-        checked, violations = legacy_name_violations(
-            repo_root, tracked_files(repo_root)
-        )
+        checked, violations = legacy_name_violations(repo_root, tracked_blobs(repo_root))
 
         self.assertGreater(checked, 100, "Expected to scan the complete repository")
         self.assertEqual(violations, [], "Old project names found:\n" + "\n".join(violations))
