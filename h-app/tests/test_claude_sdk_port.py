@@ -16,14 +16,14 @@ from core.envelope import parse
 from core.keys import prefix
 from core.registry import port_type
 from lib.profile_env import resolve_claude_profile_env
-from modules.sdk.port import deliver_sdk
+from modules.claude_sdk.port import deliver_claude_sdk
 from test_tmux_port import FakeRedis
 
 POD = "testpod"
 TENANT = "testtenant"
 
 
-class SdkPortTests(unittest.TestCase):
+class ClaudeSdkPortTests(unittest.TestCase):
     def setUp(self):
         self.no_ambient_claude_token = patch.dict(
             os.environ, {"CLAUDE_OAUTH_TOKEN_DEFAULT": ""}, clear=False
@@ -33,10 +33,10 @@ class SdkPortTests(unittest.TestCase):
         self.redis = FakeRedis()
         registry = prefix(POD, TENANT, resource="registry")
         self.redis.hset(registry, "alice", "tmux")
-        # Registering the destination's port_type as "sdk" directly through
+        # Registering the destination's port_type as "claude_sdk" directly through
         # the same registry hash core/registry.py reads -- no hire command
         # involved, per this PoC's validation scope.
-        self.redis.hset(registry, "bob", "sdk")
+        self.redis.hset(registry, "bob", "claude_sdk")
 
     def queue(self, kind="Message", payload=None):
         stream_id = send(
@@ -53,12 +53,12 @@ class SdkPortTests(unittest.TestCase):
         return stream_id
 
     def test_registers_cleanly_as_a_generic_port_type(self):
-        self.assertEqual(port_type(self.redis, pod=POD, tenant=TENANT, agent="bob"), "sdk")
+        self.assertEqual(port_type(self.redis, pod=POD, tenant=TENANT, agent="bob"), "claude_sdk")
 
     def test_message_runs_one_query_and_replies(self):
         stream_id = self.queue(payload={"text": "what's 2+2"})
-        with patch("modules.sdk.port._run_query", return_value="4") as mock_query:
-            deliver_sdk(self.redis, pod=POD, tenant=TENANT, agent="bob")
+        with patch("modules.claude_sdk.port._run_query", return_value="4") as mock_query:
+            deliver_claude_sdk(self.redis, pod=POD, tenant=TENANT, agent="bob")
 
         mock_query.assert_called_once_with(
             "[message from alice] what's 2+2",
@@ -81,16 +81,16 @@ class SdkPortTests(unittest.TestCase):
 
     def test_no_reply_sent_when_result_is_blank(self):
         self.queue(payload={"text": "be silent"})
-        with patch("modules.sdk.port._run_query", return_value="   "):
-            deliver_sdk(self.redis, pod=POD, tenant=TENANT, agent="bob")
+        with patch("modules.claude_sdk.port._run_query", return_value="   "):
+            deliver_claude_sdk(self.redis, pod=POD, tenant=TENANT, agent="bob")
 
         raw = self.redis.lpop(prefix(POD, TENANT, "bob", "egress"))
         self.assertIsNone(raw)
 
     def test_empty_text_is_dead_lettered_without_calling_the_sdk(self):
         self.queue(payload={"text": ""})
-        with patch("modules.sdk.port._run_query") as mock_query:
-            deliver_sdk(self.redis, pod=POD, tenant=TENANT, agent="bob")
+        with patch("modules.claude_sdk.port._run_query") as mock_query:
+            deliver_claude_sdk(self.redis, pod=POD, tenant=TENANT, agent="bob")
 
         mock_query.assert_not_called()
         dead = self.redis.lpop(prefix(POD, TENANT, "bob", "dead"))
@@ -98,8 +98,8 @@ class SdkPortTests(unittest.TestCase):
 
     def test_query_failure_lands_in_unresolved_not_dead(self):
         self.queue(payload={"text": "boom"})
-        with patch("modules.sdk.port._run_query", side_effect=RuntimeError("sdk exploded")):
-            deliver_sdk(self.redis, pod=POD, tenant=TENANT, agent="bob")
+        with patch("modules.claude_sdk.port._run_query", side_effect=RuntimeError("sdk exploded")):
+            deliver_claude_sdk(self.redis, pod=POD, tenant=TENANT, agent="bob")
 
         # An exception after the query started is an unknown-effect outcome,
         # not a clean rejection -- it must not land in `dead`.
@@ -109,8 +109,8 @@ class SdkPortTests(unittest.TestCase):
 
     def test_unknown_kind_is_dead_lettered_by_core_not_sdk_code(self):
         self.queue(kind="Command", payload={"text": "irrelevant"})
-        with patch("modules.sdk.port._run_query") as mock_query:
-            deliver_sdk(self.redis, pod=POD, tenant=TENANT, agent="bob")
+        with patch("modules.claude_sdk.port._run_query") as mock_query:
+            deliver_claude_sdk(self.redis, pod=POD, tenant=TENANT, agent="bob")
 
         mock_query.assert_not_called()
         dead = self.redis.lpop(prefix(POD, TENANT, "bob", "dead"))
@@ -120,8 +120,8 @@ class SdkPortTests(unittest.TestCase):
         self.redis.set(prefix(POD, TENANT, agent="bob", resource="profile"), "work")
         self.queue()
         with patch.dict(os.environ, {"CLAUDE_OAUTH_TOKEN_WORK": "tok-work"}, clear=False):
-            with patch("modules.sdk.port._run_query", return_value="ok") as mock_query:
-                deliver_sdk(self.redis, pod=POD, tenant=TENANT, agent="bob")
+            with patch("modules.claude_sdk.port._run_query", return_value="ok") as mock_query:
+                deliver_claude_sdk(self.redis, pod=POD, tenant=TENANT, agent="bob")
 
         home_dir = os.environ.get("HOME", os.path.expanduser("~"))
         mock_query.assert_called_once_with(
@@ -141,9 +141,9 @@ class SdkPortTests(unittest.TestCase):
         self.queue(payload={"text": "first"})
         self.queue(payload={"text": "second"})
         with patch(
-            "modules.sdk.port._run_query", side_effect=["reply-1", "reply-2"]
+            "modules.claude_sdk.port._run_query", side_effect=["reply-1", "reply-2"]
         ) as mock_query:
-            deliver_sdk(self.redis, pod=POD, tenant=TENANT, agent="bob")
+            deliver_claude_sdk(self.redis, pod=POD, tenant=TENANT, agent="bob")
 
         self.assertEqual(mock_query.call_count, 2)
         first = parse(self.redis.lpop(prefix(POD, TENANT, "bob", "egress")))
@@ -229,10 +229,10 @@ class LogHopTests(unittest.TestCase):
             for message in (started, turn, finished):
                 yield message
 
-        from modules.sdk.port import _run_query
+        from modules.claude_sdk.port import _run_query
 
         with patch("claude_agent_sdk.query", new=fake_query), patch(
-            "modules.sdk.port.log_record"
+            "modules.claude_sdk.port.log_record"
         ) as mock_log:
             text = _run_query(
                 "prompt",
@@ -246,10 +246,10 @@ class LogHopTests(unittest.TestCase):
         self.assertEqual(text, "done")
 
         events = [call.args[1] for call in mock_log.call_args_list]
-        self.assertEqual(events, ["sdk_query_started", "sdk_turn", "sdk_query_finished"])
+        self.assertEqual(events, ["claude_sdk_query_started", "claude_sdk_turn", "claude_sdk_query_finished"])
 
         for call in mock_log.call_args_list:
-            self.assertEqual(call.args[0], "sdk")
+            self.assertEqual(call.args[0], "claude_sdk")
             self.assertEqual(call.kwargs["stream_id"], "sid")
             self.assertEqual(call.kwargs["correlation_id"], "cid")
             self.assertEqual(call.kwargs["source"], "alice")
@@ -273,10 +273,10 @@ class LogHopTests(unittest.TestCase):
         async def fake_query(*, prompt, options=None):
             yield sentinel
 
-        from modules.sdk.port import _run_query
+        from modules.claude_sdk.port import _run_query
 
         with patch("claude_agent_sdk.query", new=fake_query), patch(
-            "modules.sdk.port.log_record"
+            "modules.claude_sdk.port.log_record"
         ) as mock_log:
             text = _run_query(
                 "prompt", {},
@@ -286,7 +286,7 @@ class LogHopTests(unittest.TestCase):
 
         self.assertEqual(text, "")
         mock_log.assert_called_once()
-        self.assertEqual(mock_log.call_args.args[1], "sdk_hop")
+        self.assertEqual(mock_log.call_args.args[1], "claude_sdk_hop")
         self.assertEqual(mock_log.call_args.kwargs["evidence"], "object")
 
 

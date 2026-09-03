@@ -1,6 +1,6 @@
-"""SDK port: one-off Claude Agent SDK query() delivery, no persistent session."""
+"""Claude SDK port: one-off Claude Agent SDK query() delivery, no persistent session."""
 
-_DELIVERY_EXPORTS = {"deliver_sdk", "main"}
+_DELIVERY_EXPORTS = {"deliver_claude_sdk", "main"}
 
 
 def __getattr__(name: str):
@@ -12,4 +12,4 @@ def __getattr__(name: str):
     return getattr(port, name)
 
 
-__all__ = ["deliver_sdk", "main"]
+__all__ = ["deliver_claude_sdk", "main"]

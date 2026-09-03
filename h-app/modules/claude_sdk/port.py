@@ -1,4 +1,14 @@
-"""SDK port: one-off Claude Agent SDK query() calls, no persistent session.
+"""Claude SDK port: one-off Claude Agent SDK query() calls, no persistent session.
+
+Named for the vendor SDK it wraps, not "sdk" generically -- a Codex or
+Agy/Antigravity SDK port would be its own separate module and port_type
+(``modules/codex_sdk/``, ``modules/agy_sdk/``, ...), each independently
+addable the same way this one was, not branches inside this file. The three
+vendor SDKs are different enough (different libraries, different call
+shapes, different auth wiring) that unifying them the way tmux unifies
+claude/codex/agy behind one pane-paste mechanism doesn't hold: tmux's
+mechanism (paste text, tail a pane) is identical across CLIs, these SDKs'
+mechanisms are not.
 
 Unlike tmux (a persistent pane the switch pastes into) or openshell (a
 resumable sandbox with its own session files), this port keeps nothing to
@@ -11,7 +21,7 @@ uses for the same reason).
 
 Any envelope kind other than ``Message`` (``Command``, ``AddTicket``,
 ``Attachment``) is out of scope for this PoC and is dead-lettered by
-``core.channels``'s own "unknown kind" handling -- nothing sdk-specific to
+``core.channels``'s own "unknown kind" handling -- nothing port-specific to
 build for that.
 """
 
@@ -62,7 +72,7 @@ def _log_hop(
         source=source, destination=destination,
     )
     if isinstance(message, SystemMessage):
-        log_record("sdk", "sdk_query_started", evidence=message.subtype, **common)
+        log_record("claude_sdk", "claude_sdk_query_started", evidence=message.subtype, **common)
     elif isinstance(message, AssistantMessage):
         tool_names = sorted(
             {block.name for block in message.content if isinstance(block, ToolUseBlock)}
@@ -70,10 +80,10 @@ def _log_hop(
         reason = f"stop_reason={message.stop_reason}"
         if tool_names:
             reason += f" tools={','.join(tool_names)}"
-        log_record("sdk", "sdk_turn", reason=reason, **common)
+        log_record("claude_sdk", "claude_sdk_turn", reason=reason, **common)
     elif isinstance(message, ResultMessage):
         log_record(
-            "sdk", "sdk_query_finished",
+            "claude_sdk", "claude_sdk_query_finished",
             evidence=message.subtype,
             reason=f"is_error={message.is_error} num_turns={message.num_turns}",
             **common,
@@ -83,7 +93,7 @@ def _log_hop(
         # ConversationResetMessage without include_partial_messages, but the
         # Message union can grow -- an unrecognized hop is still logged, not
         # silently dropped.
-        log_record("sdk", "sdk_hop", evidence=type(message).__name__, **common)
+        log_record("claude_sdk", "claude_sdk_hop", evidence=type(message).__name__, **common)
 
 
 def _run_query(
@@ -178,12 +188,12 @@ def _deliver_message(
         # would just propagate whatever (possibly absent) thread id the
         # original sender happened to set.
         correlation_id=stream_id,
-        module="sdk",
+        module="claude_sdk",
         in_reply_to=stream_id,
     )
 
 
-def deliver_sdk(
+def deliver_claude_sdk(
     r,
     pod: str,
     tenant: str,
@@ -210,7 +220,7 @@ def deliver_sdk(
         openers=openers,
         timeout=timeout,
         blocking=blocking,
-        module="sdk",
+        module="claude_sdk",
     )
 
 
@@ -221,7 +231,7 @@ def main(argv: list[str] | None = None) -> None:
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     args = sys.argv[1:] if argv is None else argv
     if not args:
-        print("usage: python -m modules.sdk.port <agent>", file=sys.stderr)
+        print("usage: python -m modules.claude_sdk.port <agent>", file=sys.stderr)
         sys.exit(1)
     agent = args[0]
     pod = os.environ["POD"]
@@ -233,7 +243,7 @@ def main(argv: list[str] | None = None) -> None:
         paused_key = prefix(pod, tenant, agent=agent, resource="paused")
         if r.get(paused_key):
             return
-        deliver_sdk(r, pod=pod, tenant=tenant, agent=agent)
+        deliver_claude_sdk(r, pod=pod, tenant=tenant, agent=agent)
 
 
 if __name__ == "__main__":

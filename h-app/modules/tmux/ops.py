@@ -481,7 +481,8 @@ def window_env(
     # here means the profile decides both which config dir and which
     # credential, so the two compose instead of competing. See
     # lib/profile_env.py for the shared resolution logic (also used by the
-    # sdk port, which needs the same mapping for its own one-off SDK calls).
+    # claude_sdk port, which needs the same mapping for its own one-off SDK
+    # calls).
     profile_env = resolve_claude_profile_env(profile)
     env_vars.extend(f"{key}={value}" for key, value in profile_env.items())
 

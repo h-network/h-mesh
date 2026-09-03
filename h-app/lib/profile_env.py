@@ -1,7 +1,7 @@
 """Account profile -> Claude/Codex config-dir and credential env resolution.
 
 A hired tmux agent's window environment (``modules/tmux/ops.py::window_env``)
-and a one-shot SDK port invocation (``modules/sdk/port.py``) both need the
+and a one-shot SDK port invocation (``modules/claude_sdk/port.py``) both need the
 same mapping from an account profile to ``CLAUDE_CONFIG_DIR``/``CODEX_HOME``
 and a profile-scoped OAuth token. This is the one place that owns it, so a
 third caller never has to re-derive it a third way.
