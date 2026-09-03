@@ -57,8 +57,38 @@ def _context():
     return redis.Redis.from_url(_REDIS_URL), pod, tenant, source
 
 
-def _operation_parser(command: str, description: str) -> argparse.ArgumentParser:
-    return argparse.ArgumentParser(prog=f"office {command}", description=description)
+class _UsageErrorParser(argparse.ArgumentParser):
+    """An ArgumentParser whose own parse failures exit with a caller-chosen
+    code instead of argparse's hardcoded 2.
+
+    Most callers pass the default (2) and see no change. `hire` is the
+    exception: its own outcomes already use exit 1 (a real, stream_id-proven
+    rejection) and 2 (sent, unconfirmed within the wait) -- see
+    _lifecycle_command. A parse failure (an invalid --cli choice, a missing
+    required argument, ...) happens before send() is ever called, so nothing
+    was sent at all, but reusing argparse's default 2 made that
+    indistinguishable from the real "sent, no proof of failure" outcome to
+    every caller, setup.sh included: it reported "requested -- no rejection
+    seen" for a hire that never left this process. See hire's own
+    --cli/--wait help text for the exit code contract this protects.
+    """
+
+    def __init__(self, *args, usage_error_exit_code: int = 2, **kwargs):
+        self._usage_error_exit_code = usage_error_exit_code
+        super().__init__(*args, **kwargs)
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(self._usage_error_exit_code, f"{self.prog}: error: {message}\n")
+
+
+def _operation_parser(
+    command: str, description: str, *, usage_error_exit_code: int = 2
+) -> argparse.ArgumentParser:
+    return _UsageErrorParser(
+        prog=f"office {command}", description=description,
+        usage_error_exit_code=usage_error_exit_code,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -506,7 +536,10 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
         "pause": "PauseAgent",
         "resume": "ResumeAgent",
     }
-    parser = _operation_parser(command, descriptions[command])
+    parser = _operation_parser(
+        command, descriptions[command],
+        usage_error_exit_code=_HIRE_USAGE_ERROR_EXIT if command == "hire" else 2,
+    )
     parser.add_argument("agent", help="target agent")
     if command == "hire":
         # ⚠ `choices` rather than a free string. An unknown value would be
@@ -592,7 +625,9 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
                  "never claims success -- only the absence of a proven failure. A "
                  "timeout is not a failure: a stranded request can still complete "
                  "later once switch recovery re-kicks it (see switch-agent's "
-                 "drain/recovery fix).",
+                 "drain/recovery fix). A bad invocation -- an invalid --cli choice, "
+                 "a missing agent, an unrecognized flag -- never reaches send() at "
+                 "all and exits 3, not 1 or 2: nothing was requested.",
         )
     args = parser.parse_args(argv)
     r, pod, tenant, source = _context()
@@ -675,6 +710,14 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
 # silently, for the same proven-rejection check --wait itself runs. Keep
 # in sync with _lifecycle_command's --wait help text if this ever changes.
 _BARE_HIRE_CHECK_TIMEOUT_S = 1.0
+
+# Distinct from hire's own exit 1 (failed) and 2 (unknown) -- a parse
+# failure on hire's own arguments never reaches send(), so it must not be
+# mistaken for either real outcome. setup.sh's hire-status dispatch already
+# treats any exit code outside {0, 1, 2} as a hard, surfaced error (see its
+# own comment above the roster loop); this just keeps hire's parser from
+# colliding with the two exit codes that already mean something else.
+_HIRE_USAGE_ERROR_EXIT = 3
 
 _HIRE_CONFIRMATION_POLL_INTERVAL_S = 0.5
 

@@ -938,6 +938,13 @@ print("1" if pt == "tmux" else "0")
             # remove, rebuilt one layer out in the wrapper that reads the
             # CLI's own honest exit code. An unenumerated status means "I
             # do not know what happened", never "probably fine".
+            #
+            # ⚠ office hire's own argument-parse failures (bad --cli, missing
+            # agent, ...) exit 3, deliberately distinct from 1/2 above so
+            # they land here rather than being misread as "requested" --
+            # exit 2 already means "sent, unconfirmed", and a parse failure
+            # never reaches send() at all. See modules/office/cli.py's
+            # _HIRE_USAGE_ERROR_EXIT.
             HIRE_ARGS=("$a" --cli "$CLI_FOR_A" --wait)
             [ "$PROF_FOR_A" != "default" ] && HIRE_ARGS+=(--profile "$PROF_FOR_A")
             [ -n "$EP_FOR_A" ] && HIRE_ARGS+=(--provider "$EP_FOR_A")

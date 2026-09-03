@@ -90,14 +90,19 @@ exec {sys.executable} "$@"
     return fake_venv
 
 
-def _run_setup_with_forced_hire_exits(agents: list, exits: dict) -> subprocess.CompletedProcess:
+def _run_setup_with_forced_hire_exits(
+    agents: list, exits: dict, *, extra_env: dict | None = None,
+) -> subprocess.CompletedProcess:
     """Run setup.sh --non-interactive with roster `agents`, where `exits`
     forces a specific fake hire exit code for named agents (deterministic,
     no real hire logic for those -- see the wrapper docstring above). Any
     agent not in `exits` would go through the real pipeline; every test
     here forces all roster agents so runs stay fast. Cleans up all
     daemons/tmux/redis state before returning, so callers only assert on
-    the returned CompletedProcess."""
+    the returned CompletedProcess. `extra_env` layers on top of the
+    scrubbed/isolated base env (e.g. a deliberately invalid DEFAULT_CLI, to
+    exercise the REAL office hire CLI's own usage-error exit rather than a
+    forced one)."""
     tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_hire_status_dispatch_")
     home_dir = os.path.join(tmpdir, "home")
     os.makedirs(home_dir, exist_ok=True)
@@ -134,6 +139,8 @@ def _run_setup_with_forced_hire_exits(agents: list, exits: dict) -> subprocess.C
     env["TMUX_SESSION"] = f"sess-{os.urandom(4).hex()}"
     env["TMUX_TMPDIR"] = tmpdir
     env["TMUX_SOCKET"] = os.path.join(tmpdir, "isolated.sock")
+    if extra_env:
+        env.update(extra_env)
 
     try:
         return subprocess.run(
@@ -265,4 +272,45 @@ def test_setup_exits_nonzero_after_a_proven_hire_rejection():
     assert "worker1" in res.stderr and "worker2" not in res.stderr, (
         f"the failure summary must name only the agent that was actually "
         f"rejected:\n{res.stderr}"
+    )
+
+
+def test_setup_surfaces_a_corrupted_default_cli_instead_of_reporting_requested():
+    """Live incident, not a hypothetical: h-mesh-halil's persisted
+    DEFAULT_CLI held a Telegram bot token instead of claude/codex/agy (a
+    provisioning mistake, not a code bug), so office hire's own argparse
+    rejected --cli before ever calling send() -- and that rejection used to
+    exit 2, identical to hire's own legitimate "sent, unconfirmed" outcome.
+    setup.sh's dispatch trusted that 2 and printed "requested -- no
+    rejection seen" for a hire that had never been sent: no entry in
+    switch.log, no registry row, no visible error anywhere.
+
+    No forced-exit wrapper here -- DEFAULT_CLI is genuinely invalid and the
+    REAL office hire subprocess runs end to end, to prove the fix (hire's
+    argparse usage errors now exit 3, distinct from 1/2) actually closes
+    the silent-failure path setup.sh's existing "any unenumerated exit is a
+    hard, surfaced error" branch was already designed to catch.
+    """
+    _skip_unless_redis()
+    res = _run_setup_with_forced_hire_exits(
+        ["worker1"], {}, extra_env={"DEFAULT_CLI": "not-a-real-cli"},
+    )
+
+    assert res.returncode != 0, (
+        "a hire that was never actually sent (bad --cli) must make "
+        f"setup.sh's own exit code say failure:\nstdout:{res.stdout}\nstderr:{res.stderr}"
+    )
+    combined = res.stdout.splitlines() + res.stderr.splitlines()
+    worker1_line = next((l for l in combined if "worker1" in l and "•" in l), None)
+    assert worker1_line is not None, (
+        f"no per-agent summary line for worker1 in stdout:\n{res.stdout}\nstderr:\n{res.stderr}"
+    )
+    assert "requested" not in worker1_line, (
+        f"a hire that never called send() was reported as a soft success: {worker1_line!r}"
+    )
+    assert "setup error" in worker1_line and "unexpected exit 3" in worker1_line, (
+        f"a bad --cli must surface as an explicit, named exit code: {worker1_line!r}"
+    )
+    assert "invalid choice" in res.stderr, (
+        f"the real argparse rejection reason must reach the operator:\n{res.stderr}"
     )

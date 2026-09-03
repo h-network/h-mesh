@@ -674,7 +674,11 @@ def test_hire_wait_times_out_as_unknown_not_failed_when_neither_happens(mock_sen
 # negative duration in the message. All four are now rejected by argparse's
 # own type= callback, which runs during parse_args() -- strictly before the
 # send() call below it in this file -- so no hire is ever admitted from an
-# invalid --wait.
+# invalid --wait. Exit code 3 (_HIRE_USAGE_ERROR_EXIT), not 2: this is a
+# parser.error() path (argparse.ArgumentTypeError from type= is caught and
+# re-raised as a usage error internally), and 2 already means "sent,
+# unconfirmed" -- see test_hire_bad_cli_choice_is_a_usage_error_not_unknown
+# for why that collision was the actual bug.
 @pytest.mark.parametrize("bad_value", ["nan", "inf", "-inf", "-5"])
 @patch("modules.office.cli.send")
 def test_hire_wait_rejects_non_finite_and_negative_values_before_any_send(mock_send, monkeypatch, bad_value):
@@ -689,8 +693,33 @@ def test_hire_wait_rejects_non_finite_and_negative_values_before_any_send(mock_s
             # that ambiguity so every one of these four is actually
             # exercising the same validation path, not two different ones.
             office_main(["hire", "worker-1", "--cli", "claude", f"--wait={bad_value}"])
-    assert exc_info.value.code == 2
+    assert exc_info.value.code == 3
     mock_send.assert_not_called()
+
+
+# ⚠ Root cause of a real, silent production failure: a tenant's persisted
+# DEFAULT_CLI ended up holding something other than claude/codex/agy, so
+# every hire's --cli choice was rejected by argparse -- which used to exit
+# 2, identical to hire's own legitimate "sent, no proof of failure yet"
+# outcome. setup.sh's dispatch (see its own comment above the roster hire
+# loop) trusted that 2 and reported "requested -- no rejection seen" for a
+# hire that had in fact never called send() at all. Nothing in switch.log,
+# nothing in the registry, and no visible error -- see the investigation
+# ticket for the live repro. Exit code 3 is what lets setup.sh's existing
+# "any unenumerated status is a hard, surfaced error" branch catch this
+# instead of silently swallowing it.
+@patch("modules.office.cli.send")
+def test_hire_bad_cli_choice_is_a_usage_error_not_unknown(mock_send, monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis()
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit) as exc_info:
+            office_main(["hire", "worker-1", "--cli", "not-a-real-cli", "--wait"])
+    assert exc_info.value.code == 3
+    mock_send.assert_not_called()
+    err = capsys.readouterr().err
+    assert "invalid choice" in err
+    assert "unknown: no proof of failure" not in err
 
 
 @patch("modules.office.cli.send")
