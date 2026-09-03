@@ -19,6 +19,7 @@ if str(H_APP) not in sys.path:
 from core.channels import receive
 from core.envelope import build, encode, parse
 from core.keys import prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key
+from lib.board_interaction import add_ticket
 from modules.office import cli as office_cli
 from modules.office.cli import main as office_main
 
@@ -1346,8 +1347,27 @@ def test_concurrent_takes_leave_exactly_one_doing_ticket(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# add -- unchanged behavior, AddTicket envelope only
+# delete / add
 # ---------------------------------------------------------------------------
+
+
+def test_delete_miss_names_own_board_scope_and_preserves_assignees_ticket(monkeypatch, capsys):
+    """A raiser cannot silently mistake delegated creation for delete authority."""
+    _env(monkeypatch)
+    r = FakeRedis(registry={"architect": "tmux", "reviewer": "tmux"})
+    reviewer_todo = prefix(POD, TENANT, "reviewer", "tasks.todo")
+    raw = json.dumps(_ticket("architect", task_id="delegated-ticket", status="todo"))
+    r.lists[reviewer_todo].append(raw)
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit) as exc:
+            office_main(["delete", "delegated-ticket"])
+
+    assert exc.value.code == 1
+    assert r.lists[reviewer_todo] == [raw]
+    error = capsys.readouterr().err
+    assert "delete searches only your own board" in error
+    assert "cannot withdraw a task assigned to another agent" in error
 
 
 @patch("modules.office.cli.send")
@@ -1373,6 +1393,31 @@ def test_add_sends_envelope_and_prints_the_ticket_id(mock_send, monkeypatch, cap
     assert ticket_id != "stream-1"
     todo_key = prefix(POD, TENANT, "backend", "tasks.todo")
     assert r.lists[todo_key] == []
+
+
+def test_add_printed_id_is_created_and_takeable_on_assignees_board(monkeypatch, capsys):
+    """The address handed to the raiser must be the assignee's task address."""
+    _env(monkeypatch)
+    r = FakeRedis(registry={"architect": "tmux", "reviewer": "tmux"})
+    allocated_bytes = bytes.fromhex("fedcba9876543210" * 2)
+    with (
+        patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")),
+        patch("modules.office.cli.os.urandom", return_value=allocated_bytes),
+    ):
+        office_main(["add", "-a", "reviewer", "-t", "review me", "-d", "full context"])
+
+    printed_id = capsys.readouterr().out.strip()
+    envelope = parse(r.lists[prefix(POD, TENANT, "architect", "egress")].pop(0))
+    add_ticket(r, pod=POD, tenant=TENANT, agent="reviewer", envelope=envelope)
+    stored = json.loads(r.lists[prefix(POD, TENANT, "reviewer", "tasks.todo")][0])
+
+    assert printed_id == "fedcba9876543210" * 2
+    assert envelope["payload"]["id"] == printed_id
+    assert stored["id"] == printed_id
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "reviewer")):
+        office_main(["take", printed_id])
+    taken = json.loads(r.lists[prefix(POD, TENANT, "reviewer", "tasks.doing")][0])
+    assert taken["id"] == printed_id
 
 
 # ---------------------------------------------------------------------------

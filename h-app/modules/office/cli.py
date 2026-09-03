@@ -900,7 +900,14 @@ def _entries(r, keys: dict[str, str], states: Sequence[str]):
             yield state, raw, normalize_ticket(raw, state=state)
 
 
-def _select(r, keys: dict[str, str], states: Sequence[str], reference: str | None):
+def _select(
+    r,
+    keys: dict[str, str],
+    states: Sequence[str],
+    reference: str | None,
+    *,
+    missing_message: str | None = None,
+):
     try:
         entries = list(_entries(r, keys, states))
     except BoardError as exc:
@@ -913,7 +920,7 @@ def _select(r, keys: dict[str, str], states: Sequence[str], reference: str | Non
         return entries[0]
     matches = [entry for entry in entries if entry[2]["id"].startswith(reference)]
     if not matches:
-        raise OfficeError(f"no task matches id {reference!r}")
+        raise OfficeError(missing_message or f"no task matches id {reference!r}")
     if len(matches) != 1:
         raise OfficeError(f"task id {reference!r} is ambiguous")
     return matches[0]
@@ -1355,12 +1362,21 @@ def _hold_command(argv: list[str]) -> None:
 
 
 def _delete_command(argv: list[str]) -> None:
-    parser = _operation_parser("delete", "Permanently remove a task.")
+    parser = _operation_parser("delete", "Permanently remove a task from your own board.")
     parser.add_argument("id", help="ticket id or unique prefix")
     args = parser.parse_args(argv)
     r, pod, tenant, source = _context()
     keys = _task_keys(pod, tenant, source)
-    state, raw, ticket = _select(r, keys, ("todo", "doing", "hold", "done"), args.id)
+    state, raw, ticket = _select(
+        r,
+        keys,
+        ("todo", "doing", "hold", "done"),
+        args.id,
+        missing_message=(
+            f"delete searches only your own board; no task matches id {args.id!r}. "
+            "It cannot withdraw a task assigned to another agent"
+        ),
+    )
     _remove(r, keys[state], raw)
     record_task_event("delete", id=ticket["id"], title=ticket["title"], agent=source, actor=source)
     _log_task("task_deleted", agent=source, ticket=ticket)
@@ -1724,7 +1740,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("show",), "read one ticket without changing it", _show_command),
     (("retitle",), "correct the title of your open task", _retitle_command),
     (("hold",), "put an active or queued task on hold", _hold_command),
-    (("delete",), "permanently remove a task", _delete_command),
+    (("delete",), "permanently remove a task from your own board", _delete_command),
     (("add",), "add a task to another agent's board", _add_command),
     (("clone-to-all",), "clone a repository into agent workspaces", _clone_to_all_command),
     (("usage",), "show token usage and estimated cost", _usage_command),

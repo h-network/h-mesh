@@ -75,6 +75,15 @@ asynchronous envelope, includes that id in the payload, and prints it—not the
 transport stream id—after the envelope is admitted. This is the allocated
 identity the board will use if downstream creation succeeds, not proof that a
 ticket was created. Transport and custody logs establish later delivery states.
+The deployed predecessor may still print an unrelated transport identity; that
+is deployment lag, not the h-mesh contract above.
+
+`office delete ID` is deliberately scoped to the caller's own board. Delegated
+creation is not authority to destroy another agent's queued or in-flight work,
+even when the caller originally raised it. A miss therefore names that scope
+and says that `delete` cannot withdraw a task assigned to another agent instead
+of implying that an otherwise valid cross-board id does not exist. Coordinate
+with the assignee to return, cancel, or delete work in their custody.
 For review work, use `passed` or `failed`. Hold a QUESTIONS review while its
 answers block the verdict; use `completed` only when its questions are
 non-blocking. Returned work joins the back of a nonempty `todo` queue.
