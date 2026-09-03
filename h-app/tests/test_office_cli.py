@@ -144,6 +144,16 @@ def _env(monkeypatch, agent="architect"):
     monkeypatch.setenv("AGENT_NAME", agent)
     monkeypatch.setenv("POD", POD)
     monkeypatch.setenv("TENANT", TENANT)
+    # ⚠ Bare hire (no --wait) now runs a real, short attributable-completion
+    # check before returning (operator's call, restoring --wait after its
+    # removal) -- a real time.sleep in that poll loop, unaffected by
+    # FakeRedis being fake. 0.0 still resolves correctly (the dead-letter
+    # scan runs before the deadline check, so a pre-seeded rejection is
+    # still caught -- see test_hire_wait_accepts_zero_as_an_immediate_
+    # single_check's identical reasoning for --wait=0), it just does it
+    # without spending a real second per call across this whole file.
+    # Tests of the real 1s ceiling itself override this back explicitly.
+    monkeypatch.setattr(office_cli, "_BARE_HIRE_CHECK_TIMEOUT_S", 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -704,14 +714,58 @@ def test_hire_wait_accepts_zero_as_an_immediate_single_check(mock_send, monkeypa
 
 @patch("modules.office.cli.send")
 def test_hire_without_wait_stays_fire_and_forget(mock_send, monkeypatch, capsys):
-    # The default, unflagged path must be unchanged -- callers that want
-    # fire-and-forget still get it.
+    # No --wait flag still runs the short, silent bare-hire check
+    # internally (see _BARE_HIRE_CHECK_TIMEOUT_S) -- but it must stay
+    # observably fire-and-forget when unresolved: only the stream_id on
+    # stdout, nothing on stderr, no nonzero exit. _env() patches the
+    # timeout to 0 so this doesn't spend a real second finding that out.
     _env(monkeypatch)
     mock_send.return_value = "stream-1"
     r = FakeRedis()
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
         office_main(["hire", "worker-1", "--cli", "claude"])
     assert capsys.readouterr().out.strip() == "stream-1"
+
+
+@patch("modules.office.cli.send")
+def test_hire_without_wait_still_speaks_on_a_proven_rejection(mock_send, monkeypatch, capsys):
+    # The other half of the same contract: bare hire must not go so quiet
+    # that it hides a rejection it can actually prove within its short
+    # internal check -- silence is for "unknown", not for "failed". Same
+    # dead-letter-seeded setup as the explicit --wait failure tests above,
+    # just with no --wait flag at all.
+    _env(monkeypatch)
+    raw, real_stream_id = _dead_letter_envelope()
+    mock_send.return_value = real_stream_id
+    r = FakeRedis()
+    dead_key = prefix(POD, TENANT, agent="host", resource="dead")
+    r.lists[dead_key].append(raw)
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit) as exc_info:
+            office_main(["hire", "worker-1", "--cli", "claude"])
+    assert exc_info.value.code == 1
+    assert "failed: worker-1 was not registered" in capsys.readouterr().err
+
+
+def test_hire_wait_bare_flag_defaults_to_five_seconds_not_thirty(monkeypatch, capsys):
+    # Pin the operator's actual number, not just its shape -- --wait with
+    # no value used to default to 30s (and was in --help as such, which is
+    # part of why agents used it and burned that much time per hire).
+    # Restored --wait defaults to 5s; a bare hire (no --wait at all) still
+    # only ever waits 1s (_BARE_HIRE_CHECK_TIMEOUT_S), tested separately.
+    with pytest.raises(SystemExit):
+        office_main(["hire", "--help"])
+    out = capsys.readouterr().out
+    assert "default 5" in out
+    assert "default 30" not in out
+
+
+def test_bare_hire_check_timeout_is_exactly_one_second():
+    # The real module constant, not a docstring's claim about it -- _env()
+    # patches this to 0 everywhere else in this file for speed, so nothing
+    # else in this file would catch it drifting from what the operator
+    # actually asked for.
+    assert office_cli._BARE_HIRE_CHECK_TIMEOUT_S == 1.0
 
 
 def test_peers_warns_when_configured_lead_is_not_enrolled(monkeypatch, capsys):

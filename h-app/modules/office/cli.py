@@ -544,13 +544,18 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
             help="claude's --tools list, space-separated (default: Bash Read Write Edit "
                  "Glob Grep); '' means unrestricted. claude only, ignored by codex/agy",
         )
-        # ⚠ Opt-in, not the default -- a StartAgent envelope is fire-and-forget
-        # by design (see core.channels.send's own docstring), and a caller that
-        # wants that stays fire-and-forget. This exists because printing the
-        # word "hired" off nothing but this command's exit code is ADMITTED
-        # (the envelope was durably enqueued) reported as CREATED (the agent
-        # actually exists) -- exactly the shape of a real incident where an
-        # operator was told an agent existed when it did not.
+        # ⚠ Bare hire (no --wait at all) still runs a short, SILENT
+        # attributable-completion check (see _BARE_HIRE_CHECK_TIMEOUT_S)
+        # before returning -- operator's explicit call, reversing an
+        # earlier removal of --wait entirely: a fast sanity check that can
+        # catch a real, proven rejection is worth having on every hire,
+        # but a message that fires on every hire saying nothing new (the
+        # far more common "unknown" outcome) is noise, not signal. So bare
+        # hire speaks ONLY on a proven rejection (exit 1, same failure
+        # message --wait itself would print) and stays exactly as quiet as
+        # it always was -- prints the stream_id, exits 0 -- on "unknown".
+        # An explicit --wait keeps its existing loud contract for BOTH
+        # outcomes, since asking for it means wanting to know either way.
         #
         # ⚠ Cannot currently report success, only the ABSENCE of a proven
         # failure -- read this before scripting against exit 0. "hire" is
@@ -566,23 +571,27 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
         # writes a signal tying a *successful* StartAgent back to the
         # specific stream_id that caused it, for either case -- so
         # neither can be safely confirmed, only proven failed or left
-        # unknown. See ticket ff53e7e9 for the attributable-completion
+        # unknown. See held ticket 74f1edf3 for the attributable-completion
         # signal (success AND failure, keyed by stream_id, covering both
-        # operations) this would need to safely report a real success.
+        # operations) this would need to safely report a real success --
+        # 1s/5s make the cost of checking bearable, they do not make
+        # success provable.
         parser.add_argument(
-            "--wait", nargs="?", const=30.0, type=_wait_seconds, default=None, metavar="SECONDS",
-            help="wait up to SECONDS (default 30) and report what can be proven about "
-                 "this request, instead of returning as soon as it's merely accepted. "
-                 "Two outcomes today, not three: exit 1 = failed (a real, stream_id-"
-                 "matched rejection, seen in the destination's dead-letter list); "
-                 "exit 2 = unknown -- no proof of failure within SECONDS. Exit 0 is "
-                 "NOT currently reachable: bare registry membership cannot be "
-                 "attributed to this specific request under concurrency (a different "
-                 "request for the same agent name could be the one that actually "
-                 "registered it, or already had), so this never claims success -- "
-                 "only the absence of a proven failure. A timeout is not a failure: "
-                 "a stranded request can still complete later once switch recovery "
-                 "re-kicks it (see switch-agent's drain/recovery fix).",
+            "--wait", nargs="?", const=5.0, type=_wait_seconds, default=None, metavar="SECONDS",
+            help="wait up to SECONDS (default 5; a bare hire with no --wait at all "
+                 "still waits 1s, silently, for the same check) and report what can "
+                 "be proven about this request, instead of returning as soon as it's "
+                 "merely accepted. Two outcomes today, not three: exit 1 = failed (a "
+                 "real, stream_id-matched rejection, seen in the destination's "
+                 "dead-letter list); exit 2 = unknown -- no proof of failure within "
+                 "SECONDS. Exit 0 is NOT currently reachable: bare registry "
+                 "membership cannot be attributed to this specific request under "
+                 "concurrency (a different request for the same agent name could be "
+                 "the one that actually registered it, or already had), so this "
+                 "never claims success -- only the absence of a proven failure. A "
+                 "timeout is not a failure: a stranded request can still complete "
+                 "later once switch recovery re-kicks it (see switch-agent's "
+                 "drain/recovery fix).",
         )
     args = parser.parse_args(argv)
     r, pod, tenant, source = _context()
@@ -620,24 +629,36 @@ def _lifecycle_command(command: str, argv: list[str]) -> None:
         kind=kinds[command],
         module="office",
     )
-    if command == "hire" and args.wait is not None:
+    if command == "hire":
+        explicit_wait = args.wait is not None
+        timeout = args.wait if explicit_wait else _BARE_HIRE_CHECK_TIMEOUT_S
         outcome, detail = _await_hire_confirmation(
-            r, pod=pod, tenant=tenant, stream_id=stream_id, timeout=args.wait,
+            r, pod=pod, tenant=tenant, stream_id=stream_id, timeout=timeout,
         )
         if outcome == "failed":
             print(f"failed: {args.agent} was not registered -- {detail}", file=sys.stderr)
             raise SystemExit(1)
-        print(
-            f"unknown: no proof of failure for {args.agent} within {args.wait:.0f}s -- "
-            "this does NOT mean it failed, it may well have succeeded; there is "
-            "currently no way to prove success for this request, only to disprove "
-            "it. Check 'office status' or the registry directly if you want to "
-            "look for yourself.",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
+        # outcome == "unknown" -- explicit --wait always speaks (that's what
+        # asking for it means); bare hire stays silent and falls through to
+        # the same plain stream_id print it always had, unchanged.
+        if explicit_wait:
+            print(
+                f"unknown: no proof of failure for {args.agent} within {timeout:.0f}s -- "
+                "this does NOT mean it failed, it may well have succeeded; there is "
+                "currently no way to prove success for this request, only to disprove "
+                "it. Check 'office status' or the registry directly if you want to "
+                "look for yourself.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
     print(stream_id)
 
+
+# ⚠ Not a magic number picked here -- the operator's own value, restoring
+# --wait after removing it entirely once: a bare hire waits this long,
+# silently, for the same proven-rejection check --wait itself runs. Keep
+# in sync with _lifecycle_command's --wait help text if this ever changes.
+_BARE_HIRE_CHECK_TIMEOUT_S = 1.0
 
 _HIRE_CONFIRMATION_POLL_INTERVAL_S = 0.5
 
