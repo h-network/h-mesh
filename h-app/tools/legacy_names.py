@@ -62,7 +62,9 @@ def tracked_text_files(root: Path) -> list[Path]:
 
 
 def legacy_name_violations(
-    root: Path, paths: Iterable[Path] | None = None
+    root: Path,
+    paths: Iterable[Path] | None = None,
+    binary_skips: list[str] | None = None,
 ) -> tuple[int, list[str]]:
     checked = 0
     violations = []
@@ -75,14 +77,22 @@ def legacy_name_violations(
             or any(part in excluded_dirs or part.endswith(".egg-info") for part in path.parts)
         ):
             continue
-        try:
-            lines = path.read_text(encoding="utf-8").splitlines()
-        except UnicodeDecodeError:
-            # The policy covers tracked UTF-8 source and documentation. Treat
-            # other encodings as binary rather than guessing their text codec.
+        content = path.read_bytes()
+        if b"\0" in content:
+            # A NUL byte is the explicit binary boundary. Decode failure alone
+            # is not evidence: valid source can declare another encoding.
+            if binary_skips is not None:
+                binary_skips.append(str(path.relative_to(root)))
             continue
         relative = path.relative_to(root)
         checked += 1
+        try:
+            lines = content.decode("utf-8").splitlines()
+        except UnicodeDecodeError:
+            violations.append(
+                f"{relative}:?: tracked non-UTF-8 text cannot be scanned"
+            )
+            continue
         for line_number, line in enumerate(lines, start=1):
             code, marker, allowance_text = line.partition(LEGACY_ALLOW_MARKER)
             folded = code.casefold()
@@ -115,11 +125,18 @@ def legacy_name_violations(
     return checked, violations
 
 
-def legacy_name_diagnostics(root: Path, paths: Iterable[Path] | None = None) -> list[str]:
-    _, violations = legacy_name_violations(root, paths)
+def legacy_name_diagnostics(
+    root: Path,
+    paths: Iterable[Path] | None = None,
+    binary_skips: list[str] | None = None,
+) -> list[str]:
+    _, violations = legacy_name_violations(root, paths, binary_skips)
     diagnostics = []
     for violation in violations:
         relative, line_text, _ = violation.rsplit(":", 2)
+        if line_text == "?":
+            diagnostics.append(violation)
+            continue
         line_number = int(line_text)
         offending = (root / relative).read_text(encoding="utf-8").splitlines()[
             line_number - 1
@@ -131,7 +148,12 @@ def legacy_name_diagnostics(root: Path, paths: Iterable[Path] | None = None) -> 
 def main(root: Path | None = None, paths: Iterable[Path] | None = None) -> int:
     repo_root = root or Path(__file__).resolve().parents[2]
     candidates = paths if paths is not None else tracked_text_files(repo_root)
-    diagnostics = legacy_name_diagnostics(repo_root, candidates)
+    binary_skips: list[str] = []
+    diagnostics = legacy_name_diagnostics(repo_root, candidates, binary_skips)
+    if binary_skips:
+        print("NUL-marked binary files skipped:")
+        for relative in binary_skips:
+            print(f"  {relative}")
     if diagnostics:
         print("Unreviewed legacy-name references found:")
         for diagnostic in diagnostics:

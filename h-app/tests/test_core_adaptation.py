@@ -155,6 +155,42 @@ def test_legacy_name_guard_reports_source_and_markdown_text(
     )
 
 
+def test_legacy_name_guard_cannot_silently_skip_non_utf8_source(tmp_path: Path):
+    banned_name = "f" + "lock"
+    source = tmp_path / "latin1_source.py"
+    source.write_bytes(
+        b"# -*- coding: latin-1 -*-\n"
+        + f'VALUE = "{banned_name}"\n'.encode("ascii")
+        + 'LABEL = "caf\N{LATIN SMALL LETTER E WITH ACUTE}"\n'.encode("latin-1")
+    )
+
+    checked, violations = legacy_name_violations(tmp_path)
+
+    assert checked == 1, "valid text source must not disappear from scan accounting"
+    assert violations == [
+        "latin1_source.py:?: tracked non-UTF-8 text cannot be scanned"
+    ], (
+        "an undecodable tracked source file must fail closed rather than certify; "
+        f"observed checked={checked}, violations={violations}"
+    )
+
+
+def test_legacy_name_guard_reports_nul_marked_binary_skip(tmp_path: Path, capsys):
+    banned_name = "f" + "lock"
+    binary = tmp_path / "asset.bin"
+    binary.write_bytes(b"\0" + banned_name.encode("ascii"))
+
+    result = legacy_name_guard_main(tmp_path, [binary])
+    output = capsys.readouterr().out
+
+    assert result == 0
+    assert "NUL-marked binary files skipped:" in output
+    assert "asset.bin" in output, (
+        "a binary exclusion must remain visible even when it contains the "
+        f"banned byte sequence; observed {output!r}"
+    )
+
+
 class RegistryRedis:
     def __init__(self):
         self.calls = []
