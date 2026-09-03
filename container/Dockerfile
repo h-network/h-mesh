@@ -19,9 +19,22 @@ FROM python:3.12-slim
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1
 
+# ⚠ jq is load-bearing, not a convenience: h-agent's own installer's
+# seed_claude_state()/seed_claude_settings() (install.sh) merge their
+# defaults into an already-existing ~/.claude.json/settings.json with jq --
+# and one already exists by the time they run, because install_claude()
+# itself invokes `claude --version` moments earlier to verify the install,
+# which is enough for the CLI to write a bare .claude.json with no
+# `hasCompletedOnboarding` key. Without jq, seed_claude_state() takes its
+# "preserve existing, warn, do nothing" branch instead of merging --
+# silently, printed only as a build-log warning easy to miss (measured:
+# this is exactly what happened here) -- and hasCompletedOnboarding never
+# gets set, so claude's full first-run tour (theme picker, then a demo
+# screen, then account selection) shows on every agent's very first
+# launch instead of being skipped.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        tmux redis-server tini curl ca-certificates git procps \
+        tmux redis-server tini curl ca-certificates git procps jq \
     && rm -rf /var/lib/apt/lists/*
 
 # Agent CLIs (h-agent, claude, codex, agy) run unattended, as a real,
@@ -98,6 +111,24 @@ ARG H_AGENT_INSTALLER_URL=https://raw.githubusercontent.com/h-network/h-agent/ma
 RUN curl -fsSL "$H_AGENT_INSTALLER_URL" -o /tmp/h-agent-install.sh \
     || curl -fsSL "$H_AGENT_INSTALLER_URL" -o /tmp/h-agent-install.sh
 RUN bash /tmp/h-agent-install.sh && rm -f /tmp/h-agent-install.sh && command -v h-agent
+
+# ⚠ modules/tmux/ops.py's _seed_profile_dirs says outright: "Unprofiled
+# agents need nothing -- they read ~/.claude directly, which the image
+# already ships populated." True of the base image this codebase otherwise
+# assumes, false of h-agent's installer alone: its own seed_claude_settings
+# covers permission/telemetry/notification defaults but never sets a
+# `theme`, and claude stops on the interactive colour-scheme picker on its
+# very first launch without one -- measured live, an agent otherwise fully
+# credentialed and trusted sat there unreachable. seedProfile (used for
+# profiled accounts) copies settings.json from this same live dir at hire
+# time, so seeding it once here covers both the default and every profiled
+# account. `dark` matches the picker's own highlighted default.
+RUN python3 -c "\
+import json; \
+path = '$HOME/.claude/settings.json'; \
+data = json.load(open(path)); \
+data.setdefault('theme', 'dark'); \
+json.dump(data, open(path, 'w'), indent=2)"
 
 # The doors bind every interface *inside* the container; a compose/`docker
 # run -p` mapping is the deliberate act that decides what actually leaves

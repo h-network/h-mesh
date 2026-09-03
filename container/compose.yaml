@@ -27,6 +27,18 @@ services:
       # container restart resumes the same registry/boards/message history
       # instead of a purged-transport, empty-roster restart.
       - h-mesh-state:/home/ubuntu/.h-mesh
+      # claude/codex's own local state, notably session history --continue/
+      # --resume reads (README's "conversation history that persists and
+      # resumes across restarts") -- without this it lived only in the old
+      # container's writable layer and was gone the moment `up` replaced it.
+      # Separate from h-mesh's own state, so dropping one with `-v` doesn't
+      # have to mean losing the other.
+      # ⚠ Does NOT cover ~/.claude.json itself (a file directly in $HOME,
+      # outside this directory) -- that's where onboarding/trust state
+      # actually lives, and it comes from the image's own build-time seeding
+      # (see Dockerfile) on every fresh container, not from this volume.
+      - h-mesh-claude:/home/ubuntu/.claude
+      - h-mesh-codex:/home/ubuntu/.codex
     restart: unless-stopped
     stop_grace_period: 30s
     healthcheck:
@@ -44,3 +56,7 @@ services:
 volumes:
   h-mesh-state:
     name: "${COMPOSE_PROJECT_NAME:-h-mesh}-state"
+  h-mesh-claude:
+    name: "${COMPOSE_PROJECT_NAME:-h-mesh}-claude"
+  h-mesh-codex:
+    name: "${COMPOSE_PROJECT_NAME:-h-mesh}-codex"
