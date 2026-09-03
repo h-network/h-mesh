@@ -2,15 +2,11 @@
 
 ## Legacy-name guard
 
-CI scans every tracked UTF-8 text file in the repository and rejects an
-unreviewed reference to the predecessor project's identity. A NUL byte marks a
-tracked file as binary and excludes it. Any other tracked file that cannot be
-decoded as UTF-8 fails the guard instead of being silently classified as
-binary; repository source and documentation must be UTF-8 to receive the
-content scan. Every NUL-marked binary exclusion is listed in the command output
-so this boundary remains visible even on a passing run. A matched reference
-prints the file, line number, and complete offending line so it can be
-corrected without reproducing CI locally.
+CI scans every tracked file as raw bytes and rejects an unreviewed reference to
+the predecessor project's ASCII identity. It does not classify or exclude
+files by encoding or content type. A matched reference prints the file, line
+number, and complete offending line, rendering non-UTF-8 bytes as escapes, so
+it can be corrected without reproducing CI locally.
 
 A required compatibility identifier may be allowed on its own line by adding a
 source comment containing `legacy-name-allow`, then a colon and the exact
