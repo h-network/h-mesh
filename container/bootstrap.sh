@@ -21,8 +21,7 @@
 # implicit default -- so multiple offices on one host, or one checkout,
 # are isolated by construction rather than by an operator remembering to
 # pass `-p` themselves. (The predecessor project solves the identical
-# problem the same way, with a `tenants/<name>/` directory of its own --
-# see h-flock's container/flock-compose.sh if you want the reference.)
+# problem the same way, with a per-office directory of its own.)
 #
 # At a terminal, with no flags, this prompts the same way setup.sh's own
 # wizard does; piped/scripted or with --non-interactive, it reads flags/env

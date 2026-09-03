@@ -33,9 +33,13 @@ def _run_wizard(cwd: str, args: list[str], env: dict, answers: list[str], timeou
     interactive branch -- a piped/redirected stdin (what subprocess.run
     would give it otherwise) is never a tty, so the wizard would never
     activate at all."""
+    # --host: this whole module exercises the host wizard specifically: the
+    # host-vs-container picker that now runs before it would otherwise
+    # consume the first scripted answer in `answers` (it recognizes the same
+    # ":"-ending prompt heuristic below) and desync every prompt after it.
     master, slave = pty.openpty()
     proc = subprocess.Popen(
-        [str(SETUP_SH), *args],
+        [str(SETUP_SH), "--host", *args],
         stdin=slave, stdout=slave, stderr=slave, env=env, cwd=cwd,
     )
     os.close(slave)

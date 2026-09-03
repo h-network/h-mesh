@@ -252,7 +252,12 @@ def test_install_sh_recovers_a_tty_for_setup_sh_when_piped_to_sh():
                 # entire prompt deadline before setup.sh could exercise tty
                 # recovery at all. Pass the real installer's supported flag
                 # through the piped-sh argv and keep the tty assertion exact.
-                os.execvp("sh", ["sh", "-s", "--", "--skip-deps"])
+                # --host: this test's subject is tty recovery for setup.sh's
+                # own wizard specifically -- without it, the host-vs-container
+                # picker now prompts first instead, and never seeing "Pod
+                # name [" isn't a failure of tty recovery, it's a different
+                # (real, first) prompt this test never answers.
+                os.execvp("sh", ["sh", "-s", "--", "--host", "--skip-deps"])
             except Exception:
                 os._exit(127)
 
