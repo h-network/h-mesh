@@ -138,13 +138,83 @@ def test_telegram_yes_with_both_values_persists_all_three(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        answers=["", "", "", "y", "tg-token-xyz", "12345", "n"],
+        # ..., voice=n, TLS cert path=blank (accept plaintext)
+        answers=["", "", "", "y", "tg-token-xyz", "12345", "n", ""],
     )
     assert code == 0, output
     text = _env_file_text(env_file)
     assert "TELEGRAM_BOT_TOKEN=tg-token-xyz" in text
     assert "TELEGRAM_CHAT_ID=12345" in text
     assert "TELEGRAM_VOICE=0" in text
+
+
+def test_enabling_telegram_forces_a_plaintext_or_tls_decision(tmp_path):
+    """The actual bug this closes: container/entrypoint.sh refuses to start
+    at all once Telegram is on, without H_MESH_ALLOW_PLAINTEXT=1 or real TLS
+    certs -- previously discoverable only as a live crash-loop. The wizard
+    must never let Telegram get enabled without resolving this."""
+    _fake_docker(tmp_path)
+    env_file = tmp_path / "office.env"
+    output, code = _run_wizard(
+        ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
+        env=_env(tmp_path),
+        answers=["", "", "", "y", "tg-token-xyz", "12345", "n", ""],  # blank = accept plaintext
+    )
+    assert code == 0, output
+    assert "H_MESH_ALLOW_PLAINTEXT=1" in _env_file_text(env_file)
+    assert "unencrypted" in output
+
+
+def test_telegram_with_a_real_cert_path_persists_cert_and_key_not_plaintext(tmp_path):
+    _fake_docker(tmp_path)
+    env_file = tmp_path / "office.env"
+    output, code = _run_wizard(
+        ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
+        env=_env(tmp_path),
+        answers=[
+            "", "", "", "y", "tg-token-xyz", "12345", "n",
+            "/home/ubuntu/tlscerts/tls.crt", "/home/ubuntu/tlscerts/tls.key",
+        ],
+    )
+    assert code == 0, output
+    text = _env_file_text(env_file)
+    assert "API_TLS_CERT=/home/ubuntu/tlscerts/tls.crt" in text
+    assert "API_TLS_KEY=/home/ubuntu/tlscerts/tls.key" in text
+    assert "H_MESH_ALLOW_PLAINTEXT" not in text
+
+
+def test_a_cert_path_with_no_key_is_a_hard_error_before_persisting_anything(tmp_path):
+    _fake_docker(tmp_path)
+    env_file = tmp_path / "office.env"
+    output, code = _run_wizard(
+        ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
+        env=_env(tmp_path),
+        answers=["", "", "", "y", "tg-token-xyz", "12345", "n", "/home/ubuntu/tlscerts/tls.crt", ""],
+    )
+    assert code != 0
+    text = _env_file_text(env_file)
+    assert "API_TLS_CERT" not in text
+    assert "H_MESH_ALLOW_PLAINTEXT" not in text
+
+
+def test_rerun_with_existing_plaintext_choice_does_not_reprompt(tmp_path):
+    _fake_docker(tmp_path)
+    env_file = tmp_path / "office.env"
+    env_file.write_text(
+        "POD=testpod\nTENANT=testtenant\n"
+        "TELEGRAM_BOT_TOKEN=already-set\nTELEGRAM_CHAT_ID=99999\n"
+        "H_MESH_ALLOW_PLAINTEXT=1\n"
+    )
+    output, code = _run_wizard(
+        ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
+        env=_env(tmp_path),
+        # oauth blank, telegram=y, both prompts show "[keep existing]" so
+        # blank keeps them, voice -- no TLS/plaintext answer supplied at all
+        answers=["", "", "", "y", "", "", "n"],
+    )
+    assert code == 0, output
+    assert "H_MESH_ALLOW_PLAINTEXT=1" in _env_file_text(env_file)
+    assert "Telegram turns on the API and session doors" not in output
 
 
 def test_telegram_partial_pair_is_not_persisted(tmp_path):

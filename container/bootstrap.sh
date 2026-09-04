@@ -309,6 +309,50 @@ if [ "$INTERACTIVE" -eq 1 ]; then
             upsert_env_line TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN"
             upsert_env_line TELEGRAM_CHAT_ID "$TELEGRAM_CHAT_ID"
             upsert_env_line TELEGRAM_VOICE "$TELEGRAM_VOICE"
+
+            # ⚠ Telegram unconditionally turns on the api/session doors,
+            # both bound 0.0.0.0 *inside* this container (Dockerfile's
+            # API_BIND/SESSION_BIND) -- container/entrypoint.sh refuses to
+            # start at all without either real TLS certs or an explicit
+            # H_MESH_ALLOW_PLAINTEXT=1. h-flock's own wizard asks exactly
+            # this (real cert path / self-signed generation / explicit
+            # plaintext) whenever a door is being exposed; this container
+            # exposes these two the moment Telegram is on, so the same
+            # decision is always required here too -- forced now, not left
+            # to surface as a crash-loop after the fact (a real outage,
+            # not a hypothetical -- see ticket b87f9f0a's own follow-up).
+            #
+            # Self-signed generation isn't offered here the way h-flock's
+            # is: that needs a compose.yaml bind mount to actually deliver
+            # generated cert files into the container, which doesn't exist
+            # yet -- real, separate scope, not something to improvise
+            # under this fix. A real cert path is still accepted for an
+            # operator who has already arranged to get one into the
+            # container themselves (e.g. a manual compose.yaml volume
+            # edit); this only records the in-container paths.
+            EXISTING_TLS_CERT="$(env_file_get API_TLS_CERT)"
+            EXISTING_PLAINTEXT="$(env_file_get H_MESH_ALLOW_PLAINTEXT)"
+            if [ -z "$EXISTING_TLS_CERT" ] && [ "$EXISTING_PLAINTEXT" != "1" ]; then
+                echo
+                echo "  Telegram turns on the API and session doors, both bound 0.0.0.0"
+                echo "  inside this container -- it will not start without deciding how"
+                echo "  they're reached."
+                read -rp "  Path to a TLS certificate already reachable inside the container (blank to accept plaintext instead): " IN_TLS_CERT
+                if [ -n "$IN_TLS_CERT" ]; then
+                    read -rp "  Path to its key: " IN_TLS_KEY
+                    if [ -z "$IN_TLS_KEY" ]; then
+                        echo "  error: a TLS certificate requires its key" >&2
+                        exit 1
+                    fi
+                    upsert_env_line API_TLS_CERT "$IN_TLS_CERT"
+                    upsert_env_line API_TLS_KEY "$IN_TLS_KEY"
+                else
+                    echo "  ⚠ Plain HTTP inside the container: the api token and everything"
+                    echo "    typed crosses the network unencrypted between the host and this"
+                    echo "    container. Recorded as H_MESH_ALLOW_PLAINTEXT=1 in $ENV_FILE."
+                    upsert_env_line H_MESH_ALLOW_PLAINTEXT 1
+                fi
+            fi
         else
             echo "  ⚠ Both a Telegram Bot Token and Chat ID are required -- Telegram bot not enabled." >&2
             TELEGRAM_BOT_TOKEN=""
@@ -324,6 +368,13 @@ echo "  Agents:       $AGENTS"
 echo "  Default CLI:  $DEFAULT_CLI"
 echo "  OAuth token:  $([ -n "$CLAUDE_OAUTH_TOKEN_DEFAULT" ] && echo "configured" || echo "not set -- log in interactively later, or add CLAUDE_OAUTH_TOKEN_DEFAULT to $ENV_FILE")"
 echo "  Telegram:     $([ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] && echo "enabled, chat id $TELEGRAM_CHAT_ID" || echo "not enabled")"
+if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+    if [ -n "$(env_file_get API_TLS_CERT)" ]; then
+        echo "  API/session:  TLS ($(env_file_get API_TLS_CERT))"
+    else
+        echo "  API/session:  plaintext (H_MESH_ALLOW_PLAINTEXT=1)"
+    fi
+fi
 echo "  Env file:     $ENV_FILE"
 echo "  Project name: $PROJECT_NAME"
 echo
