@@ -166,6 +166,18 @@ Two offices whose `API_PORT`/`SESSION_PORT` doors are both enabled and both
 default to `8080`/`8081` still need distinct host ports set explicitly --
 Compose project isolation doesn't free up an OS-level port collision.
 
+**Finding and attaching a running office's tmux session.** `./container/
+bootstrap.sh --pod POD --tenant TENANT --attach` (defaults match the rest of
+this script: `default`/`default`) attaches you directly, in one step --
+resolves the same office identity `bootstrap.sh` always does, then runs
+`docker compose exec` into the container and `tmux attach`s there. Every
+`up`/`--attach` run also prints the exact one-liner for the office it just
+resolved (including the equivalent plain `docker compose ... exec ... tmux
+attach ...` form, if you'd rather not depend on this script). The tmux
+session name is always the tenant name (`$TENANT`), inside the container's
+own `$HOME/.h-mesh/tmux` socket directory -- not the host's tmux, and not
+guessable from a bare `tmux attach` run outside the container.
+
 Every non-interactive env var from "Bootstrap script" above (`AGENTS`,
 `DEFAULT_CLI`, `ACCOUNTS`, `AGENT_CLIS`/`AGENT_PROFILES`/`AGENT_PROVIDERS`,
 `CLAUDE_OAUTH_TOKEN_<PROFILE>`, `PROVIDER_LOCAL_*`, `TELEGRAM_*`,

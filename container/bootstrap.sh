@@ -39,6 +39,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENV_FILE_OVERRIDE="${H_MESH_TENANT_ENV_FILE:-}"
 NON_INTERACTIVE=0
 SKIP_BUILD=0
+ATTACH=0
 POD="${POD:-}"
 TENANT="${TENANT:-}"
 AGENTS="${AGENTS:-}"
@@ -66,6 +67,10 @@ Options:
   --project-name <name>   Override the computed h-mesh-<pod>-<tenant> Compose project name
   --skip-build            Run 'docker compose up' without '--build' (image must already exist)
   --non-interactive       Never prompt; use flags/env/existing office values only
+  --attach                Skip build/up entirely; attach to the running office's tmux
+                          session in one step (same --pod/--tenant target it otherwise
+                          would). Requires the office to already be up -- see --skip-build
+                          if you only meant to skip a rebuild, not the up itself.
   -h, --help              Show this help message
 
 Advanced options (per-agent exceptions, credentials, Telegram, TLS) are not
@@ -87,6 +92,7 @@ while [ $# -gt 0 ]; do
         --project-name) PROJECT_NAME_OVERRIDE="$2"; shift 2 ;;
         --skip-build) SKIP_BUILD=1; shift ;;
         --non-interactive) NON_INTERACTIVE=1; shift ;;
+        --attach) ATTACH=1; shift ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1" >&2; usage ;;
     esac
@@ -161,6 +167,17 @@ fi
 
 PROJECT_NAME="${PROJECT_NAME_OVERRIDE:-h-mesh-$POD-$TENANT}"
 
+# --attach only ever needs POD/TENANT/ENV_FILE/PROJECT_NAME (resolved above,
+# identically to the up path) -- it deliberately never reaches the AGENTS/
+# DEFAULT_CLI prompts or `docker compose up` below, since a running office's
+# agent roster isn't this flag's business to touch. `exec`, not a plain
+# call: replaces this script's own process with tmux's, so signals (Ctrl-C
+# to detach, etc.) reach tmux directly instead of an intermediate shell.
+if [ "$ATTACH" -eq 1 ]; then
+    exec docker compose -p "$PROJECT_NAME" -f "$SCRIPT_DIR/compose.yaml" --env-file "$ENV_FILE" \
+        exec h-mesh sh -c 'exec env TMUX_TMPDIR="$HOME/.h-mesh/tmux" tmux attach -t "$1"' -- "$TENANT"
+fi
+
 # ⚠ Read existing values from the env file BEFORE prompting, same "blank
 # keeps existing" contract setup.sh's own wizard has -- re-running this
 # against an already-configured office must not silently reset it. A plain
@@ -227,6 +244,8 @@ echo "Running: docker compose ${COMPOSE_ARGS[*]}"
 
 echo
 echo "✓ Container started (project: $PROJECT_NAME)."
+echo "  Attach:  $SCRIPT_DIR/bootstrap.sh --pod $POD --tenant $TENANT --attach"
+echo "           (or directly: docker compose -p $PROJECT_NAME -f $SCRIPT_DIR/compose.yaml --env-file $ENV_FILE exec h-mesh env TMUX_TMPDIR=\"\$HOME/.h-mesh/tmux\" tmux attach -t $TENANT)"
 echo "  Logs:    docker compose -p $PROJECT_NAME -f $SCRIPT_DIR/compose.yaml --env-file $ENV_FILE logs -f"
 echo "  Status:  docker ps --filter name=$PROJECT_NAME"
 echo "  Stop:    docker compose -p $PROJECT_NAME -f $SCRIPT_DIR/compose.yaml --env-file $ENV_FILE down       # keeps state"
