@@ -40,6 +40,14 @@ that the agent currently cannot accept a prompt, so clients must not use it as
 an admission gate. They may show it as a warning; the attempted send's own
 result is the evidence for whether new work was admitted.
 
+`GET /agents/{agent}/contexts` lists the hot-tier memory contexts a
+`claude_sdk` agent (see `modules/claude_sdk/README.md`) currently has live
+turns for -- `{"agent": "...", "contexts": [...]}`. 404 for an unknown agent
+or one whose `port_type` isn't `claude_sdk` (no memory contexts to have). A
+direct `lib/chat_memory.py` read, not a round trip through the agent's own
+`ListContexts` envelope kind -- both doors read the same underlying store,
+this one just doesn't need the target agent's ingress to be drained first.
+
 ## SSE idle keepalive
 
 `/agents/{agent}/activity/stream` and `/alerts/stream` (both routed through

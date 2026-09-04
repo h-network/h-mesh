@@ -12,7 +12,7 @@
 
 An agentic CLI framework where agents address each other directly, by name, and a single switch forwards every message to its destination. Work is tracked on a shared board per agent: pull a ticket, work it, mark it done.
 
-Each agent is a real, stateful terminal session -- not a one-shot API call. It runs its own CLI (Claude, Codex, or Gemini/agy) in a live TUI, with conversation history that persists and resumes across restarts.
+Each agent is a real, stateful terminal session -- not a one-shot API call. It runs its own CLI (Claude, Codex, or Gemini/agy) in a live TUI, with conversation history that persists and resumes across restarts. One deliberate exception: a `claude_sdk`-type agent is the reverse of this by design -- a stateless one-off SDK call per message, with optional context-addressed memory layered on top instead of a persistent pane (see [One-off SDK agents and memory](#one-off-sdk-agents-and-memory) below).
 
 The design borrows its layering from networking, not just its name -- a bus layer that only knows envelopes and queues, a switch layer that forwards by address without reading payloads, and an edge layer where each agent's actual delivery -- a terminal, a mailbox, or another destination-specific target -- lives. Same separation of concerns Ethernet uses between physical transport, switching, and the endpoint.
 
@@ -146,10 +146,17 @@ implementation.
 
 At a real terminal with no `--host`/`--container` flag, `./setup.sh` asks
 which you want before anything else -- see "Bootstrap script" above. Either
-form hands off entirely to `container/bootstrap.sh`, a much smaller wizard
-that only collects `POD`/`TENANT`/`AGENTS`/`DEFAULT_CLI`, writes them to
-`offices/<pod>/<tenant>/.env`, and runs `docker compose up --build`. Run
-`./container/bootstrap.sh --help` for its full flag/env surface.
+form hands off entirely to `container/bootstrap.sh`, a smaller wizard (same
+banner as the host wizard) that collects `POD`/`TENANT`/`AGENTS`/
+`DEFAULT_CLI`, the default account's OAuth token (blank to log in
+interactively later -- see "Finding and attaching..." below for how a
+container operator can actually do that), and optional Telegram bot config,
+writes them to `offices/<pod>/<tenant>/.env`, and runs `docker compose up
+--build`. Enabling Telegram here also forces the TLS-or-plaintext decision
+described below on the spot -- it can no longer ship silently unresolved
+the way it originally could, which produced a container that refused to
+start with no interactive warning beforehand. Run `./container/bootstrap.sh
+--help` for its full flag/env surface.
 
 **One office, one directory, one explicit Compose project.** Docker
 Compose's own project-name default is the *containing folder's* name
@@ -181,20 +188,42 @@ guessable from a bare `tmux attach` run outside the container.
 Every non-interactive env var from "Bootstrap script" above (`AGENTS`,
 `DEFAULT_CLI`, `ACCOUNTS`, `AGENT_CLIS`/`AGENT_PROFILES`/`AGENT_PROVIDERS`,
 `CLAUDE_OAUTH_TOKEN_<PROFILE>`, `PROVIDER_LOCAL_*`, `TELEGRAM_*`,
-`API_TOKEN`) applies unchanged -- set the advanced ones directly in the
-office's env file; `bootstrap.sh` doesn't prompt for them. `API_PORT`/
-`SESSION_PORT` choose the **host** side of the port mapping only; the api
-and session doors always bind `0.0.0.0:8080`/`0.0.0.0:8081` inside the
-container (see the Dockerfile's own comment on why), so publishing them is
-compose's decision, not the process's. As on a bare host, the api/session/
-Telegram-bot daemons only start once `TELEGRAM_BOT_TOKEN` and
-`TELEGRAM_CHAT_ID` are both set -- but because those doors bind `0.0.0.0`
-inside the container unconditionally, enabling them here also requires
-either `API_TLS_CERT`/`API_TLS_KEY` or an explicit `H_MESH_ALLOW_PLAINTEXT=1`
-in the office's env file (see `container/.env.example`'s own comment on the
-tradeoff); the entrypoint refuses to start at all with a single clear
+`API_TOKEN`) applies unchanged. `bootstrap.sh`'s interactive wizard prompts
+for the *default* account's `CLAUDE_OAUTH_TOKEN_DEFAULT` and for
+`TELEGRAM_*` directly, mirroring the host wizard -- these were previously,
+incorrectly, treated as file-only "advanced" options; a working office
+always needs some credential, and the choice to enable Telegram is one the
+host wizard already offered. Per-agent exceptions
+(`AGENT_CLIS`/`AGENT_PROFILES`/`AGENT_PROVIDERS`), a second-or-later
+account, and local model provider config (`PROVIDER_LOCAL_*`) remain
+file-only -- this script has no per-agent or multi-account UI at all,
+uniform-single-account is its whole model, so those genuinely don't apply
+to it. `API_TOKEN` is never prompted anywhere, even on a bare host --
+always generated. `API_PORT`/`SESSION_PORT` choose the **host** side of the
+port mapping only; the api and session doors always bind
+`0.0.0.0:8080`/`0.0.0.0:8081` inside the container (see the Dockerfile's
+own comment on why), so publishing them is compose's decision, not the
+process's.
+
+As on a bare host, the api/session/Telegram-bot daemons only start once
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are both set -- but because
+those doors bind `0.0.0.0` inside the container unconditionally, enabling
+them also requires either `API_TLS_CERT`/`API_TLS_KEY` or an explicit
+`H_MESH_ALLOW_PLAINTEXT=1` (see `container/.env.example`'s own comment on
+the tradeoff); the entrypoint refuses to start at all with a single clear
 message if neither is set, rather than crash-looping the container with the
-real reason buried in a per-daemon log.
+real reason buried in a per-daemon log. This same `API_TLS_CERT`/
+`H_MESH_ALLOW_PLAINTEXT` check is app-level (`modules/api/server.py`,
+`modules/session/app.py`), not container-specific -- it applies to a bare
+host too whenever `API_BIND`/`SESSION_BIND` isn't loopback, though that's
+rare on a host since those default to loopback there. `setup.sh`'s own host
+wizard has no interactive handling of this either; `bootstrap.sh`'s wizard
+is the first place in this project that actually prompts for it, forcing
+the decision the moment Telegram is enabled rather than leaving it to
+surface as a crash-loop afterward: a real cert path (for an operator who
+has already arranged to get one into the container themselves -- there is
+no built-in delivery mechanism for a *generated* one yet) or explicit,
+warned plaintext.
 
 Three named volumes per office carry state that must survive a container
 recreate: Redis's AOF file, the persisted tenant config, and daemon
@@ -214,6 +243,31 @@ network just to boot.
 
 `clients/web` (the browser console) is not part of this image -- it has its
 own separate container path; see `clients/web/README.md`.
+
+## One-off SDK agents and memory
+
+Not every agent needs a persistent terminal session. A `claude_sdk`-type
+agent (see `modules/claude_sdk/README.md`) runs one Claude Agent SDK
+`query()` call per message instead of hosting a live CLI pane -- no
+`ClaudeSDKClient`, no persistent session, the opener sends the reply itself.
+There's no `office hire` path for one yet; it's registered directly in the
+tenant registry.
+
+A `Message` payload's `context` field names a hot-tier, TTL-evicted
+conversation (`lib/chat_memory.py`) -- the same `context` on a later
+message recalls that conversation's recent turns; omitting `context`
+entirely is a genuine one-off, no memory read or write at all:
+
+```bash
+h-mesh-office send -a AGENT --context bgp-65001 "..."   # threads into that context
+h-mesh-office send -a AGENT "..."                        # genuine one-off, no memory touched
+h-mesh-office contexts -a AGENT                          # list AGENT's live contexts
+```
+
+The same discovery is reachable externally at `GET /agents/{agent}/contexts`
+(see `modules/api/README.md`). Long-term/semantic memory -- what, if
+anything, happens once a context's TTL elapses -- is deliberately out of
+scope today; see `lib/chat_memory.py`'s own module docstring.
 
 ## Upgrading and restarting daemons
 

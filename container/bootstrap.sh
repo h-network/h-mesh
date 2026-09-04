@@ -3,12 +3,13 @@
 #
 # setup.sh hands off here entirely (see its own "Host-vs-container picker"
 # comment) once --container/H_MESH_INSTALL_MODE=container is chosen. This is
-# a separate, much smaller wizard than setup.sh's own: it only collects what
-# a tenant's env file needs (POD, TENANT, AGENTS, DEFAULT_CLI), writes/
-# updates that file, and hands off to `docker compose up --build` -- setup.sh's
-# own non-interactive path, roster seeding, hire, and daemon-start logic
-# still run, just inside the container (see container/entrypoint.sh), not
-# reimplemented here.
+# a separate, smaller wizard than setup.sh's own: it collects what a
+# tenant's env file needs (POD, TENANT, AGENTS, DEFAULT_CLI, the default
+# account's OAuth token, optional Telegram bot config, and -- if Telegram
+# is enabled -- a TLS-or-plaintext decision), writes/updates that file, and
+# hands off to `docker compose up --build` -- setup.sh's own non-interactive
+# path, roster seeding, hire, and daemon-start logic still run, just inside
+# the container (see container/entrypoint.sh), not reimplemented here.
 #
 # ⚠ ONE OFFICE, ONE DIRECTORY, ONE EXPLICIT PROJECT NAME. Docker Compose's
 # own project-name default is the *containing folder's* name -- identical
@@ -25,11 +26,13 @@
 #
 # At a terminal, with no flags, this prompts the same way setup.sh's own
 # wizard does; piped/scripted or with --non-interactive, it reads flags/env
-# only, same as setup.sh. Advanced options (AGENT_CLIS/AGENT_PROFILES/
-# AGENT_PROVIDERS, CLAUDE_OAUTH_TOKEN_<PROFILE>, PROVIDER_LOCAL_*,
-# TELEGRAM_*, API_TOKEN, H_MESH_ALLOW_PLAINTEXT, API_TLS_CERT/KEY) aren't
-# prompted for here -- add them to the office's env file directly; every one
-# of them reaches the container exactly as documented in README.md's
+# only, same as setup.sh. Per-agent exceptions (AGENT_CLIS/AGENT_PROFILES/
+# AGENT_PROVIDERS), a second-or-later account, and local model provider
+# config (PROVIDER_LOCAL_*) aren't prompted for here -- this script has no
+# per-agent or multi-account UI at all, uniform-single-account is its whole
+# model; add those directly to the office's env file. `API_TOKEN` is never
+# prompted anywhere, even on a bare host -- always generated. Every one of
+# these reaches the container exactly as documented in README.md's
 # "Bootstrap script" section.
 set -uo pipefail
 
@@ -51,7 +54,9 @@ Usage: ./setup.sh --container [options]
        ./container/bootstrap.sh [options]
 
 Collects what an office's env file needs (POD, TENANT, AGENTS,
-DEFAULT_CLI), writes it to offices/<pod>/<tenant>/.env, then runs
+DEFAULT_CLI, the default account's OAuth token, optional Telegram bot
+config, and -- if Telegram is enabled -- a TLS-or-plaintext decision),
+writes it to offices/<pod>/<tenant>/.env, then runs
 'docker compose -p h-mesh-<pod>-<tenant> up --build' -- setup.sh's own
 non-interactive path runs inside the container from there (see
 container/entrypoint.sh).
@@ -73,10 +78,13 @@ Options:
                           if you only meant to skip a rebuild, not the up itself.
   -h, --help              Show this help message
 
-Advanced options (per-agent exceptions, credentials, Telegram, TLS) are not
-prompted for here -- add them directly to the office's env file; see
-README.md's "Bootstrap script" section for the complete non-interactive
-variable set, all of which apply unchanged inside the container.
+Per-agent exceptions (AGENT_CLIS/AGENT_PROFILES/AGENT_PROVIDERS), a second
+or later account, and local model provider config (PROVIDER_LOCAL_*) are
+not prompted for here -- this script has no per-agent or multi-account UI
+at all, uniform-single-account is its whole model; add those directly to
+the office's env file. See README.md's "Bootstrap script" section for the
+complete non-interactive variable set, all of which apply unchanged inside
+the container.
 EOF
     exit 0
 }
@@ -314,21 +322,23 @@ if [ "$INTERACTIVE" -eq 1 ]; then
             # both bound 0.0.0.0 *inside* this container (Dockerfile's
             # API_BIND/SESSION_BIND) -- container/entrypoint.sh refuses to
             # start at all without either real TLS certs or an explicit
-            # H_MESH_ALLOW_PLAINTEXT=1. h-flock's own wizard asks exactly
-            # this (real cert path / self-signed generation / explicit
-            # plaintext) whenever a door is being exposed; this container
-            # exposes these two the moment Telegram is on, so the same
-            # decision is always required here too -- forced now, not left
-            # to surface as a crash-loop after the fact (a real outage,
-            # not a hypothetical -- see ticket b87f9f0a's own follow-up).
+            # H_MESH_ALLOW_PLAINTEXT=1. The predecessor project's own
+            # wizard asks exactly this (real cert path / self-signed
+            # generation / explicit plaintext) whenever a door is being
+            # exposed; this container exposes these two the moment
+            # Telegram is on, so the same decision is always required here
+            # too -- forced now, not left to surface as a crash-loop after
+            # the fact (a real outage, not a hypothetical -- see ticket
+            # b87f9f0a's own follow-up).
             #
-            # Self-signed generation isn't offered here the way h-flock's
-            # is: that needs a compose.yaml bind mount to actually deliver
-            # generated cert files into the container, which doesn't exist
-            # yet -- real, separate scope, not something to improvise
-            # under this fix. A real cert path is still accepted for an
-            # operator who has already arranged to get one into the
-            # container themselves (e.g. a manual compose.yaml volume
+            # Self-signed generation isn't offered here the way the
+            # predecessor project's is: that needs a compose.yaml bind
+            # mount to actually deliver generated cert files into the
+            # container, which doesn't exist yet -- real, separate scope,
+            # not something to improvise under this fix. A real cert path
+            # is still accepted for an operator who has already arranged
+            # to get one into the container themselves (e.g. a manual
+            # compose.yaml volume
             # edit); this only records the in-container paths.
             EXISTING_TLS_CERT="$(env_file_get API_TLS_CERT)"
             EXISTING_PLAINTEXT="$(env_file_get H_MESH_ALLOW_PLAINTEXT)"
