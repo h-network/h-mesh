@@ -104,6 +104,29 @@ INTERACTIVE=1
 
 echo "=== h-mesh :: container bootstrap ==="
 
+if [ "$INTERACTIVE" -eq 1 ]; then
+    # Same literal ASCII art as setup.sh's own host wizard (figlet -f
+    # ansishadow.flf "H-MESH") -- a human at a real terminal picking
+    # --container gets the same identity setup.sh's own wizard gives one
+    # picking --host, not a visibly stripped-down variant.
+    YELLOW="\033[0;33m"
+    CYAN="\033[0;36m"
+    GREY="\033[0;37m"
+    NC="\033[0m"
+    echo -e "${YELLOW}"
+    cat <<'BANNER'
+██╗  ██╗      ███╗   ███╗███████╗███████╗██╗  ██╗
+██║  ██║      ████╗ ████║██╔════╝██╔════╝██║  ██║
+███████║█████╗██╔████╔██║█████╗  ███████╗███████║
+██╔══██║╚════╝██║╚██╔╝██║██╔══╝  ╚════██║██╔══██║
+██║  ██║      ██║ ╚═╝ ██║███████╗███████║██║  ██║
+╚═╝  ╚═╝      ╚═╝     ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝
+BANNER
+    echo -e "${NC}"
+    echo -e "  ${CYAN}H-MESH${NC} ${GREY}//${NC} ${CYAN}agentic office framework${NC} ${GREY}//${NC} ${CYAN}h-network${NC} ${GREY}//${NC} ${CYAN}container${NC}"
+    echo ""
+fi
+
 if ! command -v docker >/dev/null 2>&1; then
     echo "error: docker is required for --container -- install it and re-run (https://docs.docker.com/engine/install/)" >&2
     exit 1
@@ -227,11 +250,80 @@ upsert_env_line TENANT "$TENANT"
 upsert_env_line AGENTS "$AGENTS"
 upsert_env_line DEFAULT_CLI "$DEFAULT_CLI"
 
+check_bool() {
+    local val="$1" def="$2"
+    val="${val:-$def}"
+    case "$val" in
+        [Yy]|[Yy][Ee][Ss]) return 0 ;;
+        [Nn]|[Nn][Oo])    return 1 ;;
+        *) echo "error: expected yes or no, got '$val'" >&2; exit 1 ;;
+    esac
+}
+
+# ⚠ These two are NOT the same kind of "advanced" as AGENT_CLIS/
+# AGENT_PROFILES/AGENT_PROVIDERS/PROVIDER_LOCAL_* (still file-only, still
+# correctly deferred -- this script has no per-agent CLI/profile UI at
+# all, uniform-office is its whole model, so those never apply to it) or
+# API_TOKEN (never a prompt even in the host wizard -- always generated).
+# CLAUDE_OAUTH_TOKEN_DEFAULT is required for a single-account office to do
+# anything; Telegram is genuinely optional but the *choice* to enable it
+# is something setup.sh's own host wizard offers and this one didn't.
+# Mirrors that wizard's ask_token()/Telegram-enable block for the single
+# ("default") account this script's own model supports -- see ticket
+# b87f9f0a.
+CLAUDE_OAUTH_TOKEN_DEFAULT=""
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_CHAT_ID=""
+TELEGRAM_VOICE=""
+if [ "$INTERACTIVE" -eq 1 ]; then
+    EXISTING_TOKEN="$(env_file_get CLAUDE_OAUTH_TOKEN_DEFAULT)"
+    if [ -n "$EXISTING_TOKEN" ]; then
+        read -rsp "OAuth token for the default account [keep existing]: " IN_TOKEN; echo
+    else
+        read -rsp "OAuth token for the default account (blank to log in interactively later): " IN_TOKEN; echo
+    fi
+    CLAUDE_OAUTH_TOKEN_DEFAULT="${IN_TOKEN:-$EXISTING_TOKEN}"
+    [ -n "$CLAUDE_OAUTH_TOKEN_DEFAULT" ] && upsert_env_line CLAUDE_OAUTH_TOKEN_DEFAULT "$CLAUDE_OAUTH_TOKEN_DEFAULT"
+
+    EXISTING_TG_TOKEN="$(env_file_get TELEGRAM_BOT_TOKEN)"
+    EXISTING_TG_CHAT="$(env_file_get TELEGRAM_CHAT_ID)"
+    read -rp "Run the Telegram bot? [y/N]: " WANT_TELEGRAM
+    if check_bool "$WANT_TELEGRAM" "n"; then
+        if [ -n "$EXISTING_TG_TOKEN" ]; then
+            read -rsp "  Telegram Bot Token [keep existing]: " IN_TG_TOKEN; echo
+        else
+            read -rsp "  Telegram Bot Token (required, blank to skip): " IN_TG_TOKEN; echo
+        fi
+        TELEGRAM_BOT_TOKEN="${IN_TG_TOKEN:-$EXISTING_TG_TOKEN}"
+        read -rp "  Telegram Chat ID (required)${EXISTING_TG_CHAT:+ [$EXISTING_TG_CHAT]}: " IN_TG_CHAT
+        TELEGRAM_CHAT_ID="${IN_TG_CHAT:-$EXISTING_TG_CHAT}"
+        if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            EXISTING_TG_VOICE="$(env_file_get TELEGRAM_VOICE)"
+            if [ "$EXISTING_TG_VOICE" = "1" ]; then
+                read -rp "  Enable spoken voice replies? [Y/n]: " WANT_VOICE
+                check_bool "$WANT_VOICE" "y" && TELEGRAM_VOICE=1 || TELEGRAM_VOICE=0
+            else
+                read -rp "  Enable spoken voice replies? [y/N]: " WANT_VOICE
+                check_bool "$WANT_VOICE" "n" && TELEGRAM_VOICE=1 || TELEGRAM_VOICE=0
+            fi
+            upsert_env_line TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN"
+            upsert_env_line TELEGRAM_CHAT_ID "$TELEGRAM_CHAT_ID"
+            upsert_env_line TELEGRAM_VOICE "$TELEGRAM_VOICE"
+        else
+            echo "  ⚠ Both a Telegram Bot Token and Chat ID are required -- Telegram bot not enabled." >&2
+            TELEGRAM_BOT_TOKEN=""
+            TELEGRAM_CHAT_ID=""
+        fi
+    fi
+fi
+
 echo
 echo "  Pod:          $POD"
 echo "  Tenant:       $TENANT"
 echo "  Agents:       $AGENTS"
 echo "  Default CLI:  $DEFAULT_CLI"
+echo "  OAuth token:  $([ -n "$CLAUDE_OAUTH_TOKEN_DEFAULT" ] && echo "configured" || echo "not set -- log in interactively later, or add CLAUDE_OAUTH_TOKEN_DEFAULT to $ENV_FILE")"
+echo "  Telegram:     $([ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] && echo "enabled, chat id $TELEGRAM_CHAT_ID" || echo "not enabled")"
 echo "  Env file:     $ENV_FILE"
 echo "  Project name: $PROJECT_NAME"
 echo
