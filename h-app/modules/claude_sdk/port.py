@@ -19,20 +19,30 @@ long-lived process on the other end to notice a paste and answer later
 (the same reply-inside-the-opener shape ``modules/openshell/port.py`` already
 uses for the same reason).
 
-Any envelope kind other than ``Message`` (``Command``, ``AddTicket``,
-``Attachment``) is out of scope for this PoC and is dead-lettered by
-``core.channels``'s own "unknown kind" handling -- nothing port-specific to
-build for that.
+Any envelope kind other than ``Message``/``ListContexts`` (``Command``,
+``AddTicket``, ``Attachment``) is out of scope for this PoC and is
+dead-lettered by ``core.channels``'s own "unknown kind" handling -- nothing
+port-specific to build for that.
 
 "No persistent session" above is about the SDK's own session mechanism
 specifically (still true: no ``ClaudeSDKClient``, no ``continue``/``resume``/
 ``fork_session``, one ``query()`` per delivery). It is not the same claim as
-"no memory": ``lib/chat_memory.py``'s hot tier gives each delivery its
-counterparty's recent turns as prompt text, prepended before the ``query()``
-call (see ``_deliver_message``/``lib/chat_cycle.py``) -- a different,
-simpler mechanism than SDK session resume, TTL-bounded and independent of
-it. Ticket 0902ee96 covers why prompt-level replay was chosen over wiring
-up the SDK's own session/``resume`` machinery.
+"no memory": a ``Message`` whose payload names a ``context`` gets
+``lib/chat_memory.py``'s hot tier -- that context's recent turns prepended
+as prompt text before the ``query()`` call (see ``_deliver_message``/
+``lib/chat_cycle.py``) -- a different, simpler mechanism than SDK session
+resume, TTL-bounded and independent of it.
+
+``context`` is the caller's own identifier, not derived from ``source`` or
+any envelope field: this port has no opinion on what makes two messages
+"the same conversation," only on giving a name to it something it's asked
+to remember by. A ``Message`` with no ``context`` is a genuine one-off --
+no memory read, no memory write, not merely a `context` that happens not to
+repeat. ``ListContexts`` (see ``_deliver_list_contexts``) lets a caller
+discover which contexts an agent currently has live memory for, rather than
+requiring every caller to already know its own vocabulary in advance.
+Ticket 38c7ab0d covers why addressing moved from the earlier ``source``-
+keyed default (ticket 0902ee96) to this explicit, caller-named scheme.
 """
 
 from __future__ import annotations
@@ -47,23 +57,28 @@ import redis
 
 from core.channels import DeadLetter, receive, send
 from core.dispatch import delivery_lock
-from core.keys import prefix
+from core.keys import prefix, validate_segment
 from core.logging import configure_logging, log_record
 from lib.chat_cycle import run_chat_cycle
+from lib.chat_memory import HOT_KEEP_COUNT as CHAT_MEMORY_HOT_KEEP_COUNT
+from lib.chat_memory import TTL_SECONDS_MAX as CHAT_MEMORY_TTL_SECONDS
 from lib.chat_memory import ChatMemory
 from lib.profile_env import resolve_claude_profile_env
 from lib.reply_correlation import record_delivered
 
-# Hot-tier conversation memory (lib/chat_memory.py) applies to every
-# delivery unconditionally -- there is no separate "is this a one-off"
-# flag or port_type. A counterparty (`source`) that never talks to this
-# agent again simply never accumulates history; one that does gets it
-# for free. See ticket 0902ee96's discussion for why detecting intent
-# was rejected in favor of this. Not operator-tunable per agent (yet):
-# these are the same kind of fixed, change-the-constant-not-the-mechanism
-# defaults lib/reply_correlation.py's DELIVERED_TTL_SECONDS already is.
-CHAT_MEMORY_TTL_SECONDS = 86_400
-CHAT_MEMORY_HOT_KEEP_COUNT = 20
+# Hot-tier conversation memory (lib/chat_memory.py) applies only when a
+# Message payload names a `context` -- see _deliver_message. No separate
+# "is this a one-off" flag beyond that: `context` present is the only
+# signal, absent means a genuine one-off, no memory read or write at all.
+# An earlier version of this port keyed memory off `source` unconditionally
+# (ticket 0902ee96); ticket 38c7ab0d replaced that with this explicit,
+# caller-named scheme once it became clear a caller may want several
+# independent contexts with the same counterparty (or none at all), which
+# `source` alone can't express. The TTL/keep-count values themselves live in
+# lib/chat_memory.py (re-exported here under these names for every existing
+# call site in this file), not redefined here -- see that module for why:
+# modules/api/server.py's read-only /agents/{agent}/contexts needs the same
+# constant without depending on this port module.
 
 # Per-agent, operator-set ClaudeAgentOptions overrides -- read from the same
 # kind of per-agent Redis resource `profile` already is, but nothing writes
@@ -245,8 +260,23 @@ def _deliver_message(
         # rejection rather than an unresolved effect.
         raise DeadLetter("empty message text")
 
+    # `context` is the caller's own memory-scoping id, entirely their
+    # choice -- absent (key missing or explicitly null) means a genuine
+    # one-off below, not a fallback to any implicit id of ours. Present but
+    # invalid is rejected the same way empty text is: validate_segment runs
+    # before any query() call, so this is still provably pre-call, a clean
+    # DeadLetter rather than an unresolved effect.
+    raw_context = payload.get("context") if isinstance(payload, dict) else None
+    context = None
+    if raw_context is not None:
+        try:
+            context = validate_segment(raw_context)
+        except KeyError:
+            raise DeadLetter(f"invalid context: {raw_context!r}")
+
     stream_id = envelope.get("stream_id")
     correlation_id = envelope.get("correlation_id")
+    message = f"[message from {source}] {text}"
 
     def dispatch(prompt: str) -> str:
         return _run_query(
@@ -259,24 +289,18 @@ def _deliver_message(
             destination=agent,
         )
 
-    # chat_id is `source`, not correlation_id: the one real external-caller
-    # path (modules/api/server.py's POST /agents/{agent}/envelopes) mints a
-    # fresh correlation_id on every single call, so it never actually
-    # threads a conversation in practice -- verified, not assumed, see
-    # ticket 0902ee96. `source` is stable across every message the same
-    # counterparty ever sends this agent, needs no caller cooperation, and
-    # is already scoped correctly: lib/chat_memory.py's ChatMemory is
-    # per-(pod, tenant, agent), so `source` alone is "this counterparty's
-    # thread with this agent," exactly the shape wanted.
-    memory = ChatMemory(r, pod, tenant, agent, ttl_seconds_max=CHAT_MEMORY_TTL_SECONDS)
-    result_text, _prior_turn_count = run_chat_cycle(
-        memory,
-        source,
-        f"[message from {source}] {text}",
-        dispatch,
-        ttl_seconds=CHAT_MEMORY_TTL_SECONDS,
-        hot_keep_count=CHAT_MEMORY_HOT_KEEP_COUNT,
-    )
+    if context is not None:
+        memory = ChatMemory(r, pod, tenant, agent, ttl_seconds_max=CHAT_MEMORY_TTL_SECONDS)
+        result_text, _prior_turn_count = run_chat_cycle(
+            memory,
+            context,
+            message,
+            dispatch,
+            ttl_seconds=CHAT_MEMORY_TTL_SECONDS,
+            hot_keep_count=CHAT_MEMORY_HOT_KEEP_COUNT,
+        )
+    else:
+        result_text = dispatch(message)
 
     # Recorded only after the query call returns: an in_reply_to claim must
     # not validate for a delivery whose model call never actually completed.
@@ -304,6 +328,37 @@ def _deliver_message(
     )
 
 
+def _deliver_list_contexts(r, pod: str, tenant: str, agent: str, envelope: dict) -> None:
+    """Reply to a ``ListContexts`` envelope with the requesting agent's
+    currently-live memory contexts for `agent`.
+
+    A query, not a write -- there's no established "command reply" kind in
+    this codebase (``AddTicket``'s own opener, ``lib/board_interaction.py``'s
+    ``add_ticket``, replies to nothing), so this reuses the same
+    request/response shape ``_deliver_message`` already does: a ``Message``
+    reply, correlated the same way (``in_reply_to``/``correlation_id`` both
+    the incoming ``stream_id``), sent from ``agent`` back to the caller.
+    """
+    source = envelope.get("l2", {}).get("source", "unknown")
+    stream_id = envelope.get("stream_id")
+
+    memory = ChatMemory(r, pod, tenant, agent, ttl_seconds_max=CHAT_MEMORY_TTL_SECONDS)
+    contexts = memory.list_chat_ids()
+
+    send(
+        r,
+        pod=pod,
+        tenant=tenant,
+        source=agent,
+        destination=source,
+        payload={"contexts": contexts},
+        kind="Message",
+        correlation_id=stream_id,
+        module="claude_sdk",
+        in_reply_to=stream_id,
+    )
+
+
 def deliver_claude_sdk(
     r,
     pod: str,
@@ -322,6 +377,7 @@ def deliver_claude_sdk(
         "Message": lambda env: _deliver_message(
             r, pod, tenant, agent, env, profile_env, sdk_options
         ),
+        "ListContexts": lambda env: _deliver_list_contexts(r, pod, tenant, agent, env),
     }
 
     receive(

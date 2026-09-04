@@ -19,6 +19,7 @@ from core.channels import send
 from core.envelope import parse
 from core.keys import prefix
 from core.registry import port_type
+from lib.chat_memory import ChatMemory
 from lib.profile_env import resolve_claude_profile_env
 from modules.claude_sdk.port import deliver_claude_sdk
 
@@ -167,12 +168,12 @@ class ClaudeSdkPortTests(unittest.TestCase):
         self.assertEqual(first["payload"], {"text": "reply-1"})
         self.assertEqual(second["payload"], {"text": "reply-2"})
 
-    def test_a_second_message_from_the_same_source_sees_the_first_as_history(self):
-        self.queue(payload={"text": "first"})
+    def test_a_second_message_with_the_same_context_sees_the_first_as_history(self):
+        self.queue(payload={"text": "first", "context": "bgp-65001"})
         with patch("modules.claude_sdk.port._run_query", return_value="reply-1"):
             deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
 
-        self.queue(payload={"text": "second"})
+        self.queue(payload={"text": "second", "context": "bgp-65001"})
         with patch("modules.claude_sdk.port._run_query", return_value="reply-2") as mock_query:
             deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
 
@@ -181,19 +182,57 @@ class ClaudeSdkPortTests(unittest.TestCase):
         self.assertIn("[assistant] reply-1", prompt)
         self.assertIn("Current message:\n[message from alice] second", prompt)
 
-    def test_a_different_source_talking_to_the_same_agent_gets_no_shared_history(self):
-        self.redis.hset(prefix(POD, self.tenant, resource="registry"), "carol", "tmux")
-        self.queue(source="alice", payload={"text": "alice's message"})
-        with patch("modules.claude_sdk.port._run_query", return_value="reply-to-alice"):
+    def test_a_different_context_from_the_same_source_gets_no_shared_history(self):
+        self.queue(payload={"text": "about bgp", "context": "bgp-65001"})
+        with patch("modules.claude_sdk.port._run_query", return_value="reply-bgp"):
             deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
 
-        self.queue(source="carol", payload={"text": "carol's message"})
-        with patch("modules.claude_sdk.port._run_query", return_value="reply-to-carol") as mock_query:
+        self.queue(payload={"text": "about ospf", "context": "ospf-area0"})
+        with patch("modules.claude_sdk.port._run_query", return_value="reply-ospf") as mock_query:
             deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
 
         prompt = mock_query.call_args.args[0]
-        self.assertNotIn("alice", prompt)
-        self.assertEqual(prompt, "[message from carol] carol's message")
+        self.assertNotIn("bgp", prompt)
+        self.assertEqual(prompt, "[message from alice] about ospf")
+
+    def test_no_context_is_a_genuine_one_off_with_no_memory_touched(self):
+        self.queue(payload={"text": "first, no context"})
+        with patch("modules.claude_sdk.port._run_query", return_value="reply-1"):
+            deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+
+        self.queue(payload={"text": "second, no context"})
+        with patch("modules.claude_sdk.port._run_query", return_value="reply-2") as mock_query:
+            deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+
+        # Byte-identical to the raw message -- no history prefix, because no
+        # ChatMemory read ever happened (not merely "happened to be empty").
+        self.assertEqual(mock_query.call_args.args[0], "[message from alice] second, no context")
+
+        memory = ChatMemory(self.redis, POD, self.tenant, "bob", ttl_seconds_max=3600)
+        self.assertEqual(memory.list_chat_ids(), [])
+
+    def test_invalid_context_is_dead_lettered_without_calling_the_sdk(self):
+        self.queue(payload={"text": "hi", "context": "Not_Valid!"})
+        with patch("modules.claude_sdk.port._run_query") as mock_query:
+            deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+
+        mock_query.assert_not_called()
+        dead = self.redis.lpop(prefix(POD, self.tenant, "bob", "dead"))
+        self.assertIsNotNone(dead)
+
+    def test_list_contexts_replies_with_the_agents_known_contexts(self):
+        self.queue(payload={"text": "hi", "context": "bgp-65001"})
+        with patch("modules.claude_sdk.port._run_query", return_value="ok"):
+            deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+        self.redis.lpop(prefix(POD, self.tenant, "bob", "egress"))  # discard the Message reply
+
+        stream_id = self.queue(kind="ListContexts", payload={})
+        deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+
+        raw = self.redis.lpop(prefix(POD, self.tenant, "bob", "egress"))
+        reply = parse(raw)
+        self.assertEqual(reply["payload"], {"contexts": ["bgp-65001"]})
+        self.assertEqual(reply["in_reply_to"], stream_id)
 
     def test_configured_sdk_options_are_threaded_into_the_query_call(self):
         self.redis.set(

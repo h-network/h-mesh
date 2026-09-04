@@ -24,6 +24,8 @@ from core.channels import DeadLetter, send
 from core.envelope import EnvelopeError, resolve_destination
 from core.keys import prefix
 from core.registry import is_member, members, port_type
+from lib.chat_memory import TTL_SECONDS_MAX as CHAT_MEMORY_TTL_SECONDS
+from lib.chat_memory import ChatMemory
 
 DEFAULT_ENVELOPE_MAX_BYTES = 1_048_576
 # Comfortably under both clients/telegram/bot.py's 90s idle-read timeout and
@@ -328,6 +330,10 @@ def _render_restdoc_html(app: FastAPI) -> str:
         "/agents/{agent}": {
             "desc": "Get queue depths, activity-derived presence, and any separate unverified-delivery marker for an agent.",
             "curl": 'curl -H "Authorization: Bearer $API_TOKEN" http://localhost:8080/agents/sme-2',
+        },
+        "/agents/{agent}/contexts": {
+            "desc": "List the hot-tier memory contexts a claude_sdk agent currently has live turns for (see the `context` field on a Message payload).",
+            "curl": 'curl -H "Authorization: Bearer $API_TOKEN" http://localhost:8080/agents/sme-2/contexts',
         },
         "/agents/{agent}/envelopes": {
             "desc": "Post an envelope of any kind to a specific agent or broadcast to 'all'. Accepts standard envelope shape, sugar `{\"text\": \"...\"}` for Message, and optional `\"as\"` for api client source identity.",
@@ -1059,6 +1065,22 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
         if not is_member(client, pod=settings.pod, tenant=settings.tenant, agent=agent):
             raise HTTPException(status_code=404, detail="unknown agent")
         return board_response(agent, [client.lrange(key, 0, -1) for key in keys])
+
+    @app.get("/agents/{agent}/contexts")
+    def agent_contexts(agent: str) -> dict[str, Any]:
+        # Same shape as get_messages's own two-step check (existence via
+        # a KeyError-raising helper, then port_type) -- direct Redis read,
+        # same as agent_board/agent_queues, not a round trip through a
+        # ListContexts envelope: this door reads the same underlying
+        # lib/chat_memory.py store modules/claude_sdk/port.py's own
+        # ListContexts opener does, rather than duplicating the listing
+        # logic in two places.
+        if not is_member(client, pod=settings.pod, tenant=settings.tenant, agent=agent):
+            raise HTTPException(status_code=404, detail="unknown agent")
+        if port_type(client, pod=settings.pod, tenant=settings.tenant, agent=agent) != "claude_sdk":
+            raise HTTPException(status_code=404, detail="agent has no memory contexts")
+        memory = ChatMemory(client, settings.pod, settings.tenant, agent, ttl_seconds_max=CHAT_MEMORY_TTL_SECONDS)
+        return {"agent": agent, "contexts": memory.list_chat_ids()}
 
     @app.get("/board")
     def all_boards() -> dict[str, list[dict[str, Any]]]:

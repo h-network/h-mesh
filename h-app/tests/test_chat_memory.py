@@ -71,10 +71,28 @@ class ChatMemoryTests(unittest.TestCase):
         # chat_id flows into a core.keys resource segment, which rejects
         # all-digit segments -- the "c"/"t" prefixes in _turn_key/_index_key
         # exist specifically so an all-digit chat_id or ts_ns doesn't hit
-        # that rejection. A real caller (chat_id == `source`, an agent
-        # name) can't itself be all-digit -- core.keys already forbids that
-        # agent name entirely -- but nothing enforces it for chat_id here,
+        # that rejection. A caller-named context (modules/claude_sdk/port.py
+        # validates it with core.keys.validate_segment before it ever
+        # reaches here, which already forbids all-digit) shouldn't produce
+        # one in practice, but nothing in this class enforces that itself,
         # so this is a structural guarantee, not a "can't happen" argument.
         turn_key = self.memory.write_turn("1234567890", "user", "hi", 3600)
         self.assertIn("c1234567890", turn_key)
         self.assertEqual([t["content"] for t in self.memory.read_turns("1234567890")], ["hi"])
+
+    def test_list_chat_ids_is_empty_for_a_fresh_agent(self):
+        self.assertEqual(self.memory.list_chat_ids(), [])
+
+    def test_list_chat_ids_returns_every_live_context_sorted(self):
+        self.memory.write_turn("ospf-area0", "user", "hi", 3600)
+        self.memory.write_turn("bgp-65001", "user", "hi", 3600)
+
+        self.assertEqual(self.memory.list_chat_ids(), ["bgp-65001", "ospf-area0"])
+
+    def test_list_chat_ids_does_not_include_other_agents(self):
+        other = ChatMemory(self.redis, POD, self.tenant, "alice", ttl_seconds_max=3600)
+        self.memory.write_turn("bob-context", "user", "hi", 3600)
+        other.write_turn("alice-context", "user", "hi", 3600)
+
+        self.assertEqual(self.memory.list_chat_ids(), ["bob-context"])
+        self.assertEqual(other.list_chat_ids(), ["alice-context"])

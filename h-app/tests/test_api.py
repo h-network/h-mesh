@@ -19,6 +19,7 @@ from core.channels import send
 from core.envelope import build, encode, parse
 from clients.telegram.bot import TelegramBot
 from core.keys import incarnation_key, prefix
+from lib.chat_memory import ChatMemory
 from modules.api import server as server_module
 from modules.api.port import deliver_api
 from modules.api.server import ApiSettings, create_app
@@ -184,6 +185,7 @@ class ApiTests(unittest.TestCase):
             ("GET", "/agents/{agent}/activity"),
             ("GET", "/agents/{agent}/activity/stream"),
             ("GET", "/agents/{agent}/board"),
+            ("GET", "/agents/{agent}/contexts"),
             ("GET", "/board"),
             ("GET", "/alerts"),
             ("GET", "/alerts/stream"),
@@ -926,6 +928,57 @@ class RealApiPortSubprocessTests(unittest.TestCase):
 
         delivering_key = prefix(self.pod, self.tenant, agent="ivy", resource="delivering")
         self.assertIsNone(self.r.get(delivering_key))
+
+
+class AgentContextsRealRedisTests(unittest.TestCase):
+    """GET /agents/{agent}/contexts reads real ChatMemory index keys (ZSETs
+    via SCAN) -- this file's own FakeRedis/FakePipeline (used by ApiTests
+    above) only implements the narrow set of commands core.channels' own
+    Lua scripts need, same reason test_claude_sdk_port.py's port-level tests
+    moved to real Redis."""
+
+    def setUp(self):
+        self.redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+        self.r = redis.Redis.from_url(self.redis_url)
+        try:
+            self.r.ping()
+        except Exception:
+            self.skipTest("real Redis server not available at REDIS_URL")
+        self.pod = "test"
+        self.tenant = f"contexts-{os.urandom(4).hex()}"
+        self.registry = prefix(self.pod, self.tenant, resource="registry")
+        self.r.hset(self.registry, "bob", "claude_sdk")
+        self.r.hset(self.registry, "alice", "tmux")
+        self.app = create_app(
+            settings=ApiSettings(pod=self.pod, tenant=self.tenant, api_token="secret"),
+            redis_client=self.r,
+        )
+
+    def test_unknown_agent_is_404(self):
+        status, body = request(self.app, "GET", "/agents/nobody/contexts", token="secret")
+        self.assertEqual(status, 404)
+
+    def test_non_claude_sdk_agent_is_404(self):
+        status, body = request(self.app, "GET", "/agents/alice/contexts", token="secret")
+        self.assertEqual(status, 404)
+
+    def test_claude_sdk_agent_with_no_contexts_yet(self):
+        status, body = request(self.app, "GET", "/agents/bob/contexts", token="secret")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"agent": "bob", "contexts": []})
+
+    def test_lists_live_contexts_for_the_agent(self):
+        memory = ChatMemory(self.r, self.pod, self.tenant, "bob", ttl_seconds_max=3600)
+        memory.write_turn("bgp-65001", "user", "hello", 3600)
+        memory.write_turn("ospf-area0", "user", "hi", 3600)
+
+        status, body = request(self.app, "GET", "/agents/bob/contexts", token="secret")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"agent": "bob", "contexts": ["bgp-65001", "ospf-area0"]})
+
+    def test_requires_auth(self):
+        status, _ = request(self.app, "GET", "/agents/bob/contexts")
+        self.assertEqual(status, 401)
 
 
 if __name__ == "__main__":

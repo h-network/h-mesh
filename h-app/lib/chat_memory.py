@@ -26,6 +26,17 @@ import time
 
 from core.keys import prefix
 
+# The shared hot-tier defaults every current caller uses -- fixed, not
+# operator-tunable per agent (yet), same "change-the-constant-not-the-
+# mechanism" posture lib/reply_correlation.py's DELIVERED_TTL_SECONDS
+# already has. Live here (not in modules/claude_sdk/port.py, the only
+# writer today) so a read-only caller -- modules/api/server.py's
+# /agents/{agent}/contexts, which never writes a turn and has no reason to
+# depend on a specific port module's constants -- can construct a
+# ChatMemory without importing anything port-specific.
+TTL_SECONDS_MAX = 86_400
+HOT_KEEP_COUNT = 20
+
 
 class ChatMemory:
     """Hot-tier turn buffer for one (pod, tenant, agent), chat_id-scoped.
@@ -141,3 +152,31 @@ class ChatMemory:
             if isinstance(turn, dict):
                 turns.append(turn)
         return turns
+
+    def list_chat_ids(self) -> list[str]:
+        """Every chat_id this agent currently has a live index for, sorted.
+
+        "Live" means the index key still exists -- which is exactly the set
+        with at least one turn that hasn't fully expired: write_turn's own
+        pruning (ZREMRANGEBYSCORE, and ZREMRANGEBYRANK when hot_keep_count
+        is used) only ever trims a *chat_id's* index entries, never deletes
+        the index key itself, so a chat_id's index key existing or not is
+        governed solely by its own EXPIRE (refreshed to ttl_seconds_max on
+        every write, same as any other Redis key -- once nothing refreshes
+        it, it's gone on its own).
+
+        SCAN-based (via ``_index_key("")`` as the exact prefix every real
+        index key extends -- built the same way every other key here is,
+        not a hand-duplicated string), not KEYS: this can run against a
+        live Redis without blocking it, at the cost of not being a single
+        atomic snapshot -- a chat_id whose index expires mid-scan may or
+        may not appear, same tolerance ``read_turns`` already has for a key
+        expiring between its own index read and MGET.
+        """
+        base = self._index_key("")
+        chat_ids: list[str] = []
+        for key in self._client.scan_iter(match=f"{base}*"):
+            key_str = key.decode() if isinstance(key, bytes) else key
+            if key_str.startswith(base):
+                chat_ids.append(key_str[len(base):])
+        return sorted(chat_ids)
