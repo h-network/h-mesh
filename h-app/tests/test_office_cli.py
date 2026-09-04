@@ -448,6 +448,104 @@ def test_send_reply_to_rejects_malformed_id_before_sending(mock_send, monkeypatc
     mock_send.assert_not_called()
 
 
+@patch("modules.office.cli.send")
+def test_send_context_is_threaded_into_the_payload(mock_send, monkeypatch, capsys):
+    _env(monkeypatch)
+    mock_send.return_value = "stream-3"
+    r = FakeRedis(registry={"backend": "claude_sdk"})
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["send", "-a", "backend", "--context", "bgp-65001", "hello there"])
+    kwargs = mock_send.call_args[1]
+    assert kwargs["payload"] == {"text": "hello there", "context": "bgp-65001"}
+
+
+@patch("modules.office.cli.send")
+def test_send_without_context_omits_the_field_entirely(mock_send, monkeypatch, capsys):
+    _env(monkeypatch)
+    mock_send.return_value = "stream-4"
+    r = FakeRedis(registry={"backend": "claude_sdk"})
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["send", "-a", "backend", "hello there"])
+    kwargs = mock_send.call_args[1]
+    assert "context" not in kwargs["payload"]
+
+
+@patch("modules.office.cli.send")
+def test_send_context_rejects_invalid_value_before_sending(mock_send, monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis(registry={"backend": "claude_sdk"})
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit):
+            office_main(["send", "-a", "backend", "--context", "Not_Valid!", "hello there"])
+    assert "--context" in capsys.readouterr().err
+    mock_send.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# contexts (real Redis -- ChatMemory pipelines ZSET/EXPIRE/ZREMRANGEBY*
+# commands FakeRedis here doesn't implement, same reason
+# test_send_stdin_identity_reaches_recipient_on_real_redis above needs it)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def real_redis():
+    r = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"))
+    try:
+        r.ping()
+    except redis.RedisError:
+        pytest.skip("real Redis server not available at REDIS_URL")
+    return r
+
+
+def test_contexts_requires_agent_flag(real_redis, monkeypatch, capsys):
+    with patch("modules.office.cli._context", return_value=(real_redis, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit):
+            office_main(["contexts"])
+    assert "requires -a" in capsys.readouterr().err
+
+
+def test_contexts_rejects_unknown_agent(real_redis, monkeypatch, capsys):
+    tenant = f"contexts-{os.urandom(8).hex()}"
+    with patch("modules.office.cli._context", return_value=(real_redis, POD, tenant, "architect")):
+        with pytest.raises(SystemExit):
+            office_main(["contexts", "-a", "ghost"])
+    assert "unknown agent" in capsys.readouterr().err
+
+
+def test_contexts_rejects_non_claude_sdk_agent(real_redis, monkeypatch, capsys):
+    tenant = f"contexts-{os.urandom(8).hex()}"
+    real_redis.hset(prefix(POD, tenant, resource="registry"), "backend", "tmux")
+    with patch("modules.office.cli._context", return_value=(real_redis, POD, tenant, "architect")):
+        with pytest.raises(SystemExit):
+            office_main(["contexts", "-a", "backend"])
+    assert "not a claude_sdk agent" in capsys.readouterr().err
+
+
+def test_contexts_reports_none_for_a_fresh_agent(real_redis, monkeypatch, capsys):
+    tenant = f"contexts-{os.urandom(8).hex()}"
+    real_redis.hset(prefix(POD, tenant, resource="registry"), "bob", "claude_sdk")
+    with patch("modules.office.cli._context", return_value=(real_redis, POD, tenant, "architect")):
+        office_main(["contexts", "-a", "bob"])
+    assert "no live memory contexts" in capsys.readouterr().out
+
+
+def test_contexts_lists_live_contexts(real_redis, monkeypatch, capsys):
+    from lib.chat_memory import ChatMemory
+
+    tenant = f"contexts-{os.urandom(8).hex()}"
+    real_redis.hset(prefix(POD, tenant, resource="registry"), "bob", "claude_sdk")
+    memory = ChatMemory(real_redis, POD, tenant, "bob", ttl_seconds_max=3600)
+    memory.write_turn("bgp-65001", "user", "hi", 3600)
+    memory.write_turn("ospf-area0", "user", "hi", 3600)
+
+    with patch("modules.office.cli._context", return_value=(real_redis, POD, tenant, "architect")):
+        office_main(["contexts", "-a", "bob"])
+    out = capsys.readouterr().out
+    assert "bgp-65001" in out
+    assert "ospf-area0" in out
+
+
 # ---------------------------------------------------------------------------
 # lifecycle commands (_lifecycle_command)
 # ---------------------------------------------------------------------------

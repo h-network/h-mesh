@@ -28,11 +28,15 @@ import redis
 
 from core.channels import send
 from core.envelope import EnvelopeError, parse
-from core.keys import prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key
+from core.keys import (
+    prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key, validate_segment,
+)
 from core.logging import log_record, record_task_event
 from core.registry import is_member, members, port_type
 from lib.attachment_schema import ATTACHMENT_MAX_BYTES, MIME_TYPE_REGEX
 from lib.board_interaction import BoardError, normalize_ticket, serialize_ticket
+from lib.chat_memory import TTL_SECONDS_MAX as _CHAT_MEMORY_TTL_SECONDS
+from lib.chat_memory import ChatMemory
 from lib.paths import get_workdir_root
 from lib.reply_correlation import is_valid_reply_id
 
@@ -98,15 +102,24 @@ def _operation_parser(
 
 def _message(
     r, *, pod: str, tenant: str, source: str, destination: str, text: str,
-    in_reply_to: str | None = None,
+    in_reply_to: str | None = None, context: str | None = None,
 ) -> str:
+    payload = {"text": text}
+    if context is not None:
+        # `context` rides in the payload, not as a separate send() argument
+        # -- it's an ordinary Message field modules/claude_sdk/port.py reads
+        # (see its own docstring), not wire-format/switch mechanics core.
+        # channels needs to know about. Meaningless to a non-claude_sdk
+        # destination, but harmless: every other port already ignores
+        # payload keys it doesn't recognize.
+        payload["context"] = context
     return send(
         r,
         pod=pod,
         tenant=tenant,
         source=source,
         destination=destination,
-        payload={"text": text},
+        payload=payload,
         kind="Message",
         module="office",
         in_reply_to=in_reply_to,
@@ -127,6 +140,16 @@ def _send_command(argv: list[str]) -> None:
             "'[message <id> from ...]' line you are answering. Best-effort -- "
             "silently dropped by the recipient's door if it doesn't validate, "
             "same as not passing it at all."
+        ),
+    )
+    parser.add_argument(
+        "--context",
+        metavar="CONTEXT",
+        help=(
+            "for a claude_sdk destination: the memory context this message belongs "
+            "to (see modules/claude_sdk/port.py) -- same context on a later send "
+            "recalls this one, a fresh context or none starts (or stays) memory-free. "
+            "Ignored by every other destination port_type."
         ),
     )
     parser.add_argument(
@@ -158,13 +181,21 @@ def _send_command(argv: list[str]) -> None:
         raise OfficeError(
             f"--reply-to {args.reply_to!r} is not a 32-character lowercase hex stream_id"
         )
+    if args.context is not None:
+        try:
+            validate_segment(args.context)
+        except KeyError:
+            raise OfficeError(
+                f"--context {args.context!r} must be lowercase alphanumeric/hyphens, "
+                "1-63 chars, starting with a letter or digit, not all-digits"
+            )
 
     r, pod, tenant, source = _context()
     if not is_member(r, pod=pod, tenant=tenant, agent=args.agent):
         raise OfficeError(f"unknown destination agent {args.agent!r}")
     stream_id = _message(
         r, pod=pod, tenant=tenant, source=source, destination=args.agent, text=text,
-        in_reply_to=args.reply_to,
+        in_reply_to=args.reply_to, context=args.context,
     )
     print(f"sent to {args.agent}: {len(text.encode('utf-8'))} bytes ({stream_id})")
 
@@ -372,6 +403,33 @@ def _peers_command(argv: list[str]) -> None:
             if agent != source and port_type(r, pod=pod, tenant=tenant, agent=agent) in ("api", "office")
         )
         print(f"interfaces (api/office -- recognized, not tmux colleagues): {', '.join(labeled) or '(none)'}")
+
+
+def _contexts_command(argv: list[str]) -> None:
+    parser = _operation_parser("contexts", "List a claude_sdk agent's live memory contexts.")
+    parser.add_argument("-a", "--agent", metavar="AGENT", help="claude_sdk destination agent")
+    args = parser.parse_args(argv)
+
+    if not args.agent:
+        raise OfficeError("office contexts requires -a <agent>")
+
+    r, pod, tenant, _source = _context()
+    if not is_member(r, pod=pod, tenant=tenant, agent=args.agent):
+        raise OfficeError(f"unknown agent {args.agent!r}")
+    if port_type(r, pod=pod, tenant=tenant, agent=args.agent) != "claude_sdk":
+        raise OfficeError(f"{args.agent!r} is not a claude_sdk agent -- it has no memory contexts")
+
+    # Direct Redis read, same as office status/peers -v already do for their
+    # own per-agent state -- not a round trip through the ListContexts
+    # envelope kind: this file already owns a Redis client and this agent's
+    # (pod, tenant, agent) identity, the exact shape lib/chat_memory.py's
+    # own docstring says any such caller can use directly.
+    memory = ChatMemory(r, pod, tenant, args.agent, ttl_seconds_max=_CHAT_MEMORY_TTL_SECONDS)
+    contexts = memory.list_chat_ids()
+    if not contexts:
+        print(f"{args.agent}: no live memory contexts")
+        return
+    print(f"{args.agent}: {', '.join(contexts)}")
 
 
 def _timestamp(value) -> datetime | None:
@@ -1822,6 +1880,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("send-file",), "send a file attachment to one agent", _send_file_command),
     (("broadcast",), "send a message to every peer agent", _broadcast_command),
     (("peers",), "list peer agents", _peers_command),
+    (("contexts",), "list a claude_sdk agent's live memory contexts", _contexts_command),
     (("status",), "show agent presence and open work", _status_command),
     (("hire",), "enrol a new agent", lambda argv: _lifecycle_command("hire", argv)),
     (("let-go",), "retire an agent", lambda argv: _lifecycle_command("letGo", argv)),

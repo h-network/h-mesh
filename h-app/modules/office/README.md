@@ -135,6 +135,19 @@ against real delivery provenance and silently drops it if it doesn't hold,
 same as if `--reply-to` had never been passed. See `lib/reply_correlation.py`
 and `modules/api/README.md` for the full mechanism.
 
+`office send -a AGENT --context CONTEXT TEXT` names the hot-tier memory
+context (`lib/chat_memory.py`, `modules/claude_sdk/port.py`) this message
+belongs to, for a `claude_sdk` destination: the same `CONTEXT` on a later
+send recalls this exchange, a different one (or omitting `--context`
+entirely) doesn't. `--context` is format-checked locally the same way
+`--reply-to` is (`core.keys.validate_segment`), and is simply ignored by any
+destination whose port_type isn't `claude_sdk` -- every existing opener
+already reads only the payload fields it recognizes and drops the rest.
+`office contexts -a AGENT` lists a `claude_sdk` agent's currently-live
+contexts, reading `lib/chat_memory.py`'s `ChatMemory` directly (same "own a
+Redis client, read state directly" shape `office status`/`office peers -v`
+already use, not a round trip through an envelope).
+
 Operational compatibility warning: the legacy `office` CLI deployed where
 this module was developed silently loses messages submitted with `office send
 --stdin`. It still reports success and prints the submitted byte count, but the

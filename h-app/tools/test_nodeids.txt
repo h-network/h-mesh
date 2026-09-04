@@ -389,6 +389,14 @@ h-app/tests/test_office_cli.py::test_send_refuses_unknown_agent
 h-app/tests/test_office_cli.py::test_send_builds_message_envelope
 h-app/tests/test_office_cli.py::test_send_reply_to_threads_through_to_the_wire
 h-app/tests/test_office_cli.py::test_send_reply_to_rejects_malformed_id_before_sending
+h-app/tests/test_office_cli.py::test_send_context_is_threaded_into_the_payload
+h-app/tests/test_office_cli.py::test_send_without_context_omits_the_field_entirely
+h-app/tests/test_office_cli.py::test_send_context_rejects_invalid_value_before_sending
+h-app/tests/test_office_cli.py::test_contexts_requires_agent_flag
+h-app/tests/test_office_cli.py::test_contexts_rejects_unknown_agent
+h-app/tests/test_office_cli.py::test_contexts_rejects_non_claude_sdk_agent
+h-app/tests/test_office_cli.py::test_contexts_reports_none_for_a_fresh_agent
+h-app/tests/test_office_cli.py::test_contexts_lists_live_contexts
 h-app/tests/test_office_cli.py::test_hire_defaults_to_fresh_session
 h-app/tests/test_office_cli.py::test_hire_carries_profile_provider_resume_permissions_and_tools
 h-app/tests/test_office_cli.py::test_hire_wait_is_unknown_not_confirmed_even_for_a_clean_new_registration
