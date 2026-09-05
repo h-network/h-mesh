@@ -186,6 +186,9 @@ class ApiTests(unittest.TestCase):
             ("GET", "/agents/{agent}/activity/stream"),
             ("GET", "/agents/{agent}/board"),
             ("GET", "/agents/{agent}/contexts"),
+            ("GET", "/agents/{agent}/live"),
+            ("GET", "/agents/{agent}/live/events"),
+            ("GET", "/agents/{agent}/live/stream"),
             ("GET", "/board"),
             ("GET", "/alerts"),
             ("GET", "/alerts/stream"),
@@ -978,6 +981,145 @@ class AgentContextsRealRedisTests(unittest.TestCase):
 
     def test_requires_auth(self):
         status, _ = request(self.app, "GET", "/agents/bob/contexts")
+        self.assertEqual(status, 401)
+
+
+class WebuiRoutesRealRedisTests(unittest.TestCase):
+    """The webui-facing routes (modules/webui/routes.py), mounted onto this
+    same api app -- see modules/webui/port.py's own docstring for why there
+    is no separate daemon/app to construct here. Real Redis for the same
+    reason AgentContextsRealRedisTests is: XADD/XRANGE aren't in this file's
+    own FakeRedis."""
+
+    def setUp(self):
+        self.redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+        self.r = redis.Redis.from_url(self.redis_url)
+        try:
+            self.r.ping()
+        except Exception:
+            self.skipTest("real Redis server not available at REDIS_URL")
+        self.pod = "test"
+        self.tenant = f"webuiroutes-{os.urandom(4).hex()}"
+        self.registry = prefix(self.pod, self.tenant, resource="registry")
+        self.r.hset(self.registry, "webui1", "webui")
+        self.r.hset(self.registry, "alice", "tmux")
+        self.app = create_app(
+            settings=ApiSettings(pod=self.pod, tenant=self.tenant, api_token="secret"),
+            redis_client=self.r,
+        )
+
+    def test_unknown_agent_live_page_is_404(self):
+        status, _ = request(self.app, "GET", "/agents/nobody/live/events", token="secret")
+        self.assertEqual(status, 404)
+
+    def test_non_webui_agent_live_events_is_404(self):
+        status, _ = request(self.app, "GET", "/agents/alice/live/events", token="secret")
+        self.assertEqual(status, 404)
+
+    def test_live_events_json_poll_returns_relayed_envelopes(self):
+        inbox_key = prefix(self.pod, self.tenant, "webui1", "inbox")
+        envelope = {"kind": "Progress", "payload": {"event": "claude_sdk_turn", "detail": "stop_reason=end_turn"}}
+        self.r.xadd(inbox_key, {"envelope": json.dumps(envelope)})
+
+        status, body = request(self.app, "GET", "/agents/webui1/live/events", token="secret")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["agent"], "webui1")
+        self.assertEqual(len(body["events"]), 1)
+        self.assertEqual(body["events"][0]["kind"], "Progress")
+        self.assertEqual(body["events"][0]["payload"]["event"], "claude_sdk_turn")
+
+    def test_live_page_returns_html_for_a_webui_agent(self):
+        sent = []
+        received = False
+
+        async def receive():
+            nonlocal received
+            if received:
+                return {"type": "http.disconnect"}
+            received = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/agents/webui1/live",
+            "raw_path": b"/agents/webui1/live",
+            "query_string": b"",
+            "headers": [(b"authorization", b"Bearer secret")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("127.0.0.1", 8080),
+            "root_path": "",
+        }
+        asyncio.run(self.app(scope, receive, send))
+        start = next(item for item in sent if item["type"] == "http.response.start")
+        raw_body = b"".join(item.get("body", b"") for item in sent if item["type"] == "http.response.body")
+        self.assertEqual(start["status"], 200)
+        content_type = dict(start["headers"])[b"content-type"]
+        self.assertIn(b"text/html", content_type)
+        self.assertIn(b"webui1", raw_body)
+        # No EventSource here -- native EventSource cannot set the
+        # Authorization header this same app requires, so the page must use
+        # fetch() (which can) instead, never widening the auth boundary.
+        self.assertIn(b"fetch(", raw_body)
+        self.assertNotIn(b"new EventSource", raw_body)
+
+    def test_live_stream_emits_keepalive_when_idle(self):
+        from modules.webui import routes as webui_routes_module
+
+        first = True
+
+        async def receive():
+            nonlocal first
+            if first:
+                first = False
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await asyncio.sleep(3600)
+            return {"type": "http.disconnect"}
+
+        body_chunks = []
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                body_chunks.append(message.get("body", b""))
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/agents/webui1/live/stream",
+            "raw_path": b"/agents/webui1/live/stream",
+            "query_string": b"",
+            "headers": [(b"authorization", b"Bearer secret")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("127.0.0.1", 8080),
+            "root_path": "",
+        }
+
+        async def run():
+            with patch.object(webui_routes_module, "SSE_KEEPALIVE_INTERVAL_S", 0.05):
+                task = asyncio.ensure_future(self.app(scope, receive, send))
+                await asyncio.sleep(0.3)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        asyncio.run(run())
+
+        combined = b"".join(body_chunks)
+        self.assertIn(b": keepalive\n\n", combined)
+
+    def test_requires_auth(self):
+        status, _ = request(self.app, "GET", "/agents/webui1/live/events")
         self.assertEqual(status, 401)
 
 

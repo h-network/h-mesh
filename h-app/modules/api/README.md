@@ -48,6 +48,26 @@ direct `lib/chat_memory.py` read, not a round trip through the agent's own
 `ListContexts` envelope kind -- both doors read the same underlying store,
 this one just doesn't need the target agent's ingress to be drained first.
 
+## webui: live progress, mounted here
+
+`modules/webui/routes.py`'s `register_webui_routes` mounts three more routes
+onto this same app -- `GET /agents/{agent}/live` (served HTML page),
+`GET /agents/{agent}/live/events` (JSON poll), `GET /agents/{agent}/live/stream`
+(SSE) -- all 404 unless `agent`'s registry `port_type` is `webui`. See
+`modules/webui/README.md` for why these live here rather than in a second
+daemon: this service is already running, wizard-enabled, and TLS/bind-aware,
+so a `webui`-registered agent's relayed `Progress`/`Message` envelopes (see
+`modules/claude_sdk/README.md`'s `live_to`) are just one more agent's mailbox
+this app already knows how to expose, reusing `lib/sse_stream.py`'s poll/
+keepalive machinery unchanged.
+
+The served page authenticates with `fetch()`, not `EventSource` -- native
+`EventSource` cannot set an `Authorization` header, and no `?token=`
+query-param fallback was added to `authorize()` to work around that, since
+doing so would have widened every existing api route's auth surface, not
+just these new ones. The page's own JS parses the `text/event-stream` framing
+by hand instead.
+
 ## SSE idle keepalive
 
 `/agents/{agent}/activity/stream` and `/alerts/stream` (both routed through

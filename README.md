@@ -269,6 +269,16 @@ The same discovery is reachable externally at `GET /agents/{agent}/contexts`
 anything, happens once a context's TTL elapses -- is deliberately out of
 scope today; see `lib/chat_memory.py`'s own module docstring.
 
+A `Message` payload's `live_to` additionally fans every hop of that same
+`query()` call out live as a `Progress` envelope, typically to a
+`webui`-registered agent (see `modules/webui/README.md`) -- one more
+registry-only port_type, also with no `office hire` path yet. Its served page
+(`GET /agents/{agent}/live`, once Telegram/the api service are configured) is
+the actual browser view of a `claude_sdk` agent's progress in real time;
+`GET /agents/{agent}/live/events`/`live/stream` are the same data as JSON
+poll/SSE for any other client. See `modules/claude_sdk/README.md` for the
+exact `live_to`/`live_cc_source` payload shape.
+
 ## Upgrading and restarting daemons
 
 `h-mesh-upgrade` (`services.upgrade`) updates an existing install in place --

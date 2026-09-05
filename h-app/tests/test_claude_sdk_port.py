@@ -83,6 +83,11 @@ class ClaudeSdkPortTests(unittest.TestCase):
             correlation_id=ANY,
             source="alice",
             destination="bob",
+            r=self.redis,
+            pod=POD,
+            tenant=self.tenant,
+            live_to=None,
+            live_cc_source=False,
         )
 
         raw = self.redis.lpop(prefix(POD, self.tenant, "bob", "egress"))
@@ -152,6 +157,11 @@ class ClaudeSdkPortTests(unittest.TestCase):
             correlation_id=ANY,
             source="alice",
             destination="bob",
+            r=self.redis,
+            pod=POD,
+            tenant=self.tenant,
+            live_to=None,
+            live_cc_source=False,
         )
 
     def test_drains_multiple_queued_messages_independently(self):
@@ -266,6 +276,113 @@ class ClaudeSdkPortTests(unittest.TestCase):
             deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
 
         self.assertEqual(mock_query.call_args.kwargs["sdk_options"], {})
+
+    def test_no_live_to_produces_no_progress_envelopes(self):
+        """The untouched default: neither field set means exactly one egress
+        entry (the final reply), byte-for-byte today's behavior."""
+        self.queue(payload={"text": "hello"})
+        with patch("modules.claude_sdk.port._run_query", return_value="ok"):
+            deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+
+        egress_key = prefix(POD, self.tenant, "bob", "egress")
+        self.assertEqual(self.redis.llen(egress_key), 1)
+        reply = parse(self.redis.lpop(egress_key))
+        self.assertEqual(reply["kind"], "Message")
+
+    def test_live_to_fans_out_a_progress_envelope_per_hop(self):
+        import claude_agent_sdk as sdk
+
+        stream_id = self.queue(payload={"text": "hi", "live_to": "webui1"})
+
+        started = sdk.SystemMessage(subtype="init", data={"session_id": "s1"})
+        finished = sdk.ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="s1", result="4",
+        )
+
+        async def fake_query(*, prompt, options=None):
+            yield started
+            yield finished
+
+        with patch("claude_agent_sdk.query", new=fake_query):
+            deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+
+        egress_key = prefix(POD, self.tenant, "bob", "egress")
+        envelopes = [parse(raw) for raw in self.redis.lrange(egress_key, 0, -1)]
+        progress = [env for env in envelopes if env["kind"] == "Progress"]
+        replies = [env for env in envelopes if env["kind"] == "Message"]
+
+        self.assertEqual(len(progress), 2)
+        self.assertEqual(len(replies), 1)
+        for env in progress:
+            self.assertEqual(env["l2"]["source"], "bob")
+            self.assertEqual(env["l2"]["destination"], "webui1")
+            self.assertEqual(env["correlation_id"], stream_id)
+            self.assertEqual(env["in_reply_to"], stream_id)
+        self.assertEqual(progress[0]["payload"]["event"], "claude_sdk_query_started")
+        self.assertEqual(progress[1]["payload"]["event"], "claude_sdk_query_finished")
+
+    def test_live_cc_source_also_sends_progress_to_the_original_sender(self):
+        import claude_agent_sdk as sdk
+
+        self.queue(payload={"text": "hi", "live_to": "webui1", "live_cc_source": True})
+
+        finished = sdk.ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="s1", result="4",
+        )
+
+        async def fake_query(*, prompt, options=None):
+            yield finished
+
+        with patch("claude_agent_sdk.query", new=fake_query):
+            deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+
+        egress_key = prefix(POD, self.tenant, "bob", "egress")
+        envelopes = [parse(raw) for raw in self.redis.lrange(egress_key, 0, -1)]
+        progress_destinations = sorted(
+            env["l2"]["destination"] for env in envelopes if env["kind"] == "Progress"
+        )
+        self.assertEqual(progress_destinations, ["alice", "webui1"])
+
+    def test_invalid_live_to_is_dead_lettered_without_calling_the_sdk(self):
+        self.queue(payload={"text": "hi", "live_to": "Not_Valid!"})
+        with patch("modules.claude_sdk.port._run_query") as mock_query:
+            deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+
+        mock_query.assert_not_called()
+        dead = self.redis.lpop(prefix(POD, self.tenant, "bob", "dead"))
+        self.assertIsNotNone(dead)
+
+    def test_progress_send_failure_does_not_break_the_reply(self):
+        """A live_to that send() rejects (bad name, policy denial, whatever)
+        must not take the actual query()/reply down with it -- a live-viewing
+        convenience failing is not a reason to fail the delivery it was only
+        ever describing."""
+        import claude_agent_sdk as sdk
+
+        def flaky_send(*args, **kwargs):
+            if kwargs.get("kind") == "Progress":
+                raise RuntimeError("simulated send failure")
+            return send(*args, **kwargs)
+
+        finished = sdk.ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="s1", result="ok",
+        )
+
+        async def fake_query(*, prompt, options=None):
+            yield finished
+
+        self.queue(payload={"text": "hi", "live_to": "webui1"})
+        with patch("claude_agent_sdk.query", new=fake_query), patch(
+            "modules.claude_sdk.port.send", side_effect=flaky_send
+        ):
+            deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+
+        egress_key = prefix(POD, self.tenant, "bob", "egress")
+        envelopes = [parse(raw) for raw in self.redis.lrange(egress_key, 0, -1)]
+        self.assertEqual([env["kind"] for env in envelopes], ["Message"])
 
 
 class ProfileEnvTests(unittest.TestCase):
@@ -429,6 +546,36 @@ class LogHopTests(unittest.TestCase):
         options = captured_options["value"]
         self.assertEqual(options.model, "claude-x")
         self.assertEqual(options.max_turns, 3)
+
+    def test_live_to_sends_a_progress_envelope_with_a_readable_detail_per_hop(self):
+        import claude_agent_sdk as sdk
+
+        turn = sdk.AssistantMessage(
+            content=[sdk.ToolUseBlock(id="t1", name="Read", input={})],
+            model="claude-x",
+            stop_reason="tool_use",
+        )
+
+        async def fake_query(*, prompt, options=None):
+            yield turn
+
+        from modules.claude_sdk.port import _run_query
+
+        with patch("claude_agent_sdk.query", new=fake_query), patch(
+            "modules.claude_sdk.port.send"
+        ) as mock_send:
+            _run_query(
+                "prompt", {},
+                stream_id="sid", correlation_id="cid", source="alice", destination="bob",
+                r="fake-redis", pod="pod1", tenant="ten1",
+                live_to="webui1", live_cc_source=False,
+            )
+
+        mock_send.assert_called_once_with(
+            "fake-redis", pod="pod1", tenant="ten1", source="bob", destination="webui1",
+            payload={"event": "claude_sdk_turn", "detail": "stop_reason=tool_use tools=Read"},
+            kind="Progress", correlation_id="sid", module="claude_sdk", in_reply_to="sid",
+        )
 
 
 if __name__ == "__main__":

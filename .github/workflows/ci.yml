@@ -115,6 +115,12 @@ jobs:
           POD: ci-claude-sdk
           TENANT: ci-claude-sdk
         run: python3 h-app/tools/smoke_claude_sdk.py
+      - name: webui/Progress smoke test (real Redis)
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/0
+          POD: ci-webui
+          TENANT: ci-webui
+        run: python3 h-app/tools/smoke_webui.py
       - name: Tmux port smoke test (real Redis and isolated tmux)
         env:
           REDIS_URL: redis://127.0.0.1:6379/0

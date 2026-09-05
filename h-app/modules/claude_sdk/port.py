@@ -43,6 +43,16 @@ discover which contexts an agent currently has live memory for, rather than
 requiring every caller to already know its own vocabulary in advance.
 Ticket 38c7ab0d covers why addressing moved from the earlier ``source``-
 keyed default (ticket 0902ee96) to this explicit, caller-named scheme.
+
+A ``Message`` payload's ``live_to`` (see ``_deliver_message``/``_log_hop``/
+``_send_progress``) additionally fans every hop of the underlying
+``query()`` call out live as a ``Progress`` envelope to the named
+destination -- typically a ``modules/webui``-registered agent, though this
+port has no opinion on what ``live_to`` actually is beyond a valid
+destination name. ``live_cc_source`` (bool) also sends the same hops back to
+whoever sent the ``Message``. Neither field set is today's behavior exactly,
+byte-for-byte unchanged: this is additive to, never a replacement for, the
+single final ``Message`` reply every delivery already sends.
 """
 
 from __future__ import annotations
@@ -137,13 +147,63 @@ def _agent_sdk_options(r, pod: str, tenant: str, agent: str) -> dict:
     return {key: value for key, value in options.items() if key in ALLOWED_SDK_OPTION_FIELDS}
 
 
+def _send_progress(
+    r,
+    *,
+    pod: str,
+    tenant: str,
+    agent: str,
+    original_source: str,
+    event: str,
+    detail: str,
+    stream_id: str | None,
+    correlation_id: str | None,
+    live_to: str,
+    live_cc_source: bool,
+) -> None:
+    """Fan a single hop out as a ``Progress`` envelope, best-effort.
+
+    Never allowed to break the underlying ``query()`` call: a ``live_to``
+    that isn't registered, or a policy denial between this agent and it,
+    dead-letters or raises inside ``send()`` the same way any other misrouted
+    envelope would -- caught and logged here rather than propagated, since a
+    live-viewing convenience failing is not a reason to fail the delivery
+    that convenience was only ever describing. ``correlation_id``/
+    ``in_reply_to`` both anchor to the *incoming* Message's own ``stream_id``,
+    same convention the final reply already uses, so a viewer can group every
+    hop (and the eventual reply) under one id.
+    """
+    destinations = [live_to]
+    if live_cc_source and original_source not in destinations:
+        destinations.append(original_source)
+    for destination in destinations:
+        try:
+            send(
+                r, pod=pod, tenant=tenant, source=agent, destination=destination,
+                payload={"event": event, "detail": detail},
+                kind="Progress", correlation_id=stream_id, module="claude_sdk",
+                in_reply_to=stream_id,
+            )
+        except Exception as exc:
+            log_record(
+                "claude_sdk", "progress_send_failed",
+                stream_id=stream_id, correlation_id=correlation_id,
+                source=agent, destination=destination, reason=str(exc),
+            )
+
+
 def _log_hop(
     message,
     *,
+    r=None,
+    pod: str | None = None,
+    tenant: str | None = None,
     stream_id: str | None,
     correlation_id: str | None,
     source: str,
     destination: str,
+    live_to: str | None = None,
+    live_cc_source: bool = False,
 ) -> None:
     """Log one message the query() stream yields -- every hop from pickup to
     result, not just the two endpoints a naive implementation would keep.
@@ -154,6 +214,11 @@ def _log_hop(
     proof the query was picked up, logged before anything else and well
     before the final ``ResultMessage`` that proves it finished. Every
     ``AssistantMessage`` turn in between stays visible too.
+
+    ``live_to`` set (see ``_deliver_message``) additionally fans this same
+    hop out as a ``Progress`` envelope via ``_send_progress`` -- purely
+    additive: absent (the default, and every call site before this ticket),
+    this function's own log_record behavior is untouched byte-for-byte.
     """
     from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage, ToolUseBlock
 
@@ -162,7 +227,9 @@ def _log_hop(
         source=source, destination=destination,
     )
     if isinstance(message, SystemMessage):
-        log_record("claude_sdk", "claude_sdk_query_started", evidence=message.subtype, **common)
+        event = "claude_sdk_query_started"
+        detail = f"subtype={message.subtype}"
+        log_record("claude_sdk", event, evidence=message.subtype, **common)
     elif isinstance(message, AssistantMessage):
         tool_names = sorted(
             {block.name for block in message.content if isinstance(block, ToolUseBlock)}
@@ -170,20 +237,29 @@ def _log_hop(
         reason = f"stop_reason={message.stop_reason}"
         if tool_names:
             reason += f" tools={','.join(tool_names)}"
-        log_record("claude_sdk", "claude_sdk_turn", reason=reason, **common)
+        event = "claude_sdk_turn"
+        detail = reason
+        log_record("claude_sdk", event, reason=reason, **common)
     elif isinstance(message, ResultMessage):
-        log_record(
-            "claude_sdk", "claude_sdk_query_finished",
-            evidence=message.subtype,
-            reason=f"is_error={message.is_error} num_turns={message.num_turns}",
-            **common,
-        )
+        reason = f"is_error={message.is_error} num_turns={message.num_turns}"
+        event = "claude_sdk_query_finished"
+        detail = f"{message.subtype}: {reason}"
+        log_record("claude_sdk", event, evidence=message.subtype, reason=reason, **common)
     else:
         # Defensive: query() doesn't yield StreamEvent/RateLimitEvent/
         # ConversationResetMessage without include_partial_messages, but the
         # Message union can grow -- an unrecognized hop is still logged, not
         # silently dropped.
-        log_record("claude_sdk", "claude_sdk_hop", evidence=type(message).__name__, **common)
+        event = "claude_sdk_hop"
+        detail = type(message).__name__
+        log_record("claude_sdk", event, evidence=detail, **common)
+
+    if live_to is not None:
+        _send_progress(
+            r, pod=pod, tenant=tenant, agent=destination, original_source=source,
+            event=event, detail=detail, stream_id=stream_id, correlation_id=correlation_id,
+            live_to=live_to, live_cc_source=live_cc_source,
+        )
 
 
 def _run_query(
@@ -195,6 +271,11 @@ def _run_query(
     correlation_id: str | None,
     source: str,
     destination: str,
+    r=None,
+    pod: str | None = None,
+    tenant: str | None = None,
+    live_to: str | None = None,
+    live_cc_source: bool = False,
 ) -> str:
     """Run exactly one query() call against the Claude Agent SDK.
 
@@ -219,7 +300,10 @@ def _run_query(
     here will ever read back.
 
     Every message the stream yields is logged via ``_log_hop`` as it arrives,
-    not just the final result -- see that function's docstring.
+    not just the final result -- see that function's docstring. ``r``/``pod``/
+    ``tenant``/``live_to``/``live_cc_source`` only matter when ``live_to`` is
+    set (see ``_deliver_message``); every other call site, including every
+    pre-existing test, omits them and gets today's behavior unchanged.
     """
     from claude_agent_sdk import ClaudeAgentOptions, ResultMessage
     from claude_agent_sdk import query as claude_query
@@ -233,8 +317,10 @@ def _run_query(
         async for message in claude_query(prompt=prompt, options=options):
             _log_hop(
                 message,
+                r=r, pod=pod, tenant=tenant,
                 stream_id=stream_id, correlation_id=correlation_id,
                 source=source, destination=destination,
+                live_to=live_to, live_cc_source=live_cc_source,
             )
             if isinstance(message, ResultMessage):
                 result_text = message.result or ""
@@ -274,6 +360,24 @@ def _deliver_message(
         except KeyError:
             raise DeadLetter(f"invalid context: {raw_context!r}")
 
+    # `live_to` names a destination (typically a webui-registered agent,
+    # see modules/webui/port.py) to fan every hop out to as a Progress
+    # envelope, additive to the existing single final reply -- absent (the
+    # default) is today's behavior exactly, untouched. Validated the same
+    # way `context` is: pre-call, so an invalid value is a clean DeadLetter
+    # rather than an unresolved effect. `live_cc_source` is a plain display
+    # convenience (also send the same hops to whoever sent this Message),
+    # not an identifier, so a non-bool value is merely coerced rather than
+    # rejected.
+    raw_live_to = payload.get("live_to") if isinstance(payload, dict) else None
+    live_to = None
+    if raw_live_to is not None:
+        try:
+            live_to = validate_segment(raw_live_to)
+        except KeyError:
+            raise DeadLetter(f"invalid live_to: {raw_live_to!r}")
+    live_cc_source = bool(payload.get("live_cc_source", False)) if isinstance(payload, dict) else False
+
     stream_id = envelope.get("stream_id")
     correlation_id = envelope.get("correlation_id")
     message = f"[message from {source}] {text}"
@@ -287,6 +391,8 @@ def _deliver_message(
             correlation_id=correlation_id,
             source=source,
             destination=agent,
+            r=r, pod=pod, tenant=tenant,
+            live_to=live_to, live_cc_source=live_cc_source,
         )
 
     if context is not None:

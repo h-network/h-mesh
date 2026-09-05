@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import hashlib
 import hmac
@@ -7,7 +6,6 @@ import json
 import math
 import os
 import re
-import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -26,6 +24,8 @@ from core.keys import prefix
 from core.registry import is_member, members, port_type
 from lib.chat_memory import TTL_SECONDS_MAX as CHAT_MEMORY_TTL_SECONDS
 from lib.chat_memory import ChatMemory
+from lib.sse_stream import read_stream_entries, stream_response
+from modules.webui.routes import register_webui_routes
 
 DEFAULT_ENVELOPE_MAX_BYTES = 1_048_576
 # Comfortably under both clients/telegram/bot.py's 90s idle-read timeout and
@@ -34,7 +34,7 @@ DEFAULT_ENVELOPE_MAX_BYTES = 1_048_576
 # the cause). Module-level so a test can shrink it without waiting out a
 # real multi-second interval.
 SSE_KEEPALIVE_INTERVAL_S = 3.0
-# The idle-poll interval in _stream_response's event_generator: one Redis
+# The idle-poll interval in lib/sse_stream.py's stream_response event_generator: one Redis
 # XRANGE per open connection every SSE_POLL_INTERVAL_S, whether or not
 # anything is queued -- looks like an obvious rate to tighten on sight.
 # Measured before touching it (2026-09-02, on a real server against real
@@ -359,6 +359,18 @@ def _render_restdoc_html(app: FastAPI) -> str:
             "desc": "Get task board lists (todo, doing, hold, done) for a specific agent.",
             "curl": 'curl -H "Authorization: Bearer $API_TOKEN" http://localhost:8080/agents/sme-2/board',
         },
+        "/agents/{agent}/live": {
+            "desc": "Served HTML page for a webui-registered agent: connects to its own live/stream via fetch() (not EventSource, so the same Bearer token still applies) and renders every Progress/Message it relays.",
+            "curl": 'curl -H "Authorization: Bearer $API_TOKEN" http://localhost:8080/agents/webui-1/live',
+        },
+        "/agents/{agent}/live/events": {
+            "desc": "Get relayed Progress/Message envelopes for a webui-registered agent. Supports cursor catch-up (`?after=<cursor>`) and limit.",
+            "curl": 'curl -H "Authorization: Bearer $API_TOKEN" "http://localhost:8080/agents/webui-1/live/events?after=1723150000000-0&limit=50"',
+        },
+        "/agents/{agent}/live/stream": {
+            "desc": "Live Server-Sent Events (SSE) stream of relayed Progress/Message envelopes for a webui-registered agent. Supports cursor (`?after=<cursor>`).",
+            "curl": 'curl -H "Authorization: Bearer $API_TOKEN" "http://localhost:8080/agents/webui-1/live/stream"',
+        },
         "/alerts": {
             "desc": "Get stored watchdog alert events across the tenant. Supports cursor catch-up (`?after=<cursor>`) and limit.",
             "curl": 'curl -H "Authorization: Bearer $API_TOKEN" "http://localhost:8080/alerts?after=1723150000000-0&limit=50"',
@@ -667,105 +679,6 @@ def _render_restdoc_html(app: FastAPI) -> str:
 </html>"""
 
 
-def _read_stream_entries(
-    client: Any,
-    key: str,
-    after: str | None,
-    limit: int,
-    preferred_field: str = "envelope",
-) -> list[dict[str, Any]]:
-    min_id = f"({after}" if after else "-"
-    try:
-        raw_entries = client.xrange(key, min=min_id, max="+", count=limit)
-    except Exception as exc:
-        if isinstance(exc, redis.exceptions.RedisError):
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
-        return []
-
-    entries = []
-    b_pref = preferred_field.encode()
-    s_pref = preferred_field
-
-    for entry_id, fields in raw_entries:
-        cid = entry_id.decode() if isinstance(entry_id, bytes) else str(entry_id)
-        raw_val = None
-        if b_pref in fields:
-            raw_val = fields[b_pref]
-        elif s_pref in fields:
-            raw_val = fields[s_pref]
-        elif fields:
-            raw_val = next(iter(fields.values()))
-        if not raw_val:
-            continue
-        val_str = raw_val.decode() if isinstance(raw_val, bytes) else str(raw_val)
-        try:
-            val_dict = json.loads(val_str)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        val_dict["cursor"] = cid
-        entries.append(val_dict)
-    return entries
-
-
-def _stream_response(
-    request: Request,
-    client: Any,
-    key: str,
-    event_name: str,
-    after: str | None,
-    preferred_field: str,
-) -> StreamingResponse:
-    header_last_id = request.headers.get("last-event-id")
-    cursor = after or header_last_id
-
-    async def event_generator():
-        nonlocal cursor
-        last_sent = time.monotonic()
-        while True:
-            if await request.is_disconnected():
-                break
-            try:
-                entries = await asyncio.to_thread(
-                    _read_stream_entries,
-                    client, key, cursor, 100, preferred_field
-                )
-            except Exception as exc:
-                err_detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
-                err_payload = json.dumps({"error": err_detail})
-                yield f"event: error\ndata: {err_payload}\n\n"
-                break
-            if entries:
-                for entry in entries:
-                    cid = entry["cursor"]
-                    cursor = cid
-                    data_json = json.dumps(entry)
-                    yield f"id: {cid}\nevent: {event_name}\ndata: {data_json}\n\n"
-                last_sent = time.monotonic()
-            else:
-                now = time.monotonic()
-                if now - last_sent >= SSE_KEEPALIVE_INTERVAL_S:
-                    # A bare comment line: valid SSE, ignored by EventSource
-                    # and by clients/telegram/bot.py's parser (any line
-                    # starting with ':' is skipped), but it is a byte on the
-                    # wire -- which is the whole point. An idle stream that
-                    # never sends a byte looks identical, to anything
-                    # watching the connection from outside this generator,
-                    # to a stream nobody is reading anymore.
-                    yield ": keepalive\n\n"
-                    last_sent = now
-                await asyncio.sleep(SSE_POLL_INTERVAL_S)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
 def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None) -> FastAPI:
     settings = settings or ApiSettings.from_env()
     settings.validate()
@@ -983,7 +896,7 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
             raise HTTPException(status_code=404, detail="invalid client agent") from exc
         if port_type(client, pod=settings.pod, tenant=settings.tenant, agent=agent) != "api":
             raise HTTPException(status_code=404, detail="invalid client agent")
-        messages = _read_stream_entries(client, inbox_key, after=after, limit=limit, preferred_field="envelope")
+        messages = read_stream_entries(client, inbox_key, after=after, limit=limit, preferred_field="envelope")
         next_cursor = messages[-1]["cursor"] if messages else after
         return {
             "agent": agent,
@@ -1003,7 +916,10 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
             raise HTTPException(status_code=404, detail="invalid client agent") from exc
         if port_type(client, pod=settings.pod, tenant=settings.tenant, agent=agent) != "api":
             raise HTTPException(status_code=404, detail="invalid client agent")
-        return _stream_response(request, client, inbox_key, "message", after, "envelope")
+        return stream_response(
+            request, client, inbox_key, "message", after, "envelope",
+            keepalive_interval_s=SSE_KEEPALIVE_INTERVAL_S, poll_interval_s=SSE_POLL_INTERVAL_S,
+        )
 
     @app.get("/agents/{agent}/activity")
     def get_activity(
@@ -1018,7 +934,7 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
         if not is_member(client, pod=settings.pod, tenant=settings.tenant, agent=agent):
             raise HTTPException(status_code=404, detail="unknown agent")
         activity_key = prefix(settings.pod, settings.tenant, agent, "activity")
-        activity = _read_stream_entries(client, activity_key, after=after, limit=limit, preferred_field="event")
+        activity = read_stream_entries(client, activity_key, after=after, limit=limit, preferred_field="event")
         next_cursor = activity[-1]["cursor"] if activity else after
         return {
             "agent": agent,
@@ -1039,7 +955,10 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
         if not is_member(client, pod=settings.pod, tenant=settings.tenant, agent=agent):
             raise HTTPException(status_code=404, detail="unknown agent")
         activity_key = prefix(settings.pod, settings.tenant, agent, "activity")
-        return _stream_response(request, client, activity_key, "activity", after, "event")
+        return stream_response(
+            request, client, activity_key, "activity", after, "event",
+            keepalive_interval_s=SSE_KEEPALIVE_INTERVAL_S, poll_interval_s=SSE_POLL_INTERVAL_S,
+        )
 
     def board_keys(agent: str) -> tuple[str, str, str, str]:
         try:
@@ -1109,7 +1028,7 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
         limit: int = Query(default=100, ge=1, le=1000),
     ) -> dict[str, Any]:
         alerts_key = prefix(settings.pod, settings.tenant, resource="alerts")
-        alerts = _read_stream_entries(client, alerts_key, after=after, limit=limit, preferred_field="alert")
+        alerts = read_stream_entries(client, alerts_key, after=after, limit=limit, preferred_field="alert")
         next_cursor = alerts[-1]["cursor"] if alerts else after
         return {
             "alerts": alerts,
@@ -1122,6 +1041,11 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
         after: str | None = None,
     ) -> StreamingResponse:
         alerts_key = prefix(settings.pod, settings.tenant, resource="alerts")
-        return _stream_response(request, client, alerts_key, "alert", after, "alert")
+        return stream_response(
+            request, client, alerts_key, "alert", after, "alert",
+            keepalive_interval_s=SSE_KEEPALIVE_INTERVAL_S, poll_interval_s=SSE_POLL_INTERVAL_S,
+        )
+
+    register_webui_routes(app, settings=settings, client=client)
 
     return app
