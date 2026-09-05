@@ -43,6 +43,17 @@ discover which contexts an agent currently has live memory for, rather than
 requiring every caller to already know its own vocabulary in advance.
 Ticket 38c7ab0d covers why addressing moved from the earlier ``source``-
 keyed default (ticket 0902ee96) to this explicit, caller-named scheme.
+
+A ``Message`` payload's ``live_to`` (an agent name) opts into live streaming:
+a ``Progress`` envelope per ``query()`` hop (init / each turn / final
+result), sent to ``live_to`` as it happens rather than batched, correlated to
+the incoming ``stream_id`` the same way the eventual one-shot ``Message``
+reply already is. ``live_cc_source`` (bool, default ``False``) additionally
+sends the same Progress envelopes to the incoming envelope's own ``source``.
+Both are purely additive: absent, this port's behavior is byte-for-byte what
+it was before they existed, and the final ``Message`` reply is unchanged
+either way. See ``_classify_hop`` for what a Progress envelope's payload
+contains, and ``modules/claude_sdk/README.md`` for the wire shape.
 """
 
 from __future__ import annotations
@@ -52,6 +63,7 @@ import json
 import os
 import signal
 import sys
+from collections.abc import Callable
 
 import redis
 
@@ -137,6 +149,41 @@ def _agent_sdk_options(r, pod: str, tenant: str, agent: str) -> dict:
     return {key: value for key, value in options.items() if key in ALLOWED_SDK_OPTION_FIELDS}
 
 
+def _classify_hop(message) -> tuple[str, str | None, str | None]:
+    """Classify one message the query() stream yields into (event, evidence,
+    reason) -- the shared vocabulary both ``_log_hop`` (a log record) and
+    live Progress envelopes (see ``_send_progress``) build on top of, so the
+    two never drift into disagreeing about what a given hop *is*.
+
+    The first hop is always a ``SystemMessage`` with ``subtype="init"``,
+    emitted as soon as the CLI subprocess actually starts -- this port's
+    equivalent of tmux's ``mark_delivery_pending`` + ``ActivityTailer`` pair:
+    proof the query was picked up, well before the final ``ResultMessage``
+    that proves it finished. Every ``AssistantMessage`` turn in between stays
+    visible too.
+    """
+    from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage, ToolUseBlock
+
+    if isinstance(message, SystemMessage):
+        return "claude_sdk_query_started", message.subtype, None
+    if isinstance(message, AssistantMessage):
+        tool_names = sorted(
+            {block.name for block in message.content if isinstance(block, ToolUseBlock)}
+        )
+        reason = f"stop_reason={message.stop_reason}"
+        if tool_names:
+            reason += f" tools={','.join(tool_names)}"
+        return "claude_sdk_turn", None, reason
+    if isinstance(message, ResultMessage):
+        reason = f"is_error={message.is_error} num_turns={message.num_turns}"
+        return "claude_sdk_query_finished", message.subtype, reason
+    # Defensive: query() doesn't yield StreamEvent/RateLimitEvent/
+    # ConversationResetMessage without include_partial_messages, but the
+    # Message union can grow -- an unrecognized hop is still classified, not
+    # silently dropped.
+    return "claude_sdk_hop", type(message).__name__, None
+
+
 def _log_hop(
     message,
     *,
@@ -147,43 +194,52 @@ def _log_hop(
 ) -> None:
     """Log one message the query() stream yields -- every hop from pickup to
     result, not just the two endpoints a naive implementation would keep.
-
-    The first hop is always a ``SystemMessage`` with ``subtype="init"``,
-    emitted as soon as the CLI subprocess actually starts -- this port's
-    equivalent of tmux's ``mark_delivery_pending`` + ``ActivityTailer`` pair:
-    proof the query was picked up, logged before anything else and well
-    before the final ``ResultMessage`` that proves it finished. Every
-    ``AssistantMessage`` turn in between stays visible too.
     """
-    from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage, ToolUseBlock
-
-    common = dict(
+    event, evidence, reason = _classify_hop(message)
+    log_record(
+        "claude_sdk", event,
         stream_id=stream_id, correlation_id=correlation_id,
         source=source, destination=destination,
+        evidence=evidence, reason=reason,
     )
-    if isinstance(message, SystemMessage):
-        log_record("claude_sdk", "claude_sdk_query_started", evidence=message.subtype, **common)
-    elif isinstance(message, AssistantMessage):
-        tool_names = sorted(
-            {block.name for block in message.content if isinstance(block, ToolUseBlock)}
-        )
-        reason = f"stop_reason={message.stop_reason}"
-        if tool_names:
-            reason += f" tools={','.join(tool_names)}"
-        log_record("claude_sdk", "claude_sdk_turn", reason=reason, **common)
-    elif isinstance(message, ResultMessage):
-        log_record(
-            "claude_sdk", "claude_sdk_query_finished",
-            evidence=message.subtype,
-            reason=f"is_error={message.is_error} num_turns={message.num_turns}",
-            **common,
-        )
-    else:
-        # Defensive: query() doesn't yield StreamEvent/RateLimitEvent/
-        # ConversationResetMessage without include_partial_messages, but the
-        # Message union can grow -- an unrecognized hop is still logged, not
-        # silently dropped.
-        log_record("claude_sdk", "claude_sdk_hop", evidence=type(message).__name__, **common)
+
+
+def _send_progress(
+    r,
+    pod: str,
+    tenant: str,
+    *,
+    agent: str,
+    destination: str,
+    stream_id: str | None,
+    event: str,
+    evidence: str | None,
+    reason: str | None,
+) -> None:
+    """Send one live "Progress" envelope for a single query() hop.
+
+    Correlated the same way the existing one-shot final "Message" reply
+    already is -- ``correlation_id``/``in_reply_to`` both the originating
+    ``stream_id`` -- so a caller can line up every Progress envelope and the
+    eventual Message reply under the same thread.
+    """
+    payload = {"event": event}
+    if evidence is not None:
+        payload["evidence"] = evidence
+    if reason is not None:
+        payload["reason"] = reason
+    send(
+        r,
+        pod=pod,
+        tenant=tenant,
+        source=agent,
+        destination=destination,
+        payload=payload,
+        kind="Progress",
+        correlation_id=stream_id,
+        module="claude_sdk",
+        in_reply_to=stream_id,
+    )
 
 
 def _run_query(
@@ -195,6 +251,7 @@ def _run_query(
     correlation_id: str | None,
     source: str,
     destination: str,
+    on_hop: Callable[[object], None] | None = None,
 ) -> str:
     """Run exactly one query() call against the Claude Agent SDK.
 
@@ -219,7 +276,10 @@ def _run_query(
     here will ever read back.
 
     Every message the stream yields is logged via ``_log_hop`` as it arrives,
-    not just the final result -- see that function's docstring.
+    not just the final result -- see that function's docstring. ``on_hop``,
+    when given, is additionally called with each raw message as it arrives
+    (after logging) -- ``_deliver_message`` uses it to stream live Progress
+    envelopes; absent (the default), this is exactly today's behavior.
     """
     from claude_agent_sdk import ClaudeAgentOptions, ResultMessage
     from claude_agent_sdk import query as claude_query
@@ -236,6 +296,8 @@ def _run_query(
                 stream_id=stream_id, correlation_id=correlation_id,
                 source=source, destination=destination,
             )
+            if on_hop is not None:
+                on_hop(message)
             if isinstance(message, ResultMessage):
                 result_text = message.result or ""
         return result_text
@@ -274,9 +336,40 @@ def _deliver_message(
         except KeyError:
             raise DeadLetter(f"invalid context: {raw_context!r}")
 
+    # `live_to`/`live_cc_source` are purely additive opt-ins: absent (the
+    # common case today), `live_targets` stays empty, `on_hop` below stays
+    # `None`, and dispatch's call to _run_query is byte-for-byte what it was
+    # before this existed. Invalid `live_to` is rejected the same pre-call
+    # way empty text/bad context already are -- validate_segment runs before
+    # any query() call, so this is still provably pre-call.
+    raw_live_to = payload.get("live_to") if isinstance(payload, dict) else None
+    live_to = None
+    if raw_live_to is not None:
+        try:
+            live_to = validate_segment(raw_live_to)
+        except KeyError:
+            raise DeadLetter(f"invalid live_to: {raw_live_to!r}")
+
+    live_cc_source = bool(payload.get("live_cc_source")) if isinstance(payload, dict) else False
+
+    live_targets = []
+    if live_to is not None:
+        live_targets.append(live_to)
+        if live_cc_source:
+            live_targets.append(source)
+
     stream_id = envelope.get("stream_id")
     correlation_id = envelope.get("correlation_id")
     message = f"[message from {source}] {text}"
+
+    def on_hop(hop_message: object) -> None:
+        event, evidence, reason = _classify_hop(hop_message)
+        for target in live_targets:
+            _send_progress(
+                r, pod, tenant,
+                agent=agent, destination=target, stream_id=stream_id,
+                event=event, evidence=evidence, reason=reason,
+            )
 
     def dispatch(prompt: str) -> str:
         return _run_query(
@@ -287,6 +380,7 @@ def _deliver_message(
             correlation_id=correlation_id,
             source=source,
             destination=agent,
+            on_hop=on_hop if live_targets else None,
         )
 
     if context is not None:
