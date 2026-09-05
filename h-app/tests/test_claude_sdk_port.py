@@ -380,6 +380,141 @@ class ClaudeSdkPortTests(unittest.TestCase):
             destinations.append(parse(raw)["l2"]["destination"])
         self.assertEqual(destinations, ["carol", "alice"])
 
+    def test_live_to_unauthorized_for_the_source_is_dead_lettered_not_relayed(self):
+        # The confused-deputy shape: bob's own export tags are broad enough
+        # to reach carol, but alice (who actually chose live_to) is not --
+        # a bare send(source=bob, ...) would check bob's rights and wrongly
+        # let alice's message relay through them. Authorizing against alice
+        # instead must block this before any query() call.
+        self.redis.hset(
+            prefix(POD, self.tenant, agent="bob", resource="tags"),
+            "export", json.dumps(["ops"]),
+        )
+        self.redis.hset(
+            prefix(POD, self.tenant, agent="carol", resource="tags"),
+            "import", json.dumps(["ops"]),
+        )
+        self.redis.hset(
+            prefix(POD, self.tenant, agent="alice", resource="tags"),
+            "export", json.dumps(["general"]),
+        )
+        self.queue(payload={"text": "hi", "live_to": "carol"})
+        with patch("modules.claude_sdk.port._run_query") as mock_query:
+            deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+
+        mock_query.assert_not_called()
+        dead = self.redis.lpop(prefix(POD, self.tenant, "bob", "dead"))
+        self.assertIsNotNone(dead)
+        # Not relayed: carol never received anything on bob's behalf -- the
+        # only egress traffic is core.channels' own dead-letter feedback to
+        # alice (a registered tmux source), unrelated to this check.
+        egress_key = prefix(POD, self.tenant, "bob", "egress")
+        destinations = []
+        while (raw := self.redis.lpop(egress_key)) is not None:
+            destinations.append(parse(raw)["l2"]["destination"])
+        self.assertNotIn("carol", destinations)
+
+    def test_live_to_authorized_via_the_sources_own_tags_still_streams(self):
+        # Same shared tag ("ops") on both sides of the real requester
+        # (alice) and the target (carol) -- alice has standing to reach
+        # carol on her own, so the live fanout must still work.
+        self.redis.hset(
+            prefix(POD, self.tenant, agent="alice", resource="tags"),
+            "export", json.dumps(["ops"]),
+        )
+        self.redis.hset(
+            prefix(POD, self.tenant, agent="carol", resource="tags"),
+            "import", json.dumps(["ops"]),
+        )
+        self.queue(payload={"text": "hi", "live_to": "carol"})
+        with patch("modules.claude_sdk.port._run_query", return_value="ok") as mock_query:
+            deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+
+        mock_query.assert_called_once()
+        self.assertIsNone(self.redis.lpop(prefix(POD, self.tenant, "bob", "dead")))
+
+    def test_live_to_equal_to_source_with_cc_does_not_double_send(self):
+        import claude_agent_sdk as sdk
+
+        started = sdk.SystemMessage(subtype="init", data={"session_id": "s1"})
+
+        def fake_run_query(
+            prompt, profile_env, *, sdk_options, stream_id, correlation_id,
+            source, destination, on_hop,
+        ):
+            on_hop(started)
+            return "final answer"
+
+        self.queue(payload={"text": "hi", "live_to": "alice", "live_cc_source": True})
+        with patch("modules.claude_sdk.port._run_query", side_effect=fake_run_query):
+            deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+
+        egress_key = prefix(POD, self.tenant, "bob", "egress")
+        progress = parse(self.redis.lpop(egress_key))
+        final = parse(self.redis.lpop(egress_key))
+        self.assertIsNone(self.redis.lpop(egress_key))  # exactly one Progress, not two
+        self.assertEqual(progress["kind"], "Progress")
+        self.assertEqual(progress["l2"]["destination"], "alice")
+        self.assertEqual(final["kind"], "Message")
+
+    def test_live_cc_source_non_bool_truthy_value_is_treated_as_false(self):
+        import claude_agent_sdk as sdk
+
+        started = sdk.SystemMessage(subtype="init", data={"session_id": "s1"})
+
+        def fake_run_query(
+            prompt, profile_env, *, sdk_options, stream_id, correlation_id,
+            source, destination, on_hop,
+        ):
+            on_hop(started)
+            return "final answer"
+
+        # "false" is a non-empty string -- truthy in Python -- but a sender
+        # writing JSON almost certainly means the boolean false.
+        self.queue(payload={"text": "hi", "live_to": "carol", "live_cc_source": "false"})
+        with patch("modules.claude_sdk.port._run_query", side_effect=fake_run_query):
+            deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+
+        egress_key = prefix(POD, self.tenant, "bob", "egress")
+        destinations = []
+        while (raw := self.redis.lpop(egress_key)) is not None:
+            destinations.append(parse(raw)["l2"]["destination"])
+        self.assertEqual(destinations, ["carol", "alice"])  # carol's Progress, then alice's final reply -- no cc
+
+    def test_progress_send_failure_is_isolated_and_does_not_drop_the_final_reply(self):
+        import claude_agent_sdk as sdk
+
+        started = sdk.SystemMessage(subtype="init", data={"session_id": "s1"})
+        finished = sdk.ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="s1", result="final answer",
+        )
+
+        def fake_run_query(
+            prompt, profile_env, *, sdk_options, stream_id, correlation_id,
+            source, destination, on_hop,
+        ):
+            on_hop(started)
+            on_hop(finished)
+            return "final answer"
+
+        self.queue(payload={"text": "hi", "live_to": "carol"})
+        with patch("modules.claude_sdk.port._run_query", side_effect=fake_run_query), patch(
+            "modules.claude_sdk.port._send_progress", side_effect=RuntimeError("redis hiccup")
+        ):
+            deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+
+        # No Progress envelope made it out (every send attempt raised), but
+        # the final reply must still have gone through, and the delivery
+        # must not have landed in unresolved/dead over a Progress hiccup.
+        raw = self.redis.lpop(prefix(POD, self.tenant, "bob", "egress"))
+        reply = parse(raw)
+        self.assertEqual(reply["kind"], "Message")
+        self.assertEqual(reply["payload"], {"text": "final answer"})
+        self.assertIsNone(self.redis.lpop(prefix(POD, self.tenant, "bob", "dead")))
+        unresolved_key = prefix(POD, self.tenant, resource="unresolved")
+        self.assertEqual(self.redis.llen(unresolved_key), 0)
+
     def test_invalid_live_to_is_dead_lettered_without_calling_the_sdk(self):
         self.queue(payload={"text": "hi", "live_to": 123})
         with patch("modules.claude_sdk.port._run_query") as mock_query:

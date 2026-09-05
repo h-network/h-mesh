@@ -54,6 +54,30 @@ Both are purely additive: absent, this port's behavior is byte-for-byte what
 it was before they existed, and the final ``Message`` reply is unchanged
 either way. See ``_classify_hop`` for what a Progress envelope's payload
 contains, and ``modules/claude_sdk/README.md`` for the wire shape.
+
+``live_to`` is the *incoming message's own sender's* choice, not this
+agent's -- so it is authorized against that sender, not against this agent.
+``_send_progress`` sends as this agent (the only identity able to speak for
+a live query it is running), but a bare ``send()`` checks the acting
+identity's own export tags, not the requester's -- naively honoring any
+``live_to`` would let a sender with no ability to reach some third agent
+directly use this one as an open relay to it (and, wherever tag policy
+grants this agent broader export rights than the requester has, escalate
+through it too). ``_deliver_message`` therefore requires the *incoming
+message's ``source``* to independently pass the same ``core.policy`` check
+against ``live_to`` before it is ever added to the live-fanout set,
+pre-``query()``, the same DeadLetter-before-any-effect posture invalid
+``live_to`` syntax already gets. This makes the feature no more capable of
+reaching a third party than the sender already was on their own -- routing
+through this agent never grants more reach than the sender already had.
+
+Every ``_send_progress`` call inside ``on_hop`` is also independently
+best-effort: caught and logged, never left to propagate out of the
+``query()`` stream. Progress is a bonus channel layered on top of the one
+guaranteed outcome (the final reply) -- a single bad ``live_to``/policy
+change mid-stream, a transient Redis hiccup, or any other one-off send
+failure must not turn an otherwise-successful query into a dropped final
+reply and an unresolved delivery.
 """
 
 from __future__ import annotations
@@ -71,6 +95,7 @@ from core.channels import DeadLetter, receive, send
 from core.dispatch import delivery_lock
 from core.keys import prefix, validate_segment
 from core.logging import configure_logging, log_record
+from core.policy import allows as policy_allows
 from lib.chat_cycle import run_chat_cycle
 from lib.chat_memory import HOT_KEEP_COUNT as CHAT_MEMORY_HOT_KEEP_COUNT
 from lib.chat_memory import TTL_SECONDS_MAX as CHAT_MEMORY_TTL_SECONDS
@@ -337,8 +362,8 @@ def _deliver_message(
             raise DeadLetter(f"invalid context: {raw_context!r}")
 
     # `live_to`/`live_cc_source` are purely additive opt-ins: absent (the
-    # common case today), `live_targets` stays empty, `on_hop` below stays
-    # `None`, and dispatch's call to _run_query is byte-for-byte what it was
+    # common case today), `live_targets` stays empty, `on_hop` below stays a
+    # no-op, and dispatch's call to _run_query is byte-for-byte what it was
     # before this existed. Invalid `live_to` is rejected the same pre-call
     # way empty text/bad context already are -- validate_segment runs before
     # any query() call, so this is still provably pre-call.
@@ -349,13 +374,31 @@ def _deliver_message(
             live_to = validate_segment(raw_live_to)
         except KeyError:
             raise DeadLetter(f"invalid live_to: {raw_live_to!r}")
+        # Authorized against `source` -- the party that actually chose
+        # `live_to` -- not against `agent`. A bare send() below would check
+        # *this agent's* export tags, and this agent did not choose the
+        # destination: naively honoring `live_to` would let any sender turn
+        # this agent into an open relay to a third party the sender has no
+        # tag-policy standing to reach directly (or, wherever this agent's
+        # own export tags are broader, escalate through it). Same DeadLetter
+        # posture as an invalid-syntax `live_to`: rejected before any
+        # query() call, not silently dropped from an otherwise-run query.
+        if not policy_allows(r, pod=pod, tenant=tenant, source=source, destination=live_to):
+            raise DeadLetter(f"live_to not authorized for {source!r}: {live_to!r}")
 
-    live_cc_source = bool(payload.get("live_cc_source")) if isinstance(payload, dict) else False
+    # Only the JSON boolean `true` counts -- a truthy check here would also
+    # accept the string `"false"`, non-empty strings, and other values a
+    # sender could plausibly send while intending `false`.
+    live_cc_source = (
+        payload.get("live_cc_source") is True if isinstance(payload, dict) else False
+    )
 
     live_targets = []
     if live_to is not None:
         live_targets.append(live_to)
-        if live_cc_source:
+        # Dedupe: live_to == source would otherwise double-send every hop to
+        # the same agent for no benefit -- cc means "also", not "again".
+        if live_cc_source and source != live_to:
             live_targets.append(source)
 
     stream_id = envelope.get("stream_id")
@@ -365,11 +408,24 @@ def _deliver_message(
     def on_hop(hop_message: object) -> None:
         event, evidence, reason = _classify_hop(hop_message)
         for target in live_targets:
-            _send_progress(
-                r, pod, tenant,
-                agent=agent, destination=target, stream_id=stream_id,
-                event=event, evidence=evidence, reason=reason,
-            )
+            # Best-effort and isolated per target: Progress is a bonus
+            # channel layered on the one guaranteed outcome (the final
+            # reply). A policy change, bad destination, or transient Redis
+            # error here must not abort the query mid-stream and take the
+            # final reply/record_delivered/chat-memory completion down with
+            # it -- see the module docstring's paragraph on this.
+            try:
+                _send_progress(
+                    r, pod, tenant,
+                    agent=agent, destination=target, stream_id=stream_id,
+                    event=event, evidence=evidence, reason=reason,
+                )
+            except Exception as exc:
+                log_record(
+                    "claude_sdk", "claude_sdk_progress_send_failed",
+                    stream_id=stream_id, correlation_id=correlation_id,
+                    source=agent, destination=target, reason=str(exc),
+                )
 
     def dispatch(prompt: str) -> str:
         return _run_query(
