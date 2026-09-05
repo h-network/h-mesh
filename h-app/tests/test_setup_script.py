@@ -12,6 +12,7 @@ import redis
 from core.keys import prefix
 from core.registry import port_type
 from modules.tmux.ops import list_windows, run_tmux
+from services.daemons import pid_alive, stop_daemons
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SETUP_SH = REPO_ROOT / "setup.sh"
@@ -117,23 +118,49 @@ def _dep_check_env(tmpdir: str, *, h_agent_url: str) -> dict:
     for k in list(env.keys()):
         if k.startswith("CLAUDE_OAUTH_TOKEN_") or k == "CLAUDE_CODE_OAUTH_TOKEN":
             del env[k]
+
+    # Ensure h-agent is missing from PATH so setup.sh exercises its dependency
+    # detection and installer path, even if h-agent is installed on the host.
+    path_dirs = [p for p in env.get("PATH", "").split(":") if p]
+    clean_dirs = []
+    needed_symlinks = {}
+    for p in path_dirs:
+        if os.path.exists(os.path.join(p, "h-agent")):
+            for req in ("curl", "wget", "python3", "redis-server", "redis-cli", "bash", "mktemp", "sh"):
+                target = os.path.join(p, req)
+                if os.path.exists(target) and req not in needed_symlinks:
+                    needed_symlinks[req] = target
+        else:
+            clean_dirs.append(p)
+
+    if needed_symlinks:
+        helper_bin = os.path.join(tmpdir, "helper_bin")
+        os.makedirs(helper_bin, exist_ok=True)
+        for name, target in needed_symlinks.items():
+            dest = os.path.join(helper_bin, name)
+            if not os.path.exists(dest):
+                os.symlink(target, dest)
+        clean_dirs.insert(0, helper_bin)
+
+    env["PATH"] = ":".join(clean_dirs)
     return env
 
 
-def test_setup_fails_loudly_when_h_agent_installer_fails_twice():
+def test_setup_fails_loudly_when_h_agent_installer_fails_twice(managed_tmpdir):
     # The bug this replaced: setup.sh never checked curl|bash's exit status
     # at all, so a failed h-agent install was silently swallowed and the
     # script printed success anyway. Confirm the opposite now: a clear,
     # non-zero failure, before anything downstream (venv/daemons) even
     # starts.
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_setup_h_agent_")
+    tmpdir = managed_tmpdir("h_mesh_test_setup_h_agent_")
+    run_dir = os.path.join(tmpdir, "run")
+    env = {}
     try:
         h_agent_url, counter_path = _fake_h_agent_installer(tmpdir, behavior="fail_always")
-        run_dir = os.path.join(tmpdir, "run")
         env = _dep_check_env(tmpdir, h_agent_url=h_agent_url)
         env["H_MESH_RUN_DIR"] = run_dir
         res = subprocess.run(
-            [str(SETUP_SH), "--pod", "p", "--tenant", "t", "--non-interactive"],
+            [str(SETUP_SH), "--pod", "p", "--tenant", "t", "--non-interactive", "--no-daemons"],
             env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
         )
         assert res.returncode != 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
@@ -150,36 +177,45 @@ def test_setup_fails_loudly_when_h_agent_installer_fails_twice():
         assert "✓ Daemons are healthy" not in res.stdout, (
             "setup.sh must not proceed past a failed h-agent install:\n" + res.stdout
         )
+        assert not os.path.exists(run_dir) or not list(Path(run_dir).glob("*.pid")), (
+            "no daemons should start on installer failure"
+        )
         assert os.path.exists(counter_path)
         assert open(counter_path).read().strip() == "2", "expected exactly 2 attempts"
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if os.path.exists(run_dir):
+            stop_daemons(Path(run_dir), env=env)
 
 
-def test_setup_does_not_report_equal_exit_status_when_attempts_actually_differ():
+def test_setup_does_not_report_equal_exit_status_when_attempts_actually_differ(managed_tmpdir):
     # The equal-exit-status line is only accurate when both attempts really
     # did exit the same way -- assert it's absent when the codes differ, so
     # the reporting can't be implemented as "always say this on the second
     # failure" and still pass the matching-codes tests.
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_setup_h_agent_")
+    tmpdir = managed_tmpdir("h_mesh_test_setup_h_agent_")
+    run_dir = os.path.join(tmpdir, "run")
+    env = {}
     try:
         h_agent_url, counter_path = _fake_h_agent_installer(tmpdir, behavior="fail_differently")
-        run_dir = os.path.join(tmpdir, "run")
         env = _dep_check_env(tmpdir, h_agent_url=h_agent_url)
         env["H_MESH_RUN_DIR"] = run_dir
         res = subprocess.run(
-            [str(SETUP_SH), "--pod", "p", "--tenant", "t", "--non-interactive"],
+            [str(SETUP_SH), "--pod", "p", "--tenant", "t", "--non-interactive", "--no-daemons"],
             env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
         )
         assert res.returncode != 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
         assert "h-agent installer failed twice (last exit 42)" in res.stderr, res.stderr
         assert "Both attempts exited with status" not in res.stderr, res.stderr
+        assert not os.path.exists(run_dir) or not list(Path(run_dir).glob("*.pid")), (
+            "no daemons should start on installer failure"
+        )
         assert open(counter_path).read().strip() == "2", "expected exactly 2 attempts"
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if os.path.exists(run_dir):
+            stop_daemons(Path(run_dir), env=env)
 
 
-def test_setup_reports_only_the_observed_status_and_uncertainty_when_exit_codes_match():
+def test_setup_reports_only_the_observed_status_and_uncertainty_when_exit_codes_match(managed_tmpdir):
     # Reviewer's exact counterexample: h-agent's real installer exits 1 for
     # MULTIPLE distinct causes (claude/codex/agy each have their own
     # verification-failed path), so two attempts returning the same code
@@ -200,16 +236,17 @@ def test_setup_reports_only_the_observed_status_and_uncertainty_when_exit_codes_
     # installer's OWN stderr (a fake dependency's output, not setup.sh's
     # own words) is deliberately left unconstrained -- that content belongs
     # to the dependency, not to what's under test.
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_setup_h_agent_")
+    tmpdir = managed_tmpdir("h_mesh_test_setup_h_agent_")
+    run_dir = os.path.join(tmpdir, "run")
+    env = {}
     try:
         h_agent_url, counter_path = _fake_h_agent_installer(
             tmpdir, behavior="fail_same_code_different_cause"
         )
-        run_dir = os.path.join(tmpdir, "run")
         env = _dep_check_env(tmpdir, h_agent_url=h_agent_url)
         env["H_MESH_RUN_DIR"] = run_dir
         res = subprocess.run(
-            [str(SETUP_SH), "--pod", "p", "--tenant", "t", "--non-interactive"],
+            [str(SETUP_SH), "--pod", "p", "--tenant", "t", "--non-interactive", "--no-daemons"],
             env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
         )
         assert res.returncode != 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
@@ -236,22 +273,27 @@ def test_setup_reports_only_the_observed_status_and_uncertainty_when_exit_codes_
             f"  actual:   {observation_lines[0]!r}\n"
             f"  expected: {expected!r}"
         )
+        assert not os.path.exists(run_dir) or not list(Path(run_dir).glob("*.pid")), (
+            "no daemons should start on installer failure"
+        )
         assert open(counter_path).read().strip() == "2", "expected exactly 2 attempts"
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if os.path.exists(run_dir):
+            stop_daemons(Path(run_dir), env=env)
 
 
-def test_setup_retries_once_after_a_transient_h_agent_install_failure():
+def test_setup_retries_once_after_a_transient_h_agent_install_failure(managed_tmpdir):
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
     try:
         redis.Redis.from_url(redis_url).ping()
     except Exception:
         pytest.skip("Redis server not available at REDIS_URL")
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_setup_h_agent_")
+    tmpdir = managed_tmpdir("h_mesh_test_setup_h_agent_")
     pod, tenant = f"p-{os.urandom(4).hex()}", f"t-{os.urandom(4).hex()}"
+    run_dir = os.path.join(tmpdir, "run")
+    env = {}
     try:
         h_agent_url, counter_path = _fake_h_agent_installer(tmpdir, behavior="fail_then_succeed")
-        run_dir = os.path.join(tmpdir, "run")
         env = _dep_check_env(tmpdir, h_agent_url=h_agent_url)
         env["H_MESH_RUN_DIR"] = run_dir
         env["REDIS_URL"] = redis_url
@@ -264,30 +306,35 @@ def test_setup_retries_once_after_a_transient_h_agent_install_failure():
         assert "attempt 1/2" in res.stdout
         assert "attempt 2/2" in res.stdout
         assert "✓ h-agent installed" in res.stdout
+        assert not os.path.exists(run_dir) or not list(Path(run_dir).glob("*.pid")), (
+            "--no-daemons must not start background daemons"
+        )
         assert open(counter_path).read().strip() == "2"
         h_agent_bin = os.path.join(env["HOME"], ".local", "bin", "h-agent")
         assert os.path.isfile(h_agent_bin) and os.access(h_agent_bin, os.X_OK)
     finally:
+        if os.path.exists(run_dir):
+            stop_daemons(Path(run_dir), env=env)
         try:
             keys = redis.Redis.from_url(redis_url).keys(f"pod:{pod}:tenant:{tenant}:*") or []
             if keys:
                 redis.Redis.from_url(redis_url).delete(*keys)
         except Exception:
             pass
-        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_setup_installs_h_agent_on_first_try_when_missing():
+def test_setup_installs_h_agent_on_first_try_when_missing(managed_tmpdir):
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
     try:
         redis.Redis.from_url(redis_url).ping()
     except Exception:
         pytest.skip("Redis server not available at REDIS_URL")
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_setup_h_agent_")
+    tmpdir = managed_tmpdir("h_mesh_test_setup_h_agent_")
     pod, tenant = f"p-{os.urandom(4).hex()}", f"t-{os.urandom(4).hex()}"
+    run_dir = os.path.join(tmpdir, "run")
+    env = {}
     try:
         h_agent_url, counter_path = _fake_h_agent_installer(tmpdir, behavior="succeed")
-        run_dir = os.path.join(tmpdir, "run")
         env = _dep_check_env(tmpdir, h_agent_url=h_agent_url)
         env["H_MESH_RUN_DIR"] = run_dir
         env["REDIS_URL"] = redis_url
@@ -299,18 +346,22 @@ def test_setup_installs_h_agent_on_first_try_when_missing():
         assert res.returncode == 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
         assert "attempt 2/2" not in res.stdout
         assert "✓ h-agent installed" in res.stdout
+        assert not os.path.exists(run_dir) or not list(Path(run_dir).glob("*.pid")), (
+            "--no-daemons must not start background daemons"
+        )
         assert open(counter_path).read().strip() == "1"
     finally:
+        if os.path.exists(run_dir):
+            stop_daemons(Path(run_dir), env=env)
         try:
             keys = redis.Redis.from_url(redis_url).keys(f"pod:{pod}:tenant:{tenant}:*") or []
             if keys:
                 redis.Redis.from_url(redis_url).delete(*keys)
         except Exception:
             pass
-        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
+def test_setup_seeds_registry_and_runs_e2e_hire_and_message(managed_tmpdir):
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
     r = redis.Redis.from_url(redis_url)
     try:
@@ -318,9 +369,10 @@ def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
     except Exception:
         pytest.skip("Redis server not available at REDIS_URL")
 
-    tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_setup_")
+    tmpdir = managed_tmpdir("h_mesh_test_setup_")
     socket_path = os.path.join(tmpdir, "isolated.sock")
     run_dir = os.path.join(tmpdir, "run")
+    tmux_tmpdir = os.path.join(tmpdir, "tmux")
     pod = f"testpod-{os.urandom(4).hex()}"
     tenant = f"testtenant-{os.urandom(4).hex()}"
     session_name = f"sess-{os.urandom(4).hex()}"
@@ -357,6 +409,7 @@ def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
     env["REDIS_URL"] = redis_url
     env["TMUX_SESSION"] = session_name
     env["TMUX_SOCKET"] = socket_path
+    env["TMUX_TMPDIR"] = tmux_tmpdir
 
     # Scrub ambient tokens to prevent real credential leakage into test processes
     for k in list(env.keys()):
@@ -379,6 +432,7 @@ def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
                 "--tenant", tenant,
                 "--session", session_name,
                 "--tmux-socket", socket_path,
+                "--tmux-tmpdir", tmux_tmpdir,
                 "--redis-url", redis_url,
                 "--venv", venv_dir,
                 "--skip-install",
@@ -503,23 +557,12 @@ def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
         assert "[message from host] welcome to h-mesh worker1" in pane_output
 
     finally:
-        # Stop background daemons
+        # Stop background daemons cleanly via pidfd with exit confirmation
+        stop_daemons(Path(run_dir), env=env)
+
         for pid in (switch_pid, reconciler_pid):
             if pid:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except OSError:
-                    pass
-        # ⚠ Also sweep every pidfile still under run_dir, not just the
-        # explicitly-tracked switch/reconciler pids above -- setup.sh
-        # starts every daemon in DAEMON_MODULES (now including watchdog),
-        # and a fixed pid list here silently orphaned it on every run once
-        # that set grew. Measured: it did.
-        for pidfile in Path(run_dir).glob("*.pid"):
-            try:
-                os.kill(int(pidfile.read_text().strip()), signal.SIGTERM)
-            except (ValueError, OSError):
-                pass
+                assert not pid_alive(pid), f"daemon pid {pid} was not stopped"
 
         # Kill test tmux server
         try:
@@ -537,4 +580,107 @@ def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
         except Exception:
             pass
 
-        shutil.rmtree(tmpdir, ignore_errors=True)
+
+def test_setup_daemons_cannot_survive_test_teardown(managed_tmpdir):
+    """Verify that background daemons started by setup.sh cannot survive test
+    cleanup.
+
+    Demonstrates that:
+    1. setup.sh starts real background daemons when invoked without --no-daemons.
+    2. stop_daemons stops every started daemon cleanly.
+    3. No daemon process survives into subsequent tests or ambient system.
+    """
+    redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
+    r = redis.Redis.from_url(redis_url)
+    try:
+        r.ping()
+    except Exception:
+        pytest.skip("Redis server not available at REDIS_URL")
+
+    tmpdir = managed_tmpdir("h_mesh_test_setup_daemon_leak_")
+    socket_path = os.path.join(tmpdir, "isolated.sock")
+    run_dir = os.path.join(tmpdir, "run")
+    tmux_tmpdir = os.path.join(tmpdir, "tmux")
+    pod = f"testpod-{os.urandom(4).hex()}"
+    tenant = f"testtenant-{os.urandom(4).hex()}"
+    session_name = f"sess-{os.urandom(4).hex()}"
+
+    fake_bin = os.path.join(tmpdir, "bin")
+    os.makedirs(fake_bin, exist_ok=True)
+    fake_h_agent = os.path.join(fake_bin, "h-agent")
+    with open(fake_h_agent, "w") as f:
+        f.write("#!/usr/bin/env bash\nexec bash -il\n")
+    os.chmod(fake_h_agent, 0o755)
+
+    home_dir = os.path.join(tmpdir, "home")
+    os.makedirs(home_dir, exist_ok=True)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+    env["HOME"] = home_dir
+    env["PYTHONPATH"] = str(REPO_ROOT / "h-app")
+    env["H_MESH_RUN_DIR"] = run_dir
+    env["AGENT_NAME"] = "architect"
+    env["POD"] = pod
+    env["TENANT"] = tenant
+    env["REDIS_URL"] = redis_url
+    env["TMUX_SESSION"] = session_name
+    env["TMUX_SOCKET"] = socket_path
+    env["TMUX_TMPDIR"] = tmux_tmpdir
+
+    for k in list(env.keys()):
+        if k.startswith("CLAUDE_OAUTH_TOKEN_") or k == "CLAUDE_CODE_OAUTH_TOKEN":
+            del env[k]
+
+    started_pids: list[int] = []
+    try:
+        # Run setup.sh WITHOUT --no-daemons so real daemons are started
+        res = subprocess.run(
+            [
+                str(SETUP_SH),
+                "--pod", pod,
+                "--tenant", tenant,
+                "--session", session_name,
+                "--tmux-socket", socket_path,
+                "--tmux-tmpdir", tmux_tmpdir,
+                "--redis-url", redis_url,
+                "--venv", sys.prefix,
+                "--skip-install",
+                "--skip-deps",
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+        assert res.returncode == 0, f"setup.sh failed: {res.stderr}\nstdout: {res.stdout}"
+
+        # Collect all daemon PIDs started by setup.sh
+        pidfiles = list(Path(run_dir).glob("*.pid"))
+        assert len(pidfiles) >= 3, f"expected at least switch/reconciler/watchdog pidfiles, got {pidfiles}"
+        for pf in pidfiles:
+            pid = int(pf.read_text().strip())
+            started_pids.append(pid)
+            assert pid_alive(pid), f"daemon {pf.stem} (pid {pid}) was not alive after setup.sh"
+
+    finally:
+        # Teardown: stop all daemons and verify none survive
+        stop_daemons(Path(run_dir), env=env)
+        try:
+            run_tmux("kill-server", socket=socket_path)
+        except Exception:
+            pass
+        try:
+            keys = r.keys(f"{pod}.{tenant}.*") or []
+            colon_keys = r.keys(f"pod:{pod}:tenant:{tenant}:*") or []
+            all_keys = list(set(keys + colon_keys))
+            if all_keys:
+                r.delete(*all_keys)
+        except Exception:
+            pass
+
+    # Assert that every started daemon is dead -- none survived test teardown
+    assert len(started_pids) >= 3
+    for pid in started_pids:
+        assert not pid_alive(pid), f"leaked daemon process {pid} survived test teardown"
