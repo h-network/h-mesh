@@ -937,6 +937,9 @@ h-app/tests/test_venv_path.py::test_persist_venv_on_path_preserves_existing_cont
 h-app/tests/test_venv_path.py::test_persist_venv_on_path_is_idempotent
 h-app/tests/test_venv_path.py::test_persist_venv_on_path_updates_in_place_when_venv_moves
 h-app/tests/test_venv_path.py::test_persist_venv_on_path_creates_missing_files
+h-app/tests/test_webui_port.py::WebuiPortTests::test_progress_envelope_is_relayed_to_connected_client
+h-app/tests/test_webui_port.py::WebuiPortTests::test_registers_cleanly_as_a_generic_port_type
+h-app/tests/test_webui_port.py::WebuiPortTests::test_unknown_kind_is_dead_lettered_without_raising
 h-app/tests/test_watchdog.py::AdmissionEvidenceContractTests::test_accepts_a_correct_evidence_tag_with_ordinary_reason_text
 h-app/tests/test_watchdog.py::AdmissionEvidenceContractTests::test_accepts_every_known_admission_only_value
 h-app/tests/test_watchdog.py::AdmissionEvidenceContractTests::test_accepts_multiple_records_only_if_all_are_admission_only
