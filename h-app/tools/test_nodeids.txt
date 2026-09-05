@@ -202,6 +202,7 @@ h-app/tests/test_claude_sdk_port.py::ClaudeSdkPortTests::test_no_live_fields_sen
 h-app/tests/test_claude_sdk_port.py::ClaudeSdkPortTests::test_no_reply_sent_when_result_is_blank
 h-app/tests/test_claude_sdk_port.py::ClaudeSdkPortTests::test_profile_env_is_threaded_into_the_query_call
 h-app/tests/test_claude_sdk_port.py::ClaudeSdkPortTests::test_progress_send_failure_is_isolated_and_does_not_drop_the_final_reply
+h-app/tests/test_claude_sdk_port.py::ClaudeSdkPortTests::test_progress_send_failure_survives_a_failing_failure_logger_too
 h-app/tests/test_claude_sdk_port.py::ClaudeSdkPortTests::test_query_failure_lands_in_unresolved_not_dead
 h-app/tests/test_claude_sdk_port.py::ClaudeSdkPortTests::test_registers_cleanly_as_a_generic_port_type
 h-app/tests/test_claude_sdk_port.py::ClaudeSdkPortTests::test_unknown_kind_is_dead_lettered_by_core_not_sdk_code

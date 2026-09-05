@@ -421,11 +421,19 @@ def _deliver_message(
                     event=event, evidence=evidence, reason=reason,
                 )
             except Exception as exc:
-                log_record(
-                    "claude_sdk", "claude_sdk_progress_send_failed",
-                    stream_id=stream_id, correlation_id=correlation_id,
-                    source=agent, destination=target, reason=str(exc),
-                )
+                # The observation itself must not reopen the same hole it
+                # exists to close -- log_record does real I/O and is not
+                # guaranteed not to raise (same reasoning as
+                # core.channels._emit_observation). A failure here is
+                # swallowed, not left to propagate and abort the query.
+                try:
+                    log_record(
+                        "claude_sdk", "claude_sdk_progress_send_failed",
+                        stream_id=stream_id, correlation_id=correlation_id,
+                        source=agent, destination=target, reason=str(exc),
+                    )
+                except Exception:
+                    pass
 
     def dispatch(prompt: str) -> str:
         return _run_query(

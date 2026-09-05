@@ -515,6 +515,38 @@ class ClaudeSdkPortTests(unittest.TestCase):
         unresolved_key = prefix(POD, self.tenant, resource="unresolved")
         self.assertEqual(self.redis.llen(unresolved_key), 0)
 
+    def test_progress_send_failure_survives_a_failing_failure_logger_too(self):
+        """The observational fallback (log_record inside on_hop's except
+        block) must not itself be able to recreate the abort it exists to
+        prevent -- both _send_progress and the logger raise here, and the
+        final reply/delivery outcome must be unaffected either way."""
+        import claude_agent_sdk as sdk
+
+        started = sdk.SystemMessage(subtype="init", data={"session_id": "s1"})
+
+        def fake_run_query(
+            prompt, profile_env, *, sdk_options, stream_id, correlation_id,
+            source, destination, on_hop,
+        ):
+            on_hop(started)
+            return "final answer"
+
+        self.queue(payload={"text": "hi", "live_to": "carol"})
+        with patch("modules.claude_sdk.port._run_query", side_effect=fake_run_query), patch(
+            "modules.claude_sdk.port._send_progress", side_effect=RuntimeError("redis hiccup")
+        ), patch(
+            "modules.claude_sdk.port.log_record", side_effect=RuntimeError("disk full")
+        ):
+            deliver_claude_sdk(self.redis, pod=POD, tenant=self.tenant, agent="bob")
+
+        raw = self.redis.lpop(prefix(POD, self.tenant, "bob", "egress"))
+        reply = parse(raw)
+        self.assertEqual(reply["kind"], "Message")
+        self.assertEqual(reply["payload"], {"text": "final answer"})
+        self.assertIsNone(self.redis.lpop(prefix(POD, self.tenant, "bob", "dead")))
+        unresolved_key = prefix(POD, self.tenant, resource="unresolved")
+        self.assertEqual(self.redis.llen(unresolved_key), 0)
+
     def test_invalid_live_to_is_dead_lettered_without_calling_the_sdk(self):
         self.queue(payload={"text": "hi", "live_to": 123})
         with patch("modules.claude_sdk.port._run_query") as mock_query:
