@@ -36,6 +36,10 @@ def test_help_documents_attach():
     )
     assert res.returncode == 0, res.stderr
     assert "--attach" in res.stdout
+    assert "--bind-ports" in res.stdout
+    assert "--no-bind-ports" in res.stdout
+    assert "--api-port" in res.stdout
+    assert "--session-port" in res.stdout
 
 
 def test_attach_execs_the_right_compose_command(tmp_path):
@@ -101,3 +105,93 @@ def test_up_prints_an_attach_hint_with_the_resolved_identity(tmp_path):
     assert "--pod testpod --tenant testtenant --attach" in res.stdout
     assert "h-mesh-testpod-testtenant" in res.stdout
     assert "tmux attach -t testtenant" in res.stdout
+    assert "compose.ports.yaml" in res.stdout
+
+
+def test_noninteractive_default_binds_default_ports(tmp_path):
+    log = tmp_path / "docker_calls.log"
+    env_file = tmp_path / "office.env"
+    _fake_docker(tmp_path, log)
+
+    res = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP), "--pod", "testpod", "--tenant", "testtenant",
+            "--env-file", str(env_file), "--skip-build", "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+    )
+    assert res.returncode == 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+    assert "compose.ports.yaml" in log.read_text().splitlines()[-1]
+    text = env_file.read_text()
+    assert "H_MESH_BIND_PORTS=1" in text
+    assert "API_PORT=8080" in text
+    assert "SESSION_PORT=8081" in text
+
+
+def test_no_bind_ports_omits_overlay_and_persists_choice(tmp_path):
+    log = tmp_path / "docker_calls.log"
+    env_file = tmp_path / "office.env"
+    _fake_docker(tmp_path, log)
+
+    res = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP), "--pod", "testpod", "--tenant", "testtenant",
+            "--env-file", str(env_file), "--no-bind-ports", "--skip-build",
+            "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+    )
+    assert res.returncode == 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+    assert "compose.ports.yaml" not in log.read_text().splitlines()[-1]
+    assert "H_MESH_BIND_PORTS=0" in env_file.read_text()
+    assert "Host ports:   not published" in res.stdout
+
+
+def test_existing_env_without_bind_key_remains_bound(tmp_path):
+    log = tmp_path / "docker_calls.log"
+    env_file = tmp_path / "office.env"
+    env_file.write_text("POD=testpod\nTENANT=testtenant\nAPI_PORT=19080\nSESSION_PORT=19081\n")
+    _fake_docker(tmp_path, log)
+
+    res = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP), "--pod", "testpod", "--tenant", "testtenant",
+            "--env-file", str(env_file), "--skip-build", "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+    )
+    assert res.returncode == 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+    assert "compose.ports.yaml" in log.read_text().splitlines()[-1]
+    text = env_file.read_text()
+    assert "H_MESH_BIND_PORTS=1" in text
+    assert "API_PORT=19080" in text
+    assert "SESSION_PORT=19081" in text
+
+
+def test_custom_port_flags_are_persisted_and_invalid_ports_fail(tmp_path):
+    log = tmp_path / "docker_calls.log"
+    env_file = tmp_path / "office.env"
+    _fake_docker(tmp_path, log)
+    base = [
+        "bash", str(BOOTSTRAP), "--pod", "testpod", "--tenant", "testtenant",
+        "--env-file", str(env_file), "--non-interactive",
+    ]
+
+    res = subprocess.run(
+        [*base, "--api-port", "18080", "--session-port", "18081"],
+        capture_output=True, text=True, timeout=10,
+        env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+    )
+    assert res.returncode == 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+    assert "API_PORT=18080" in env_file.read_text()
+    assert "SESSION_PORT=18081" in env_file.read_text()
+
+    res = subprocess.run(
+        [*base, "--api-port", "65536"], capture_output=True, text=True, timeout=10,
+        env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+    )
+    assert res.returncode != 0
+    assert "1 to 65535" in res.stderr

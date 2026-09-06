@@ -5,8 +5,9 @@
 # comment) once --container/H_MESH_INSTALL_MODE=container is chosen. This is
 # a separate, smaller wizard than setup.sh's own: it collects what a
 # tenant's env file needs (POD, TENANT, AGENTS, DEFAULT_CLI, the default
-# account's OAuth token, optional Telegram bot config, and -- if Telegram
-# is enabled -- a TLS-or-plaintext decision), writes/updates that file, and
+# account's OAuth token, host port-publishing choice, optional Telegram bot
+# config, and -- if Telegram is enabled -- a TLS-or-plaintext decision),
+# writes/updates that file, and
 # hands off to `docker compose up --build` -- setup.sh's own non-interactive
 # path, roster seeding, hire, and daemon-start logic still run, just inside
 # the container (see container/entrypoint.sh), not reimplemented here.
@@ -47,6 +48,9 @@ POD="${POD:-}"
 TENANT="${TENANT:-}"
 AGENTS="${AGENTS:-}"
 DEFAULT_CLI="${DEFAULT_CLI:-}"
+H_MESH_BIND_PORTS="${H_MESH_BIND_PORTS:-}"
+API_PORT="${API_PORT:-}"
+SESSION_PORT="${SESSION_PORT:-}"
 
 usage() {
     cat <<EOF
@@ -54,8 +58,9 @@ Usage: ./setup.sh --container [options]
        ./container/bootstrap.sh [options]
 
 Collects what an office's env file needs (POD, TENANT, AGENTS,
-DEFAULT_CLI, the default account's OAuth token, optional Telegram bot
-config, and -- if Telegram is enabled -- a TLS-or-plaintext decision),
+DEFAULT_CLI, host port publishing, the default account's OAuth token,
+optional Telegram bot config, and -- if Telegram is enabled -- a
+TLS-or-plaintext decision),
 writes it to offices/<pod>/<tenant>/.env, then runs
 'docker compose -p h-mesh-<pod>-<tenant> up --build' -- setup.sh's own
 non-interactive path runs inside the container from there (see
@@ -66,6 +71,10 @@ Options:
   --tenant <name>         Tenant name (default: \$TENANT, or existing office's value, or "default")
   --agents <a,b,c>        Comma-separated agent names (default: \$AGENTS, or existing value, or "architect")
   --cli <claude|codex|agy> Default CLI (default: \$DEFAULT_CLI, or existing value, or "claude")
+  --bind-ports           Publish API/session ports to the host (the default)
+  --no-bind-ports        Do not publish API/session ports to the host
+  --api-port <port>      API host port (default: \$API_PORT, existing value, or 8080)
+  --session-port <port>  Session host port (default: \$SESSION_PORT, existing value, or 8081)
   --env-file <path>       Use this exact env file instead of offices/<pod>/<tenant>/.env
                           (advanced/testing use -- also disables the project-name isolation
                           this script otherwise guarantees; pass --project-name too if you use it)
@@ -96,6 +105,10 @@ while [ $# -gt 0 ]; do
         --tenant) TENANT="$2"; shift 2 ;;
         --agents) AGENTS="$2"; shift 2 ;;
         --cli) DEFAULT_CLI="$2"; shift 2 ;;
+        --bind-ports) H_MESH_BIND_PORTS=1; shift ;;
+        --no-bind-ports) H_MESH_BIND_PORTS=0; shift ;;
+        --api-port) API_PORT="$2"; shift 2 ;;
+        --session-port) SESSION_PORT="$2"; shift 2 ;;
         --env-file) ENV_FILE_OVERRIDE="$2"; shift 2 ;;
         --project-name) PROJECT_NAME_OVERRIDE="$2"; shift 2 ;;
         --skip-build) SKIP_BUILD=1; shift ;;
@@ -222,8 +235,14 @@ env_file_get() {
 
 [ -z "$AGENTS" ] && AGENTS="$(env_file_get AGENTS)"
 [ -z "$DEFAULT_CLI" ] && DEFAULT_CLI="$(env_file_get DEFAULT_CLI)"
+[ -z "$H_MESH_BIND_PORTS" ] && H_MESH_BIND_PORTS="$(env_file_get H_MESH_BIND_PORTS)"
+[ -z "$API_PORT" ] && API_PORT="$(env_file_get API_PORT)"
+[ -z "$SESSION_PORT" ] && SESSION_PORT="$(env_file_get SESSION_PORT)"
 AGENTS="${AGENTS:-architect}"
 DEFAULT_CLI="${DEFAULT_CLI:-claude}"
+H_MESH_BIND_PORTS="${H_MESH_BIND_PORTS:-1}"
+API_PORT="${API_PORT:-8080}"
+SESSION_PORT="${SESSION_PORT:-8081}"
 
 if [ "$INTERACTIVE" -eq 1 ]; then
     read -rp "Agent names, comma-separated [$AGENTS]: " _in; AGENTS="${_in:-$AGENTS}"
@@ -267,6 +286,62 @@ check_bool() {
         *) echo "error: expected yes or no, got '$val'" >&2; exit 1 ;;
     esac
 }
+
+normalize_bind_ports() {
+    case "$1" in
+        1|[Yy]|[Yy][Ee][Ss]) echo 1 ;;
+        0|[Nn]|[Nn][Oo]) echo 0 ;;
+        *) echo "error: H_MESH_BIND_PORTS must be 1 or 0 (got: $1)" >&2; return 1 ;;
+    esac
+}
+
+validate_port() {
+    local value="$1" label="$2"
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
+        echo "error: $label must be an integer from 1 to 65535 (got: '$value')" >&2
+        return 1
+    fi
+}
+
+warn_port_collision() {
+    local port="$1" label="$2" candidate claimed_key claimed_port
+    while IFS= read -r candidate; do
+        [ "$candidate" = "$ENV_FILE" ] && continue
+        for claimed_key in API_PORT SESSION_PORT; do
+            claimed_port="$(sed -n "s/^${claimed_key}=//p" "$candidate" | tail -n1)"
+            if [ "$claimed_port" = "$port" ]; then
+                echo "warning: $label port $port is already claimed as $claimed_key in $candidate" >&2
+            fi
+        done
+    done < <(find "$REPO_ROOT/offices" -mindepth 3 -maxdepth 3 -name .env -type f 2>/dev/null)
+
+    if command -v ss >/dev/null 2>&1 && ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}$"; then
+        echo "warning: $label port $port is already listening on this host" >&2
+    elif command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "warning: $label port $port is already listening on this host" >&2
+    fi
+}
+
+H_MESH_BIND_PORTS="$(normalize_bind_ports "$H_MESH_BIND_PORTS")" || exit 1
+if [ "$INTERACTIVE" -eq 1 ]; then
+    read -rp "Publish the API/session ports to the host? [Y/n]: " _in
+    if check_bool "$_in" "y"; then
+        H_MESH_BIND_PORTS=1
+        read -rp "API host port [$API_PORT]: " _in; API_PORT="${_in:-$API_PORT}"
+        read -rp "Session host port [$SESSION_PORT]: " _in; SESSION_PORT="${_in:-$SESSION_PORT}"
+    else
+        H_MESH_BIND_PORTS=0
+    fi
+fi
+validate_port "$API_PORT" "API port" || exit 1
+validate_port "$SESSION_PORT" "session port" || exit 1
+if [ "$H_MESH_BIND_PORTS" -eq 1 ]; then
+    warn_port_collision "$API_PORT" "API"
+    warn_port_collision "$SESSION_PORT" "session"
+fi
+upsert_env_line H_MESH_BIND_PORTS "$H_MESH_BIND_PORTS"
+upsert_env_line API_PORT "$API_PORT"
+upsert_env_line SESSION_PORT "$SESSION_PORT"
 
 # ⚠ These two are NOT the same kind of "advanced" as AGENT_CLIS/
 # AGENT_PROFILES/AGENT_PROVIDERS/PROVIDER_LOCAL_* (still file-only, still
@@ -376,6 +451,11 @@ echo "  Pod:          $POD"
 echo "  Tenant:       $TENANT"
 echo "  Agents:       $AGENTS"
 echo "  Default CLI:  $DEFAULT_CLI"
+if [ "$H_MESH_BIND_PORTS" -eq 1 ]; then
+    echo "  Host ports:   API $API_PORT, session $SESSION_PORT"
+else
+    echo "  Host ports:   not published"
+fi
 echo "  OAuth token:  $([ -n "$CLAUDE_OAUTH_TOKEN_DEFAULT" ] && echo "configured" || echo "not set -- log in interactively later, or add CLAUDE_OAUTH_TOKEN_DEFAULT to $ENV_FILE")"
 echo "  Telegram:     $([ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] && echo "enabled, chat id $TELEGRAM_CHAT_ID" || echo "not enabled")"
 if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
@@ -390,6 +470,7 @@ echo "  Project name: $PROJECT_NAME"
 echo
 
 COMPOSE_ARGS=(-p "$PROJECT_NAME" -f "$SCRIPT_DIR/compose.yaml" --env-file "$ENV_FILE" up -d)
+[ "$H_MESH_BIND_PORTS" -eq 1 ] && COMPOSE_ARGS=(-p "$PROJECT_NAME" -f "$SCRIPT_DIR/compose.yaml" -f "$SCRIPT_DIR/compose.ports.yaml" --env-file "$ENV_FILE" up -d)
 [ "$SKIP_BUILD" -eq 0 ] && COMPOSE_ARGS+=(--build)
 
 echo "Running: docker compose ${COMPOSE_ARGS[*]}"
@@ -397,9 +478,11 @@ echo "Running: docker compose ${COMPOSE_ARGS[*]}"
 
 echo
 echo "✓ Container started (project: $PROJECT_NAME)."
+COMPOSE_FILES="-f $SCRIPT_DIR/compose.yaml"
+[ "$H_MESH_BIND_PORTS" -eq 1 ] && COMPOSE_FILES="$COMPOSE_FILES -f $SCRIPT_DIR/compose.ports.yaml"
 echo "  Attach:  $SCRIPT_DIR/bootstrap.sh --pod $POD --tenant $TENANT --attach"
-echo "           (or directly: docker compose -p $PROJECT_NAME -f $SCRIPT_DIR/compose.yaml --env-file $ENV_FILE exec h-mesh env TMUX_TMPDIR=\"\$HOME/.h-mesh/tmux\" tmux attach -t $TENANT)"
-echo "  Logs:    docker compose -p $PROJECT_NAME -f $SCRIPT_DIR/compose.yaml --env-file $ENV_FILE logs -f"
+echo "           (or directly: docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE exec h-mesh env TMUX_TMPDIR=\"\$HOME/.h-mesh/tmux\" tmux attach -t $TENANT)"
+echo "  Logs:    docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE logs -f"
 echo "  Status:  docker ps --filter name=$PROJECT_NAME"
-echo "  Stop:    docker compose -p $PROJECT_NAME -f $SCRIPT_DIR/compose.yaml --env-file $ENV_FILE down       # keeps state"
-echo "           docker compose -p $PROJECT_NAME -f $SCRIPT_DIR/compose.yaml --env-file $ENV_FILE down -v    # also drops it"
+echo "  Stop:    docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE down       # keeps state"
+echo "           docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE down -v    # also drops it"
