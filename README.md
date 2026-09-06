@@ -150,7 +150,8 @@ which you want before anything else -- see "Bootstrap script" above. Either
 form hands off entirely to `container/bootstrap.sh`, a smaller wizard (same
 banner as the host wizard) that collects `POD`/`TENANT`/`AGENTS`/
 `DEFAULT_CLI`, whether to publish the API/session ports (and which host
-ports to use), the default account's OAuth token (blank to log in
+ports to use), one or more Claude account names, and each account's OAuth
+token (blank to log in
 interactively later -- see "Finding and attaching..." below for how a
 container operator can actually do that), and optional Telegram bot config,
 writes them to `offices/<pod>/<tenant>/.env`, and runs `docker compose up
@@ -207,16 +208,15 @@ Every non-interactive env var from "Bootstrap script" above (`AGENTS`,
 `CLAUDE_OAUTH_TOKEN_<PROFILE>`, `PROVIDER_LOCAL_*`, `TELEGRAM_*`,
 `API_TOKEN`, `H_MESH_BIND_PORTS`, `API_PORT`, and `SESSION_PORT`) applies
 unchanged. `bootstrap.sh`'s interactive wizard prompts
-for the *default* account's `CLAUDE_OAUTH_TOKEN_DEFAULT` and for
+for the account count and names, each account's corresponding
+`CLAUDE_OAUTH_TOKEN_<PROFILE>`, and for
 `TELEGRAM_*` directly, mirroring the host wizard -- these were previously,
 incorrectly, treated as file-only "advanced" options; a working office
 always needs some credential, and the choice to enable Telegram is one the
-host wizard already offered. Per-agent exceptions
-(`AGENT_CLIS`/`AGENT_PROFILES`/`AGENT_PROVIDERS`), a second-or-later
-account, and local model provider config (`PROVIDER_LOCAL_*`) remain
-file-only -- this script has no per-agent or multi-account UI at all,
-uniform-single-account is its whole model, so those genuinely don't apply
-to it. `API_TOKEN` is never prompted anywhere, even on a bare host --
+host wizard already offered. Per-agent account assignment and other
+exceptions (`AGENT_CLIS`/`AGENT_PROFILES`/`AGENT_PROVIDERS`) and local model
+provider config (`PROVIDER_LOCAL_*`) remain file-only. `API_TOKEN` is never
+prompted anywhere, even on a bare host --
 always generated. `H_MESH_BIND_PORTS=1` selects the ports overlay, while
 `API_PORT`/`SESSION_PORT` choose the **host** side of that mapping only; the
 api and session doors always bind

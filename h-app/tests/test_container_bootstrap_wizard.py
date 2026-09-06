@@ -68,6 +68,11 @@ def _run_wizard(args: list[str], env: dict, answers: list[str], timeout: float =
 def _env(bin_dir: Path) -> dict:
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    env.pop("ACCOUNTS", None)
+    env.pop("DEFAULT_ACCOUNT", None)
+    for key in list(env):
+        if key.startswith("CLAUDE_OAUTH_TOKEN_") or key == "CLAUDE_CODE_OAUTH_TOKEN":
+            del env[key]
     return env
 
 
@@ -75,9 +80,9 @@ def _env_file_text(path: Path) -> str:
     return path.read_text() if path.exists() else ""
 
 
-def _with_default_ports(answers: list[str]) -> list[str]:
-    """Insert bind=yes/API=8080/session=8081 defaults after agents/CLI."""
-    return [*answers[:2], "", "", "", *answers[2:]]
+def _with_defaults(answers: list[str]) -> list[str]:
+    """Accept default port publishing and the default single account."""
+    return [*answers[:2], "", "", "", "", *answers[2:]]
 
 
 def test_banner_prints_at_a_real_terminal(tmp_path):
@@ -87,7 +92,7 @@ def test_banner_prints_at_a_real_terminal(tmp_path):
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
         # agents, cli, oauth, telegram(no)
-        answers=_with_default_ports(["", "", "", "n"]),
+        answers=_with_defaults(["", "", "", "n"]),
     )
     assert code == 0, output
     assert "H-MESH" in output
@@ -100,7 +105,7 @@ def test_oauth_token_answer_is_persisted(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        answers=_with_default_ports(["", "", "tok-abc123", "n"]),
+        answers=_with_defaults(["", "", "tok-abc123", "n"]),
     )
     assert code == 0, output
     assert "CLAUDE_OAUTH_TOKEN_DEFAULT=tok-abc123" in _env_file_text(env_file)
@@ -116,7 +121,7 @@ def test_blank_oauth_token_answer_is_not_persisted_at_all(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        answers=_with_default_ports(["", "", "", "n"]),
+        answers=_with_defaults(["", "", "", "n"]),
     )
     assert code == 0, output
     assert "CLAUDE_OAUTH_TOKEN_DEFAULT" not in _env_file_text(env_file)
@@ -130,7 +135,7 @@ def test_rerun_keeps_existing_oauth_token_when_answer_is_blank(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        answers=_with_default_ports(["", "", "", "n"]),
+        answers=_with_defaults(["", "", "", "n"]),
     )
     assert code == 0, output
     assert "CLAUDE_OAUTH_TOKEN_DEFAULT=already-set" in _env_file_text(env_file)
@@ -144,7 +149,7 @@ def test_telegram_yes_with_both_values_persists_all_three(tmp_path):
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
         # ..., voice=n, TLS cert path=blank (accept plaintext)
-        answers=_with_default_ports(["", "", "", "y", "tg-token-xyz", "12345", "n", ""]),
+        answers=_with_defaults(["", "", "", "y", "tg-token-xyz", "12345", "n", ""]),
     )
     assert code == 0, output
     text = _env_file_text(env_file)
@@ -163,7 +168,7 @@ def test_enabling_telegram_forces_a_plaintext_or_tls_decision(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        answers=_with_default_ports(["", "", "", "y", "tg-token-xyz", "12345", "n", ""]),  # blank = accept plaintext
+        answers=_with_defaults(["", "", "", "y", "tg-token-xyz", "12345", "n", ""]),  # blank = accept plaintext
     )
     assert code == 0, output
     assert "H_MESH_ALLOW_PLAINTEXT=1" in _env_file_text(env_file)
@@ -176,7 +181,7 @@ def test_telegram_with_a_real_cert_path_persists_cert_and_key_not_plaintext(tmp_
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        answers=_with_default_ports([
+        answers=_with_defaults([
             "", "", "", "y", "tg-token-xyz", "12345", "n",
             "/home/ubuntu/tlscerts/tls.crt", "/home/ubuntu/tlscerts/tls.key",
         ]),
@@ -194,7 +199,7 @@ def test_a_cert_path_with_no_key_is_a_hard_error_before_persisting_anything(tmp_
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        answers=_with_default_ports(["", "", "", "y", "tg-token-xyz", "12345", "n", "/home/ubuntu/tlscerts/tls.crt", ""]),
+        answers=_with_defaults(["", "", "", "y", "tg-token-xyz", "12345", "n", "/home/ubuntu/tlscerts/tls.crt", ""]),
     )
     assert code != 0
     text = _env_file_text(env_file)
@@ -215,7 +220,7 @@ def test_rerun_with_existing_plaintext_choice_does_not_reprompt(tmp_path):
         env=_env(tmp_path),
         # oauth blank, telegram=y, both prompts show "[keep existing]" so
         # blank keeps them, voice -- no TLS/plaintext answer supplied at all
-        answers=_with_default_ports(["", "", "", "y", "", "", "n"]),
+        answers=_with_defaults(["", "", "", "y", "", "", "n"]),
     )
     assert code == 0, output
     assert "H_MESH_ALLOW_PLAINTEXT=1" in _env_file_text(env_file)
@@ -229,7 +234,7 @@ def test_telegram_partial_pair_is_not_persisted(tmp_path):
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
         # telegram=y, token given, chat id left blank
-        answers=_with_default_ports(["", "", "", "y", "tg-token-xyz", ""]),
+        answers=_with_defaults(["", "", "", "y", "tg-token-xyz", ""]),
     )
     assert code == 0, output
     text = _env_file_text(env_file)
@@ -244,7 +249,7 @@ def test_telegram_declined_prompts_nothing_further(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        answers=_with_default_ports(["", "", "", ""]),  # blank telegram answer = No, same as setup.sh's own default
+        answers=_with_defaults(["", "", "", ""]),  # blank telegram answer = No, same as setup.sh's own default
     )
     assert code == 0, output
     text = _env_file_text(env_file)
@@ -268,6 +273,8 @@ def test_non_interactive_never_prompts_for_oauth_or_telegram(tmp_path):
     text = _env_file_text(env_file)
     assert "CLAUDE_OAUTH_TOKEN_DEFAULT" not in text
     assert "TELEGRAM_BOT_TOKEN" not in text
+    assert "ACCOUNTS=default" in text
+    assert "DEFAULT_ACCOUNT=default" in text
 
 
 def test_port_prompt_accepts_custom_ports(tmp_path):
@@ -276,8 +283,8 @@ def test_port_prompt_accepts_custom_ports(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        # agents, cli, bind=yes, api, session, oauth, telegram=no
-        answers=["", "", "y", "18080", "18081", "", "n"],
+        # agents, cli, bind=yes, api, session, single account, oauth, telegram=no
+        answers=["", "", "y", "18080", "18081", "", "", "n"],
     )
     assert code == 0, output
     text = _env_file_text(env_file)
@@ -292,9 +299,49 @@ def test_port_prompt_can_disable_host_publishing(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        # agents, cli, bind=no (no port prompts), oauth, telegram=no
-        answers=["", "", "n", "", "n"],
+        # agents, cli, bind=no (no port prompts), single account, oauth, telegram=no
+        answers=["", "", "n", "", "", "n"],
     )
     assert code == 0, output
     assert "H_MESH_BIND_PORTS=0" in _env_file_text(env_file)
     assert "Host ports:   not published" in output
+
+
+def test_multiple_accounts_and_oauth_tokens_are_persisted(tmp_path):
+    _fake_docker(tmp_path)
+    env_file = tmp_path / "office.env"
+    output, code = _run_wizard(
+        ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
+        env=_env(tmp_path),
+        # agents, cli, multi=yes, count, account names/tokens, default, telegram=no
+        answers=["", "", "", "", "", "y", "2", "", "tok-default", "backup", "tok-backup", "backup", "n"],
+    )
+    assert code == 0, output
+    text = _env_file_text(env_file)
+    assert "ACCOUNTS=default,backup" in text
+    assert "DEFAULT_ACCOUNT=backup" in text
+    assert "CLAUDE_OAUTH_TOKEN_DEFAULT=tok-default" in text
+    assert "CLAUDE_OAUTH_TOKEN_BACKUP=tok-backup" in text
+    assert "OAuth tokens: 2/2 configured" in output
+
+
+def test_multiple_account_rerun_keeps_existing_names_and_tokens(tmp_path):
+    _fake_docker(tmp_path)
+    env_file = tmp_path / "office.env"
+    env_file.write_text(
+        "POD=testpod\nTENANT=testtenant\nACCOUNTS=default,backup\n"
+        "DEFAULT_ACCOUNT=default\nCLAUDE_OAUTH_TOKEN_DEFAULT=one\n"
+        "CLAUDE_OAUTH_TOKEN_BACKUP=two\n"
+    )
+    output, code = _run_wizard(
+        ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
+        env=_env(tmp_path),
+        # agents, cli, multi=yes, keep count/names/tokens/default, telegram=no
+        answers=["", "", "", "", "", "y", "", "", "", "", "", "", "n"],
+    )
+    assert code == 0, output
+    text = _env_file_text(env_file)
+    assert "ACCOUNTS=default,backup" in text
+    assert "CLAUDE_OAUTH_TOKEN_DEFAULT=one" in text
+    assert "CLAUDE_OAUTH_TOKEN_BACKUP=two" in text
+    assert output.count("[keep existing]") == 2

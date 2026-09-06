@@ -4,8 +4,8 @@
 # setup.sh hands off here entirely (see its own "Host-vs-container picker"
 # comment) once --container/H_MESH_INSTALL_MODE=container is chosen. This is
 # a separate, smaller wizard than setup.sh's own: it collects what a
-# tenant's env file needs (POD, TENANT, AGENTS, DEFAULT_CLI, the default
-# account's OAuth token, host port-publishing choice, optional Telegram bot
+# tenant's env file needs (POD, TENANT, AGENTS, DEFAULT_CLI, Claude account
+# names and OAuth tokens, host port-publishing choice, optional Telegram bot
 # config, and -- if Telegram is enabled -- a TLS-or-plaintext decision),
 # writes/updates that file, and
 # hands off to `docker compose up --build` -- setup.sh's own non-interactive
@@ -28,10 +28,9 @@
 # At a terminal, with no flags, this prompts the same way setup.sh's own
 # wizard does; piped/scripted or with --non-interactive, it reads flags/env
 # only, same as setup.sh. Per-agent exceptions (AGENT_CLIS/AGENT_PROFILES/
-# AGENT_PROVIDERS), a second-or-later account, and local model provider
-# config (PROVIDER_LOCAL_*) aren't prompted for here -- this script has no
-# per-agent or multi-account UI at all, uniform-single-account is its whole
-# model; add those directly to the office's env file. `API_TOKEN` is never
+# AGENT_PROVIDERS) and local model provider config (PROVIDER_LOCAL_*) aren't
+# prompted for here -- add those directly to the office's env file.
+# `API_TOKEN` is never
 # prompted anywhere, even on a bare host -- always generated. Every one of
 # these reaches the container exactly as documented in README.md's
 # "Bootstrap script" section.
@@ -51,6 +50,8 @@ DEFAULT_CLI="${DEFAULT_CLI:-}"
 H_MESH_BIND_PORTS="${H_MESH_BIND_PORTS:-}"
 API_PORT="${API_PORT:-}"
 SESSION_PORT="${SESSION_PORT:-}"
+ACCOUNTS="${ACCOUNTS:-}"
+DEFAULT_ACCOUNT="${DEFAULT_ACCOUNT:-}"
 
 usage() {
     cat <<EOF
@@ -58,7 +59,7 @@ Usage: ./setup.sh --container [options]
        ./container/bootstrap.sh [options]
 
 Collects what an office's env file needs (POD, TENANT, AGENTS,
-DEFAULT_CLI, host port publishing, the default account's OAuth token,
+DEFAULT_CLI, Claude account names and OAuth tokens, host port publishing,
 optional Telegram bot config, and -- if Telegram is enabled -- a
 TLS-or-plaintext decision),
 writes it to offices/<pod>/<tenant>/.env, then runs
@@ -87,11 +88,9 @@ Options:
                           if you only meant to skip a rebuild, not the up itself.
   -h, --help              Show this help message
 
-Per-agent exceptions (AGENT_CLIS/AGENT_PROFILES/AGENT_PROVIDERS), a second
-or later account, and local model provider config (PROVIDER_LOCAL_*) are
-not prompted for here -- this script has no per-agent or multi-account UI
-at all, uniform-single-account is its whole model; add those directly to
-the office's env file. See README.md's "Bootstrap script" section for the
+Per-agent exceptions (AGENT_CLIS/AGENT_PROFILES/AGENT_PROVIDERS) and local
+model provider config (PROVIDER_LOCAL_*) are not prompted for here; add
+those directly to the office's env file. See README.md's "Bootstrap script" section for the
 complete non-interactive variable set, all of which apply unchanged inside
 the container.
 EOF
@@ -238,11 +237,14 @@ env_file_get() {
 [ -z "$H_MESH_BIND_PORTS" ] && H_MESH_BIND_PORTS="$(env_file_get H_MESH_BIND_PORTS)"
 [ -z "$API_PORT" ] && API_PORT="$(env_file_get API_PORT)"
 [ -z "$SESSION_PORT" ] && SESSION_PORT="$(env_file_get SESSION_PORT)"
-AGENTS="${AGENTS:-architect}"
-DEFAULT_CLI="${DEFAULT_CLI:-claude}"
 H_MESH_BIND_PORTS="${H_MESH_BIND_PORTS:-1}"
 API_PORT="${API_PORT:-8080}"
 SESSION_PORT="${SESSION_PORT:-8081}"
+[ -z "$ACCOUNTS" ] && ACCOUNTS="$(env_file_get ACCOUNTS)"
+[ -z "$DEFAULT_ACCOUNT" ] && DEFAULT_ACCOUNT="$(env_file_get DEFAULT_ACCOUNT)"
+AGENTS="${AGENTS:-architect}"
+DEFAULT_CLI="${DEFAULT_CLI:-claude}"
+ACCOUNTS="${ACCOUNTS:-default}"
 
 if [ "$INTERACTIVE" -eq 1 ]; then
     read -rp "Agent names, comma-separated [$AGENTS]: " _in; AGENTS="${_in:-$AGENTS}"
@@ -343,31 +345,76 @@ upsert_env_line H_MESH_BIND_PORTS "$H_MESH_BIND_PORTS"
 upsert_env_line API_PORT "$API_PORT"
 upsert_env_line SESSION_PORT "$SESSION_PORT"
 
-# ⚠ These two are NOT the same kind of "advanced" as AGENT_CLIS/
-# AGENT_PROFILES/AGENT_PROVIDERS/PROVIDER_LOCAL_* (still file-only, still
-# correctly deferred -- this script has no per-agent CLI/profile UI at
-# all, uniform-office is its whole model, so those never apply to it) or
-# API_TOKEN (never a prompt even in the host wizard -- always generated).
-# CLAUDE_OAUTH_TOKEN_DEFAULT is required for a single-account office to do
-# anything; Telegram is genuinely optional but the *choice* to enable it
-# is something setup.sh's own host wizard offers and this one didn't.
-# Mirrors that wizard's ask_token()/Telegram-enable block for the single
-# ("default") account this script's own model supports -- see ticket
-# b87f9f0a.
-CLAUDE_OAUTH_TOKEN_DEFAULT=""
+# Match setup.sh's account-name/token flow: account names live in ACCOUNTS,
+# and each token is stored under CLAUDE_OAUTH_TOKEN_<SLUG>. Read env values
+# indirectly rather than sourcing the office file, which may contain
+# operator-edited content and secrets.
+slug() { echo "$1" | tr '[:upper:]' '[:lower:]' | tr ' ' '-'; }
+token_var() { printf 'CLAUDE_OAUTH_TOKEN_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
+IFS=',' read -r -a PROFILES <<< "$ACCOUNTS"
+TOKEN_VARS=()
+
+resolve_token() {
+    local profile="$1" var existing live entered
+    var="$(token_var "$profile")"
+    existing="$(env_file_get "$var")"
+    live="${!var:-}"
+    [ -n "$live" ] && existing="$live"
+    if [ "$INTERACTIVE" -eq 1 ]; then
+        if [ -n "$existing" ]; then
+            read -rsp "  OAuth token for '$profile' [keep existing]: " entered; echo
+        else
+            read -rsp "  OAuth token for '$profile' (blank to log in interactively later): " entered; echo
+        fi
+        [ -n "$entered" ] || entered="$existing"
+    else
+        entered="$existing"
+    fi
+    TOKEN_VARS+=("$var")
+    [ -n "$entered" ] && upsert_env_line "$var" "$entered"
+}
+
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
 TELEGRAM_VOICE=""
 if [ "$INTERACTIVE" -eq 1 ]; then
-    EXISTING_TOKEN="$(env_file_get CLAUDE_OAUTH_TOKEN_DEFAULT)"
-    if [ -n "$EXISTING_TOKEN" ]; then
-        read -rsp "OAuth token for the default account [keep existing]: " IN_TOKEN; echo
+    read -rp "Use more than one account? [y/N]: " USE_PROFILES
+    if check_bool "$USE_PROFILES" "n"; then
+        read -rp "  How many accounts? [${#PROFILES[@]}]: " NP
+        NP="${NP:-${#PROFILES[@]}}"
+        [[ "$NP" =~ ^[1-9][0-9]*$ ]] || { echo "  error: expected a positive number" >&2; exit 2; }
+        NEW_PROFILES=()
+        for i in $(seq 1 "$NP"); do
+            if [ "$i" -eq 1 ]; then pdef="default"; else pdef="${PROFILES[$((i-1))]:-account-$i}"; fi
+            read -rp "  Account #$i name [$pdef]: " P
+            P="$(slug "${P:-$pdef}")"
+            NEW_PROFILES+=("$P")
+            resolve_token "$P"
+        done
+        PROFILES=("${NEW_PROFILES[@]}")
     else
-        read -rsp "OAuth token for the default account (blank to log in interactively later): " IN_TOKEN; echo
+        PROFILES=(default)
+        DEFAULT_ACCOUNT=default
+        resolve_token default
     fi
-    CLAUDE_OAUTH_TOKEN_DEFAULT="${IN_TOKEN:-$EXISTING_TOKEN}"
-    [ -n "$CLAUDE_OAUTH_TOKEN_DEFAULT" ] && upsert_env_line CLAUDE_OAUTH_TOKEN_DEFAULT "$CLAUDE_OAUTH_TOKEN_DEFAULT"
+else
+    for P in "${PROFILES[@]}"; do resolve_token "$P"; done
+fi
+ACCOUNTS="$(IFS=,; echo "${PROFILES[*]}")"
+if [ "$INTERACTIVE" -eq 1 ] && { [ "${#PROFILES[@]}" -gt 1 ] || [ "${PROFILES[0]}" != "default" ]; }; then
+    DEFAULT_ACCOUNT="${DEFAULT_ACCOUNT:-${PROFILES[0]}}"
+    read -rp "  Default account for every agent [$DEFAULT_ACCOUNT]: " IN_DEFAULT_ACCOUNT
+    DEFAULT_ACCOUNT="$(slug "${IN_DEFAULT_ACCOUNT:-$DEFAULT_ACCOUNT}")"
+fi
+DEFAULT_ACCOUNT="${DEFAULT_ACCOUNT:-${PROFILES[0]}}"
+if ! printf '%s\n' "${PROFILES[@]}" | grep -qx "$DEFAULT_ACCOUNT"; then
+    echo "error: default account '$DEFAULT_ACCOUNT' is not listed in ACCOUNTS ($ACCOUNTS)" >&2
+    exit 1
+fi
+upsert_env_line ACCOUNTS "$ACCOUNTS"
+upsert_env_line DEFAULT_ACCOUNT "$DEFAULT_ACCOUNT"
 
+if [ "$INTERACTIVE" -eq 1 ]; then
     EXISTING_TG_TOKEN="$(env_file_get TELEGRAM_BOT_TOKEN)"
     EXISTING_TG_CHAT="$(env_file_get TELEGRAM_CHAT_ID)"
     read -rp "Run the Telegram bot? [y/N]: " WANT_TELEGRAM
@@ -456,7 +503,11 @@ if [ "$H_MESH_BIND_PORTS" -eq 1 ]; then
 else
     echo "  Host ports:   not published"
 fi
-echo "  OAuth token:  $([ -n "$CLAUDE_OAUTH_TOKEN_DEFAULT" ] && echo "configured" || echo "not set -- log in interactively later, or add CLAUDE_OAUTH_TOKEN_DEFAULT to $ENV_FILE")"
+echo "  Accounts:     $ACCOUNTS"
+echo "  Default acct: $DEFAULT_ACCOUNT"
+CONFIGURED_TOKENS=0
+for token_name in "${TOKEN_VARS[@]}"; do [ -n "$(env_file_get "$token_name")" ] && CONFIGURED_TOKENS=$((CONFIGURED_TOKENS + 1)); done
+echo "  OAuth tokens: $CONFIGURED_TOKENS/${#PROFILES[@]} configured"
 echo "  Telegram:     $([ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] && echo "enabled, chat id $TELEGRAM_CHAT_ID" || echo "not enabled")"
 if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
     if [ -n "$(env_file_get API_TLS_CERT)" ]; then
