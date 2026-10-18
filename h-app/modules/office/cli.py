@@ -128,7 +128,7 @@ def _message(
 
 def _send_command(argv: list[str]) -> None:
     parser = _operation_parser("send", "Send a message to one agent.")
-    parser.add_argument("-a", "--agent", metavar="AGENT", help="destination agent")
+    parser.add_argument("-a", "--agent", metavar="AGENT", required=True, help="destination agent")
     sources = parser.add_mutually_exclusive_group()
     sources.add_argument("--stdin", action="store_true", help="read message text from stdin")
     sources.add_argument("--file", type=Path, metavar="PATH", help="read message text from a file")
@@ -236,7 +236,7 @@ def _validate_mime_type(mime_type: str) -> None:
 
 def _send_file_command(argv: list[str]) -> None:
     parser = _operation_parser("send-file", "Send a file attachment to one agent.")
-    parser.add_argument("-a", "--agent", metavar="AGENT", help="destination agent")
+    parser.add_argument("-a", "--agent", metavar="AGENT", required=True, help="destination agent")
     parser.add_argument("path", type=Path, metavar="PATH", help="path to regular file")
     parser.add_argument("--caption", metavar="TEXT", help="optional caption")
     parser.add_argument(
@@ -407,7 +407,7 @@ def _peers_command(argv: list[str]) -> None:
 
 def _contexts_command(argv: list[str]) -> None:
     parser = _operation_parser("contexts", "List a claude_sdk agent's live memory contexts.")
-    parser.add_argument("-a", "--agent", metavar="AGENT", help="claude_sdk destination agent")
+    parser.add_argument("-a", "--agent", metavar="AGENT", required=True, help="claude_sdk destination agent")
     args = parser.parse_args(argv)
 
     if not args.agent:

@@ -498,11 +498,22 @@ def real_redis():
     return r
 
 
-def test_contexts_requires_agent_flag(real_redis, monkeypatch, capsys):
-    with patch("modules.office.cli._context", return_value=(real_redis, POD, TENANT, "architect")):
-        with pytest.raises(SystemExit):
-            office_main(["contexts"])
-    assert "requires -a" in capsys.readouterr().err
+def test_send_requires_agent_flag(capsys):
+    with pytest.raises(SystemExit):
+        office_main(["send"])
+    assert "-a/--agent" in capsys.readouterr().err
+
+
+def test_send_file_requires_agent_flag(capsys):
+    with pytest.raises(SystemExit):
+        office_main(["send-file", "dummy-path"])
+    assert "-a/--agent" in capsys.readouterr().err
+
+
+def test_contexts_requires_agent_flag(capsys):
+    with pytest.raises(SystemExit):
+        office_main(["contexts"])
+    assert "-a/--agent" in capsys.readouterr().err
 
 
 def test_contexts_rejects_unknown_agent(real_redis, monkeypatch, capsys):
