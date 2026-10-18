@@ -182,6 +182,19 @@ def test_root_help_lists_every_command_without_environment_or_redis(capsys):
         assert name in out
 
 
+def test_broken_pipe_during_dispatch_exits_quietly(monkeypatch):
+    # A downstream reader closing the pipe (e.g. `office list | head`) makes a
+    # write raise BrokenPipeError; main() should swallow it and exit 0, not dump
+    # a traceback. argv is passed (in-process), so fd 1 is left untouched.
+    def _raise_broken_pipe(_argv):
+        raise BrokenPipeError
+
+    monkeypatch.setattr(office_cli, "_dispatch", _raise_broken_pipe)
+    with pytest.raises(SystemExit) as exc:
+        office_main(["list"])
+    assert exc.value.code == 0
+
+
 def test_send_stdin_identity_reaches_recipient_on_real_redis(monkeypatch, capsys):
     """Pin h-mesh's working boundary by what the recipient opens.
 

@@ -1950,6 +1950,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     os.environ["H_MESH_LOG_QUIET"] = "1"
     try:
         _dispatch(list(sys.argv[1:] if argv is None else argv))
+    except BrokenPipeError:
+        # A downstream reader closed the pipe early (e.g. `office list | head`).
+        # Exit quietly instead of letting the BrokenPipeError surface as a
+        # traceback. Only for the real CLI (argv is None) do we also redirect
+        # fd 1 to os.devnull, so the interpreter's shutdown flush cannot
+        # re-raise on the dead pipe; in-process callers (the test suite always
+        # passes argv) must never have fd 1 clobbered.
+        if argv is None:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        raise SystemExit(0)
     finally:
         if previous_quiet is None:
             os.environ.pop("H_MESH_LOG_QUIET", None)
