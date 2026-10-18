@@ -253,7 +253,7 @@ class TmuxPortTests(unittest.TestCase):
 
         expected_msg = (
             f"[message from telegram] ping\n"
-            f'[reply to telegram: office send -a telegram --reply-to {stream_id} "..."]\n'
+            f'[reply to telegram: h-mesh-office send -a telegram --reply-to {stream_id} "..."]\n'
         )
         mock_submit.assert_called_once_with(
             "testtenant", "bob", expected_msg,

@@ -16,7 +16,7 @@ from lib.attachment_schema import validate_attachment_payload
 from lib.board_interaction import add_ticket
 from lib.paths import get_workdir_root
 from lib.reply_correlation import record_delivered
-from .ops import list_windows, submit_text
+from .ops import list_windows, submit_text, OFFICE_TOOLS_CMD
 
 # The CLIs that write a session file the switch can tail. An agent running
 # anything else — a bare shell — produces no activity, so a delivery to it can
@@ -118,7 +118,7 @@ def message_opener(
         # message (tmux-to-tmux included, where nothing would ever read it)
         # would be a permanent width tax on the line every agent actually
         # reads, for a benefit that only exists here. See lib/reply_correlation.py.
-        blocks.append(f"[reply to {source}: office send -a {source} --reply-to {stream_id} \"...\"]\n")
+        blocks.append(f"[reply to {source}: {OFFICE_TOOLS_CMD} send -a {source} --reply-to {stream_id} \"...\"]\n")
 
     msg = "".join(blocks)
     corr_id = envelope.get("correlation_id")
