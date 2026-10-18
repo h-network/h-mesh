@@ -1360,6 +1360,11 @@ def _done_command(argv: list[str]) -> None:
         choices=("completed", "passed", "failed"),
         help="completed work, or the verdict from review work",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print the full ticket as JSON instead of a one-line confirmation",
+    )
     args = parser.parse_args(argv)
     if args.outcome is None:
         if sys.stdin.isatty():
@@ -1371,17 +1376,24 @@ def _done_command(argv: list[str]) -> None:
                 "done requires --outcome {completed,passed,failed}; "
                 "use completed for ordinary work"
             )
-    _finish_command("done", args.id, outcome=args.outcome)
+    _finish_command("done", args.id, outcome=args.outcome, json_output=args.json)
 
 
 def _cancel_command(argv: list[str]) -> None:
     parser = _operation_parser("cancel", "Cancel your open task.")
     parser.add_argument("id", nargs="?", help="ticket id or unique prefix")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print the full ticket as JSON instead of a one-line confirmation",
+    )
     args = parser.parse_args(argv)
-    _finish_command("cancel", args.id)
+    _finish_command("cancel", args.id, json_output=args.json)
 
 
-def _finish_command(action: str, task_id: str | None, *, outcome: str | None = None) -> None:
+def _finish_command(
+    action: str, task_id: str | None, *, outcome: str | None = None, json_output: bool = False
+) -> None:
     r, pod, tenant, source = _context()
     keys = _task_keys(pod, tenant, source)
     # `done` requires a taken (doing) ticket; `cancel` may also drop an untaken
@@ -1409,7 +1421,12 @@ def _finish_command(action: str, task_id: str | None, *, outcome: str | None = N
     )
     log_event = "task_done" if action == "done" else "task_cancelled"
     _log_task(log_event, agent=source, ticket=ticket)
-    print(serialize_ticket(ticket))
+    if json_output:
+        print(serialize_ticket(ticket))
+    else:
+        verb = "done" if action == "done" else "cancelled"
+        detail = f" ({outcome})" if outcome else ""
+        print(f'{verb} {ticket["id"]}: "{ticket["title"]}"{detail}')
 
 
 def _return_command(argv: list[str]) -> None:

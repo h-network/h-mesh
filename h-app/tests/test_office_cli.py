@@ -1170,6 +1170,30 @@ def test_done_requires_and_lists_outcome(monkeypatch, capsys):
     assert "outcome:failed" in capsys.readouterr().out
 
 
+def test_done_prints_one_line_confirmation_by_default(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis()
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    r.lists[doing_key].append(json.dumps(_ticket("architect", status="doing")))
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["done", "--outcome", "completed"])
+    out = capsys.readouterr().out
+    assert out.strip() == 'done a1b2c3d4: "do the thing" (completed)'
+    assert '"v": 1' not in out and '"status"' not in out
+
+
+def test_done_json_flag_prints_full_ticket(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis()
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    r.lists[doing_key].append(json.dumps(_ticket("architect", status="doing")))
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["done", "--outcome", "completed", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "done"
+    assert payload["outcome"] == "completed"
+
+
 def test_cancel_removes_an_untaken_todo_ticket(monkeypatch):
     # `cancel` must work on a todo (never-taken) ticket, not only a doing one.
     _env(monkeypatch)
