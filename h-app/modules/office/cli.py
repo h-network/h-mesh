@@ -1384,14 +1384,17 @@ def _cancel_command(argv: list[str]) -> None:
 def _finish_command(action: str, task_id: str | None, *, outcome: str | None = None) -> None:
     r, pod, tenant, source = _context()
     keys = _task_keys(pod, tenant, source)
-    _, raw, ticket = _select(r, keys, ("doing",), task_id)
+    # `done` requires a taken (doing) ticket; `cancel` may also drop an untaken
+    # (todo) one -- it is still this agent's ticket to abandon.
+    states = ("doing",) if action == "done" else ("doing", "todo")
+    state, raw, ticket = _select(r, keys, states, task_id)
     ticket["status"] = "done" if action == "done" else "cancelled"
     ticket["done_ts"] = _now()
     if outcome is not None:
         ticket["outcome"] = outcome
     _transition_selected(
         r,
-        source_key=keys["doing"],
+        source_key=keys[state],
         destination_key=keys["done"],
         raw=raw,
         replacement=serialize_ticket(ticket),

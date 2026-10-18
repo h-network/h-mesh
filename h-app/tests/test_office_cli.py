@@ -1170,6 +1170,22 @@ def test_done_requires_and_lists_outcome(monkeypatch, capsys):
     assert "outcome:failed" in capsys.readouterr().out
 
 
+def test_cancel_removes_an_untaken_todo_ticket(monkeypatch):
+    # `cancel` must work on a todo (never-taken) ticket, not only a doing one.
+    _env(monkeypatch)
+    r = FakeRedis()
+    todo_key = prefix(POD, TENANT, "architect", "tasks.todo")
+    done_key = prefix(POD, TENANT, "architect", "tasks.done")
+    r.lists[todo_key].append(json.dumps(_ticket("architect", status="todo")))
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["cancel", "a1b2c3d4"])
+
+    assert r.lists[todo_key] == []
+    assert len(r.lists[done_key]) == 1
+    assert json.loads(r.lists[done_key][0])["status"] == "cancelled"
+
+
 @pytest.mark.parametrize(
     "command",
     [

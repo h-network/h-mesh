@@ -454,6 +454,7 @@ h-app/tests/test_office_cli.py::test_take_moves_todo_into_doing_using_board_inte
 h-app/tests/test_office_cli.py::test_take_refuses_when_doing_nonempty
 h-app/tests/test_office_cli.py::test_return_moves_doing_ticket_to_back_of_todo
 h-app/tests/test_office_cli.py::test_done_requires_and_lists_outcome
+h-app/tests/test_office_cli.py::test_cancel_removes_an_untaken_todo_ticket
 h-app/tests/test_office_cli.py::test_board_moves_preserve_doing_ticket_when_transition_fails_before_execution[command0]
 h-app/tests/test_office_cli.py::test_board_moves_preserve_doing_ticket_when_transition_fails_before_execution[command1]
 h-app/tests/test_office_cli.py::test_board_moves_preserve_doing_ticket_when_transition_fails_before_execution[command2]
