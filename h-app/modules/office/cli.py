@@ -501,7 +501,7 @@ def _status_row(r, *, pod: str, tenant: str, agent: str, now: datetime) -> str:
             if unverified_age
             else "; delivery unverified (age unknown)"
         )
-    return f"  {agent:<12}{state:<10}{task:<35}{activity}"
+    return f"  {agent:<12} {state:<10} {task:<35} {activity}"
 
 
 def _status_command(argv: list[str]) -> None:
@@ -1828,7 +1828,7 @@ def _usage_command(argv: list[str]) -> None:
         return
 
     has_rate_limits = any("rate_limits" in r for r in rows)
-    header = f"{'agent':<10}{'cli':<8}{'model':<23}{'input':>7}{'cache_r':>10}{'cache_w':>9}{'output':>9}{'USD':>10}"
+    header = f"{'agent':<10} {'cli':<8} {'model':<23} {'input':>7}{'cache_r':>10}{'cache_w':>9}{'output':>9}{'USD':>10}"
     if has_rate_limits:
         header += f"{'limit':>15}"
     print(header)
@@ -1840,7 +1840,7 @@ def _usage_command(argv: list[str]) -> None:
         out_str = "-" if is_uncollected else _format_token_count(row["output"])
         usd_str = "unpriced" if row["unpriced"] else f"{row['usd']:.2f}"
         line = (
-            f"{row['agent']:<10}{row['cli']:<8}{row['model']:<23}"
+            f"{row['agent']:<10} {row['cli']:<8} {row['model']:<23} "
             f"{in_str:>7}{cr_str:>10}{cw_str:>9}{out_str:>9}{usd_str:>10}"
         )
         if has_rate_limits:
@@ -1855,8 +1855,8 @@ def _usage_command(argv: list[str]) -> None:
             line += f"{rl_str:>15}"
         print(line)
     if rows:
-        print(f"{'':>66}{'------':>10}")
-        print(f"{'':>66}{total_usd:>10.2f}")
+        print(f"{'':>79}{'------':>10}")
+        print(f"{'':>79}{total_usd:>10.2f}")
 
 
 # ---------------------------------------------------------------------------

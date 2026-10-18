@@ -195,6 +195,25 @@ def test_broken_pipe_during_dispatch_exits_quietly(monkeypatch):
     assert exc.value.code == 0
 
 
+def test_status_row_long_agent_name_does_not_collide():
+    # A name longer than the 12-wide agent column must not run straight into the
+    # next column (the reported overlap) -- there must be whitespace after it.
+    class _EmptyRedis:
+        def hgetall(self, *a, **k):
+            return {}
+
+        def lrange(self, *a, **k):
+            return []
+
+    agent = "a-very-long-agent-name"  # 22 chars > the 12-wide column
+    row = office_cli._status_row(
+        _EmptyRedis(), pod="p", tenant="t", agent=agent,
+        now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    after_name = row[row.index(agent) + len(agent):]
+    assert after_name[:1] == " "
+
+
 def test_send_stdin_identity_reaches_recipient_on_real_redis(monkeypatch, capsys):
     """Pin h-mesh's working boundary by what the recipient opens.
 
@@ -1882,7 +1901,7 @@ def test_status_does_not_report_active_empty_board_as_blocked_by_delivery_marker
         office_main(["status", "ci-agent"])
 
     row = capsys.readouterr().out
-    assert "ci-agent    idle" in row
+    assert "ci-agent     idle" in row
     assert "ci-agent    blocked" not in row
     assert "—" in row
     assert "last activity 8s ago" in row
@@ -1902,8 +1921,8 @@ def test_status_keeps_unknown_presence_unknown_with_delivery_marker(monkeypatch,
         office_main(["status", "ci-agent"])
 
     row = capsys.readouterr().out
-    assert "ci-agent    unknown" in row
-    assert "ci-agent    idle" not in row
+    assert "ci-agent     unknown" in row
+    assert "ci-agent     idle" not in row
     assert "no activity feed; delivery unverified" in row
 
 
@@ -1921,7 +1940,7 @@ def test_status_keeps_delivery_marker_visible_when_its_age_is_malformed(monkeypa
         office_main(["status", "ci-agent"])
 
     row = capsys.readouterr().out
-    assert "ci-agent    idle" in row
+    assert "ci-agent     idle" in row
     assert "delivery unverified (age unknown)" in row
 
 
