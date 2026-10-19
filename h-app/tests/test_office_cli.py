@@ -1210,6 +1210,22 @@ def test_cancel_removes_an_untaken_todo_ticket(monkeypatch):
     assert json.loads(r.lists[done_key][0])["status"] == "cancelled"
 
 
+def test_list_distinguishes_cancelled_from_completed_in_done():
+    # Both land in the done list; a cancelled ticket must not look like a
+    # completed one (the reported ambiguity).
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    completed = office_cli._ticket_line(
+        _ticket("architect", status="done", outcome="completed"), state="done", now=now
+    )
+    cancelled = office_cli._ticket_line(
+        _ticket("architect", status="cancelled"), state="done", now=now
+    )
+    assert "outcome:completed" in completed
+    assert "cancelled" in cancelled
+    assert "cancelled" not in completed
+    assert completed != cancelled
+
+
 @pytest.mark.parametrize(
     "command",
     [

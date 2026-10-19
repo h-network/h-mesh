@@ -1127,8 +1127,11 @@ def _ticket_line(ticket: dict, *, state: str, now: datetime) -> str:
         line += f"  age:{age}"
     if state == "hold" and ticket.get("hold_reason"):
         line += f"  reason:{' '.join(ticket['hold_reason'].split())}"
-    if state == "done" and ticket.get("outcome"):
-        line += f"  outcome:{ticket['outcome']}"
+    if state == "done":
+        if ticket.get("status") == "cancelled":
+            line += "  cancelled"
+        elif ticket.get("outcome"):
+            line += f"  outcome:{ticket['outcome']}"
     return line
 
 
