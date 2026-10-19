@@ -195,6 +195,26 @@ def test_broken_pipe_during_dispatch_exits_quietly(monkeypatch):
     assert exc.value.code == 0
 
 
+def test_broken_pipe_on_final_flush_exits_quietly(monkeypatch):
+    # The reader may close the pipe with output still buffered, so dispatch
+    # succeeds and the only BrokenPipeError is the final stdout flush. main()
+    # must catch that too (it flushes inside the try), not let it escape to the
+    # interpreter's shutdown flush as a traceback.
+    monkeypatch.setattr(office_cli, "_dispatch", lambda _argv: None)
+
+    class _BrokenStdout:
+        def write(self, *a, **k):
+            return 0
+
+        def flush(self):
+            raise BrokenPipeError
+
+    monkeypatch.setattr(office_cli.sys, "stdout", _BrokenStdout())
+    with pytest.raises(SystemExit) as exc:
+        office_main(["list"])
+    assert exc.value.code == 0
+
+
 def test_status_row_long_agent_name_does_not_collide():
     # A name longer than the 12-wide agent column must not run straight into the
     # next column (the reported overlap) -- there must be whitespace after it.
