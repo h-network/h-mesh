@@ -701,14 +701,6 @@ def write_agent_guide(
         # instructionFiles override to claude-md/managed-only.)
         with open(os.path.join(cwd, "AGENTS.md"), "w", encoding="utf-8") as f:
             f.write(content)
-        # Remove a CLAUDE.md left by an older dual-writing build. claude prefers
-        # CLAUDE.md over AGENTS.md, so a stale copy would shadow the guide just
-        # written and never pick up updates -- stepping off CLAUDE.md means it
-        # must not be left behind. Per-agent workdir only (never a repo-root one).
-        try:
-            os.remove(os.path.join(cwd, "CLAUDE.md"))
-        except OSError:
-            pass
 
         # ⚠ SEED THE PROFILE DIR BEFORE TRUST, AND THE ORDER IS LOAD-BEARING.
         # A CLI pointed at CLAUDE_CONFIG_DIR=~/.claude-<profile> does NOT fall

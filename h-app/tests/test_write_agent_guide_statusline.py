@@ -127,23 +127,6 @@ def test_write_agent_guide_writes_only_agents_md_not_claude_md(tmp_path, monkeyp
     assert not (cwd / "CLAUDE.md").exists()
 
 
-def test_write_agent_guide_removes_stale_claude_md(tmp_path, monkeypatch):
-    # An older dual-writing build may have left a CLAUDE.md; write_agent_guide
-    # must remove it so it can't shadow the AGENTS.md we now rely on (claude
-    # prefers CLAUDE.md over AGENTS.md).
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    cwd = tmp_path / "workdir" / "testagent"
-    cwd.mkdir(parents=True)
-    (cwd / "CLAUDE.md").write_text("stale guide from an older build", encoding="utf-8")
-
-    write_agent_guide(str(cwd), "testagent", cli="claude")
-
-    assert (cwd / "AGENTS.md").is_file()
-    assert not (cwd / "CLAUDE.md").exists()
-
-
 def test_write_agent_guide_with_env_operator_entrance_and_enrolled(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
