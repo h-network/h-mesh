@@ -1226,6 +1226,32 @@ def test_list_distinguishes_cancelled_from_completed_in_done():
     assert completed != cancelled
 
 
+def test_unhold_resumes_a_held_ticket(monkeypatch, capsys):
+    # `unhold` is an alias for `take`; it resumes a held ticket into doing.
+    _env(monkeypatch)
+    r = FakeRedis()
+    hold_key = prefix(POD, TENANT, "architect", "tasks.hold")
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    r.lists[hold_key].append(json.dumps(_ticket("architect", status="hold")))
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["unhold", "a1b2c3d4"])
+    assert r.lists[hold_key] == []
+    assert len(r.lists[doing_key]) == 1
+    assert json.loads(r.lists[doing_key][0])["status"] == "doing"
+
+
+def test_list_shows_resume_hint_for_held_tickets(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis()
+    hold_key = prefix(POD, TENANT, "architect", "tasks.hold")
+    r.lists[hold_key].append(json.dumps(_ticket("architect", status="hold")))
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["list"])
+    out = capsys.readouterr().out
+    assert "unhold" in out
+    assert "take <id>" in out
+
+
 @pytest.mark.parametrize(
     "command",
     [
