@@ -693,14 +693,10 @@ def write_agent_guide(
                 enrolled_entrances=enrolled_entrances, raise_on_invalid=False,
             )
 
-        # Only AGENTS.md. claude's default instructionFiles mode
-        # (claude-md-or-agents-md) loads AGENTS.md exactly where/how it would
-        # CLAUDE.md when no CLAUDE.md is present, so codex, agy, and claude all
-        # read a single guide file. (Verified against Claude Code 2.1.302; see
-        # issue #31. Requires a claude new enough for that default and no
-        # instructionFiles override to claude-md/managed-only.)
-        with open(os.path.join(cwd, "AGENTS.md"), "w", encoding="utf-8") as f:
-            f.write(content)
+        for filename in ("AGENTS.md", "CLAUDE.md"):
+            file_path = os.path.join(cwd, filename)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(content)
 
         # ⚠ SEED THE PROFILE DIR BEFORE TRUST, AND THE ORDER IS LOAD-BEARING.
         # A CLI pointed at CLAUDE_CONFIG_DIR=~/.claude-<profile> does NOT fall
