@@ -2006,7 +2006,22 @@ def test_broadcast_resolves_tmux_peers_without_self(mock_send, monkeypatch):
     mock_send.return_value = "stream-1"
     r = FakeRedis(registry={"architect": "tmux", "backend": "tmux", "frontend": "tmux", "api": "api"})
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
-        office_main(["broadcast", "standup", "in", "five"])
+        office_main(["broadcast", "standup in five"])
     destinations = {call.kwargs["destination"] for call in mock_send.call_args_list}
     assert destinations == {"backend", "frontend"}
     assert mock_send.call_args_list[0].kwargs["payload"] == {"text": "standup in five"}
+
+
+@patch("modules.office.cli.send")
+def test_broadcast_reads_stdin(mock_send, monkeypatch):
+    _env(monkeypatch)
+    mock_send.return_value = "stream-1"
+    r = FakeRedis(registry={"architect": "tmux", "backend": "tmux", "api": "api"})
+    with (
+        patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")),
+        patch("modules.office.cli.sys.stdin", io.StringIO("multi\nline body")),
+    ):
+        office_main(["broadcast", "--stdin"])
+    destinations = {call.kwargs["destination"] for call in mock_send.call_args_list}
+    assert destinations == {"backend"}
+    assert mock_send.call_args_list[0].kwargs["payload"] == {"text": "multi\nline body"}
