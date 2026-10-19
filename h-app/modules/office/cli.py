@@ -1993,6 +1993,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     os.environ["H_MESH_LOG_QUIET"] = "1"
     try:
         _dispatch(list(sys.argv[1:] if argv is None else argv))
+        # Flush inside the try: if a reader closed the pipe with output still
+        # buffered, the BrokenPipeError surfaces here (and is caught below)
+        # rather than from the interpreter's shutdown flush after main()
+        # returns, where this handler could no longer catch it.
+        sys.stdout.flush()
     except BrokenPipeError:
         # A downstream reader closed the pipe early (e.g. `office list | head`).
         # Exit quietly instead of letting the BrokenPipeError surface as a
