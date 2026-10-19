@@ -503,6 +503,7 @@ h-app/tests/test_office_cli.py::test_status_does_not_report_active_empty_board_a
 h-app/tests/test_office_cli.py::test_status_keeps_unknown_presence_unknown_with_delivery_marker
 h-app/tests/test_office_cli.py::test_status_keeps_delivery_marker_visible_when_its_age_is_malformed
 h-app/tests/test_office_cli.py::test_broadcast_resolves_tmux_peers_without_self
+h-app/tests/test_office_cli.py::test_broadcast_reads_stdin
 h-app/tests/test_office_port.py::test_lifecycle_validation_failure_is_explicit_rejection
 h-app/tests/test_office_port.py::test_lifecycle_unknown_failure_is_not_misclassified_as_rejection
 h-app/tests/test_office_port.py::test_late_validation_rejection_writes_nothing_and_is_dead_letterable

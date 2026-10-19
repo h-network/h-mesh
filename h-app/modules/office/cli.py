@@ -126,6 +126,31 @@ def _message(
     )
 
 
+def _resolve_message_text(args, command: str) -> str:
+    """Resolve one message body from positional text, --stdin, or --file.
+
+    Shared by send and broadcast so both reject the same conflicts with the
+    same wording.
+    """
+    if (args.stdin or args.file is not None) and args.text is not None:
+        raise OfficeError(
+            f"office {command} accepts exactly one of positional text, --stdin, or --file"
+        )
+    if args.stdin:
+        text = sys.stdin.read()
+        if text == "":
+            raise OfficeError(f"office {command} --stdin received no message text")
+        return text
+    if args.file is not None:
+        try:
+            return args.file.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise OfficeError(f"cannot read message file {str(args.file)!r}: {exc}") from exc
+    if args.text is not None:
+        return args.text
+    raise OfficeError(f"office {command} requires message text, --stdin, or --file")
+
+
 def _send_command(argv: list[str]) -> None:
     parser = _operation_parser("send", "Send a message to one agent.")
     parser.add_argument("-a", "--agent", metavar="AGENT", required=True, help="destination agent")
@@ -161,21 +186,7 @@ def _send_command(argv: list[str]) -> None:
 
     if not args.agent:
         raise OfficeError("office send requires -a <agent>")
-    if (args.stdin or args.file is not None) and args.text is not None:
-        raise OfficeError("office send accepts exactly one of positional text, --stdin, or --file")
-    if args.stdin:
-        text = sys.stdin.read()
-        if text == "":
-            raise OfficeError("office send --stdin received no message text")
-    elif args.file is not None:
-        try:
-            text = args.file.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise OfficeError(f"cannot read message file {str(args.file)!r}: {exc}") from exc
-    elif args.text is not None:
-        text = args.text
-    else:
-        raise OfficeError("office send requires message text, --stdin, or --file")
+    text = _resolve_message_text(args, "send")
 
     if args.reply_to is not None and not is_valid_reply_id(args.reply_to):
         raise OfficeError(
@@ -333,11 +344,16 @@ def _send_file_command(argv: list[str]) -> None:
 
 def _broadcast_command(argv: list[str]) -> None:
     parser = _operation_parser("broadcast", "Send a message to every peer agent.")
-    parser.add_argument("text", nargs=argparse.REMAINDER, help="message text")
-    if argv in (["-h"], ["--help"]):
-        parser.parse_args(argv)
-    if not argv:
-        raise OfficeError("office broadcast requires message text")
+    sources = parser.add_mutually_exclusive_group()
+    sources.add_argument("--stdin", action="store_true", help="read message text from stdin")
+    sources.add_argument("--file", type=Path, metavar="PATH", help="read message text from a file")
+    parser.add_argument(
+        "text",
+        nargs="?",
+        help="one quoted message argument; use -- before text that begins with a dash",
+    )
+    args = parser.parse_args(argv)
+    text = _resolve_message_text(args, "broadcast")
 
     r, pod, tenant, source = _context()
     recipients = sorted(
@@ -346,7 +362,7 @@ def _broadcast_command(argv: list[str]) -> None:
         if agent != source and port_type(r, pod=pod, tenant=tenant, agent=agent) == "tmux"
     )
     for destination in recipients:
-        print(_message(r, pod=pod, tenant=tenant, source=source, destination=destination, text=" ".join(argv)))
+        print(_message(r, pod=pod, tenant=tenant, source=source, destination=destination, text=text))
 
 
 def _peers_command(argv: list[str]) -> None:
