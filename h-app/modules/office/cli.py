@@ -1162,6 +1162,8 @@ def _list_one(r, *, pod: str, tenant: str, agent: str, heading: bool, now: datet
         if tickets:
             for ticket in tickets:
                 print(f"{indent}  {_ticket_line(ticket, state=state, now=now)}")
+            if state == "hold":
+                print(f"{indent}  (resume with: take <id> or unhold <id>)")
         else:
             print(f"{indent}  (empty)")
     invalid = r.lrange(keys["invalid"], 0, -1)
@@ -1929,13 +1931,13 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("unresolved",), "show unresolved delivery outcomes", _unresolved_command),
     (("undeliverable",), "show messages not opened before retirement", _undeliverable_command),
     (("retired-inbox",), "show api agents' inbox content conserved at retirement", _retired_inbox_command),
-    (("take",), "take your next todo task", _take_command),
+    (("take", "unhold"), "take (or unhold) a todo or held task into doing", _take_command),
     (("done",), "finish your open task and record its outcome", _done_command),
     (("cancel",), "cancel your open task", _cancel_command),
     (("return",), "return your open task to todo", _return_command),
     (("show",), "read one ticket without changing it", _show_command),
     (("retitle",), "correct the title of your open task", _retitle_command),
-    (("hold",), "put an active or queued task on hold", _hold_command),
+    (("hold",), "pause (hold) an active or queued task; resume with take/unhold", _hold_command),
     (("delete",), "permanently remove a task from your own board", _delete_command),
     (("add",), "add a task to another agent's board", _add_command),
     (("clone-to-all",), "clone a repository into agent workspaces", _clone_to_all_command),
