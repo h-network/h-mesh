@@ -1417,9 +1417,11 @@ def _finish_command(
 ) -> None:
     r, pod, tenant, source = _context()
     keys = _task_keys(pod, tenant, source)
-    # `done` requires a taken (doing) ticket; `cancel` may also drop an untaken
-    # (todo) one -- it is still this agent's ticket to abandon.
-    states = ("doing",) if action == "done" else ("doing", "todo")
+    # `done` acts only on the taken (doing) ticket. `cancel <id>` may also drop
+    # an untaken (todo) one, but bare `cancel` (no id) still abandons the single
+    # active ticket -- key on whether an id was given, like `hold` does, so a
+    # todo backlog doesn't make the no-id form ambiguous.
+    states = ("doing",) if action == "done" or task_id is None else ("doing", "todo")
     state, raw, ticket = _select(r, keys, states, task_id)
     ticket["status"] = "done" if action == "done" else "cancelled"
     ticket["done_ts"] = _now()

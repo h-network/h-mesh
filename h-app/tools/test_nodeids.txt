@@ -457,6 +457,7 @@ h-app/tests/test_office_cli.py::test_done_requires_and_lists_outcome
 h-app/tests/test_office_cli.py::test_done_prints_one_line_confirmation_by_default
 h-app/tests/test_office_cli.py::test_done_json_flag_prints_full_ticket
 h-app/tests/test_office_cli.py::test_cancel_removes_an_untaken_todo_ticket
+h-app/tests/test_office_cli.py::test_cancel_without_id_abandons_active_ticket_despite_todo_backlog
 h-app/tests/test_office_cli.py::test_list_distinguishes_cancelled_from_completed_in_done
 h-app/tests/test_office_cli.py::test_unhold_resumes_a_held_ticket
 h-app/tests/test_office_cli.py::test_list_shows_resume_hint_for_held_tickets

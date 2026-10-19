@@ -1210,6 +1210,27 @@ def test_cancel_removes_an_untaken_todo_ticket(monkeypatch):
     assert json.loads(r.lists[done_key][0])["status"] == "cancelled"
 
 
+def test_cancel_without_id_abandons_active_ticket_despite_todo_backlog(monkeypatch, capsys):
+    # Bare `cancel` (no id) must still abandon the single active (doing) ticket
+    # even with a todo backlog present -- it must not become ambiguous.
+    _env(monkeypatch)
+    r = FakeRedis()
+    todo_key = prefix(POD, TENANT, "architect", "tasks.todo")
+    doing_key = prefix(POD, TENANT, "architect", "tasks.doing")
+    done_key = prefix(POD, TENANT, "architect", "tasks.done")
+    r.lists[todo_key].append(json.dumps(_ticket("architect", task_id="todo0001", status="todo")))
+    r.lists[doing_key].append(json.dumps(_ticket("architect", task_id="doin0001", status="doing")))
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["cancel"])
+
+    assert r.lists[doing_key] == []
+    assert len(r.lists[todo_key]) == 1  # backlog untouched
+    cancelled = [json.loads(x) for x in r.lists[done_key]]
+    assert len(cancelled) == 1
+    assert cancelled[0]["id"] == "doin0001" and cancelled[0]["status"] == "cancelled"
+
+
 def test_list_distinguishes_cancelled_from_completed_in_done():
     # Both land in the done list; a cancelled ticket must not look like a
     # completed one (the reported ambiguity).
