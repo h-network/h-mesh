@@ -29,3 +29,28 @@ is exactly the condition that already gated this hint line before the id
 existed. `record_delivered()` (`lib/reply_correlation.py`) runs on every
 delivery regardless of source type, so a later `--reply-to` can be
 validated against real provenance.
+
+## Agent guide
+
+`write_agent_guide` (called by `create_window` on every hire/reconcile, and by
+`ensure_server_and_session` for the first window) renders `generate_agents_md`
+and writes the identical text to both `AGENTS.md` and `CLAUDE.md` in the
+agent's directory.
+
+The guide deliberately carries **no operator-authority text**: earlier versions
+added a per-entrance block ("routing provenance, not cryptographic proof of
+identity", "operator coordination authority cannot attach...") and an
+"Interface entries may only accept specific envelope kinds" sentence. Agents,
+claude especially, read those as a reason to refuse or to demand an architect
+ack for legitimate Telegram/api messages (issue #5), so they were removed.
+What remains on the subject is the `⚠` external-door paragraph and the
+"destructive, ambiguous, or outside scope: ask the lead first" rule.
+
+`operator_entrance` / `OPERATOR_ENTRANCE`, `enrolled_entrances` and
+`raise_on_invalid` are still accepted and still validated, but now only choose
+the wording of the "colleagues only -- ..." sentence (and log an error for an
+unenrolled entrance); they no longer add guide text of their own.
+
+⚠ A guide is only (re)written when a window is created. Agents that are already
+running keep their old `AGENTS.md`/`CLAUDE.md` until their window is next
+created (hire, or the reconciler recreating a missing window).
