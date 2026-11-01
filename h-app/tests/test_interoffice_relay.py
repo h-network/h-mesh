@@ -2,9 +2,11 @@ import io
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
@@ -18,6 +20,7 @@ from lib.agentlifecycle.lifecycle import start_agent
 from modules.api.port import deliver_api
 from modules.interoffice.relay import InterofficeRelay, OfficeWorker, sse_events
 from modules.interoffice.store import RelayStateError, Store, cursor_order, parse_office
+from services.daemons import pid_alive, start_daemons, stop_daemons
 
 TOKEN = "coop." + "a" * 16 + "." + "b" * 43
 REPLY_ID = "c" * 32
@@ -177,6 +180,40 @@ def test_early_reply_waits_for_the_post_receipt_mapping(store):
     writer.join()
     assert egress(store)[0]["l2"]["destination"] == "alice"
     assert store.cursor(office) == "10-0"
+
+
+def test_daemon_launcher_reads_redis_credentials_without_exporting_them(store, sse_server, managed_tmpdir):
+    office = add_office(store, sse_server.url)
+    sender_record(store)
+    sse_server.responses = [frame(message())]
+    tmpdir = Path(managed_tmpdir("h_mesh_test_relay_"))
+    run_dir = tmpdir / "run"
+    env = {
+        "PATH": os.defpath, "HOME": str(tmpdir),
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+        "POD": store.pod, "TENANT": store.tenant,
+        "REDIS_URL": os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"),
+        "H_MESH_ALLOW_PLAINTEXT": "1",
+        "TMUX_TMPDIR": str(tmpdir), "TMUX_SESSION": "relay-test",
+        "TMUX_SOCKET": str(tmpdir / "isolated.sock"),
+    }
+    try:
+        pids = start_daemons(
+            python=Path(sys.executable), run_dir=run_dir, env=env,
+            daemon_modules={"interoffice_relay": "services.interoffice_relay"},
+        )
+        pid = pids["interoffice_relay"]
+        wait_until(lambda: store.cursor(office) == "10-0")
+        assert pid_alive(pid)
+        assert TOKEN.encode() not in Path(f"/proc/{pid}/cmdline").read_bytes()
+        assert TOKEN.encode() not in Path(f"/proc/{pid}/environ").read_bytes()
+        logs = (run_dir / "interoffice_relay.log").read_text()
+        assert TOKEN not in logs
+        assert "hello from the remote office" not in logs
+        assert len(egress(store)) == 1
+    finally:
+        stop_daemons(run_dir, env=env)
+    assert not pid_alive(pid)
 
 
 @pytest.mark.parametrize("record", [
