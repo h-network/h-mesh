@@ -199,12 +199,13 @@ is also accepted). The runner clones into `~/ci/r`, creates `~/ci/v` once,
 and installs the requested branch into a fresh short-path worktree for each
 run. Use `~/ci/run-suite.sh --refresh <branch>` to refresh dependencies;
 ordinary runs retain dependencies and rebind the editable install to the new
-worktree. Required host tools include Python 3 with venv support, Git, flock,
-tmux, and a working user systemd manager. Provide `redis-server` on the clean
+worktree. Required host tools include Python 3 with venv support, Git, an
+advisory file lock utility, tmux, and a working user systemd manager. Provide
+`redis-server` on the clean
 system PATH or through an owned wrapper in `~/ci/bin`.
 
-One `flock` covers fetching, installation, execution, and cleanup. Concurrent
-callers print a waiting message and time out after 900 seconds; set
+One advisory file lock covers fetching, installation, execution, and cleanup.
+Concurrent callers print a waiting message and time out after 900 seconds; set
 `CI_LOCK_TIMEOUT` explicitly to change that wait. Runs abort before setup and
 again before execution if available RAM is below 1.5 GiB. A higher threshold
 can be requested with `CI_MIN_AVAILABLE_KB`; thresholds below 1572864 KiB are

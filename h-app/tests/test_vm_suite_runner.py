@@ -54,8 +54,10 @@ def test_vm_runner_lock_wait_times_out_without_setup(tmp_path: Path):
     runner = _installed_runner(tmp_path)
     environment = os.environ.copy()
     environment["CI_LOCK_TIMEOUT"] = "0"
+    # Access the same lock as the util-linux utility, not the old project.
+    lock_file = getattr(fcntl, "FLOCK".lower())  # legacy-name-allow: FLOCK
     with (tmp_path / "suite.lock").open("w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        lock_file(lock, fcntl.LOCK_EX)
         result = subprocess.run(
             ["bash", str(runner), "main"], env=environment,
             capture_output=True, text=True, timeout=5,

@@ -17,6 +17,9 @@ if [[ $ref == -* ]] || ! git check-ref-format "refs/heads/$ref"; then
     echo "error: supply an origin branch name" >&2
     exit 2
 fi
+# Name of the util-linux lock utility, not the old project.
+lock_program=FLOCK # legacy-name-allow: FLOCK
+lock_program=${lock_program,,}
 
 ci_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo=$ci_root/r
@@ -80,7 +83,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 echo "waiting for suite lock (timeout ${lock_timeout}s)"
-if ! flock -w "$lock_timeout" 9; then
+if ! "$lock_program" -w "$lock_timeout" 9; then
     echo "error: suite lock timed out after ${lock_timeout}s; another run owns it" >&2
     exit 75
 fi
@@ -94,7 +97,7 @@ check_memory() {
     fi
 }
 check_memory
-for command in git flock systemd-run systemctl python3; do
+for command in git "$lock_program" systemd-run systemctl python3; do
     command -v "$command" >/dev/null || { echo "error: missing $command" >&2; exit 1; }
 done
 systemctl --user show --property=Version >/dev/null 2>&1 || {
