@@ -5,7 +5,8 @@
 # (agent roster, CLI/account choices, local model provider) when run at a
 # terminal, seeds the fixed lifecycle participants (host->office, api->api)
 # in the Redis registry, starts the required daemons (h-mesh-switch,
-# h-mesh-tmux-reconciler, h-mesh-watchdog, and -- only once Telegram is
+# h-mesh-tmux-reconciler, h-mesh-watchdog, the idle inter-office reply relay,
+# and -- only once Telegram is
 # configured -- h-mesh-api, the Telegram bot, and h-mesh-session), and
 # hires any agent from the wizard's roster that isn't already running.
 #
@@ -888,7 +889,7 @@ print(f"✓ Registry seeded ({registry_key}): host -> office, api -> api")
 echo
 
 # 6. Start required daemons (h-mesh-switch, h-mesh-tmux-reconciler,
-#    h-mesh-watchdog, plus api/telegram_bot/session once Telegram is
+#    h-mesh-watchdog, the inter-office reply relay, plus api/telegram_bot/session once Telegram is
 #    configured -- see services.daemons.enabled_daemon_modules)
 if [ "$NO_DAEMONS" -eq 0 ]; then
     RUN_DIR="${H_MESH_RUN_DIR:-$HOME/.h-mesh/run/${TENANT}}"
