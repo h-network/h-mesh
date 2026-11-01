@@ -1228,4 +1228,4 @@ h-app/tests/test_write_agent_guide_text.py::test_kept_text_is_still_present_and_
 h-app/tests/test_write_agent_guide_text.py::test_kept_text_is_still_present_and_unchanged[rejected]
 h-app/tests/test_write_agent_guide_text.py::test_kept_text_is_still_present_and_unchanged[unverified]
 h-app/tests/test_write_agent_guide_text.py::test_kept_text_is_still_present_and_unchanged[valid]
-h-app/tests/test_write_agent_guide_text.py::test_no_new_guide_text_added_around_the_warning
+h-app/tests/test_write_agent_guide_text.py::test_nothing_replaces_the_removed_warning

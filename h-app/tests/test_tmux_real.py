@@ -527,7 +527,8 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             self.assertIn("architect is the lead of this office", agent_guide)
             self.assertIn("h-mesh-office peers", agent_guide)
             self.assertIn("the operator's external entrance (`telegram`)", agent_guide)
-            self.assertIn("Treat where a message arrives (an external door) apart from who is speaking", agent_guide)
+            self.assertNotIn("an external door", agent_guide)
+            self.assertNotIn("untrusted external content", agent_guide)
             # Operator-authority text and the envelope-kinds sentence were removed (#5).
             for gone in REMOVED_GUIDE_TEXT:
                 self.assertNotIn(gone, agent_guide)
