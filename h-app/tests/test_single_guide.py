@@ -330,3 +330,67 @@ def test_reconciler_retries_a_sweep_blocked_by_claude_version(env, monkeypatch):
     monkeypatch.setattr(ops, "_claude_version", lambda: TESTED)
     rec._migrate_guides(_R(), {"worker"})
     assert not (env.cwd / "CLAUDE.md").exists()
+
+
+def _rec_logging(env, monkeypatch):
+    monkeypatch.setenv("H_MESH_WORKDIR", str(env.cwd.parent))
+    monkeypatch.setattr(
+        "modules.tmux.reconciler.log_record",
+        lambda m, e, **kw: env.logged.append((e, kw.get("reason", ""))),
+    )
+    return TmuxReconciler(pod="p", tenant="t", redis_url="redis://unused")
+
+
+def test_a_version_blocked_sweep_logs_once_not_every_poll(env, monkeypatch):
+    rec = _rec_logging(env, monkeypatch)
+    _live(env, "guide\n")
+    monkeypatch.setattr(ops, "_claude_version", lambda: None)
+    for _ in range(5):
+        rec._migrate_guides(_R(), {"worker"})
+    blocked = [r for e, r in env.logged if e == "guide_migrated"]
+    assert blocked == ["kept: claude --version is unavailable"]
+    assert "worker" not in rec._guide_migrated
+    monkeypatch.setattr(ops, "_claude_version", lambda: TESTED)
+    rec._migrate_guides(_R(), {"worker"})
+    assert [r for e, r in env.logged if e == "guide_migrated"][-1] == "removed"
+    assert "worker" in rec._guide_migrated
+
+
+def test_only_the_version_block_is_retried(env, monkeypatch):
+    rec = _rec_logging(env, monkeypatch)
+    monkeypatch.setattr(ops, "_claude_version", lambda: TESTED)
+    _live(env, "mine, not generated\n")  # foreign: final
+    rec._migrate_guides(_R(), {"worker"})
+    assert "worker" in rec._guide_migrated
+    assert (env.cwd / "CLAUDE.md").read_text(encoding="utf-8") == "mine, not generated\n"
+
+
+def test_a_settings_override_is_final_not_retried(env, monkeypatch):
+    rec = _rec_logging(env, monkeypatch)
+    monkeypatch.setattr(ops, "_claude_version", lambda: TESTED)
+    _live(env, "guide\n")
+    _put(SOURCES["project"](env), {"instructionFiles": "claude-md"})
+    rec._migrate_guides(_R(), {"worker"})
+    assert "worker" in rec._guide_migrated and (env.cwd / "CLAUDE.md").exists()
+
+
+def test_claude_updating_mid_process_converts_hire_then_sweep(env, monkeypatch):
+    rec = _rec_logging(env, monkeypatch)
+    monkeypatch.setattr(ops, "_claude_version", lambda: None)  # installer not done
+    agents, claude = _write(env)
+    assert claude.exists()  # dual-write while claude is unusable
+    rec._migrate_guides(_R(), {"worker"})
+    assert claude.exists() and "worker" not in rec._guide_migrated
+    monkeypatch.setattr(ops, "_claude_version", lambda: (2, 1, 302))  # floor boundary
+    rec._migrate_guides(_R(), {"worker"})
+    assert not claude.exists() and agents.exists()
+
+
+def test_recreating_a_window_puts_the_agent_back_in_the_sweep(env, monkeypatch):
+    rec = _rec_logging(env, monkeypatch)
+    rec._guide_migrated.add("worker")
+    monkeypatch.setattr("modules.tmux.reconciler.tmux_ops.create_window", lambda *a, **k: (0, "", ""))
+    monkeypatch.setattr("modules.tmux.reconciler.members", lambda *a, **k: set())
+    monkeypatch.setattr(rec, "log_window_created", lambda *a, **k: None)
+    assert rec.create_window(_R(), "worker", cli=None) is True
+    assert "worker" not in rec._guide_migrated

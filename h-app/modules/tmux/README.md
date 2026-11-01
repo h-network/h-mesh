@@ -79,6 +79,14 @@ rewritten); otherwise it is kept. Each outcome is logged as a `guide_migrated`
 event. A live claude session keeps what it already loaded; the change takes effect
 at its next start.
 
+**Retry.** A sweep blocked only by claude's version (`kept: claude ...`: unavailable
+or older than the floor) is not final: claude can self-update after the reconciler
+started, so the agent is re-checked on every reconcile (the version probe itself
+runs at most once per 30 s) and the status is logged only when it changes. Every
+other outcome (foreign `CLAUDE.md`, settings override, ancestor `CLAUDE.md`, no
+`AGENTS.md`) is final for the process. An agent whose window is recreated goes
+back into the sweep, since its guide was just rewritten.
+
 **What cannot be detected:** organisation/remote policy settings (not readable
 from files); settings added after the last check; a claude binary replaced
 under a running reconciler (the version is cached for 30 s); the agent

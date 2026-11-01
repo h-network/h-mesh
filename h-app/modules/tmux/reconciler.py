@@ -200,6 +200,7 @@ class TmuxReconciler:
                 if initial_window != "__init__":
                     self.log_window_created(r, initial_window)
                     self._spawned_agents[initial_window] = time.monotonic()
+                    self._guide_migrated.discard(initial_window)
 
         # Set session & server options
         tmux_ops.run_tmux("set-option", "-g", "exit-empty", "off", socket=self.socket)
@@ -263,6 +264,10 @@ class TmuxReconciler:
             except Exception:
                 pass
             self._spawned_agents[agent_name] = time.monotonic()
+            # The guide was just rewritten (possibly as the dual-write, if claude
+            # was not usable yet), so a window recreated for an agent the sweep
+            # had already finished must be looked at again.
+            self._guide_migrated.discard(agent_name)
             return True
         else:
             try:

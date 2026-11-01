@@ -644,8 +644,9 @@ def _seed_profile_dirs(profile: str | None) -> None:
 #
 # claude reads CLAUDE.md, and -- when a project has none of its own -- falls
 # back to AGENTS.md (its `instructionFiles` setting, default
-# `claude-md-or-agents-md`). Tested by the operator on Claude Code 2.1.316, which
-# is also the floor below. codex/agy read AGENTS.md directly.
+# `claude-md-or-agents-md`). Issue #31 verified this against Claude Code 2.1.302,
+# which is the floor below; the operator also confirmed it live on 2.1.316.
+# codex/agy read AGENTS.md directly.
 #
 # ⚠ A "no CLAUDE.md" guide is a guide-less claude agent if that fallback does
 # not hold, which is worse than one harmless identical extra file. So the
@@ -654,7 +655,7 @@ def _seed_profile_dirs(profile: str | None) -> None:
 # dual-write. See README "Agent guide" for what it can and cannot detect.
 # ---------------------------------------------------------------------------
 
-# Tested and recorded: the version the operator verified the fallback on.
+# The oldest claude the fallback was verified on (issue #31).
 CLAUDE_AGENTS_MD_FLOOR = (2, 1, 302)
 MANAGED_SETTINGS_DIR = "/etc/claude-code"
 _INSTRUCTION_FILES_OK = frozenset({"claude-md-or-agents-md", "claude-md-and-agents-md"})
