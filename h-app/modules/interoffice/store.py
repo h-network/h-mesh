@@ -7,7 +7,10 @@ from urllib.parse import urlsplit
 
 from redis.exceptions import WatchError
 
-from core.keys import incarnation_key, prefix, validate_segment
+from core.keys import (
+    incarnation_key, office_cursor_key, office_sent_key, office_tokens_key,
+    offices_key, prefix, validate_segment,
+)
 from core.registry import is_member, port_type
 
 _TOKEN = re.compile(r"coop\.[0-9a-f]{16}\.[A-Za-z0-9_-]{43}\Z")
@@ -72,9 +75,9 @@ class Store:
     def __init__(self, r, *, pod: str, tenant: str, allow_plaintext: bool = False):
         self.r, self.pod, self.tenant = r, pod, tenant
         self.allow_plaintext = allow_plaintext
-        self.offices_key = prefix(pod, tenant, resource="offices")
-        self.tokens_key = prefix(pod, tenant, resource="offices.tokens")
-        self.cursor_key = prefix(pod, tenant, resource="offices.cursor")
+        self.offices_key = offices_key(pod, tenant)
+        self.tokens_key = office_tokens_key(pod, tenant)
+        self.cursor_key = office_cursor_key(pod, tenant)
 
     def snapshot(self) -> tuple[dict[str, Office], int]:
         with self.r.pipeline(transaction=True) as pipe:
@@ -136,7 +139,7 @@ class Store:
     def sender(self, office: Office, reply_id: str, remote_agent: str) -> str | None:
         if not isinstance(reply_id, str) or not _REPLY_ID.fullmatch(reply_id):
             return None
-        raw = self.r.get(prefix(self.pod, self.tenant, resource=f"xsent.s{reply_id}"))
+        raw = self.r.get(office_sent_key(self.pod, self.tenant, reply_id))
         if raw is None:
             return None
         try:

@@ -12,7 +12,7 @@ import pytest
 import redis
 
 from core.envelope import EnvelopeError, build, parse
-from core.keys import incarnation_key, prefix
+from core.keys import incarnation_key, office_sent_key, prefix
 from core.service import Switch
 from lib.agentlifecycle.lifecycle import start_agent
 from modules.api.port import deliver_api
@@ -64,7 +64,7 @@ def sender_record(store, **changes):
         "sender_incarnation": store.r.get(incarnation_key(store.pod, store.tenant, "alice")).decode(),
     }
     data.update(changes)
-    store.r.set(prefix(store.pod, store.tenant, resource="xsent.s" + REPLY_ID), json.dumps(data), ex=86400)
+    store.r.set(office_sent_key(store.pod, store.tenant, REPLY_ID), json.dumps(data), ex=86400)
 
 
 def message(cursor="10-0", **changes):
