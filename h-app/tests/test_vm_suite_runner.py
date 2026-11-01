@@ -63,4 +63,7 @@ def test_vm_runner_lock_wait_times_out_without_setup(tmp_path: Path):
     assert result.returncode == 75
     assert "waiting for suite lock" in result.stdout
     assert "another run owns it" in result.stderr
+    summary = json.loads(result.stdout.split("suite summary: ")[1])
+    assert summary["exit_code"] == 75
+    assert summary["collected"] == summary["passed"] == 0
     assert not (tmp_path / "r").exists()

@@ -30,11 +30,6 @@ if [[ ! $lock_timeout =~ ^[0-9]+$ || ! $minimum_kb =~ ^[1-9][0-9]*$ ]] ||
 fi
 mkdir -p "$ci_root/logs" "$ci_root/cache"
 exec 9>"$ci_root/suite.lock"
-echo "waiting for suite lock (timeout ${lock_timeout}s)"
-if ! flock -w "$lock_timeout" 9; then
-    echo "error: suite lock timed out after ${lock_timeout}s; another run owns it" >&2
-    exit 75
-fi
 
 sha=unresolved
 run_root=
@@ -83,6 +78,12 @@ PY
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+echo "waiting for suite lock (timeout ${lock_timeout}s)"
+if ! flock -w "$lock_timeout" 9; then
+    echo "error: suite lock timed out after ${lock_timeout}s; another run owns it" >&2
+    exit 75
+fi
 
 check_memory() {
     local available
