@@ -285,6 +285,11 @@ h-app/tests/test_core_primitives.py::EnvelopeTests::test_resolve_local_and_broad
 h-app/tests/test_core_primitives.py::EnvelopeTests::test_resolve_rejects_nonlocal_and_malformed_addresses
 h-app/tests/test_core_primitives.py::EnvelopeTests::test_stamp_source_changes_only_fixed_source_segment
 h-app/tests/test_core_primitives.py::EnvelopeTests::test_zero_ttl_remains_zero_for_switch_to_reject
+h-app/tests/test_core_primitives.py::KeyTests::test_inter_office_helpers_use_the_contract_resource_names
+h-app/tests/test_core_primitives.py::KeyTests::test_inter_office_helpers_validate_pod_and_tenant
+h-app/tests/test_core_primitives.py::KeyTests::test_inter_office_keys_are_tenant_level_and_distinct
+h-app/tests/test_core_primitives.py::KeyTests::test_office_sent_key_accepts_an_all_digit_stream_id
+h-app/tests/test_core_primitives.py::KeyTests::test_office_sent_key_rejects_a_malformed_stream_id
 h-app/tests/test_core_primitives.py::KeyTests::test_prefix_builds_tenant_agent_and_dotted_resource_boundaries
 h-app/tests/test_core_primitives.py::KeyTests::test_prefix_rejects_digit_only_invalid_and_oversized_segments
 h-app/tests/test_core_primitives.py::KeyTests::test_prefix_rejects_empty_dotted_resource_parts

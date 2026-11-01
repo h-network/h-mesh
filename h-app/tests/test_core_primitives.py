@@ -27,7 +27,14 @@ from core.envelope import (
     resolve_source,
     stamp_source,
 )
-from core.keys import prefix
+from core.keys import (
+    coop_tokens_key,
+    office_cursor_key,
+    office_sent_key,
+    office_tokens_key,
+    offices_key,
+    prefix,
+)
 from core.queues import admit_ingress
 
 
@@ -274,6 +281,51 @@ class KeyTests(unittest.TestCase):
             with self.subTest(resource=resource):
                 with self.assertRaises(KeyError):
                     prefix(POD, TENANT, resource=resource)
+
+    def test_inter_office_helpers_use_the_contract_resource_names(self):
+        base = f"pod:{POD}:tenant:{TENANT}"
+        self.assertEqual(offices_key(POD, TENANT), f"{base}:offices")
+        self.assertEqual(office_tokens_key(POD, TENANT), f"{base}:offices.tokens")
+        self.assertEqual(office_cursor_key(POD, TENANT), f"{base}:offices.cursor")
+        self.assertEqual(coop_tokens_key(POD, TENANT), f"{base}:coop-tokens")
+        self.assertEqual(
+            office_sent_key(POD, TENANT, "ab12" * 8), f"{base}:xsent.sab12ab12ab12ab12ab12ab12ab12ab12"
+        )
+
+    def test_office_sent_key_accepts_an_all_digit_stream_id(self):
+        # A 32-hex stream_id with no a-f character is all digits, which a bare
+        # segment would reject. The "s" prefix must make it keyable.
+        stream_id = "0123456789" * 3 + "01"
+        with self.assertRaises(KeyError):
+            prefix(POD, TENANT, resource=f"xsent.{stream_id}")
+        self.assertEqual(
+            office_sent_key(POD, TENANT, stream_id),
+            f"pod:{POD}:tenant:{TENANT}:xsent.s{stream_id}",
+        )
+
+    def test_office_sent_key_rejects_a_malformed_stream_id(self):
+        for bad in ("", "UPPER", "has.dot", "a/b", "x" * 63):
+            with self.subTest(stream_id=bad):
+                with self.assertRaises(KeyError):
+                    office_sent_key(POD, TENANT, bad)
+
+    def test_inter_office_helpers_validate_pod_and_tenant(self):
+        for helper in (offices_key, office_tokens_key, office_cursor_key, coop_tokens_key):
+            with self.subTest(helper=helper.__name__):
+                with self.assertRaises(KeyError):
+                    helper("Bad_Pod", TENANT)
+                with self.assertRaises(KeyError):
+                    helper(POD, "all")
+
+    def test_inter_office_keys_are_tenant_level_and_distinct(self):
+        keys = {
+            offices_key(POD, TENANT), office_tokens_key(POD, TENANT),
+            office_cursor_key(POD, TENANT), coop_tokens_key(POD, TENANT),
+            office_sent_key(POD, TENANT, "a" * 32),
+        }
+        self.assertEqual(len(keys), 5)
+        for key in keys:
+            self.assertNotIn(":agent:", key)
 
 
 class QueueTests(unittest.TestCase):
