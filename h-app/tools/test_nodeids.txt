@@ -648,6 +648,88 @@ h-app/tests/test_setup_wizard.py::test_wizard_prints_the_h_mesh_banner_before_th
 h-app/tests/test_setup_wizard.py::test_wizard_persists_telegram_config_and_generates_an_api_token
 h-app/tests/test_setup_wizard.py::test_wizard_requires_both_bot_token_and_chat_id
 h-app/tests/test_setup_wizard.py::test_wizard_round_trips_a_custom_provider_name_through_a_re_run
+h-app/tests/test_single_guide.py::test_floor_is_the_tested_version
+h-app/tests/test_single_guide.py::test_single_guide_when_fallback_is_established
+h-app/tests/test_single_guide.py::test_newer_claude_is_fine
+h-app/tests/test_single_guide.py::test_unknown_or_old_claude_keeps_dual_write[None]
+h-app/tests/test_single_guide.py::test_unknown_or_old_claude_keeps_dual_write[version1]
+h-app/tests/test_single_guide.py::test_unknown_or_old_claude_keeps_dual_write[version2]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": "claude-md"}-local]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": "claude-md"}-managed]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": "claude-md"}-managed.d]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": "claude-md"}-project]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": "claude-md"}-user]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": "managed-only"}-local]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": "managed-only"}-managed]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": "managed-only"}-managed.d]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": "managed-only"}-project]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": "managed-only"}-user]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": ["claude-md"]}-local]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": ["claude-md"]}-managed]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": ["claude-md"]}-managed.d]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": ["claude-md"]}-project]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": ["claude-md"]}-user]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": null}-local]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": null}-managed]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": null}-managed.d]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": null}-project]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"instructionFiles": null}-user]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"projectInstructions": "claude"}-local]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"projectInstructions": "claude"}-managed]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"projectInstructions": "claude"}-managed.d]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"projectInstructions": "claude"}-project]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"projectInstructions": "claude"}-user]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"projectInstructions": "none"}-local]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"projectInstructions": "none"}-managed]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"projectInstructions": "none"}-managed.d]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"projectInstructions": "none"}-project]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"projectInstructions": "none"}-user]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"projectInstructions": 3}-local]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"projectInstructions": 3}-managed]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"projectInstructions": 3}-managed.d]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"projectInstructions": 3}-project]
+h-app/tests/test_single_guide.py::test_any_override_in_any_settings_source_keeps_dual_write[{"projectInstructions": 3}-user]
+h-app/tests/test_single_guide.py::test_unreadable_or_malformed_settings_keeps_dual_write[{not json-local]
+h-app/tests/test_single_guide.py::test_unreadable_or_malformed_settings_keeps_dual_write[{not json-managed]
+h-app/tests/test_single_guide.py::test_unreadable_or_malformed_settings_keeps_dual_write[{not json-managed.d]
+h-app/tests/test_single_guide.py::test_unreadable_or_malformed_settings_keeps_dual_write[{not json-project]
+h-app/tests/test_single_guide.py::test_unreadable_or_malformed_settings_keeps_dual_write[{not json-user]
+h-app/tests/test_single_guide.py::test_unreadable_or_malformed_settings_keeps_dual_write[[1, 2]-local]
+h-app/tests/test_single_guide.py::test_unreadable_or_malformed_settings_keeps_dual_write[[1, 2]-managed]
+h-app/tests/test_single_guide.py::test_unreadable_or_malformed_settings_keeps_dual_write[[1, 2]-managed.d]
+h-app/tests/test_single_guide.py::test_unreadable_or_malformed_settings_keeps_dual_write[[1, 2]-project]
+h-app/tests/test_single_guide.py::test_unreadable_or_malformed_settings_keeps_dual_write[[1, 2]-user]
+h-app/tests/test_single_guide.py::test_unreadable_or_malformed_settings_keeps_dual_write["text"-local]
+h-app/tests/test_single_guide.py::test_unreadable_or_malformed_settings_keeps_dual_write["text"-managed]
+h-app/tests/test_single_guide.py::test_unreadable_or_malformed_settings_keeps_dual_write["text"-managed.d]
+h-app/tests/test_single_guide.py::test_unreadable_or_malformed_settings_keeps_dual_write["text"-project]
+h-app/tests/test_single_guide.py::test_unreadable_or_malformed_settings_keeps_dual_write["text"-user]
+h-app/tests/test_single_guide.py::test_non_blocking_settings_still_allow_single_guide[ok0]
+h-app/tests/test_single_guide.py::test_non_blocking_settings_still_allow_single_guide[ok1]
+h-app/tests/test_single_guide.py::test_non_blocking_settings_still_allow_single_guide[ok2]
+h-app/tests/test_single_guide.py::test_non_blocking_settings_still_allow_single_guide[ok3]
+h-app/tests/test_single_guide.py::test_non_blocking_settings_still_allow_single_guide[ok4]
+h-app/tests/test_single_guide.py::test_profile_reads_its_own_config_dir_only
+h-app/tests/test_single_guide.py::test_ancestor_claude_md_keeps_dual_write
+h-app/tests/test_single_guide.py::test_reversal_restores_claude_md
+h-app/tests/test_single_guide.py::test_stale_claude_md_identical_to_the_previous_agents_md_is_removed
+h-app/tests/test_single_guide.py::test_stale_claude_md_identical_to_the_new_guide_is_removed
+h-app/tests/test_single_guide.py::test_foreign_claude_md_is_kept_and_logged
+h-app/tests/test_single_guide.py::test_symlinked_claude_md_is_never_removed
+h-app/tests/test_single_guide.py::test_migrate_removes_an_identical_duplicate_without_rewriting_agents_md
+h-app/tests/test_single_guide.py::test_migrate_leaves_a_different_claude_md_and_logs
+h-app/tests/test_single_guide.py::test_migrate_needs_the_agents_md_beside_it
+h-app/tests/test_single_guide.py::test_migrate_does_nothing_when_fallback_cannot_be_relied_on
+h-app/tests/test_single_guide.py::test_migrate_reports_absent
+h-app/tests/test_single_guide.py::test_reconciler_sweeps_each_agent_once_per_process
+h-app/tests/test_single_guide.py::test_reconciler_sweep_never_raises
+h-app/tests/test_single_guide.py::test_claude_version_parsing[2.1.316 (Claude Code)\n-0-expected0]
+h-app/tests/test_single_guide.py::test_claude_version_parsing[Claude Code v2.2.0\n-0-expected1]
+h-app/tests/test_single_guide.py::test_claude_version_parsing[no version here\n-0-None]
+h-app/tests/test_single_guide.py::test_claude_version_parsing[2.1.316\n-1-None]
+h-app/tests/test_single_guide.py::test_claude_version_unavailable_is_none[exc0]
+h-app/tests/test_single_guide.py::test_claude_version_unavailable_is_none[exc1]
+h-app/tests/test_single_guide.py::test_claude_version_unavailable_is_none[exc2]
 h-app/tests/test_telegram_bot_launcher.py::test_telegram_bot_launcher_starts_and_stays_alive_against_a_real_api
 h-app/tests/test_telegram_bot_launcher.py::test_telegram_bot_launcher_exits_cleanly_with_a_clear_error_when_api_token_missing
 h-app/tests/test_telegram_client.py::test_enrol_retries_until_success_and_seeds_cursor

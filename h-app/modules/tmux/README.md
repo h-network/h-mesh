@@ -9,7 +9,7 @@ same as every module owning its own daemon logic.
 
 | file | what it holds |
 |---|---|
-| `ops.py` | passive tmux mechanics: `run_tmux`, `create_window`, `kill_window`, `submit_text`, session-history detection, CLI trust/guide seeding |
+| `ops.py` | passive tmux mechanics: `run_tmux`, `create_window`, `kill_window`, `submit_text`, session-history detection, CLI trust/guide seeding, single-guide decision (`claude_reads_agents_md`, `migrate_agent_guide`) |
 | `port.py` | `deliver_tmux` entrypoint and terminal delivery handlers (`message_opener`, `command_opener`, `attachment_opener`), delivery-verification marking |
 | `reconciler.py` | `TmuxReconciler` -- the daemon logic: compares desired tmux membership against real windows, creates/removes them |
 
@@ -34,8 +34,59 @@ validated against real provenance.
 
 `write_agent_guide` (called by `create_window` on every hire/reconcile, and by
 `ensure_server_and_session` for the first window) renders `generate_agents_md`
-and writes the identical text to both `AGENTS.md` and `CLAUDE.md` in the
-agent's directory.
+and writes it to `AGENTS.md` in the agent's directory. codex and agy read that
+file; claude reads `CLAUDE.md` and, when a project has none of its own, falls
+back to `AGENTS.md` (its `instructionFiles` setting, default
+`claude-md-or-agents-md`).
+
+### One file, or two (#31)
+
+The per-agent `CLAUDE.md` is no longer written **when claude's fallback can be
+positively established**. That fallback was tested by the operator on the live
+office with **Claude Code 2.1.316**, which is recorded as `CLAUDE_AGENTS_MD_FLOOR`
+and is the minimum version. `claude_reads_agents_md` decides, and **fails
+closed**: any doubt keeps writing `CLAUDE.md` exactly as before (a guide-less
+claude agent is worse than one identical extra file). It requires all of:
+
+1. `claude --version` (5 s timeout, cached per process) parses and is >= the floor.
+2. No settings file sets a blocking override. Checked: the agent's user config
+   dir (`~/.claude` or `~/.claude-<profile>`) `settings.json`, the agent's
+   `<workdir>/.claude/settings.json` and `settings.local.json`, and
+   `/etc/claude-code/managed-settings.json` plus `managed-settings.d/*.json`.
+   `instructionFiles` must be `claude-md-or-agents-md` or
+   `claude-md-and-agents-md`; the legacy `projectInstructions` must be
+   `agents-fallback` or `both`. A file that exists but is unreadable, not JSON, or
+   not an object also keeps the dual-write.
+3. No `CLAUDE.md` in any ancestor directory of the agent's workdir (whether that
+   counts as the project's "own" is unverified, so it is treated as blocking).
+
+Decided on every guide write, so adding an override later brings `CLAUDE.md`
+back on the agent's next window creation.
+
+**Cleaning up a stale `CLAUDE.md`** (left by an older dual-writing build) never
+deletes anything we cannot prove we generated. It is removed only if
+byte-identical to the `AGENTS.md` that was on disk before it was overwritten
+(the old dual-write wrote identical files, so this holds even if the template
+has since changed) or to the newly generated guide. Anything else (including a
+symlink) is left in place and logged as an `error` event, and claude will then
+read it **instead of** `AGENTS.md`.
+
+**Already-running agents.** Their window is never recreated, so the guide is not
+rewritten. The reconciler therefore runs `migrate_agent_guide` once per agent per
+reconciler process: when the conditions above hold and `CLAUDE.md` is
+byte-identical to the `AGENTS.md` beside it, it is removed (`AGENTS.md` is not
+rewritten); otherwise it is kept. Each outcome is logged as a `guide_migrated`
+event. A live claude session keeps what it already loaded; the change takes effect
+at its next start.
+
+**What cannot be detected:** organisation/remote policy settings (not readable
+from files); settings added after the last check; a claude binary replaced
+under a running reconciler (the version is cached per process); the agent
+editing its own `.claude/settings.json`; settings passed on the command line
+(h-agent only passes a capture-hook `--settings`, but that is outside this
+module).
+
+### Guide contents
 
 The guide deliberately carries **no operator-authority text**: earlier versions
 added a per-entrance block ("routing provenance, not cryptographic proof of
@@ -52,5 +103,5 @@ the wording of the "colleagues only -- ..." sentence (and log an error for an
 unenrolled entrance); they no longer add guide text of their own.
 
 ⚠ A guide is only (re)written when a window is created. Agents that are already
-running keep their old `AGENTS.md`/`CLAUDE.md` until their window is next
+running keep their old `AGENTS.md`/`CLAUDE.md` text until their window is next
 created (hire, or the reconciler recreating a missing window).

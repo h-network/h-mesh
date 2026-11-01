@@ -45,6 +45,22 @@ def _scrub_ambient_tmux_env(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_ambient_claude_for_guide_decision(monkeypatch):
+    """The per-agent CLAUDE.md decision must not depend on the host's claude.
+
+    `modules.tmux.ops.claude_reads_agents_md` fails closed when it cannot read a
+    claude version, which is the dual-write every test written before #31 expects.
+    Tests of the single-guide path set their own version. Only patched when the
+    module is already imported, so this never forces an import.
+    """
+    import sys
+
+    ops = sys.modules.get("modules.tmux.ops")
+    if ops is not None:
+        monkeypatch.setattr(ops, "_claude_version", lambda: None)
+
+
+@pytest.fixture(autouse=True)
 def _scrub_ambient_telegram_and_api_env(monkeypatch):
     for var in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "TELEGRAM_VOICE", "API_TOKEN"):
         monkeypatch.delenv(var, raising=False)
