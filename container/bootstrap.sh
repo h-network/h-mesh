@@ -508,8 +508,10 @@ echo "  Default acct: $DEFAULT_ACCOUNT"
 CONFIGURED_TOKENS=0
 for token_name in "${TOKEN_VARS[@]}"; do [ -n "$(env_file_get "$token_name")" ] && CONFIGURED_TOKENS=$((CONFIGURED_TOKENS + 1)); done
 echo "  OAuth tokens: $CONFIGURED_TOKENS/${#PROFILES[@]} configured"
-echo "  Telegram:     $([ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] && echo "enabled, chat id $TELEGRAM_CHAT_ID" || echo "not enabled")"
-if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+SUMMARY_TG_TOKEN="$(env_file_get TELEGRAM_BOT_TOKEN)"
+SUMMARY_TG_CHAT="$(env_file_get TELEGRAM_CHAT_ID)"
+echo "  Telegram:     $([ -n "$SUMMARY_TG_TOKEN" ] && [ -n "$SUMMARY_TG_CHAT" ] && echo "enabled, chat id $SUMMARY_TG_CHAT" || echo "not enabled")"
+if [ -n "$SUMMARY_TG_TOKEN" ] && [ -n "$SUMMARY_TG_CHAT" ]; then
     if [ -n "$(env_file_get API_TLS_CERT)" ]; then
         echo "  API/session:  TLS ($(env_file_get API_TLS_CERT))"
     else
