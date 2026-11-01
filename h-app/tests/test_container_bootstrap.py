@@ -195,3 +195,49 @@ def test_custom_port_flags_are_persisted_and_invalid_ports_fail(tmp_path):
     )
     assert res.returncode != 0
     assert "1 to 65535" in res.stderr
+
+
+def test_noninteractive_summary_reports_telegram_from_env_file(tmp_path):
+    log = tmp_path / "docker_calls.log"
+    env_file = tmp_path / "office.env"
+    env_file.write_text(
+        "POD=testpod\n"
+        "TENANT=testtenant\n"
+        "TELEGRAM_BOT_TOKEN=tg-secret-token\n"
+        "TELEGRAM_CHAT_ID=424242\n"
+        "H_MESH_ALLOW_PLAINTEXT=1\n"
+    )
+    _fake_docker(tmp_path, log)
+
+    res = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP), "--pod", "testpod", "--tenant", "testtenant",
+            "--env-file", str(env_file), "--skip-build", "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+    )
+    assert res.returncode == 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+    assert "Telegram:     enabled, chat id 424242" in res.stdout
+    assert "API/session:  plaintext (H_MESH_ALLOW_PLAINTEXT=1)" in res.stdout
+
+    env_file.write_text(
+        "POD=testpod\n"
+        "TENANT=testtenant\n"
+        "TELEGRAM_BOT_TOKEN=tg-secret-token\n"
+        "TELEGRAM_CHAT_ID=424242\n"
+        "API_TLS_CERT=/etc/ssl/certs/h-mesh.pem\n"
+        "API_TLS_KEY=/etc/ssl/private/h-mesh.key\n"
+    )
+    res_tls = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP), "--pod", "testpod", "--tenant", "testtenant",
+            "--env-file", str(env_file), "--skip-build", "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+    )
+    assert res_tls.returncode == 0, f"stdout: {res_tls.stdout}\nstderr: {res_tls.stderr}"
+    assert "Telegram:     enabled, chat id 424242" in res_tls.stdout
+    assert "API/session:  TLS (/etc/ssl/certs/h-mesh.pem)" in res_tls.stdout
+
