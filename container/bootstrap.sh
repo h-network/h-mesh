@@ -62,7 +62,8 @@ Collects what an office's env file needs (POD, TENANT, AGENTS,
 DEFAULT_CLI, Claude account names and OAuth tokens, host port publishing,
 optional Telegram bot config, and -- if Telegram is enabled -- a
 TLS-or-plaintext decision),
-writes it to offices/<pod>/<tenant>/.env, then runs
+writes it to offices/<pod>/<tenant>/.env (alongside a regenerated
+SUMMARY.md and executable attach.sh containing no secrets), then runs
 'docker compose -p h-mesh-<pod>-<tenant> up --build' -- setup.sh's own
 non-interactive path runs inside the container from there (see
 container/entrypoint.sh).
@@ -522,6 +523,91 @@ echo "  Env file:     $ENV_FILE"
 echo "  Project name: $PROJECT_NAME"
 echo
 
+COMPOSE_FILES="-f $SCRIPT_DIR/compose.yaml"
+[ "$H_MESH_BIND_PORTS" -eq 1 ] && COMPOSE_FILES="$COMPOSE_FILES -f $SCRIPT_DIR/compose.ports.yaml"
+
+OFFICE_DIR="$(dirname "$ENV_FILE")"
+SUMMARY_FILE="$OFFICE_DIR/SUMMARY.md"
+ATTACH_SCRIPT="$OFFICE_DIR/attach.sh"
+mkdir -p "$OFFICE_DIR"
+
+if [ "$H_MESH_BIND_PORTS" -eq 1 ]; then
+    SUMMARY_PORTS="API $API_PORT, session $SESSION_PORT"
+else
+    SUMMARY_PORTS="not published"
+fi
+
+if [ -n "$SUMMARY_TG_TOKEN" ] && [ -n "$SUMMARY_TG_CHAT" ]; then
+    SUMMARY_TELEGRAM="enabled"
+    if [ -n "$(env_file_get API_TLS_CERT)" ]; then
+        SUMMARY_TLS="TLS ($(env_file_get API_TLS_CERT))"
+    else
+        SUMMARY_TLS="plaintext (H_MESH_ALLOW_PLAINTEXT=1)"
+    fi
+else
+    SUMMARY_TELEGRAM="not enabled (disabled)"
+    SUMMARY_TLS="not enabled"
+fi
+
+cat > "$ATTACH_SCRIPT" <<EOF
+#!/usr/bin/env bash
+# Attach to the h-mesh office container for pod=$POD tenant=$TENANT.
+# Equivalent to: $SCRIPT_DIR/bootstrap.sh --pod $POD --tenant $TENANT --attach
+set -euo pipefail
+exec docker compose -p "$PROJECT_NAME" $COMPOSE_FILES --env-file "$ENV_FILE" \\
+    exec h-mesh sh -c 'exec env TMUX_TMPDIR="\$HOME/.h-mesh/tmux" tmux attach -t "\$1"' -- "$TENANT"
+EOF
+chmod 0755 "$ATTACH_SCRIPT"
+
+cat > "$SUMMARY_FILE" <<EOF
+# h-mesh Office Summary ($POD / $TENANT)
+
+- **Pod:** $POD
+- **Tenant:** $TENANT
+- **Agents:** $AGENTS
+- **Default CLI:** $DEFAULT_CLI
+- **Accounts:** $ACCOUNTS (default: $DEFAULT_ACCOUNT; OAuth tokens: $CONFIGURED_TOKENS/${#PROFILES[@]} configured)
+- **Published ports:** $SUMMARY_PORTS
+- **Telegram:** $SUMMARY_TELEGRAM
+- **API/session transport:** $SUMMARY_TLS
+- **Compose project name:** $PROJECT_NAME
+
+## Commands
+
+### Attach
+\`\`\`bash
+$ATTACH_SCRIPT
+# or via bootstrap.sh:
+$SCRIPT_DIR/bootstrap.sh --pod $POD --tenant $TENANT --attach
+# or directly:
+docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE exec h-mesh env TMUX_TMPDIR="\$HOME/.h-mesh/tmux" tmux attach -t $TENANT
+\`\`\`
+
+### Tail logs
+\`\`\`bash
+docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE logs -f
+\`\`\`
+
+### Stop
+\`\`\`bash
+docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE down       # keeps state
+docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE down -v    # also drops it
+\`\`\`
+
+### Start
+\`\`\`bash
+docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE up -d
+\`\`\`
+
+### Upgrade
+\`\`\`bash
+docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE up -d --build
+# or in-place inside the running container:
+docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE exec h-mesh h-mesh-upgrade --pod $POD --tenant $TENANT
+\`\`\`
+EOF
+chmod 0644 "$SUMMARY_FILE"
+
 COMPOSE_ARGS=(-p "$PROJECT_NAME" -f "$SCRIPT_DIR/compose.yaml" --env-file "$ENV_FILE" up -d)
 [ "$H_MESH_BIND_PORTS" -eq 1 ] && COMPOSE_ARGS=(-p "$PROJECT_NAME" -f "$SCRIPT_DIR/compose.yaml" -f "$SCRIPT_DIR/compose.ports.yaml" --env-file "$ENV_FILE" up -d)
 [ "$SKIP_BUILD" -eq 0 ] && COMPOSE_ARGS+=(--build)
@@ -531,9 +617,9 @@ echo "Running: docker compose ${COMPOSE_ARGS[*]}"
 
 echo
 echo "✓ Container started (project: $PROJECT_NAME)."
-COMPOSE_FILES="-f $SCRIPT_DIR/compose.yaml"
-[ "$H_MESH_BIND_PORTS" -eq 1 ] && COMPOSE_FILES="$COMPOSE_FILES -f $SCRIPT_DIR/compose.ports.yaml"
-echo "  Attach:  $SCRIPT_DIR/bootstrap.sh --pod $POD --tenant $TENANT --attach"
+echo "  Summary: $SUMMARY_FILE"
+echo "  Attach:  $ATTACH_SCRIPT"
+echo "           (or: $SCRIPT_DIR/bootstrap.sh --pod $POD --tenant $TENANT --attach)"
 echo "           (or directly: docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE exec h-mesh env TMUX_TMPDIR=\"\$HOME/.h-mesh/tmux\" tmux attach -t $TENANT)"
 echo "  Logs:    docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE logs -f"
 echo "  Status:  docker ps --filter name=$PROJECT_NAME"

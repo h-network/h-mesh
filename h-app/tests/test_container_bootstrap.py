@@ -273,3 +273,110 @@ def test_noninteractive_summary_reports_telegram_from_env_file(tmp_path):
     assert "Telegram:     enabled, chat id 424242" in res_tls.stdout
     assert "API/session:  TLS (/etc/ssl/certs/h-mesh.pem)" in res_tls.stdout
 
+
+def test_bootstrap_writes_office_summary_and_attach_script_without_secrets(tmp_path):
+    log = tmp_path / "docker_calls.log"
+    office_dir = tmp_path / "offices" / "testpod" / "testtenant"
+    office_dir.mkdir(parents=True)
+    env_file = office_dir / ".env"
+    fake_oauth_default = "fake-oauth-secret-value-111"
+    fake_oauth_backup = "fake-oauth-secret-value-222"
+    fake_tg_token = "fake-telegram-bot-secret-333"
+    fake_tg_chat = "987654321"
+    fake_api_token = "fake-api-token-secret-444"
+    env_file.write_text(
+        "POD=testpod\n"
+        "TENANT=testtenant\n"
+        "AGENTS=architect,worker\n"
+        "DEFAULT_CLI=codex\n"
+        "ACCOUNTS=default,backup\n"
+        "DEFAULT_ACCOUNT=backup\n"
+        f"CLAUDE_OAUTH_TOKEN_DEFAULT={fake_oauth_default}\n"
+        f"CLAUDE_OAUTH_TOKEN_BACKUP={fake_oauth_backup}\n"
+        f"TELEGRAM_BOT_TOKEN={fake_tg_token}\n"
+        f"TELEGRAM_CHAT_ID={fake_tg_chat}\n"
+        f"API_TOKEN={fake_api_token}\n"
+        "H_MESH_ALLOW_PLAINTEXT=1\n"
+    )
+    _fake_docker(tmp_path, log)
+
+    res = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP),
+            "--pod", "testpod", "--tenant", "testtenant",
+            "--api-port", "18080", "--session-port", "18081",
+            "--env-file", str(env_file), "--skip-build", "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+    )
+    assert res.returncode == 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+
+    summary_file = office_dir / "SUMMARY.md"
+    attach_script = office_dir / "attach.sh"
+    assert summary_file.is_file()
+    assert attach_script.is_file()
+    assert stat.S_IMODE(summary_file.stat().st_mode) == 0o644
+    assert stat.S_IMODE(attach_script.stat().st_mode) == 0o755
+
+    summary_text = summary_file.read_text()
+    attach_text = attach_script.read_text()
+
+    for secret in (fake_oauth_default, fake_oauth_backup, fake_tg_token, fake_tg_chat, fake_api_token):
+        assert secret not in summary_text
+        assert secret not in attach_text
+
+    assert "testpod" in summary_text
+    assert "testtenant" in summary_text
+    assert "architect,worker" in summary_text
+    assert "codex" in summary_text
+    assert "default,backup" in summary_text
+    assert "2/2 configured" in summary_text
+    assert "API 18080, session 18081" in summary_text
+    assert "enabled" in summary_text
+    assert "plaintext (H_MESH_ALLOW_PLAINTEXT=1)" in summary_text
+    assert "h-mesh-testpod-testtenant" in summary_text
+    assert str(attach_script) in summary_text
+    assert "logs -f" in summary_text
+    assert "down" in summary_text
+    assert "up -d" in summary_text
+    assert "h-mesh-upgrade" in summary_text
+
+    assert "-p \"h-mesh-testpod-testtenant\"" in attach_text or "-p h-mesh-testpod-testtenant" in attach_text
+    assert str(REPO_ROOT / "container" / "compose.yaml") in attach_text
+    assert str(env_file) in attach_text
+    assert 'TMUX_TMPDIR="$HOME/.h-mesh/tmux"' in attach_text
+    assert "tmux attach -t" in attach_text
+
+    log.write_text("")
+    attach_res = subprocess.run(
+        [str(attach_script)],
+        cwd=tmp_path,
+        capture_output=True, text=True, timeout=10,
+        env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+    )
+    assert attach_res.returncode == 0, f"stdout: {attach_res.stdout}\nstderr: {attach_res.stderr}"
+    attach_call = log.read_text().splitlines()[-1]
+    assert "-p h-mesh-testpod-testtenant" in attach_call
+    assert f"--env-file {env_file}" in attach_call
+    assert "exec h-mesh" in attach_call
+    assert 'TMUX_TMPDIR="$HOME/.h-mesh/tmux"' in attach_call
+    assert attach_call.rstrip().endswith("-- testtenant")
+
+    # Regenerated on subsequent runs while preserving custom .env entries.
+    res_rerun = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP),
+            "--pod", "testpod", "--tenant", "testtenant",
+            "--no-bind-ports",
+            "--env-file", str(env_file), "--skip-build", "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+    )
+    assert res_rerun.returncode == 0, f"stdout: {res_rerun.stdout}\nstderr: {res_rerun.stderr}"
+    assert "not published" in summary_file.read_text()
+    assert "compose.ports.yaml" not in attach_script.read_text()
+    assert f"API_TOKEN={fake_api_token}" in env_file.read_text()
+
+

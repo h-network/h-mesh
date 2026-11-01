@@ -160,7 +160,9 @@ ports to use), one or more Claude account names, and each account's OAuth
 token (blank to log in
 interactively later -- see "Finding and attaching..." below for how a
 container operator can actually do that), and optional Telegram bot config,
-writes them to `offices/<pod>/<tenant>/.env`, and runs `docker compose up
+writes them to `offices/<pod>/<tenant>/.env` (alongside a regenerated
+`SUMMARY.md` and executable `attach.sh`, neither of which contains secret
+values), and runs `docker compose up
 --build`. Enabling Telegram here also forces the TLS-or-plaintext decision
 described below on the spot -- it can no longer ship silently unresolved
 the way it originally could, which produced a container that refused to
@@ -197,9 +199,16 @@ docker compose -p h-mesh-POD-TENANT \
   --env-file offices/POD/TENANT/.env up -d --build
 ```
 
-**Finding and attaching a running office's tmux session.** `./container/
-bootstrap.sh --pod POD --tenant TENANT --attach` (defaults match the rest of
-this script: `default`/`default`) attaches you directly, in one step --
+**Finding and attaching a running office's tmux session.** Every bootstrap
+run writes an executable `offices/<pod>/<tenant>/attach.sh` (using absolute
+paths so it works from any directory) and a regenerated
+`offices/<pod>/<tenant>/SUMMARY.md` (recording the deployed pod, tenant,
+agents, default CLI, account names, published ports, Telegram on/off and TLS
+vs plaintext mode, Compose project name, and the exact commands to attach,
+stop, start, tail logs, and upgrade -- with no OAuth tokens, bot tokens, or
+chat IDs written to either file). You can also run `./container/bootstrap.sh
+--pod POD --tenant TENANT --attach` (defaults match the rest of
+this script: `default`/`default`) to attach directly in one step --
 resolves the same office identity `bootstrap.sh` always does, then runs
 `docker compose exec` into the container and `tmux attach`s there. Every
 `up`/`--attach` run also prints the exact one-liner for the office it just
