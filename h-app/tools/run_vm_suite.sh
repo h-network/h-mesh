@@ -72,7 +72,8 @@ summary = dict(
     ref=f"origin/{ref}", sha=sha,
     collected=int(collected[-1]) if collected else 0,
     passed=int(passed[-1]) if passed else 0,
-    failed_ids=re.findall(r"^FAILED (\S+)", output, re.MULTILINE),
+    failed_ids=[line.removeprefix("FAILED ").split(" - ", 1)[0]
+                for line in output.splitlines() if line.startswith("FAILED ")],
     exit_code=int(status), log=log,
 )
 print("suite summary: " + json.dumps(summary), flush=True)
