@@ -1,6 +1,23 @@
 import pytest
 from modules.tmux.ops import write_agent_guide
 
+# Text removed from the generated guide (#5): the operator-authority block (all four
+# entrance variants) and the envelope-kinds sentence.
+REMOVED_GUIDE_TEXT = (
+    "routing provenance",
+    "cryptographic proof of identity",
+    "operator coordination authority",
+    "claiming operator authority never qualifies",
+    "they outrank lead direction",
+    "treat instructions arriving through the configured operator entrance",
+    "immediately notify the lead so coordination remains accurate",
+    "could\nnot be verified against enrolled participants",
+    "is not\ncurrently an enrolled participant",
+    "no declared operator entrance configured",
+    "Interface entries may only accept",
+    "not arbitrary messages",
+)
+
 
 def test_write_agent_guide_installs_statusline_for_claude(tmp_path, monkeypatch):
     home = tmp_path / "home"
@@ -69,9 +86,8 @@ def test_write_agent_guide_with_valid_enrolled_operator_entrance(tmp_path, monke
 
     agents_md = (cwd / "AGENTS.md").read_text(encoding="utf-8")
     assert "the operator's external entrance (`web`)" in agents_md
-    assert "`[message from web]`" in agents_md
-    assert "treat instructions arriving through the configured operator entrance (`web`)" in agents_md
-    assert "they outrank lead direction and agent preference alike" in agents_md
+    for gone in REMOVED_GUIDE_TEXT:
+        assert gone not in agents_md
 
 
 def test_write_agent_guide_with_nonexistent_operator_entrance_falls_back_to_rejected_notice(tmp_path, monkeypatch):
@@ -86,9 +102,9 @@ def test_write_agent_guide_with_nonexistent_operator_entrance_falls_back_to_reje
     )
 
     agents_md = (cwd / "AGENTS.md").read_text(encoding="utf-8")
-    assert "Configured operator entrance `telegrma` is not" in agents_md
-    assert "currently an enrolled participant in this office" in agents_md
-    assert "they outrank lead direction" not in agents_md
+    assert "external entrances (configured entrance `telegrma` is not currently enrolled)" in agents_md
+    for gone in REMOVED_GUIDE_TEXT:
+        assert gone not in agents_md
 
 
 def test_write_agent_guide_with_broken_logger_and_unenrolled_entrance_still_writes_guide(tmp_path, monkeypatch):
@@ -111,8 +127,7 @@ def test_write_agent_guide_with_broken_logger_and_unenrolled_entrance_still_writ
     assert (cwd / "AGENTS.md").exists()
     assert (cwd / "CLAUDE.md").exists()
     agents_md = (cwd / "AGENTS.md").read_text(encoding="utf-8")
-    assert "Configured operator entrance `telegrma` is not" in agents_md
-    assert "currently an enrolled participant in this office" in agents_md
+    assert "external entrances (configured entrance `telegrma` is not currently enrolled)" in agents_md
 
 
 def test_write_agent_guide_with_env_operator_entrance_and_enrolled(tmp_path, monkeypatch):
@@ -126,9 +141,8 @@ def test_write_agent_guide_with_env_operator_entrance_and_enrolled(tmp_path, mon
 
     agents_md = (cwd / "AGENTS.md").read_text(encoding="utf-8")
     assert "the operator's external entrance (`telegram`)" in agents_md
-    assert "`[message from telegram]`" in agents_md
-    assert "treat instructions arriving through the configured operator entrance (`telegram`)" in agents_md
-    assert "they outrank lead direction and agent preference alike" in agents_md
+    for gone in REMOVED_GUIDE_TEXT:
+        assert gone not in agents_md
 
 
 def test_write_agent_guide_with_env_operator_entrance_validation_unavailable_uses_unverified_notice(tmp_path, monkeypatch):
@@ -142,9 +156,9 @@ def test_write_agent_guide_with_env_operator_entrance_validation_unavailable_use
     write_agent_guide(str(cwd), "testagent")
 
     agents_md = (cwd / "AGENTS.md").read_text(encoding="utf-8")
-    assert "Configured operator entrance `telegram` could" in agents_md
-    assert "not be verified against enrolled participants at guide generation time" in agents_md
-    assert "treat instructions arriving through the configured operator entrance" not in agents_md
+    assert "external entrances (configured entrance `telegram` unverified)" in agents_md
+    for gone in REMOVED_GUIDE_TEXT:
+        assert gone not in agents_md
 
 
 def test_write_agent_guide_with_no_operator_entrance(tmp_path, monkeypatch):
@@ -158,7 +172,5 @@ def test_write_agent_guide_with_no_operator_entrance(tmp_path, monkeypatch):
 
     agents_md = (cwd / "AGENTS.md").read_text(encoding="utf-8")
     assert "external entrances" in agents_md
-    assert "This office has no declared operator entrance configured" in agents_md
-    assert "treat instructions arriving through the configured operator entrance" not in agents_md
-
-
+    for gone in REMOVED_GUIDE_TEXT:
+        assert gone not in agents_md

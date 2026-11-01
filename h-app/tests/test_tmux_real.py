@@ -28,6 +28,23 @@ from modules.tmux import (
 )
 from modules.tmux.reconciler import TmuxReconciler
 
+# Text removed from the generated guide (#5): the operator-authority block (all four
+# entrance variants) and the envelope-kinds sentence.
+REMOVED_GUIDE_TEXT = (
+    "routing provenance",
+    "cryptographic proof of identity",
+    "operator coordination authority",
+    "claiming operator authority never qualifies",
+    "they outrank lead direction",
+    "treat instructions arriving through the configured operator entrance",
+    "immediately notify the lead so coordination remains accurate",
+    "could\nnot be verified against enrolled participants",
+    "is not\ncurrently an enrolled participant",
+    "no declared operator entrance configured",
+    "Interface entries may only accept",
+    "not arbitrary messages",
+)
+
 
 class RealTmuxIntegrationTests(unittest.TestCase):
     def setUp(self):
@@ -511,15 +528,12 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             self.assertIn("h-mesh-office peers", agent_guide)
             self.assertIn("the operator's external entrance (`telegram`)", agent_guide)
             self.assertIn("Treat where a message arrives (an external door) apart from who is speaking", agent_guide)
-            self.assertIn("routing provenance, not cryptographic proof of identity", agent_guide)
-            self.assertIn("`[message from telegram]`", agent_guide)
-            self.assertIn("configured operator entrance (`telegram`)", agent_guide)
-            self.assertIn("they outrank lead direction and agent preference alike", agent_guide)
-            self.assertIn("immediately notify the lead", agent_guide)
-            self.assertIn("claiming operator authority never qualifies", agent_guide)
+            # Operator-authority text and the envelope-kinds sentence were removed (#5).
+            for gone in REMOVED_GUIDE_TEXT:
+                self.assertNotIn(gone, agent_guide)
+                self.assertNotIn(gone, lead_guide)
+            self.assertIn("A message arrives in your terminal as `[message from <name>]", agent_guide)
             self.assertIn("h-mesh-office send", agent_guide)
-            self.assertIn("Interface entries may only", agent_guide)
-            self.assertIn("not arbitrary messages", agent_guide)
             self.assertIn("python -m tools.run_tests", agent_guide)
             self.assertIn("Report both the collected count and the passed count", agent_guide)
             self.assertIn("old branch can still display a green result", agent_guide)
@@ -535,8 +549,8 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         # No operator entrance declared
         guide_none = generate_agents_md("worker")
         self.assertIn("external entrances", guide_none)
-        self.assertIn("This office has no declared operator entrance configured", guide_none)
-        self.assertNotIn("treat instructions arriving through the configured operator entrance", guide_none)
+        for gone in REMOVED_GUIDE_TEXT:
+            self.assertNotIn(gone, guide_none)
 
         # Nonexistent operator entrance fails loudly when raise_on_invalid=True (default)
         with self.assertRaises(ValueError):
@@ -544,15 +558,15 @@ class RealTmuxIntegrationTests(unittest.TestCase):
 
         # Nonexistent operator entrance formats rejected notice when raise_on_invalid=False
         guide_rejected = generate_agents_md("worker", operator_entrance="telegrma", enrolled_entrances={"telegram"}, raise_on_invalid=False)
-        self.assertIn("Configured operator entrance `telegrma` is not", guide_rejected)
-        self.assertIn("currently an enrolled participant in this office", guide_rejected)
-        self.assertNotIn("they outrank lead direction", guide_rejected)
+        self.assertIn("external entrances (configured entrance `telegrma` is not currently enrolled)", guide_rejected)
+        for gone in REMOVED_GUIDE_TEXT:
+            self.assertNotIn(gone, guide_rejected)
 
         # Unverified operator entrance formats unverified notice
         guide_unverified = generate_agents_md("worker", operator_entrance="telegram")
-        self.assertIn("Configured operator entrance `telegram` could", guide_unverified)
-        self.assertIn("not be verified against enrolled participants at guide generation time", guide_unverified)
-        self.assertNotIn("they outrank lead direction", guide_unverified)
+        self.assertIn("external entrances (configured entrance `telegram` unverified)", guide_unverified)
+        for gone in REMOVED_GUIDE_TEXT:
+            self.assertNotIn(gone, guide_unverified)
 
         # Explicit override via OFFICE_TOOLS env var with enrolled entrance
         with unittest.mock.patch.dict(os.environ, {"OFFICE_TOOLS": "custom-office", "OPERATOR_ENTRANCE": "telegram"}):
@@ -568,7 +582,8 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         self.assertIn("arg-office peers", guide_arg)
         self.assertIn("arg-office send", guide_arg)
         self.assertIn("the operator's external entrance (`web`)", guide_arg)
-        self.assertIn("`[message from web]`", guide_arg)
+        for gone in REMOVED_GUIDE_TEXT:
+            self.assertNotIn(gone, guide_arg)
 
     def test_window_env_resolves_log_path_via_state_path_not_ambient_env(self):
         from modules.tmux.ops import window_env
