@@ -190,6 +190,42 @@ run, explicitly set `REDIS_URL` to a private Redis on a nonstandard loopback
 port. Tests that default to localhost port 6379 can otherwise reach the live
 office Redis.
 
+## Serialized runs on the test VM
+
+Use the test VM rather than the live office container for merge evidence.
+Install `h-app/tools/run_vm_suite.sh` as `~/ci/run-suite.sh` on that VM, then
+run `~/ci/run-suite.sh architect/integration-test-batch` (an `origin/` prefix
+is also accepted). The runner clones into `~/ci/r`, creates `~/ci/v` once,
+and installs the requested branch into a fresh short-path worktree for each
+run. Use `~/ci/run-suite.sh --refresh <branch>` to refresh dependencies;
+ordinary runs retain dependencies and rebind the editable install to the new
+worktree. Required host tools include Python 3 with venv support, Git, flock,
+tmux, and a working user systemd manager. Provide `redis-server` on the clean
+system PATH or through an owned wrapper in `~/ci/bin`.
+
+One `flock` covers fetching, installation, execution, and cleanup. Concurrent
+callers print a waiting message and time out after 900 seconds; set
+`CI_LOCK_TIMEOUT` explicitly to change that wait. Runs abort before setup and
+again before execution if available RAM is below 1.5 GiB. A higher threshold
+can be requested with `CI_MIN_AVAILABLE_KB`; thresholds below 1572864 KiB are
+refused.
+
+The canonical command runs at nice 10 in its own user systemd service, with a
+temporary HOME and an allowlisted environment. Ambient office configuration,
+credentials, `PYTHONPATH`, and shared Redis overrides are absent. The normal
+runner provisions private Redis. On completion, failure, SIGINT, or SIGTERM,
+the VM wrapper stops only its own transient service, killing any remaining
+Redis, tmux, or daemon descendants before removing its worktree and temporary
+HOME. It never starts or stops existing offices. SIGKILL cannot run the
+wrapper's cleanup trap.
+
+Logs persist in `~/ci/logs`. Each attempted run prints one JSON summary with
+the requested ref, resolved SHA, collection and pass counts, failing node IDs,
+exit code, and log path. Check both the process exit code and canonical
+runner's certificate in that log; partial counts from a failed run are not a
+certificate. Keep this runner and its dependencies under `~/ci/`, with short
+temporary worktree paths so test tmux sockets fit Unix socket path limits.
+
 ## There is no enforced merge gate, and that is deliberate
 
 Nothing in the repository prevents a change from reaching `main` without
