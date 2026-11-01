@@ -181,10 +181,6 @@ Run any of those with --help. To see your tmux colleagues:
 
     {cmd} peers
 
-That's colleagues only — {entrance_peers_desc}
-or the tenant's lifecycle provider won't be on it; `{cmd} peers -i` lists those
-too, labeled apart from colleagues.
-
 A message arrives in your terminal as `[message from <name>] …` — reply by name,
 whether or not `peers` lists it:
 

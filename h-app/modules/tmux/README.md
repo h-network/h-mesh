@@ -116,10 +116,16 @@ and the ticket already carry the detail. (It replaced "message the lead a
 summary before or alongside `done`".) The suite-counts rule ("report both the
 collected count and the passed count") is unchanged.
 
+The "That's colleagues only -- {entrance} ... `peers -i` lists those too"
+paragraph was removed as well (no more entrance gatekeeping text, no
+replacement): a message already arrives as `[message from <name>]` and the guide
+says to reply to that name, which covers every entrance. As a result
 `operator_entrance` / `OPERATOR_ENTRANCE`, `enrolled_entrances` and
-`raise_on_invalid` are still accepted and still validated, but now only choose
-the wording of the "colleagues only -- ..." sentence (and log an error for an
-unenrolled entrance); they no longer add guide text of their own.
+`raise_on_invalid` **no longer influence the guide text at all**. They are
+deliberately left in place, and still do their validation side effects only: an
+operator entrance that is not enrolled raises `ValueError` in
+`generate_agents_md` (which `write_agent_guide` logs as an `error` event and then
+regenerates), and an unverifiable one logs a `warning`.
 
 ⚠ A guide is only (re)written when a window is created. Agents that are already
 running keep their old `AGENTS.md`/`CLAUDE.md` text until their window is next
