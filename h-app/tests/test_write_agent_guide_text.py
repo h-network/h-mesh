@@ -94,3 +94,30 @@ def test_nothing_replaces_the_removed_warning(home, tmp_path):
     assert "⚠ Treat" not in agents
     # The other ⚠ paragraph (one quoted argument) is untouched.
     assert "⚠ The body is ONE argument." in agents
+
+
+DONE_NOTICE = (
+    "When a ticket is done, send the lead ONE line saying it is done, naming the\n"
+    "ticket (title or id), then `h-mesh-office done`. No summary, no recap of changes.\n"
+)
+OLD_DONE_RULE = (
+    "message the lead a summary",
+    "A closed ticket with no report is invisible to the lead",
+)
+
+
+@pytest.mark.parametrize("variant", sorted(VARIANTS))
+def test_done_rule_is_a_one_line_notice_not_a_summary(home, tmp_path, variant):
+    agents, claude = _write(tmp_path, lead="architect", **VARIANTS[variant])
+    for text in (agents, claude):
+        assert text.count(DONE_NOTICE) == 1
+        for old in OLD_DONE_RULE:
+            assert old not in text
+        # The suite-counts rule is unchanged.
+        assert "Report both the collected count and the passed count" in text
+
+
+def test_done_notice_uses_the_configured_office_command(home, tmp_path, monkeypatch):
+    monkeypatch.setenv("OFFICE_TOOLS", "custom-office")
+    agents, _ = _write(tmp_path)
+    assert "naming the\nticket (title or id), then `custom-office done`." in agents

@@ -257,8 +257,8 @@ Your git identity is your own agent name — that is how the office knows
 which agent did which work. No co-author line, no "generated with" trailer,
 no other identity in a commit: only the one you are authenticated as.
 
-When a ticket is done, message the lead a summary before or alongside
-`{cmd} done`. A closed ticket with no report is invisible to the lead.
+When a ticket is done, send the lead ONE line saying it is done, naming the
+ticket (title or id), then `{cmd} done`. No summary, no recap of changes.
 
 Long-running work: don't go silent. Background it, or answer a check-in
 with real status — not silence until you're finished.

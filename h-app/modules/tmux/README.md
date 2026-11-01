@@ -109,6 +109,13 @@ the first alarm an agent read and the main cause of refusals of the operator's
 own Telegram messages. All that remains on the subject is the "destructive,
 ambiguous, or outside scope: ask the lead first" rule.
 
+The "ticket done" rule is a one-line notice, not a report: when a ticket is
+done the agent sends the lead ONE line saying so, naming the ticket (title or
+id), then runs `h-mesh-office done`. No summary or recap of changes; the commit
+and the ticket already carry the detail. (It replaced "message the lead a
+summary before or alongside `done`".) The suite-counts rule ("report both the
+collected count and the passed count") is unchanged.
+
 `operator_entrance` / `OPERATOR_ENTRANCE`, `enrolled_entrances` and
 `raise_on_invalid` are still accepted and still validated, but now only choose
 the wording of the "colleagues only -- ..." sentence (and log an error for an
