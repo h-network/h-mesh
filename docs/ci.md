@@ -56,8 +56,9 @@ returns non-zero, and issues no certificate.
 
 This makes the required environment a hard prerequisite for merge evidence. In
 particular, tests gate on Redis during their call phase, so a machine without
-reachable Redis cannot produce a suite certificate. Start the required service
-and rerun; the diagnostic enumerates the exact skipped nodes. A skip failure is
+reachable Redis cannot produce a suite certificate. The runner prepares a
+private Redis by default (see below); fix any startup failure and rerun. The
+diagnostic enumerates the exact skipped nodes. A skip failure is
 not a manifest mismatch, and regenerating the manifest cannot fix it.
 
 Bare focused pytest can exit zero while reporting skips. That is valid pytest
@@ -153,6 +154,41 @@ Use an owned environment installed with `.[test]` when reproducing CI or
 reporting results intended to be comparable with CI; a `PYTHONPATH` run is
 useful source-tree evidence but is not a reproduction of CI's dependency
 environment.
+
+## Private Redis for test runs
+
+With `REDIS_URL` unset, `python -m tools.run_tests` starts its own Redis bound
+to `127.0.0.1` on an OS-selected free port. It uses a temporary directory with
+RDB snapshots and append-only persistence disabled. A readiness check on a
+unique Unix socket verifies the newly launched server before pytest starts;
+the pytest child and its descendants inherit the private `REDIS_URL`. The
+runner stops that Redis and removes its directory after success, failure,
+SIGINT, or SIGTERM. SIGKILL cannot run process cleanup.
+
+Install the `redis-server` executable before running the suite (for example,
+`apt-get install redis-server` on Debian/Ubuntu). If it is missing or cannot
+start, the runner exits non-zero before pytest rather than falling back to
+localhost port 6379. No office startup or shutdown command is needed.
+
+An explicit `REDIS_URL` must be a `redis://` or `rediss://` TCP URL. The runner
+uses the Redis client's URL parsing rules, including percent-decoded hosts
+and query-string defaults. It refuses port 6379 and non-loopback hosts by
+default, even if the URL selects a separate Redis database. To use a Redis you
+have already isolated, supply a loopback URL on another port. The runner does
+not start or stop explicitly supplied servers. An empty or malformed URL is
+an error; unset the variable to request automatic isolation.
+
+`H_MESH_ALLOW_SHARED_REDIS=1` explicitly overrides the shared-endpoint guard
+for an intentional shared-server run. Other values do not enable it. Such a
+run can block or modify that server, so leave this override unset for office
+verification. Alongside the tree, runner module, and pytest cwd lines, the
+runner prints `test Redis: host:port` and whether the endpoint is private or
+explicit. These diagnostics never print URL usernames or passwords.
+
+Bare pytest does not use this provisioning or endpoint guard. For a focused
+run, explicitly set `REDIS_URL` to a private Redis on a nonstandard loopback
+port. Tests that default to localhost port 6379 can otherwise reach the live
+office Redis.
 
 ## There is no enforced merge gate, and that is deliberate
 

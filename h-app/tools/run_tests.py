@@ -4,18 +4,147 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import secrets
 import shlex
+import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 
 RUNNER_PATH = Path(__file__).resolve()
 FIRST_PARTY_PROBE = "services.daemons"
+
+
+class RedisSetupError(Exception):
+    """A safe Redis endpoint could not be prepared."""
+
+
+class RunnerInterrupted(BaseException):
+    def __init__(self, signum: int):
+        self.signum = signum
+
+
+def _interrupt(signum: int, _frame) -> None:
+    raise RunnerInterrupted(signum)
+
+
+def _redis_endpoint(url: str, *, allow_shared: bool) -> str:
+    # Use the client's parser so percent escapes and query-string defaults are
+    # checked exactly as they will be used by the tests. Never echo the URL or
+    # parser exception: either can contain credentials.
+    from redis.connection import parse_url
+
+    try:
+        if not url.startswith(("redis://", "rediss://")):
+            raise ValueError
+        options = parse_url(url)
+        host = options.get("host", "localhost")
+        port = int(options.get("port", 6379))
+        if not host or not 1 <= port <= 65535:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise RedisSetupError(
+            "invalid REDIS_URL; use a redis:// or rediss:// TCP URL"
+        ) from None
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host.lower() == "localhost"
+    endpoint = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    if (not loopback or port == 6379) and not allow_shared:
+        raise RedisSetupError(
+            f"refusing REDIS_URL endpoint {endpoint}: port 6379 and non-loopback "
+            "hosts may be a live office Redis. Unset REDIS_URL for a private "
+            "server, or explicitly set H_MESH_ALLOW_SHARED_REDIS=1 to override"
+        )
+    return endpoint
+
+
+def _stop_process(process: subprocess.Popen) -> None:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+@contextmanager
+def _redis_environment(environment: dict[str, str]):
+    if "REDIS_URL" in environment:
+        endpoint = _redis_endpoint(
+            environment["REDIS_URL"],
+            allow_shared=environment.get("H_MESH_ALLOW_SHARED_REDIS") == "1",
+        )
+        print(f"test Redis: {endpoint} (explicit REDIS_URL)", flush=True)
+        yield
+        return
+
+    binary = shutil.which("redis-server")
+    if binary is None:
+        raise RedisSetupError(
+            "redis-server is not installed; install redis-server and rerun "
+            "(for example: apt-get install redis-server), or set REDIS_URL "
+            "to a private loopback Redis on a port other than 6379"
+        )
+    with tempfile.TemporaryDirectory(prefix="h-mesh-test-redis-") as directory:
+        # The OS chooses an ephemeral loopback port. If another process wins
+        # the bind race, Redis exits and we fail closed before running pytest.
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+        if port == 6379:
+            raise RedisSetupError("OS selected reserved Redis port 6379; rerun")
+        process = None
+        try:
+            process = subprocess.Popen(
+                [binary, "--bind", "127.0.0.1", "--port", str(port),
+                 "--save", "", "--appendonly", "no", "--dir", directory,
+                 "--unixsocket", str(Path(directory) / "redis.sock"),
+                 "--unixsocketperm", "700",
+                 "--daemonize", "no"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            deadline = time.monotonic() + 5
+            while True:
+                if process.poll() is not None:
+                    raise RedisSetupError("private redis-server exited during startup")
+                try:
+                    # Readiness on our unique socket cannot mistake a process
+                    # that won the TCP bind race for the server we launched.
+                    with socket.socket(socket.AF_UNIX) as client:
+                        client.settimeout(0.1)
+                        client.connect(str(Path(directory) / "redis.sock"))
+                        client.sendall(b"*1\r\n$4\r\nPING\r\n")
+                        ready = client.recv(64) == b"+PONG\r\n"
+                    if ready and process.poll() is None:
+                        break
+                except OSError:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise RedisSetupError("private redis-server did not become ready within 5s")
+                time.sleep(0.02)
+            environment["REDIS_URL"] = f"redis://127.0.0.1:{port}/0"
+            print(f"test Redis: 127.0.0.1:{port} (private, ephemeral)", flush=True)
+            yield
+        except OSError:
+            raise RedisSetupError("could not start private redis-server; check its installation") from None
+        finally:
+            if process is not None:
+                _stop_process(process)
+            environment.pop("REDIS_URL", None)
 
 
 def _find_invoked_tree(start: Path) -> Path | None:
@@ -132,6 +261,24 @@ def main() -> int:
         )
         return 1
 
+    previous_handlers = {}
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, _interrupt)
+        with _redis_environment(pytest_env):
+            return _run_suite(repo_root, pytest_env)
+    except RedisSetupError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except RunnerInterrupted as exc:
+        print(f"test runner interrupted by signal {exc.signum}", file=sys.stderr)
+        return 128 + exc.signum
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
+def _run_suite(repo_root: Path, pytest_env: dict[str, str]) -> int:
     manifest = repo_root / "h-app" / "tools" / "test_nodeids.txt"
     manifest_bytes = manifest.read_bytes()
     expected_count = len([line for line in manifest_bytes.splitlines() if line.strip()])
