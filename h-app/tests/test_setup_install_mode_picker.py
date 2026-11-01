@@ -67,7 +67,7 @@ def _run_at_tty(setup, env, args, *, answer=None, until):
 
 
 @pytest.mark.parametrize("answer", ["", "h", "Host"])
-def test_setup_tty_picker_defaults_to_container(picker_setup, answer):
+def test_setup_tty_picker_answer_routing(picker_setup, answer):
     setup, env = picker_setup
     selected = "container-selected" if not answer else "Pod name ["
     output = _run_at_tty(
