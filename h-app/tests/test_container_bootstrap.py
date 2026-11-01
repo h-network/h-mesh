@@ -24,9 +24,29 @@ def _fake_docker(bin_dir: Path, log_path: Path) -> None:
     docker.chmod(docker.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
+_SCRUBBED_BOOTSTRAP_ENV_VARS = (
+    "H_MESH_TENANT_ENV_FILE",
+    "POD",
+    "TENANT",
+    "AGENTS",
+    "DEFAULT_CLI",
+    "H_MESH_BIND_PORTS",
+    "API_PORT",
+    "SESSION_PORT",
+    "ACCOUNTS",
+    "DEFAULT_ACCOUNT",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+
+
 def _env_with_fake_docker(bin_dir: Path) -> dict:
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
+    for key in _SCRUBBED_BOOTSTRAP_ENV_VARS:
+        env.pop(key, None)
+    for key in list(env):
+        if key.startswith("CLAUDE_OAUTH_TOKEN_"):
+            del env[key]
     return env
 
 
@@ -90,12 +110,14 @@ def test_attach_never_touches_agents_or_up(tmp_path):
 
 def test_up_prints_an_attach_hint_with_the_resolved_identity(tmp_path):
     log = tmp_path / "docker_calls.log"
+    env_file = tmp_path / "office.env"
     _fake_docker(tmp_path, log)
 
     res = subprocess.run(
         [
             "bash", str(BOOTSTRAP),
-            "--pod", "testpod", "--tenant", "testtenant", "--skip-build", "--non-interactive",
+            "--pod", "testpod", "--tenant", "testtenant",
+            "--env-file", str(env_file), "--skip-build", "--non-interactive",
         ],
         capture_output=True, text=True, timeout=10,
         env=_env_with_fake_docker(tmp_path),
@@ -106,6 +128,7 @@ def test_up_prints_an_attach_hint_with_the_resolved_identity(tmp_path):
     assert "h-mesh-testpod-testtenant" in res.stdout
     assert "tmux attach -t testtenant" in res.stdout
     assert "compose.ports.yaml" in res.stdout
+    assert not (REPO_ROOT / "offices" / "testpod" / "testtenant" / ".env").exists()
 
 
 def test_noninteractive_default_binds_default_ports(tmp_path):
@@ -149,11 +172,19 @@ def test_no_bind_ports_omits_overlay_and_persists_choice(tmp_path):
     assert "Host ports:   not published" in res.stdout
 
 
-def test_existing_env_without_bind_key_remains_bound(tmp_path):
+def test_existing_env_without_bind_key_remains_bound(tmp_path, monkeypatch):
     log = tmp_path / "docker_calls.log"
     env_file = tmp_path / "office.env"
     env_file.write_text("POD=testpod\nTENANT=testtenant\nAPI_PORT=19080\nSESSION_PORT=19081\n")
     _fake_docker(tmp_path, log)
+
+    leaked_names = (*_SCRUBBED_BOOTSTRAP_ENV_VARS, "CLAUDE_OAUTH_TOKEN_DEFAULT", "CLAUDE_OAUTH_TOKEN_ACCOUNT_2")
+    for name in leaked_names:
+        monkeypatch.setenv(name, "1")
+    helper_env = _env_with_fake_docker(tmp_path)
+    for name in leaked_names:
+        assert name not in helper_env
+    assert not any(k.startswith("CLAUDE_OAUTH_TOKEN_") for k in helper_env)
 
     res = subprocess.run(
         [
@@ -161,7 +192,7 @@ def test_existing_env_without_bind_key_remains_bound(tmp_path):
             "--env-file", str(env_file), "--skip-build", "--non-interactive",
         ],
         capture_output=True, text=True, timeout=10,
-        env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+        env=helper_env, stdin=subprocess.DEVNULL,
     )
     assert res.returncode == 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
     assert "compose.ports.yaml" in log.read_text().splitlines()[-1]
@@ -169,6 +200,7 @@ def test_existing_env_without_bind_key_remains_bound(tmp_path):
     assert "H_MESH_BIND_PORTS=1" in text
     assert "API_PORT=19080" in text
     assert "SESSION_PORT=19081" in text
+    assert "CLAUDE_OAUTH_TOKEN_" not in text
 
 
 def test_custom_port_flags_are_persisted_and_invalid_ports_fail(tmp_path):
