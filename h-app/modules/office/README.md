@@ -172,3 +172,22 @@ there is no TTL or manual resolution today, so the age is essential context,
 not a promise that the uncertainty will self-clear. With no presence evidence
 the state remains `unknown`, never guessed available from the board or guessed
 blocked from delivery uncertainty.
+
+`office usage [-a AGENT] [--since ISO] [--json]` totals the tenant's token
+usage, per agent, CLI and model, and prices it with `pricing.py`. It reads the
+`usage` stream that the watchdog's `ActivityTailer` fills from claude and codex
+session files; `office` itself measures nothing. A model with no pricing entry
+is listed as `unpriced` and left out of the USD total.
+
+agy agents are a known limitation, not a failure. agy's `history.jsonl` records
+only what was submitted and carries no token counts, and its richer per-turn
+data (`~/.gemini/antigravity-cli/conversations/*.db`) is opaque protobuf with no
+readable schema, so the watchdog has no usage source for agy and emits no
+usage records for it (`modules/watchdog/activity.py`; asserted by
+`test_agy_emits_no_usage_records`). Every enrolled agent whose `launch` is `agy`
+therefore gets a placeholder row with model `not collected`, dashes for the
+counts, and `unpriced` for the cost (`"collected": false` in `--json`). That row
+means "usage cannot be measured", not "usage was zero". It adds nothing to the
+total, so the total understates real spend whenever an agy agent is running.
+Collecting agy usage would need a new data source in the watchdog; no
+collection code exists in `office`.

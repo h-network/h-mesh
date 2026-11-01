@@ -1954,6 +1954,39 @@ def test_usage_json_reports_total(monkeypatch, capsys):
     assert payload["total_usd"] > 0
 
 
+def test_usage_reports_agy_as_not_collected_and_outside_the_total(monkeypatch, capsys):
+    """agy has no usage source (modules/watchdog/activity.py emits none), so an
+    enrolled agy agent gets an explicit placeholder row, never a priced zero.
+    Documented in modules/office/README.md; keep the two in step."""
+    _env(monkeypatch)
+    r = FakeRedis(registry={"architect": "tmux", "scout": "tmux"})
+    r.values[prefix(POD, TENANT, "scout", "launch")] = "agy"
+    usage_key = prefix(POD, TENANT, resource="usage")
+    r.streams[usage_key].append((
+        "1-0",
+        {"usage": json.dumps({
+            "agent": "architect", "cli": "claude", "model": "claude-sonnet-4",
+            "input": 1000, "output": 500, "cache_read": 0, "cache_write": 0,
+        })},
+    ))
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["usage", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    agy_row = next(row for row in payload["rows"] if row["agent"] == "scout")
+    assert agy_row["cli"] == "agy"
+    assert agy_row["model"] == "not collected"
+    assert agy_row["collected"] is False
+    assert agy_row["unpriced"] is True
+    assert agy_row["usd"] is None
+    priced = next(row for row in payload["rows"] if row["agent"] == "architect")
+    assert payload["total_usd"] == round(priced["usd"], 2)
+
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["usage"])
+    line = next(l for l in capsys.readouterr().out.splitlines() if l.startswith("scout"))
+    assert line.split() == ["scout", "agy", "not", "collected", "-", "-", "-", "-", "unpriced"]
+
+
 # ---------------------------------------------------------------------------
 # peers / status / broadcast
 # ---------------------------------------------------------------------------

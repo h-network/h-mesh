@@ -499,6 +499,7 @@ h-app/tests/test_office_cli.py::test_camel_case_command_aliases_are_rejected[sen
 h-app/tests/test_office_cli.py::test_camel_case_command_aliases_are_rejected[letGo]
 h-app/tests/test_office_cli.py::test_usage_empty_stream_prints_header_only
 h-app/tests/test_office_cli.py::test_usage_json_reports_total
+h-app/tests/test_office_cli.py::test_usage_reports_agy_as_not_collected_and_outside_the_total
 h-app/tests/test_office_cli.py::test_peers_prints_only_other_tmux_agents
 h-app/tests/test_office_cli.py::test_peers_verbose_reads_launch_profile_and_current_task
 h-app/tests/test_office_cli.py::test_peers_interfaces_labels_api_and_office_separately
