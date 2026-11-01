@@ -578,6 +578,20 @@ def test_enabled_daemon_modules_is_just_the_base_set_without_telegram_config():
     assert set(enabled_daemon_modules({})) == set(DAEMON_MODULES)
 
 
+@pytest.mark.parametrize(
+    ("env", "api_enabled"),
+    [
+        ({"API_TOKEN": "test-api-token"}, True),
+        ({"API_TOKEN": ""}, False),
+        ({"API_TOKEN": "test-api-token", "TELEGRAM_BOT_TOKEN": "partial"}, True),
+    ],
+    ids=["token-only", "empty-token", "partial-telegram"],
+)
+def test_api_token_enables_only_the_api_without_telegram(env, api_enabled):
+    expected = set(DAEMON_MODULES) | ({"api"} if api_enabled else set())
+    assert set(enabled_daemon_modules(env)) == expected
+
+
 def test_enabled_daemon_modules_adds_api_telegram_bot_and_session_when_both_present():
     # session backs the Telegram bot's "watch" command -- rides the same
     # TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID condition as api/telegram_bot,
