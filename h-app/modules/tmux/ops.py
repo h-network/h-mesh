@@ -1,5 +1,7 @@
+import functools
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -638,6 +640,176 @@ def _seed_profile_dirs(profile: str | None) -> None:
                 pass
 
 
+# ---------------------------------------------------------------------------
+# Single guide file (issue #31): AGENTS.md only, CLAUDE.md only when we must.
+#
+# claude reads CLAUDE.md, and -- when a project has none of its own -- falls
+# back to AGENTS.md (its `instructionFiles` setting, default
+# `claude-md-or-agents-md`). Tested by the operator on Claude Code 2.1.316, which
+# is also the floor below. codex/agy read AGENTS.md directly.
+#
+# ⚠ A "no CLAUDE.md" guide is a guide-less claude agent if that fallback does
+# not hold, which is worse than one harmless identical extra file. So the
+# per-agent CLAUDE.md is dropped ONLY when `claude_reads_agents_md` can positively
+# establish the fallback, and it FAILS CLOSED: anything unknown keeps the
+# dual-write. See README "Agent guide" for what it can and cannot detect.
+# ---------------------------------------------------------------------------
+
+# Tested and recorded: the version the operator verified the fallback on.
+CLAUDE_AGENTS_MD_FLOOR = (2, 1, 316)
+MANAGED_SETTINGS_DIR = "/etc/claude-code"
+_INSTRUCTION_FILES_OK = frozenset({"claude-md-or-agents-md", "claude-md-and-agents-md"})
+# Legacy spelling still honoured by claude while instructionFiles is default.
+_PROJECT_INSTRUCTIONS_OK = frozenset({"agents-fallback", "both"})
+
+
+@functools.lru_cache(maxsize=1)
+def _claude_version() -> tuple[int, int, int] | None:
+    """`claude --version` as (major, minor, patch), or None if unknowable.
+
+    Cached for the life of the process: it spawns a subprocess, and a claude
+    binary replaced under a running reconciler is picked up on its next start.
+    """
+    try:
+        proc = subprocess.run(
+            ["claude", "--version"], capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", proc.stdout or "")
+    return tuple(int(g) for g in match.groups()) if match else None  # type: ignore[return-value]
+
+
+def _claude_config_dir(profile: str | None) -> Path:
+    home_dir = os.environ.get("HOME", os.path.expanduser("~"))
+    return Path(home_dir) / (f".claude-{profile}" if profile else ".claude")
+
+
+def _settings_files(cwd: str, profile: str | None) -> list[Path]:
+    """Every settings file claude merges that could override the fallback."""
+    files = [
+        _claude_config_dir(profile) / "settings.json",
+        Path(cwd) / ".claude" / "settings.json",
+        Path(cwd) / ".claude" / "settings.local.json",
+    ]
+    managed = Path(MANAGED_SETTINGS_DIR)
+    files.append(managed / "managed-settings.json")
+    try:
+        files.extend(sorted((managed / "managed-settings.d").glob("*.json")))
+    except OSError:
+        pass
+    return files
+
+
+def claude_reads_agents_md(cwd: str, profile: str | None = None) -> tuple[bool, str]:
+    """Can claude be relied on to load AGENTS.md in `cwd` without a CLAUDE.md?
+
+    Returns (ok, reason). ⚠ FAILS CLOSED: False for anything not positively
+    established, because False only costs one duplicate file.
+    """
+    version = _claude_version()
+    if version is None:
+        return False, "claude --version is unavailable"
+    if version < CLAUDE_AGENTS_MD_FLOOR:
+        return False, (
+            f"claude {'.'.join(map(str, version))} is older than the tested "
+            f"{'.'.join(map(str, CLAUDE_AGENTS_MD_FLOOR))}"
+        )
+
+    for path in _settings_files(cwd, profile):
+        if not os.path.lexists(path):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return False, f"settings file {path} is unreadable: {exc}"
+        if not isinstance(data, dict):
+            return False, f"settings file {path} is not a JSON object"
+        if "instructionFiles" in data and not (
+            isinstance(data["instructionFiles"], str) and data["instructionFiles"] in _INSTRUCTION_FILES_OK
+        ):
+            return False, f"{path} sets instructionFiles={data['instructionFiles']!r}"
+        if "projectInstructions" in data and not (
+            isinstance(data["projectInstructions"], str)
+            and data["projectInstructions"] in _PROJECT_INSTRUCTIONS_OK
+        ):
+            return False, f"{path} sets projectInstructions={data['projectInstructions']!r}"
+
+    # A CLAUDE.md in an ancestor directory may count as the project's "own".
+    # Unverified either way, so it keeps the dual-write.
+    for ancestor in Path(cwd).absolute().parents:
+        if os.path.lexists(ancestor / "CLAUDE.md"):
+            return False, f"{ancestor / 'CLAUDE.md'} exists in an ancestor directory"
+    return True, "ok"
+
+
+def _log(event: str, reason: str) -> None:
+    """Guide housekeeping must never raise into a hire or the reconcile loop."""
+    try:
+        log_record("tmux", event, reason=reason)
+    except Exception:
+        pass
+
+
+def _read_bytes(path: str) -> bytes | None:
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _remove_generated_claude_md(cwd: str, proofs: list[bytes | None]) -> None:
+    """Remove `<cwd>/CLAUDE.md` only if it is byte-identical to one of `proofs`.
+
+    ⚠ NEVER delete a CLAUDE.md we cannot prove we generated: a human's file
+    would be data loss. A different one is left in place and logged -- note
+    claude then reads it INSTEAD of AGENTS.md.
+    """
+    path = os.path.join(cwd, "CLAUDE.md")
+    if not os.path.lexists(path):
+        return
+    if os.path.islink(path) or not os.path.isfile(path):
+        existing = None
+    else:
+        existing = _read_bytes(path)
+    if existing is not None and any(existing == p for p in proofs if p is not None):
+        try:
+            os.remove(path)
+            _log("guide_claude_md_removed", f"removed generated duplicate {path}")
+        except OSError as exc:
+            _log("error", f"could not remove {path}: {exc}")
+        return
+    _log(
+        "error",
+        f"{path} differs from the generated guide, so it was left in place; "
+        "claude will read it instead of AGENTS.md",
+    )
+
+
+def migrate_agent_guide(cwd: str, profile: str | None = None) -> str:
+    """Clean the duplicate CLAUDE.md of an agent whose guide is not being rewritten.
+
+    The reconciler never recreates an existing window, so already-running
+    agents would keep an old dual-write forever. This never rewrites AGENTS.md
+    and removes CLAUDE.md only when the fallback is established AND CLAUDE.md
+    is byte-identical to the AGENTS.md beside it. Returns a short status.
+    """
+    claude_md = os.path.join(cwd, "CLAUDE.md")
+    if not os.path.lexists(claude_md):
+        return "absent"
+    ok, reason = claude_reads_agents_md(cwd, profile)
+    if not ok:
+        return f"kept: {reason}"
+    agents = _read_bytes(os.path.join(cwd, "AGENTS.md"))
+    if agents is None:
+        return "kept: no AGENTS.md beside it"
+    _remove_generated_claude_md(cwd, [agents])
+    return "removed" if not os.path.lexists(claude_md) else "kept: differs from AGENTS.md"
+
+
 def write_agent_guide(
     cwd: str, agent_name: str, tenant: str = "default", lead: str | None = None,
     profile: str | None = None, cli: str | None = None,
@@ -661,10 +833,20 @@ def write_agent_guide(
                 enrolled_entrances=enrolled_entrances, raise_on_invalid=False,
             )
 
-        for filename in ("AGENTS.md", "CLAUDE.md"):
-            file_path = os.path.join(cwd, filename)
-            with open(file_path, "w", encoding="utf-8") as f:
+        # What an older dual-write left as AGENTS.md is the proof that a
+        # CLAUDE.md beside it is ours, even if the template has changed since.
+        previous_agents = _read_bytes(os.path.join(cwd, "AGENTS.md"))
+        with open(os.path.join(cwd, "AGENTS.md"), "w", encoding="utf-8") as f:
+            f.write(content)
+
+        single, why = claude_reads_agents_md(cwd, profile)
+        if single:
+            _remove_generated_claude_md(cwd, [previous_agents, content.encode("utf-8")])
+        else:
+            # ⚠ Unchanged dual-write: the fallback cannot be relied on here.
+            with open(os.path.join(cwd, "CLAUDE.md"), "w", encoding="utf-8") as f:
                 f.write(content)
+            _log("guide_dual_write", f"also wrote CLAUDE.md: {why}")
 
         # ⚠ SEED THE PROFILE DIR BEFORE TRUST, AND THE ORDER IS LOAD-BEARING.
         # A CLI pointed at CLAUDE_CONFIG_DIR=~/.claude-<profile> does NOT fall

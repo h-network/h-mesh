@@ -43,6 +43,7 @@ class TmuxReconciler:
         self._known_windows: Set[str] = set()
         self._failure_counts: dict[str, int] = {}
         self._next_retry: dict[str, float] = {}
+        self._guide_migrated: set[str] = set()
 
     def get_agent_cli(self, r: redis.Redis, agent: str) -> str | None:
         launch_key = prefix(self.pod, self.tenant, agent=agent, resource="launch")
@@ -323,6 +324,23 @@ class TmuxReconciler:
                         waited=backoff,
                     )
 
+    def _migrate_guides(self, r: redis.Redis, agents: Set[str]) -> None:
+        """Once per agent per process; never raises into the reconcile loop."""
+        for agent in sorted(agents - self._guide_migrated):
+            self._guide_migrated.add(agent)
+            try:
+                status = tmux_ops.migrate_agent_guide(
+                    get_agent_workdir(agent), profile=self.get_agent_profile(r, agent),
+                )
+                if status != "absent":
+                    log_record("tmux_reconciler", "guide_migrated", destination=agent, reason=status)
+            except Exception as exc:
+                try:
+                    log_record("tmux_reconciler", "error", destination=agent,
+                               reason=f"guide migration failed: {exc}")
+                except Exception:
+                    pass
+
     def reconcile_once(self, r: redis.Redis) -> None:
         all_members = members(r, pod=self.pod, tenant=self.tenant)
         roster_agents = {
@@ -390,6 +408,11 @@ class TmuxReconciler:
                     r, agent, cli=cli, profile=profile, lead=lead, provider=provider, resume=resume,
                     skip_permissions=skip_permissions, claude_tools=claude_tools,
                 )
+
+        # Already-live agents never get their guide rewritten (their window is
+        # not recreated), so a duplicate CLAUDE.md from an older dual-write
+        # build would stay forever. Sweep each agent once per process.
+        self._migrate_guides(r, roster_agents & set(self.get_windows()))
 
         # A cause marker beside an already-present window did not cause that
         # window. Consume it without attaching it to a later crash recovery.
