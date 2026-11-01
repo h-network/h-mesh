@@ -12,6 +12,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = REPO_ROOT / "container" / "bootstrap.sh"
+ENTRYPOINT = REPO_ROOT / "container" / "entrypoint.sh"
+COMPOSE_YAML = REPO_ROOT / "container" / "compose.yaml"
+COMPOSE_PORTS_YAML = REPO_ROOT / "container" / "compose.ports.yaml"
 
 
 def _fake_docker(bin_dir: Path, log_path: Path) -> None:
@@ -378,5 +381,151 @@ def test_bootstrap_writes_office_summary_and_attach_script_without_secrets(tmp_p
     assert "not published" in summary_file.read_text()
     assert "compose.ports.yaml" not in attach_script.read_text()
     assert f"API_TOKEN={fake_api_token}" in env_file.read_text()
+
+
+def test_compose_and_entrypoint_pin_internal_ports_when_custom_host_ports_are_set(tmp_path):
+    log = tmp_path / "docker_calls.log"
+    env_file = tmp_path / "office.env"
+    _fake_docker(tmp_path, log)
+
+    res = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP),
+            "--pod", "testpod", "--tenant", "testtenant",
+            "--api-port", "18080", "--session-port", "18081",
+            "--env-file", str(env_file), "--skip-build", "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+    )
+    assert res.returncode == 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+    env_text = env_file.read_text()
+    assert "API_PORT=18080" in env_text
+    assert "SESSION_PORT=18081" in env_text
+
+    compose_text = COMPOSE_YAML.read_text()
+    ports_text = COMPOSE_PORTS_YAML.read_text()
+    assert 'API_PORT: "8080"' in compose_text
+    assert 'SESSION_PORT: "8081"' in compose_text
+    assert '"${API_PORT:-8080}:8080"' in ports_text
+    assert '"${SESSION_PORT:-8081}:8081"' in ports_text
+
+    redis_ports_log = tmp_path / "redis_ports.log"
+    fake_redis_server = tmp_path / "redis-server"
+    fake_redis_server.write_text(
+        "#!/usr/bin/env bash\n"
+        f'printf "%s:%s\\n" "$API_PORT" "$SESSION_PORT" > "{redis_ports_log}"\n'
+        "exit 0\n"
+    )
+    fake_redis_server.chmod(0o755)
+    fake_redis_cli = tmp_path / "redis-cli"
+    fake_redis_cli.write_text("#!/usr/bin/env bash\nexit 1\n")
+    fake_redis_cli.chmod(0o755)
+
+    ep_env = _env_with_fake_docker(tmp_path)
+    ep_env.update({
+        "POD": "testpod",
+        "TENANT": "testtenant",
+        "API_PORT": "18080",
+        "SESSION_PORT": "18081",
+        "REDIS_DATA_DIR": str(tmp_path / "redis-data"),
+        "H_MESH_RUN_DIR": str(tmp_path / "run"),
+    })
+    ep_res = subprocess.run(
+        ["bash", str(ENTRYPOINT)],
+        capture_output=True, text=True, timeout=10,
+        env=ep_env, stdin=subprocess.DEVNULL,
+    )
+    assert ep_res.returncode != 0
+    assert "redis exited during startup" in ep_res.stdout
+    assert redis_ports_log.read_text().strip() == "8080:8081"
+
+
+def test_entrypoint_preflight_applies_when_api_token_is_set_without_telegram(tmp_path):
+    redis_called = tmp_path / "redis_called.log"
+    fake_redis_server = tmp_path / "redis-server"
+    fake_redis_server.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "started" > "{redis_called}"\n'
+        "exit 0\n"
+    )
+    fake_redis_server.chmod(0o755)
+    fake_redis_cli = tmp_path / "redis-cli"
+    fake_redis_cli.write_text("#!/usr/bin/env bash\nexit 1\n")
+    fake_redis_cli.chmod(0o755)
+
+    base_env = _env_with_fake_docker(tmp_path)
+    base_env.update({
+        "POD": "testpod",
+        "TENANT": "testtenant",
+        "API_TOKEN": "standalone-api-secret",
+        "REDIS_DATA_DIR": str(tmp_path / "redis-data"),
+        "H_MESH_RUN_DIR": str(tmp_path / "run"),
+    })
+    base_env.pop("TELEGRAM_BOT_TOKEN", None)
+    base_env.pop("TELEGRAM_CHAT_ID", None)
+    base_env.pop("H_MESH_ALLOW_PLAINTEXT", None)
+    base_env.pop("API_TLS_CERT", None)
+    base_env.pop("API_TLS_KEY", None)
+
+    refused = subprocess.run(
+        ["bash", str(ENTRYPOINT)],
+        capture_output=True, text=True, timeout=10,
+        env=base_env, stdin=subprocess.DEVNULL,
+    )
+    assert refused.returncode == 1
+    assert "refusing to start" in refused.stdout
+    assert "API_TOKEN" in refused.stdout
+    assert not redis_called.exists()
+
+    plaintext_env = {**base_env, "H_MESH_ALLOW_PLAINTEXT": "1"}
+    allowed_plaintext = subprocess.run(
+        ["bash", str(ENTRYPOINT)],
+        capture_output=True, text=True, timeout=10,
+        env=plaintext_env, stdin=subprocess.DEVNULL,
+    )
+    assert "refusing to start" not in allowed_plaintext.stdout
+    assert redis_called.exists()
+
+    redis_called.unlink()
+    tls_env = {
+        **base_env,
+        "API_TLS_CERT": "/etc/ssl/certs/api.pem",
+        "API_TLS_KEY": "/etc/ssl/private/api.key",
+    }
+    allowed_tls = subprocess.run(
+        ["bash", str(ENTRYPOINT)],
+        capture_output=True, text=True, timeout=10,
+        env=tls_env, stdin=subprocess.DEVNULL,
+    )
+    assert "refusing to start" not in allowed_tls.stdout
+    assert redis_called.exists()
+
+    log = tmp_path / "docker_calls.log"
+    _fake_docker(tmp_path, log)
+    env_file = tmp_path / "office" / ".env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text(
+        "POD=testpod\n"
+        "TENANT=testtenant\n"
+        "API_TOKEN=standalone-api-secret\n"
+        "H_MESH_ALLOW_PLAINTEXT=1\n"
+    )
+    boot_res = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP),
+            "--pod", "testpod", "--tenant", "testtenant",
+            "--env-file", str(env_file), "--skip-build", "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+    )
+    assert boot_res.returncode == 0, f"stdout: {boot_res.stdout}\nstderr: {boot_res.stderr}"
+    assert "Telegram:     not enabled" in boot_res.stdout
+    assert "API/session:  plaintext (H_MESH_ALLOW_PLAINTEXT=1)" in boot_res.stdout
+    summary_text = (env_file.parent / "SUMMARY.md").read_text()
+    assert "**API/session transport:** plaintext (H_MESH_ALLOW_PLAINTEXT=1)" in summary_text
+    assert "standalone-api-secret" not in summary_text
+
 
 

@@ -511,8 +511,9 @@ for token_name in "${TOKEN_VARS[@]}"; do [ -n "$(env_file_get "$token_name")" ] 
 echo "  OAuth tokens: $CONFIGURED_TOKENS/${#PROFILES[@]} configured"
 SUMMARY_TG_TOKEN="$(env_file_get TELEGRAM_BOT_TOKEN)"
 SUMMARY_TG_CHAT="$(env_file_get TELEGRAM_CHAT_ID)"
+SUMMARY_API_TOKEN="$(env_file_get API_TOKEN)"
 echo "  Telegram:     $([ -n "$SUMMARY_TG_TOKEN" ] && [ -n "$SUMMARY_TG_CHAT" ] && echo "enabled, chat id $SUMMARY_TG_CHAT" || echo "not enabled")"
-if [ -n "$SUMMARY_TG_TOKEN" ] && [ -n "$SUMMARY_TG_CHAT" ]; then
+if { [ -n "$SUMMARY_TG_TOKEN" ] && [ -n "$SUMMARY_TG_CHAT" ]; } || [ -n "$SUMMARY_API_TOKEN" ]; then
     if [ -n "$(env_file_get API_TLS_CERT)" ]; then
         echo "  API/session:  TLS ($(env_file_get API_TLS_CERT))"
     else
@@ -539,13 +540,16 @@ fi
 
 if [ -n "$SUMMARY_TG_TOKEN" ] && [ -n "$SUMMARY_TG_CHAT" ]; then
     SUMMARY_TELEGRAM="enabled"
+else
+    SUMMARY_TELEGRAM="not enabled (disabled)"
+fi
+if { [ -n "$SUMMARY_TG_TOKEN" ] && [ -n "$SUMMARY_TG_CHAT" ]; } || [ -n "$SUMMARY_API_TOKEN" ]; then
     if [ -n "$(env_file_get API_TLS_CERT)" ]; then
         SUMMARY_TLS="TLS ($(env_file_get API_TLS_CERT))"
     else
         SUMMARY_TLS="plaintext (H_MESH_ALLOW_PLAINTEXT=1)"
     fi
 else
-    SUMMARY_TELEGRAM="not enabled (disabled)"
     SUMMARY_TLS="not enabled"
 fi
 

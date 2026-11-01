@@ -35,6 +35,14 @@ services:
     environment:
       POD: "${POD:-default}"
       TENANT: "${TENANT:-default}"
+      # API_PORT and SESSION_PORT in the office .env choose the HOST-side
+      # published ports in compose.ports.yaml; env_file above would
+      # otherwise also pass those into the container, where server.py and
+      # session/app.py read the same variable names as their internal listen
+      # ports. Pin the internal ports to 8080/8081 so they always match
+      # Dockerfile's EXPOSE 8080 8081 and compose.ports.yaml's :8080/:8081.
+      API_PORT: "8080"
+      SESSION_PORT: "8081"
     volumes:
       # Redis's AOF, the tenant's persisted wizard config, and daemon
       # pidfiles/logs all live under $HOME/.h-mesh -- one volume, so a
