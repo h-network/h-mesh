@@ -11,16 +11,23 @@ agentlifecycle itself, the same separation `office/cli.py` and
 
 import argparse
 import base64
+import http.client
+import importlib
+import ipaddress
 import json
 import math
 import mimetypes
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Sequence
+from urllib.parse import quote, urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,7 +36,7 @@ import redis
 from core.channels import send
 from core.envelope import EnvelopeError, parse
 from core.keys import (
-    prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key, validate_segment,
+    incarnation_key, prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key, validate_segment,
 )
 from core.logging import log_record, record_task_event
 from core.registry import is_member, members, port_type
@@ -50,6 +57,17 @@ ATTACHMENT_MAX_CAPTION_BYTES = 65_536
 
 class OfficeError(ValueError):
     """A user-facing command error."""
+
+    exit_code = 1
+
+
+class OfficeUnknownOutcome(OfficeError):
+    """The request may or may not have taken effect (exit 3, never 1).
+
+    Distinct from every provable failure: callers must not blindly retry.
+    """
+
+    exit_code = 3
 
 
 def _context():
@@ -178,6 +196,16 @@ def _send_command(argv: list[str]) -> None:
         ),
     )
     parser.add_argument(
+        "--office",
+        metavar="OFFICE",
+        help=(
+            "send to agent AGENT in another office from this office's address book "
+            "(see 'office offices') instead of a local agent. Exit 0 = accepted by "
+            "the remote office (queued, not delivered); 1 = refused, provably nothing "
+            "sent; 3 = outcome unknown (timeout/reset/bad reply) -- do not blindly retry."
+        ),
+    )
+    parser.add_argument(
         "text",
         nargs="?",
         help="one quoted message argument; use -- before text that begins with a dash",
@@ -187,6 +215,11 @@ def _send_command(argv: list[str]) -> None:
     if not args.agent:
         raise OfficeError("office send requires -a <agent>")
     text = _resolve_message_text(args, "send")
+    if args.office is not None:
+        if args.reply_to is not None or args.context is not None:
+            raise OfficeError("--office cannot be combined with --reply-to or --context")
+        _send_to_office(args.office, args.agent, text)
+        return
 
     if args.reply_to is not None and not is_valid_reply_id(args.reply_to):
         raise OfficeError(
@@ -1903,6 +1936,425 @@ def _usage_command(argv: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# inter-office: address book, send --office, cooperation grants
+#
+# The sending half is this CLI alone: it POSTs straight to the other office's
+# api door (no relay on the send path). Everything it needs is in the
+# caller's own Redis (address book + token) and the HTTP contract:
+#   POST <url>/agents/<agent>/envelopes
+#   Authorization: Bearer coop.<token-id>.<secret>
+#   {"text": ..., "as": "<participant>"}  ->  202 {stream_id, correlation_id}
+# A 202 means "queued on the remote office's egress", never "delivered".
+# ---------------------------------------------------------------------------
+
+_OFFICE_SENT_TTL_SECONDS = 86400
+_OFFICE_HTTP_TIMEOUT_SECONDS = 10.0
+_COOP_TOKEN_RE = re.compile(r"^coop\.[0-9a-f]{16}\.[A-Za-z0-9_-]{43}$")
+_COOP_TOKEN_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+# The remote office's fixed participants; a cooperation can never name them
+# (the receiving door refuses them as well -- failing here is only faster).
+_FIXED_PARTICIPANTS = frozenset({"api", "host"})
+# Local api participant the relay daemon replies from; enrolled by office-add.
+_RELAY_PARTICIPANT = "relay"
+
+
+def _key(name: str, pod: str, tenant: str, *args):
+    """Prefer switch-agent's named helper in core.keys once it exists; until
+    then build the contract's exact resource name with prefix()."""
+    import core.keys as core_keys
+
+    helper = getattr(core_keys, f"{name}_key", None)
+    if helper is not None:
+        return helper(pod, tenant, *args)
+    resources = {
+        "offices": "offices",
+        "office_tokens": "offices.tokens",
+        "coop_tokens": "coop-tokens",
+    }
+    if name == "office_sent":
+        return prefix(pod, tenant, resource=f"xsent.s{args[0]}")
+    return prefix(pod, tenant, resource=resources[name])
+
+
+def _require_lead(r, *, pod: str, tenant: str, source: str, command: str) -> None:
+    """Fail closed unless the caller is the tenant's lead.
+
+    ⚠ Advisory, not authentication: the caller's identity is the AGENT_NAME
+    environment variable and anything with Redis access can write these keys
+    directly. This stops mistakes and non-lead agents, not a hostile local
+    process. See modules/office/README.md.
+    """
+    lead = _text(r.get(prefix(pod, tenant, resource="lead")))
+    if not lead:
+        raise OfficeError(f"office {command} is lead-only and this office has no lead")
+    if lead != source:
+        raise OfficeError(f"office {command} is lead-only (the lead is {lead!r}, you are {source!r})")
+
+
+def _is_loopback_host(host: str) -> bool:
+    host = host.strip("[]")
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _validated_office_url(raw: str, *, allow_plaintext: bool) -> tuple[str, bool]:
+    """Return (normalised url, is_plaintext_over_the_network)."""
+    try:
+        parts = urlsplit(raw)
+        host = parts.hostname
+        parts.port  # noqa: B018 -- raises ValueError on a bad port
+    except ValueError as exc:
+        raise OfficeError(f"invalid office url {raw!r}: {exc}") from exc
+    if parts.scheme not in ("http", "https") or not host:
+        raise OfficeError("office url must be http(s)://host[:port][/prefix]")
+    if parts.username is not None or parts.password is not None or parts.query or parts.fragment:
+        raise OfficeError("office url must not carry credentials, a query or a fragment")
+    plaintext = parts.scheme == "http" and not _is_loopback_host(host)
+    if plaintext and not (allow_plaintext or os.environ.get("H_MESH_ALLOW_PLAINTEXT") == "1"):
+        raise OfficeError(
+            "plaintext http to a non-loopback host sends the cooperation token in the clear; "
+            "use https (the supported default), or pass --allow-plaintext for a lab test bed"
+        )
+    return raw.rstrip("/"), plaintext
+
+
+def _segment_arg(value: str, what: str) -> str:
+    try:
+        return validate_segment(value)
+    except KeyError:
+        raise OfficeError(
+            f"invalid {what} {value!r}: lowercase alphanumeric/hyphens, 1-63 chars, "
+            "starting with a letter or digit, not all-digits, not a reserved word"
+        ) from None
+
+
+def _office_record(r, *, pod: str, tenant: str, name: str) -> dict | None:
+    try:
+        raw = r.hget(_key("offices", pod, tenant), name)
+    except redis.RedisError as exc:
+        raise OfficeError(f"cannot read the office address book: {exc}") from exc
+    if raw is None:
+        return None
+    try:
+        record = json.loads(_text(raw))
+    except json.JSONDecodeError:
+        record = None
+    if not isinstance(record, dict) or not isinstance(record.get("url"), str) \
+            or not isinstance(record.get("participant"), str):
+        raise OfficeError(f"address book entry for office {name!r} is unreadable; re-add it")
+    return record
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: urllib would replay the Authorization header
+    to wherever the other end points us."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _server_detail(exc: urllib.error.HTTPError, token: str) -> str:
+    try:
+        body = exc.read(2048).decode("utf-8", "replace")
+    except Exception:
+        body = ""
+    detail = body
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict) and "detail" in parsed:
+            detail = parsed["detail"] if isinstance(parsed["detail"], str) else json.dumps(parsed["detail"])
+    except json.JSONDecodeError:
+        pass
+    detail = " ".join(detail.split())[:200]
+    return detail.replace(token, "***") if token else detail
+
+
+# connect-phase failures that prove no byte of the request reached the server.
+_NOT_SENT_ERRORS = (ConnectionRefusedError, socket.gaierror)
+
+
+def _post_to_office(url: str, token: str, agent: str, body: dict) -> dict:
+    """POST one envelope; return the parsed 202 body.
+
+    Raises OfficeError when the failure proves nothing was accepted and
+    OfficeUnknownOutcome when it may have been.
+    """
+    endpoint = f"{url}/agents/{quote(agent, safe='')}/envelopes"
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(request, timeout=_OFFICE_HTTP_TIMEOUT_SECONDS) as response:
+            status = response.status
+            raw = response.read(65536)
+    except urllib.error.HTTPError as exc:
+        detail = _server_detail(exc, token)
+        if exc.code >= 500 or 300 <= exc.code < 400:
+            raise OfficeUnknownOutcome(
+                f"remote office answered HTTP {exc.code}"
+                f"{': ' + detail if detail else ''} -- the message may have been accepted; "
+                "do not blindly retry"
+            ) from None
+        hint = {
+            401: " (the cooperation token was refused: wrong, revoked or not for this office)",
+            403: " (refused by the remote office's cooperation policy)",
+        }.get(exc.code, "")
+        raise OfficeError(
+            f"remote office refused the message: HTTP {exc.code}"
+            f"{': ' + detail if detail else ''}{hint}"
+        ) from None
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, _NOT_SENT_ERRORS):
+            raise OfficeError(f"cannot reach the remote office at {url}: {exc.reason}") from None
+        raise OfficeUnknownOutcome(
+            f"request to the remote office failed mid-flight ({exc.reason}) -- the message "
+            "may have been accepted; do not blindly retry"
+        ) from None
+    except (OSError, http.client.HTTPException) as exc:
+        raise OfficeUnknownOutcome(
+            f"connection to the remote office broke ({type(exc).__name__}) -- the message "
+            "may have been accepted; do not blindly retry"
+        ) from None
+    try:
+        reply = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        reply = None
+    stream_id = reply.get("stream_id") if isinstance(reply, dict) else None
+    if status != 202 or not is_valid_reply_id(stream_id):
+        raise OfficeUnknownOutcome(
+            f"remote office answered HTTP {status} without a valid stream_id -- the message "
+            "may have been accepted; do not blindly retry"
+        )
+    return reply
+
+
+def _send_to_office(office: str, agent: str, text: str) -> None:
+    office = _segment_arg(office, "office name")
+    agent = _segment_arg(agent, "agent name")
+    if agent in _FIXED_PARTICIPANTS:
+        raise OfficeError(f"cannot send to {agent!r}: not an agent")
+    r, pod, tenant, source = _context()
+    record = _office_record(r, pod=pod, tenant=tenant, name=office)
+    if record is None:
+        raise OfficeError(f"unknown office {office!r} (see: office offices)")
+    try:
+        token = _text(r.hget(_key("office_tokens", pod, tenant), office))
+    except redis.RedisError as exc:
+        raise OfficeError(f"cannot read the office token: {exc}") from exc
+    if not token:
+        raise OfficeError(f"office {office!r} has no token; the lead must re-add it")
+
+    # Captured BEFORE the POST and retained across it: the sender identity the
+    # reply must go back to is the incarnation that sent, not whoever holds
+    # this name when the reply arrives. Unreadable/absent -> None, which the
+    # relay treats as uncorrelated (routes to the lead), never as a match.
+    try:
+        sender_incarnation = _text(r.get(incarnation_key(pod, tenant, source))) or None
+    except Exception:
+        sender_incarnation = None
+
+    reply = _post_to_office(
+        record["url"], token, agent, {"text": text, "as": record["participant"]},
+    )
+    stream_id = reply["stream_id"]
+    # The message is already accepted: a failed bookkeeping write must not
+    # make this look failed (a retry would duplicate it). It only costs reply
+    # routing for this one message, which we say out loud.
+    try:
+        r.set(
+            _key("office_sent", pod, tenant, stream_id),
+            json.dumps({
+                "sender": source, "sender_incarnation": sender_incarnation,
+                "office": office, "agent": agent, "ts": _now(),
+            }),
+            ex=_OFFICE_SENT_TTL_SECONDS,
+        )
+    except Exception as exc:
+        print(
+            f"office: warning: sent, but could not record the sender for reply routing "
+            f"({type(exc).__name__}); a reply to {stream_id} cannot be routed back to you",
+            file=sys.stderr,
+        )
+    print(f"sent to {office}/{agent}: {len(text.encode('utf-8'))} bytes ({stream_id})")
+
+
+def _office_add_command(argv: list[str]) -> None:
+    parser = _operation_parser(
+        "office-add",
+        "Add (or update) another office in the address book. Lead only. "
+        "The cooperation token is read from stdin and never accepted as an argument.",
+    )
+    parser.add_argument("name", help="local name for the other office")
+    parser.add_argument("url", help="base url of its api door, e.g. https://office-b.example:8080")
+    parser.add_argument("--participant", required=True, metavar="NAME",
+                        help="the participant the cooperation was granted to (the 'as' value)")
+    parser.add_argument("--token-stdin", action="store_true", required=True,
+                        help="read the cooperation token (coop.<id>.<secret>) from stdin")
+    parser.add_argument("--allow-plaintext", action="store_true",
+                        help="permit http:// to a non-loopback host (lab test beds only; "
+                             "the token then travels in the clear)")
+    args = parser.parse_args(argv)
+
+    name = _segment_arg(args.name, "office name")
+    participant = _segment_arg(args.participant, "participant")
+    if participant in _FIXED_PARTICIPANTS:
+        raise OfficeError(f"participant {participant!r} is reserved")
+    url, plaintext = _validated_office_url(args.url, allow_plaintext=args.allow_plaintext)
+    token = sys.stdin.read().strip()
+    if not _COOP_TOKEN_RE.fullmatch(token):
+        raise OfficeError("stdin did not carry a cooperation token of the form coop.<16 hex>.<43 chars>")
+
+    r, pod, tenant, source = _context()
+    _require_lead(r, pod=pod, tenant=tenant, source=source, command="office-add")
+    record = {"url": url, "participant": participant, "added_by": source, "added_ts": _now()}
+    # The relay daemon delivers remote replies into this office as the local
+    # api participant `relay`. Enrol it if absent (same StartAgent mechanism as
+    # coop-grant); refuse before any write if the name is taken by a non-api agent.
+    relay_enrolled = is_member(r, pod=pod, tenant=tenant, agent=_RELAY_PARTICIPANT)
+    if relay_enrolled and port_type(r, pod=pod, tenant=tenant, agent=_RELAY_PARTICIPANT) != "api":
+        raise OfficeError(f"{_RELAY_PARTICIPANT!r} exists but is not an api participant; it is reserved for the relay")
+    try:
+        existed = r.hexists(_key("offices", pod, tenant), name)
+        # Token first: the book never names an office whose token is missing.
+        r.hset(_key("office_tokens", pod, tenant), name, token)
+        r.hset(_key("offices", pod, tenant), name, json.dumps(record, separators=(",", ":")))
+    except redis.RedisError as exc:
+        raise OfficeError(f"cannot write the office address book: {exc}") from exc
+    if not relay_enrolled:
+        send(
+            r, pod=pod, tenant=tenant, source=source, destination="host",
+            payload={"agent": _RELAY_PARTICIPANT, "port_type": "api"},
+            kind="StartAgent", module="office",
+        )
+    log_record("office", "office_added", source=source, destination=name, evidence=url)
+    if plaintext:
+        print(f"office: warning: {url} is plaintext http; the token travels in the clear",
+              file=sys.stderr)
+    print(f"{'updated' if existed else 'added'} office {name} -> {url} (as {participant})")
+
+
+def _offices_command(argv: list[str]) -> None:
+    parser = _operation_parser("offices", "List the other offices in the address book (no secrets).")
+    parser.parse_args(argv)
+    r, pod, tenant, _ = _context()
+    try:
+        raw = r.hgetall(_key("offices", pod, tenant))
+    except redis.RedisError as exc:
+        raise OfficeError(f"cannot read the office address book: {exc}") from exc
+    if not raw:
+        print("no offices configured")
+        return
+    for name, value in sorted((_text(k), v) for k, v in raw.items()):
+        try:
+            rec = json.loads(_text(value))
+            line = f"{name}\t{rec['url']}\tas {rec['participant']}\tadded by {rec.get('added_by', '?')}"
+        except (json.JSONDecodeError, KeyError, TypeError):
+            line = f"{name}\t(unreadable entry)"
+        print(line)
+
+
+def _office_rm_command(argv: list[str]) -> None:
+    parser = _operation_parser("office-rm", "Remove another office from the address book. Lead only.")
+    parser.add_argument("name")
+    args = parser.parse_args(argv)
+    name = _segment_arg(args.name, "office name")
+    r, pod, tenant, source = _context()
+    _require_lead(r, pod=pod, tenant=tenant, source=source, command="office-rm")
+    try:
+        removed = r.hdel(_key("offices", pod, tenant), name)
+        r.hdel(_key("office_tokens", pod, tenant), name)
+    except redis.RedisError as exc:
+        raise OfficeError(f"cannot update the office address book: {exc}") from exc
+    if not removed:
+        raise OfficeError(f"unknown office {name!r}")
+    log_record("office", "office_removed", source=source, destination=name)
+    print(f"removed office {name}")
+
+
+def _coop_tokens():
+    try:
+        return importlib.import_module("lib.coop_tokens")
+    except ImportError as exc:
+        raise OfficeError(
+            "cooperation tokens are not available in this build (lib/coop_tokens is missing)"
+        ) from exc
+
+
+def _coop_grant_command(argv: list[str]) -> None:
+    parser = _operation_parser(
+        "coop-grant",
+        "Grant another office a cooperation token for PARTICIPANT in this office. Lead only. "
+        "The token is printed once and cannot be shown again.",
+    )
+    parser.add_argument("participant", help="name of the api participant the other office will send as")
+    args = parser.parse_args(argv)
+    participant = _segment_arg(args.participant, "participant")
+    if participant in _FIXED_PARTICIPANTS:
+        raise OfficeError(f"participant {participant!r} is reserved")
+    coop = _coop_tokens()
+    r, pod, tenant, source = _context()
+    _require_lead(r, pod=pod, tenant=tenant, source=source, command="coop-grant")
+    if is_member(r, pod=pod, tenant=tenant, agent=participant) and \
+            port_type(r, pod=pod, tenant=tenant, agent=participant) != "api":
+        raise OfficeError(f"{participant!r} is an existing non-api agent; pick another participant name")
+    # Enrol first, mint second: a failure in between leaves an idle api
+    # participant, never a live token for a participant that does not exist.
+    send(
+        r, pod=pod, tenant=tenant, source=source, destination="host",
+        payload={"agent": participant, "port_type": "api"},
+        kind="StartAgent", module="office",
+    )
+    token_id, token = coop.grant(r, pod, tenant, participant, kinds=("Message",))
+    log_record("office", "coop_granted", source=source, destination=participant, evidence=token_id)
+    print(f"participant: {participant}")
+    print(f"token-id: {token_id}")
+    print(f"token: {token}")
+    print("This token is shown once. Give it to the other office's lead "
+          "(office-add ... --token-stdin); revoke with: office coop-revoke " + token_id,
+          file=sys.stderr)
+
+
+def _coop_revoke_command(argv: list[str]) -> None:
+    parser = _operation_parser("coop-revoke", "Revoke a cooperation token immediately. Lead only.")
+    parser.add_argument("token_id", metavar="TOKEN-ID", help="16-hex id from 'office coops'")
+    args = parser.parse_args(argv)
+    if not _COOP_TOKEN_ID_RE.fullmatch(args.token_id):
+        raise OfficeError("token id must be 16 lowercase hex characters (the id, not the token)")
+    coop = _coop_tokens()
+    r, pod, tenant, source = _context()
+    _require_lead(r, pod=pod, tenant=tenant, source=source, command="coop-revoke")
+    coop.revoke(r, pod, tenant, args.token_id)
+    log_record("office", "coop_revoked", source=source, evidence=args.token_id)
+    print(f"revoked {args.token_id}")
+
+
+def _coops_command(argv: list[str]) -> None:
+    parser = _operation_parser("coops", "List cooperation tokens granted by this office (no secrets).")
+    parser.parse_args(argv)
+    coop = _coop_tokens()
+    r, pod, tenant, _ = _context()
+    rows = coop.list_tokens(r, pod, tenant)
+    if not rows:
+        print("no cooperation tokens")
+        return
+    # Whitelist what is printed: whatever else a record carries stays unprinted.
+    for row in rows:
+        kinds = ",".join(str(k) for k in (row.get("kinds") or ()))
+        state = "revoked" if row.get("revoked") else "active"
+        print(f"{row.get('token_id', '?')}\t{row.get('participant', '?')}\t{kinds}\t{state}\t"
+              f"{row.get('created_ts', '?')}")
+
+
+
+# ---------------------------------------------------------------------------
 # Dispatch: one table, not three hand-synced places.
 #
 # The previous system kept a command-name tuple, a descriptions dict, and an
@@ -1944,6 +2396,12 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("add",), "add a task to another agent's board", _add_command),
     (("clone-to-all",), "clone a repository into agent workspaces", _clone_to_all_command),
     (("usage",), "show token usage and estimated cost", _usage_command),
+    (("office-add",), "add another office to the address book (lead only)", _office_add_command),
+    (("offices",), "list other offices in the address book", _offices_command),
+    (("office-rm",), "remove another office from the address book (lead only)", _office_rm_command),
+    (("coop-grant",), "grant another office a cooperation token (lead only)", _coop_grant_command),
+    (("coop-revoke",), "revoke a cooperation token (lead only)", _coop_revoke_command),
+    (("coops",), "list granted cooperation tokens", _coops_command),
 )
 
 _COMMANDS: tuple[str, ...] = tuple(name for names, _, _ in _COMMAND_TABLE for name in names)
@@ -1979,7 +2437,7 @@ def _dispatch(args: list[str]) -> None:
         _DISPATCH[command](remainder)
     except OfficeError as exc:
         print(f"office: error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
+        raise SystemExit(exc.exit_code) from exc
 
 
 def main(argv: Sequence[str] | None = None) -> None:

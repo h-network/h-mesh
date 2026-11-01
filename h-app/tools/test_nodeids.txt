@@ -511,6 +511,52 @@ h-app/tests/test_office_cli.py::test_status_keeps_unknown_presence_unknown_with_
 h-app/tests/test_office_cli.py::test_status_keeps_delivery_marker_visible_when_its_age_is_malformed
 h-app/tests/test_office_cli.py::test_broadcast_resolves_tmux_peers_without_self
 h-app/tests/test_office_cli.py::test_broadcast_reads_stdin
+h-app/tests/test_office_interoffice.py::test_send_office_posts_the_contract_and_records_the_sender
+h-app/tests/test_office_interoffice.py::test_send_office_without_known_incarnation_records_null
+h-app/tests/test_office_interoffice.py::test_send_office_rejects_bad_arguments_before_any_io[argv0-invalid agent name]
+h-app/tests/test_office_interoffice.py::test_send_office_rejects_bad_arguments_before_any_io[argv1-not an agent]
+h-app/tests/test_office_interoffice.py::test_send_office_rejects_bad_arguments_before_any_io[argv2-not an agent]
+h-app/tests/test_office_interoffice.py::test_send_office_rejects_bad_arguments_before_any_io[argv3-invalid office name]
+h-app/tests/test_office_interoffice.py::test_send_office_rejects_bad_arguments_before_any_io[argv4-cannot be combined]
+h-app/tests/test_office_interoffice.py::test_send_office_rejects_bad_arguments_before_any_io[argv5-cannot be combined]
+h-app/tests/test_office_interoffice.py::test_send_unknown_office_and_missing_token
+h-app/tests/test_office_interoffice.py::test_send_refusals_exit_1_and_never_echo_the_token[401-payload0]
+h-app/tests/test_office_interoffice.py::test_send_refusals_exit_1_and_never_echo_the_token[403-payload1]
+h-app/tests/test_office_interoffice.py::test_send_refusals_exit_1_and_never_echo_the_token[404-payload2]
+h-app/tests/test_office_interoffice.py::test_send_refusals_exit_1_and_never_echo_the_token[422-payload3]
+h-app/tests/test_office_interoffice.py::test_send_connection_refused_is_a_provable_failure
+h-app/tests/test_office_interoffice.py::test_send_unknown_outcomes_exit_3[handler0]
+h-app/tests/test_office_interoffice.py::test_send_unknown_outcomes_exit_3[handler1]
+h-app/tests/test_office_interoffice.py::test_send_unknown_outcomes_exit_3[handler2]
+h-app/tests/test_office_interoffice.py::test_send_unknown_outcomes_exit_3[handler3]
+h-app/tests/test_office_interoffice.py::test_send_unknown_outcomes_exit_3[handler4]
+h-app/tests/test_office_interoffice.py::test_send_timeout_is_unknown_exit_3
+h-app/tests/test_office_interoffice.py::test_send_never_follows_a_redirect_with_the_token
+h-app/tests/test_office_interoffice.py::test_send_accepted_but_unrecordable_warns_and_still_succeeds
+h-app/tests/test_office_interoffice.py::test_office_add_is_lead_only_and_reads_the_token_from_stdin
+h-app/tests/test_office_interoffice.py::test_office_add_does_not_reenrol_an_existing_relay
+h-app/tests/test_office_interoffice.py::test_office_add_refuses_a_non_api_relay_before_writing
+h-app/tests/test_office_interoffice.py::test_office_add_has_no_token_argument
+h-app/tests/test_office_interoffice.py::test_office_add_validation[ftp://b.example-coop.ab12cd34ef567890.SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS-http(s)]
+h-app/tests/test_office_interoffice.py::test_office_add_validation[https://u:pw@b.example-coop.ab12cd34ef567890.SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS-credentials]
+h-app/tests/test_office_interoffice.py::test_office_add_validation[https://b.example/?x=1-coop.ab12cd34ef567890.SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS-credentials]
+h-app/tests/test_office_interoffice.py::test_office_add_validation[http://b.example:8080-coop.ab12cd34ef567890.SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS-plaintext]
+h-app/tests/test_office_interoffice.py::test_office_add_validation[https://b.example-not-a-token-cooperation token]
+h-app/tests/test_office_interoffice.py::test_office_add_validation[https://b.example--cooperation token]
+h-app/tests/test_office_interoffice.py::test_office_add_plaintext_needs_explicit_opt_in_and_warns
+h-app/tests/test_office_interoffice.py::test_offices_lists_everyone_and_never_prints_a_token
+h-app/tests/test_office_interoffice.py::test_offices_empty
+h-app/tests/test_office_interoffice.py::test_office_rm_is_lead_only_and_removes_record_and_token
+h-app/tests/test_office_interoffice.py::test_coop_grant_enrols_then_mints_and_prints_the_token_once
+h-app/tests/test_office_interoffice.py::test_coop_grant_rejects_reserved_participants[api]
+h-app/tests/test_office_interoffice.py::test_coop_grant_rejects_reserved_participants[host]
+h-app/tests/test_office_interoffice.py::test_coop_grant_rejects_reserved_participants[all]
+h-app/tests/test_office_interoffice.py::test_coop_grant_rejects_reserved_participants[Bad Name]
+h-app/tests/test_office_interoffice.py::test_coop_grant_refuses_non_lead_and_existing_non_api_agent
+h-app/tests/test_office_interoffice.py::test_coop_grant_without_the_module_fails_cleanly
+h-app/tests/test_office_interoffice.py::test_coop_revoke_is_lead_only_and_takes_the_id_not_the_token
+h-app/tests/test_office_interoffice.py::test_coops_lists_only_whitelisted_fields
+h-app/tests/test_office_interoffice.py::test_new_commands_are_registered_everywhere
 h-app/tests/test_office_port.py::test_lifecycle_validation_failure_is_explicit_rejection
 h-app/tests/test_office_port.py::test_lifecycle_unknown_failure_is_not_misclassified_as_rejection
 h-app/tests/test_office_port.py::test_late_validation_rejection_writes_nothing_and_is_dead_letterable

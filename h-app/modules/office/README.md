@@ -191,3 +191,76 @@ means "usage cannot be measured", not "usage was zero". It adds nothing to the
 total, so the total understates real spend whenever an agy agent is running.
 Collecting agy usage would need a new data source in the watchdog; no
 collection code exists in `office`.
+
+## Inter-office (proof of concept)
+
+One office can send a message to an agent in another office. The CLI itself
+POSTs to the other office's api door; a separate relay daemon handles replies
+only (it is not part of this module). Message kind only, no attachments.
+
+**Sending.** `office send --office OFFICE -a AGENT TEXT` (or `--stdin` /
+`--file`) looks OFFICE up in the address book and sends
+`POST <url>/agents/AGENT/envelopes` with `Authorization: Bearer
+coop.<token-id>.<secret>` and body `{"text": ..., "as": "<participant>"}`. On a
+`202` it prints `sent to OFFICE/AGENT: N bytes (<stream_id>)`, where
+`stream_id` is the remote office's. **202 means queued on the remote office's
+egress, never delivered.** `--office` cannot be combined with `--reply-to` or
+`--context`; `all`, `api` and `host` are refused before any I/O. Nothing goes
+onto the local bus.
+
+| exit | meaning |
+|---|---|
+| 0 | accepted (202) |
+| 1 | refused, provably nothing sent: bad arguments, unknown office, no token, connection refused / DNS failure, HTTP 4xx (401 token wrong or revoked, 403 policy, 404 unknown agent, 422 invalid) |
+| 2 | usage error (argparse) |
+| 3 | outcome unknown: timeout, connection reset, HTTP 5xx or a redirect, a 2xx that is not a 202 with a valid `stream_id`. The message may have been accepted; do not blindly retry |
+
+Redirects are never followed (urllib would replay the Authorization header).
+Error output never contains the token, including text echoed by the server.
+
+**Reply routing.** After a 202 the CLI writes `xsent.s<stream_id>` =
+`{sender, sender_incarnation, office, agent, ts}` with a 24h TTL; the relay
+uses it to hand a reply back to the sender. `sender_incarnation` is read
+before the POST so a same-named successor never inherits a reply (absent means
+the relay treats the reply as uncorrelated). If this write fails the message
+was still sent: the CLI exits 0, warns on stderr, and that one message's reply
+cannot be routed back. A remote agent's reply is only correlated when it
+answers with `--reply-to <stream_id>`, which its pasted message shows because
+the cooperation participant is an api-type source.
+
+**Address book (sending side).** Redis, via `core.keys.prefix`:
+
+| resource | holds |
+|---|---|
+| `offices` | hash `name -> {url, participant, added_by, added_ts}`, no secrets |
+| `offices.tokens` | hash `name -> token`, read only by `send --office` and the relay |
+| `xsent.s<stream_id>` | the reply-routing record above |
+
+- `office office-add NAME URL --participant P --token-stdin [--allow-plaintext]`
+  (lead only). The token is read from stdin and there is no `--token` option,
+  so it never appears in process arguments. It also enrols the local api
+  participant `relay` with a `StartAgent` envelope if it is absent, and refuses
+  if `relay` already exists as a non-api agent. It starts no process.
+- `office offices` lists names, urls and participants. It reads only the
+  `offices` hash, so it cannot print a token.
+- `office office-rm NAME` (lead only) removes the record and the token.
+- TLS is the supported default. `http://` to a non-loopback host is refused
+  unless `--allow-plaintext` (or `H_MESH_ALLOW_PLAINTEXT=1`) is given, for lab
+  test beds; the token then travels in the clear and `office-add` warns.
+
+**Granting (receiving side).** `office coop-grant PARTICIPANT` (lead only)
+enrols PARTICIPANT as an api participant (`StartAgent`, same mechanism as
+`hire`), mints a Message-only token with `lib.coop_tokens.grant` and prints it
+once; it is never stored in clear. Give it to the other office's lead for
+`office-add`. `office coop-revoke TOKEN-ID` (lead only; the 16-hex id, a full
+token is refused) revokes it. `office coops` lists id, participant, kinds and
+state, whitelisting what it prints. Enforcement of what a token may do
+(Message kind only, forced `as`, own mailbox only, immediate revocation) lives
+in the api door, not here.
+
+**"Lead only" is advisory.** The CLI compares `AGENT_NAME` with the tenant
+`lead` key and fails closed when there is no lead. `AGENT_NAME` is an
+unauthenticated environment variable and any process with Redis access can
+write the same keys directly, so this stops mistakes and non-lead agents, not a
+hostile local process. The same applies to the tokens hash: hiding tokens from
+`offices` prevents accidental disclosure, not reading Redis.
