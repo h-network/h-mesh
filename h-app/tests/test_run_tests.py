@@ -1,16 +1,243 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import signal
+import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 from tools import manifest_plugin, run_tests
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 H_APP = REPO_ROOT / "h-app"
+
+
+@pytest.mark.parametrize("url,endpoint", [
+    ("redis://127.0.0.1:16379/0", "127.0.0.1:16379"),
+    ("redis://localhost:16379/1", "localhost:16379"),
+    ("rediss://user:password@[::1]:16379/0", "[::1]:16379"),
+    ("redis://127.1.2.3:16379/0", "127.1.2.3:16379"),
+    ("redis://%31%32%37.0.0.1:16379/0", "127.0.0.1:16379"),
+    ("redis://127.0.0.1/0?port=16379", "127.0.0.1:16379"),
+    ("redis://127.0.0.1:16379/0?port=6379", "127.0.0.1:16379"),
+])
+def test_runner_accepts_explicit_private_redis(url: str, endpoint: str, monkeypatch, capsys):
+    monkeypatch.setattr(run_tests.subprocess, "Popen", lambda *a, **k: pytest.fail("must reuse explicit Redis"))
+    environment = {"REDIS_URL": url}
+    with run_tests._redis_environment(environment):
+        assert environment["REDIS_URL"] == url
+    assert f"test Redis: {endpoint} (explicit REDIS_URL)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("url", [
+    "redis://127.0.0.1:6379/0",
+    "redis://localhost/0",
+    "redis://[::1]:6379/0",
+    "rediss://user:secret@remote.example:16379/0",
+    "redis://0.0.0.0:16379/0",
+    "redis://[::]:16379/0",
+    "redis://%72emote.example:16379/0",
+    "redis://127.0.0.1/0?port=6379",
+    "redis:///0?host=remote.example&port=16379",
+])
+def test_runner_refuses_shared_redis_before_pytest(tmp_path: Path, url: str):
+    target = _make_isolated_harness_tree(
+        tmp_path, "raise AssertionError('pytest must not collect this module')\n"
+    )
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(target / "h-app")
+    env["REDIS_URL"] = url
+    env.pop("H_MESH_ALLOW_SHARED_REDIS", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "tools.run_tests"], cwd=target, env=env,
+        capture_output=True, text=True, timeout=15,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "refusing REDIS_URL endpoint" in output
+    assert "H_MESH_ALLOW_SHARED_REDIS=1" in output
+    assert "secret" not in output
+    assert "collected" not in output
+    assert "pytest must not collect" not in output
+
+
+@pytest.mark.parametrize("url", [
+    "", "unix:///tmp/redis.sock", "not a URL", "redis://localhost:bad/0",
+    "redis://localhost:99999/0", "redis://localhost/0?port=bad",
+])
+def test_runner_rejects_invalid_redis_url_without_echoing_credentials(url: str):
+    with pytest.raises(run_tests.RedisSetupError, match="invalid REDIS_URL"):
+        run_tests._redis_endpoint(url, allow_shared=True)
+
+
+@pytest.mark.parametrize("override", ["", "true", "0", "1"])
+def test_runner_shared_redis_requires_exact_explicit_override(override: str, monkeypatch, capsys):
+    monkeypatch.setattr(run_tests.subprocess, "Popen", lambda *a, **k: pytest.fail("must not launch or connect"))
+    environment = {"REDIS_URL": "redis://user:secret@remote.example:6379/0",
+                   "H_MESH_ALLOW_SHARED_REDIS": override}
+    if override == "1":
+        with run_tests._redis_environment(environment):
+            pass
+        assert "remote.example:6379" in capsys.readouterr().out
+    else:
+        with pytest.raises(run_tests.RedisSetupError) as exc:
+            with run_tests._redis_environment(environment):
+                pytest.fail("shared endpoint was accepted")
+        assert "secret" not in str(exc.value)
+
+
+def test_runner_missing_redis_server_has_actionable_failure(monkeypatch):
+    monkeypatch.setattr(run_tests.shutil, "which", lambda name: None)
+    with pytest.raises(run_tests.RedisSetupError, match="install redis-server"):
+        with run_tests._redis_environment({}):
+            pytest.fail("must not run without Redis")
+
+
+def test_runner_redis_readiness_timeout_cleans_process_and_directory(tmp_path: Path, monkeypatch):
+    binary = tmp_path / "redis-server"
+    binary.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n")
+    binary.chmod(0o755)
+    monkeypatch.setattr(run_tests.shutil, "which", lambda name: str(binary))
+    launched = []
+    popen = subprocess.Popen
+
+    def capture_launch(args, **kwargs):
+        process = popen(args, **kwargs)
+        launched.append((process, Path(args[args.index("--dir") + 1])))
+        return process
+
+    monkeypatch.setattr(run_tests.subprocess, "Popen", capture_launch)
+    clock = iter([0, 10])
+    monkeypatch.setattr(run_tests.time, "monotonic", lambda: next(clock))
+    environment = {}
+    with pytest.raises(run_tests.RedisSetupError, match="did not become ready"):
+        with run_tests._redis_environment(environment):
+            pytest.fail("must not run before Redis readiness")
+    assert len(launched) == 1
+    process, directory = launched[0]
+    assert process.poll() is not None
+    assert not directory.exists()
+    assert "REDIS_URL" not in environment
+
+
+def _private_harness_environment(target: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(target / "h-app")
+    environment.pop("REDIS_URL", None)
+    environment.pop("H_MESH_ALLOW_SHARED_REDIS", None)
+    return environment
+
+
+def _redis_record_source(record: Path) -> str:
+    return (
+        "import json, os, time\n"
+        "from pathlib import Path\n"
+        "import redis\n"
+        "def test_target_tree_marker():\n"
+        "    url = os.environ['REDIS_URL']\n"
+        "    client = redis.Redis.from_url(url)\n"
+        "    server = client.info('server')\n"
+        "    config = client.config_get()\n"
+        f"    Path({str(record)!r}).write_text(json.dumps(dict(\n"
+        "        url=url, pid=server['process_id'], child_pid=os.getpid(),\n"
+        "        directory=config['dir'], save=config['save'],\n"
+        "        appendonly=config['appendonly'], bind=config['bind'])))\n"
+    )
+
+
+def _assert_private_redis_cleaned(record: Path) -> None:
+    from urllib.parse import urlsplit
+
+    data = json.loads(record.read_text())
+    endpoint = urlsplit(data["url"])
+    assert endpoint.hostname == "127.0.0.1"
+    assert endpoint.port != 6379
+    assert data["save"] == ""
+    assert data["appendonly"] == "no"
+    assert data["bind"] == "127.0.0.1"
+    assert not Path(data["directory"]).exists()
+    with pytest.raises(ProcessLookupError):
+        os.kill(data["pid"], 0)
+    with pytest.raises(OSError):
+        socket.create_connection((endpoint.hostname, endpoint.port), timeout=0.1)
+
+
+@pytest.mark.parametrize("passes", [True, False])
+def test_runner_private_redis_reaches_child_and_is_cleaned_after_exit(tmp_path: Path, passes: bool):
+    record = tmp_path / "redis.json"
+    target = _make_isolated_harness_tree(
+        tmp_path, _redis_record_source(record) + f"    assert {passes!r}\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "tools.run_tests"], cwd=target,
+        env=_private_harness_environment(target), capture_output=True, text=True, timeout=20,
+    )
+    assert (result.returncode == 0) is passes, result.stdout + result.stderr
+    assert "test Redis: 127.0.0.1:" in result.stdout
+    assert "(private, ephemeral)" in result.stdout
+    _assert_private_redis_cleaned(record)
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+def test_runner_interrupt_cleans_private_redis_and_pytest(tmp_path: Path, signum: int):
+    record = tmp_path / "redis.json"
+    target = _make_isolated_harness_tree(
+        tmp_path, _redis_record_source(record) + "    time.sleep(30)\n"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-m", "tools.run_tests"], cwd=target,
+        env=_private_harness_environment(target), stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, start_new_session=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not record.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert record.exists(), "pytest did not reach the private Redis"
+        process.send_signal(signum)
+        stdout, stderr = process.communicate(timeout=10)
+        assert process.returncode == 128 + signum, stdout + stderr
+        _assert_private_redis_cleaned(record)
+        with pytest.raises(ProcessLookupError):
+            os.kill(json.loads(record.read_text())["child_pid"], 0)
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            process.communicate(timeout=10)
+
+
+def test_runner_failed_redis_start_cleans_directory_and_refuses_pytest(tmp_path: Path):
+    target = _make_isolated_harness_tree(
+        tmp_path, "raise AssertionError('pytest must not collect this module')\n"
+    )
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    record = tmp_path / "redis-args.json"
+    binary = binary_dir / "redis-server"
+    binary.write_text(
+        f"#!{sys.executable}\nimport json, sys\nfrom pathlib import Path\n"
+        f"Path({str(record)!r}).write_text(json.dumps(sys.argv))\nraise SystemExit(1)\n"
+    )
+    binary.chmod(0o755)
+    env = _private_harness_environment(target)
+    env["PATH"] = str(binary_dir) + os.pathsep + env["PATH"]
+    result = subprocess.run(
+        [sys.executable, "-m", "tools.run_tests"], cwd=target, env=env,
+        capture_output=True, text=True, timeout=15,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "private redis-server exited during startup" in output
+    assert "collected" not in output
+    args = json.loads(record.read_text())
+    assert not Path(args[args.index("--dir") + 1]).exists()
 
 
 def _make_isolated_harness_tree(tmp_path: Path, test_source: str) -> Path:
