@@ -126,3 +126,44 @@ def retired_inbox_key(pod: str, tenant: str) -> str:
     agent name it belonged to was retired.
     """
     return prefix(pod, tenant, resource="retired-inbox")
+
+
+# Inter-office (cooperation) keys. Tenant-level, no agent segment: they belong
+# to the office, not to a participant, so agent retirement never touches them.
+
+
+def offices_key(pod: str, tenant: str) -> str:
+    """HASH name -> JSON {url, participant, added_by, added_ts}; no secrets."""
+    return prefix(pod, tenant, resource="offices")
+
+
+def office_tokens_key(pod: str, tenant: str) -> str:
+    """HASH name -> token string for each remote office (sender side)."""
+    return prefix(pod, tenant, resource="offices.tokens")
+
+
+def office_cursor_key(pod: str, tenant: str) -> str:
+    """HASH name -> last SSE event id the reply relay has handled."""
+    return prefix(pod, tenant, resource="offices.cursor")
+
+
+def office_sent_key(pod: str, tenant: str, stream_id: str) -> str:
+    """STRING JSON {sender, office, agent, ts} written by ``send --office``.
+
+    ⚠ The ``s`` prefix is load-bearing: a 32-hex stream_id is all digits when it
+    has no a-f character, and ``validate_segment`` rejects an all-digit segment.
+    Same technique as lib/reply_correlation._key. The prefix makes the segment
+    never all-digit whatever the id.
+    """
+    # ⚠ The id is one segment. "" would give the valid-looking "xsent.s" and a
+    # "." would be split by prefix() into extra resource segments; a remote
+    # office's 202 body is untrusted input, so reject both here.
+    if not isinstance(stream_id, str) or not stream_id or "." in stream_id:
+        raise KeyError(stream_id)
+    return prefix(pod, tenant, resource=f"xsent.s{stream_id}")
+
+
+def coop_tokens_key(pod: str, tenant: str) -> str:
+    """HASH token-id -> JSON {participant, sha256, kinds, created_ts, revoked}
+    (receiving side). Only the sha256 of a secret is ever stored here."""
+    return prefix(pod, tenant, resource="coop-tokens")

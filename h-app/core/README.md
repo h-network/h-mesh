@@ -10,7 +10,7 @@ Everything else is a module that plugs into this.
 | file | what it holds |
 |---|---|
 | `envelope.py` | wire frame: `build`/`parse`/`encode`, header splicing (`stamp_source`, `advance_hop`), address resolution |
-| `keys.py` | `prefix()` and `delivery_lock_key()` — the sole Redis key constructors, segment validation |
+| `keys.py` | `prefix()`, `delivery_lock_key()` and the named per-resource helpers (`receive_*_key`, `incarnation_key`, inter-office `offices_key` family) — the sole Redis key constructors, segment validation |
 | `config.py` | local state directory resolution (`H_MESH_STATE_DIR`, default `~/.h-mesh`) |
 | `channels.py` | `send()`/`receive()`, unreplied tracking, `DeadLetter`, and best-effort failure feedback to tmux senders |
 | `queues.py` | `admit_ingress()` — shared atomic ingress-admission Lua op |
@@ -82,6 +82,24 @@ Core logging uses the `H_MESH_WRITER`, `H_MESH_CUSTODY_FILE`,
 `H_MESH_LOG_FILE`, `H_MESH_LOG_QUIET`, and
 `H_MESH_LOG_FILE_AGENT_ONLY` environment variables. Switch registry refresh is
 configured with `REGISTRY_POLL_SECONDS`.
+
+## Inter-office keys
+
+`keys.py` names the tenant-level keys used for office-to-office messaging.
+None carries an agent segment, so retiring an agent never deletes them.
+
+| helper | resource | type / content |
+|---|---|---|
+| `offices_key` | `offices` | HASH name -> JSON `{url, participant, added_by, added_ts}`; no secrets |
+| `office_tokens_key` | `offices.tokens` | HASH name -> token string (sender side) |
+| `office_cursor_key` | `offices.cursor` | HASH name -> last SSE event id handled by the reply relay |
+| `office_sent_key` | `xsent.s<stream_id>` | STRING JSON `{sender, office, agent, ts}`, 24h TTL |
+| `coop_tokens_key` | `coop-tokens` | HASH token-id -> JSON `{participant, sha256, kinds, created_ts, revoked}` (receiving side; only the sha256 is stored) |
+
+⚠ `office_sent_key` writes the `s` prefix itself: a 32-hex stream_id with no
+a-f character is all digits, which `validate_segment` rejects. It also refuses
+an empty id or one containing `.`, because the id comes from a remote office's
+response and `prefix()` would otherwise split it into extra resource segments.
 
 ## Two logging systems, one file
 

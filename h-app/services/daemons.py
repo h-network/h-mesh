@@ -1,6 +1,6 @@
 """Start/stop lifecycle for h-mesh's own background daemons.
 
-The switch, tmux-reconciler and watchdog are always-on -- setup.sh starts
+The switch, tmux-reconciler, watchdog and inter-office reply relay are always-on -- setup.sh starts
 and pidfiles them unconditionally (see its "5. Start required daemons"
 step). The REST API, Telegram bot, and session door are optional: they only
 start when the wizard's persisted config actually asks for them (see
@@ -70,6 +70,9 @@ DAEMON_MODULES = {
     "switch": "core.service",
     "tmux_reconciler": "services.tmux_reconciler",
     "watchdog": "services.watchdog",
+    # An idle supervisor discovers the first office added after startup;
+    # worker connections exist only while that office is recorded in Redis.
+    "interoffice_relay": "services.interoffice_relay",
 }
 
 # Started only when the wizard's collected config asks for them (see
@@ -662,7 +665,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     """`h-mesh start` -- start h-mesh's own daemons if they aren't already running."""
     parser = argparse.ArgumentParser(
         prog="h-mesh start",
-        description="Start h-mesh's daemons (switch, tmux-reconciler, watchdog) if not already running.",
+        description="Start h-mesh's daemons (switch, tmux-reconciler, watchdog, reply relay) if not already running.",
     )
     add_common_args(parser)
     args = parser.parse_args(argv)

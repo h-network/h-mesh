@@ -112,6 +112,11 @@ also:
   gets stopped, not orphaned
 - hires every agent from the wizard's roster that isn't already running
 
+The always-on [inter-office reply relay](h-app/modules/interoffice/README.md)
+stays idle until the lead records a remote office. It then reads that office's
+reply stream with the cooperation token and admits replies locally as `relay`.
+It checkpoints after admission; a crash before checkpoint can duplicate a reply.
+
 ```bash
 ./setup.sh                          # interactive picker, container by default
 ./setup.sh --host                   # interactive host wizard

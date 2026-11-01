@@ -498,6 +498,7 @@ def test_delayed_process_failure_rolls_back_live_sibling(monkeypatch, tmp_path):
         ("services.tmux_reconciler.main", "services.tmux_reconciler.TmuxReconciler"),
         ("modules.watchdog.service.main", "modules.watchdog.service.Watchdog"),
         ("services.telegram_bot.main", "services.telegram_bot.MeshClient"),
+        ("services.interoffice_relay.main", "services.interoffice_relay.InterofficeRelay"),
         ("core.service.main", "core.service.Switch"),
     ),
 )

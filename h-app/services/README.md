@@ -49,3 +49,4 @@ itself at import from the same variable.
 | `tmux_reconciler.py` | Loads tmux configuration and runs `TmuxReconciler.run_forever()`. |
 | `telegram_bot.py` | `clients.telegram.bot.TelegramBot` polling client |
 | `web_console.py` | `clients.web.server.WebConsoleServer` HTTP/WS proxy server |
+| `interoffice_relay.py` | Always-on idle supervisor for recorded offices' reply SSE streams; see `modules/interoffice/README.md`. |
