@@ -232,17 +232,23 @@ host wizard already offered. Per-agent account assignment and other
 exceptions (`AGENT_CLIS`/`AGENT_PROFILES`/`AGENT_PROVIDERS`) and local model
 provider config (`PROVIDER_LOCAL_*`) remain file-only. `API_TOKEN` is never
 prompted anywhere, even on a bare host --
-always generated. `H_MESH_BIND_PORTS=1` selects the ports overlay, while
+always generated when Telegram is enabled, or set directly in the office
+`.env` to run the REST API without Telegram. `H_MESH_BIND_PORTS=1` selects the ports overlay, while
 `API_PORT`/`SESSION_PORT` choose the **host** side of that mapping only; the
 api and session doors always bind
-`0.0.0.0:8080`/`0.0.0.0:8081` inside the container (see the Dockerfile's
+`0.0.0.0:8080`/`0.0.0.0:8081` inside the container (`compose.yaml` and
+`entrypoint.sh` pin the internal `API_PORT=8080` and `SESSION_PORT=8081` so
+custom host ports in `.env` never move the container's internal listen ports
+away from `compose.ports.yaml`'s `:8080`/`:8081` targets; see the Dockerfile's
 own comment on why), so publishing them is compose's decision, not the
 process's.
 
-As on a bare host, the api/session/Telegram-bot daemons only start once
-`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are both set -- but because
+As on a bare host, setting `API_TOKEN` starts the `api` daemon, and setting
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` together starts the `api`,
+`telegram_bot`, and `session` daemons -- and because
 those doors bind `0.0.0.0` inside the container unconditionally, enabling
-them also requires either `API_TLS_CERT`/`API_TLS_KEY` or an explicit
+them via `API_TOKEN` or `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` also requires
+either `API_TLS_CERT`/`API_TLS_KEY` or an explicit
 `H_MESH_ALLOW_PLAINTEXT=1` (see `container/.env.example`'s own comment on
 the tradeoff); the entrypoint refuses to start at all with a single clear
 message if neither is set, rather than crash-looping the container with the
