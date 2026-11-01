@@ -59,8 +59,10 @@ cd h-mesh
 ```
 
 `./setup.sh` bootstraps a fresh host or pod (already have a checkout? this
-is what `install.sh` above hands off to). Run at a real terminal with no
-flags, it's an interactive wizard: pod/tenant name, how many agents and
+is what `install.sh` above hands off to). At a real terminal it first offers
+container or host installation, defaulting to container; press Enter for
+container or type `host` for the host path. `--host` skips that picker and
+opens the interactive host wizard: pod/tenant name, how many agents and
 their names (`architect` is agent #1 by default), which CLI each runs
 (claude/codex/agy), account setup if more than one credential is needed,
 optional local model provider config (endpoint URL and model id, verified
@@ -69,7 +71,9 @@ Telegram bot config (bot token, chat ID, spoken voice replies). Re-running
 it never silently wipes a prior answer -- blank at a prompt keeps whatever's
 already there.
 
-Piped, scripted, or passed `--non-interactive`, it never prompts -- flags,
+Piped, scripted, or passed `--non-interactive`, it defaults to host unless
+`--container` or `H_MESH_INSTALL_MODE=container` selects container explicitly.
+It never prompts -- flags,
 environment, and whatever's already been configured for that tenant are all
 it uses. Per-agent exceptions (`AGENT_CLIS`, `AGENT_PROFILES`,
 `AGENT_PROVIDERS`) are each set as a comma-separated list of `agent=value`
@@ -109,7 +113,8 @@ also:
 - hires every agent from the wizard's roster that isn't already running
 
 ```bash
-./setup.sh                          # interactive wizard, at a terminal
+./setup.sh                          # interactive picker, container by default
+./setup.sh --host                   # interactive host wizard
 ./setup.sh --pod mypod --tenant mytenant --non-interactive   # scripted, no prompts
 ```
 
@@ -146,8 +151,9 @@ implementation.
 ```
 
 At a real terminal with no `--host`/`--container` flag, `./setup.sh` asks
-which you want before anything else -- see "Bootstrap script" above. Either
-form hands off entirely to `container/bootstrap.sh`, a smaller wizard (same
+which you want before anything else, with container as the default -- see
+"Bootstrap script" above. Selecting container or passing `--container`
+hands off entirely to `container/bootstrap.sh`, a smaller wizard (same
 banner as the host wizard) that collects `POD`/`TENANT`/`AGENTS`/
 `DEFAULT_CLI`, whether to publish the API/session ports (and which host
 ports to use), one or more Claude account names, and each account's OAuth

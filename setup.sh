@@ -9,7 +9,8 @@
 # configured -- h-mesh-api, the Telegram bot, and h-mesh-session), and
 # hires any agent from the wizard's roster that isn't already running.
 #
-# At a terminal, before anything else, this asks host or container --
+# At a terminal, before anything else, this asks container or host (default:
+# container). Without a terminal or with --non-interactive, host stays the default.
 # --container (or H_MESH_INSTALL_MODE=container for a scripted caller) skips
 # the prompt and hands off entirely to container/bootstrap.sh, a separate,
 # much smaller wizard for that path (see README.md's "Container" section, or
@@ -42,9 +43,9 @@ cd "$SCRIPT_DIR"
 # has to understand container-mode concerns, and container/bootstrap.sh's own
 # flag surface never has to understand host ones. --container/--host on the
 # command line win; H_MESH_INSTALL_MODE covers a scripted/non-interactive
-# caller that can't pass a flag; blank at a terminal prompts once. Default is
-# host -- unchanged behavior for every existing caller that has never heard
-# of this.
+# caller that can't pass a flag; blank at a terminal prompts once, defaulting
+# to container. Non-interactive/no-tty callers still default to host so a
+# container's entrypoint does not hand off to container/bootstrap.sh again.
 INSTALL_MODE="${H_MESH_INSTALL_MODE:-}"
 _help_requested=0
 for _arg in "$@"; do
@@ -67,10 +68,10 @@ if [ -z "$INSTALL_MODE" ]; then
         [ "$_arg" = "--non-interactive" ] && _noninteractive=1
     done
     if [ "$_noninteractive" -eq 0 ] && [ -t 0 ]; then
-        read -rp "Install on this host, or run in a Docker container? [host/container] (host): " _mode_answer
+        read -rp "Run in a Docker container, or install on this host? [container/host] (container): " _mode_answer
         case "$_mode_answer" in
-            [Cc]*) INSTALL_MODE="container" ;;
-            *) INSTALL_MODE="host" ;;
+            [Hh]*) INSTALL_MODE="host" ;;
+            *) INSTALL_MODE="container" ;;
         esac
     else
         INSTALL_MODE="host"
@@ -123,8 +124,8 @@ Options:
   --skip-deps             Skip system dependency checks/auto-install (redis-server, python3-venv, h-agent)
   --no-daemons            Seed registry only, do not start background daemons
   --non-interactive       Never prompt, even at a terminal; use flags/env/persisted config only
-  --host                  Install on this host (default; skips the host-vs-container prompt)
-  --container             Run in a Docker container instead -- hands off entirely to
+  --host                  Install on this host (skips the host-vs-container prompt)
+  --container             Run in a Docker container (interactive default) -- hands off entirely to
                           container/bootstrap.sh, which has its own flag surface (--help there
                           for its options); every option above is host-only and does not apply
   -h, --help              Show this help message
