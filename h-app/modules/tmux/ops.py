@@ -1,4 +1,3 @@
-import functools
 import json
 import os
 import re
@@ -656,30 +655,48 @@ def _seed_profile_dirs(profile: str | None) -> None:
 # ---------------------------------------------------------------------------
 
 # Tested and recorded: the version the operator verified the fallback on.
-CLAUDE_AGENTS_MD_FLOOR = (2, 1, 316)
+CLAUDE_AGENTS_MD_FLOOR = (2, 1, 302)
 MANAGED_SETTINGS_DIR = "/etc/claude-code"
 _INSTRUCTION_FILES_OK = frozenset({"claude-md-or-agents-md", "claude-md-and-agents-md"})
 # Legacy spelling still honoured by claude while instructionFiles is default.
 _PROJECT_INSTRUCTIONS_OK = frozenset({"agents-fallback", "both"})
 
 
-@functools.lru_cache(maxsize=1)
+_VERSION_TTL_SECONDS = 30.0
+_version_cache: dict = {"at": None, "value": None}
+
+
 def _claude_version() -> tuple[int, int, int] | None:
     """`claude --version` as (major, minor, patch), or None if unknowable.
 
-    Cached for the life of the process: it spawns a subprocess, and a claude
-    binary replaced under a running reconciler is picked up on its next start.
+    ⚠ Cached for a short TTL only, never for the process lifetime: in a fresh
+    container the guide is written seconds after boot, when claude is still
+    the version the installer put there, and claude self-updates about a
+    minute later. A process-lifetime cache pinned the stale answer forever.
     """
+    now = time.monotonic()
+    if _version_cache["at"] is not None and now - _version_cache["at"] < _VERSION_TTL_SECONDS:
+        return _version_cache["value"]
+    value = None
     try:
         proc = subprocess.run(
             ["claude", "--version"], capture_output=True, text=True, timeout=5,
         )
+        if proc.returncode == 0:
+            match = re.search(r"(\d+)\.(\d+)\.(\d+)", proc.stdout or "")
+            if match:
+                value = tuple(int(g) for g in match.groups())
     except Exception:
-        return None
-    if proc.returncode != 0:
-        return None
-    match = re.search(r"(\d+)\.(\d+)\.(\d+)", proc.stdout or "")
-    return tuple(int(g) for g in match.groups()) if match else None  # type: ignore[return-value]
+        value = None
+    _version_cache.update(at=now, value=value)
+    return value  # type: ignore[return-value]
+
+
+def _clear_version_cache() -> None:
+    _version_cache.update(at=None, value=None)
+
+
+_claude_version.cache_clear = _clear_version_cache  # type: ignore[attr-defined]
 
 
 def _claude_config_dir(profile: str | None) -> Path:

@@ -41,7 +41,7 @@ def _write(env, **kw):
 
 
 def test_floor_is_the_tested_version():
-    assert TESTED == (2, 1, 316)
+    assert TESTED == (2, 1, 302)
 
 
 def test_single_guide_when_fallback_is_established(env):
@@ -56,7 +56,7 @@ def test_newer_claude_is_fine(env, monkeypatch):
     assert not claude.exists()
 
 
-@pytest.mark.parametrize("version", [None, (2, 1, 315), (1, 9, 9)])
+@pytest.mark.parametrize("version", [None, (2, 1, 301), (1, 9, 9)])
 def test_unknown_or_old_claude_keeps_dual_write(env, monkeypatch, version):
     monkeypatch.setattr(ops, "_claude_version", lambda: version)
     agents, claude = _write(env)
@@ -268,6 +268,7 @@ def test_reconciler_sweep_never_raises(env, monkeypatch):
 # --- claude --version parsing -----------------------------------------------------------
 
 @pytest.mark.parametrize("stdout,code,expected", [
+    ("2.1.302 (Claude Code)\n", 0, (2, 1, 302)),
     ("2.1.316 (Claude Code)\n", 0, (2, 1, 316)),
     ("Claude Code v2.2.0\n", 0, (2, 2, 0)),
     ("no version here\n", 0, None),
@@ -297,3 +298,35 @@ def test_claude_version_unavailable_is_none(monkeypatch, exc):
         assert REAL_CLAUDE_VERSION() is None
     finally:
         REAL_CLAUDE_VERSION.cache_clear()
+
+
+def test_claude_version_is_not_cached_for_the_process_lifetime(monkeypatch):
+    """A fresh container writes the guide on the installer's claude, which then self-updates."""
+    REAL_CLAUDE_VERSION.cache_clear()
+    clock = [1000.0]
+    out = ["2.1.302 (Claude Code)\n"]
+    monkeypatch.setattr(ops.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        ops.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=out[0], stderr=""),
+    )
+    try:
+        assert REAL_CLAUDE_VERSION() == (2, 1, 302)
+        out[0] = "2.1.316 (Claude Code)\n"
+        assert REAL_CLAUDE_VERSION() == (2, 1, 302)  # inside the TTL
+        clock[0] += ops._VERSION_TTL_SECONDS + 1
+        assert REAL_CLAUDE_VERSION() == (2, 1, 316)  # picked up after the TTL
+    finally:
+        REAL_CLAUDE_VERSION.cache_clear()
+
+
+def test_reconciler_retries_a_sweep_blocked_by_claude_version(env, monkeypatch):
+    monkeypatch.setenv("H_MESH_WORKDIR", str(env.cwd.parent))
+    rec = TmuxReconciler(pod="p", tenant="t", redis_url="redis://unused")
+    _live(env, "guide\n")
+    monkeypatch.setattr(ops, "_claude_version", lambda: None)
+    rec._migrate_guides(_R(), {"worker"})
+    assert (env.cwd / "CLAUDE.md").exists()
+    monkeypatch.setattr(ops, "_claude_version", lambda: TESTED)
+    rec._migrate_guides(_R(), {"worker"})
+    assert not (env.cwd / "CLAUDE.md").exists()

@@ -43,12 +43,12 @@ back to `AGENTS.md` (its `instructionFiles` setting, default
 
 The per-agent `CLAUDE.md` is no longer written **when claude's fallback can be
 positively established**. That fallback was tested by the operator on the live
-office with **Claude Code 2.1.316**, which is recorded as `CLAUDE_AGENTS_MD_FLOOR`
+office; issue #31 verified the fallback against **Claude Code 2.1.302**, which is recorded as `CLAUDE_AGENTS_MD_FLOOR`
 and is the minimum version. `claude_reads_agents_md` decides, and **fails
 closed**: any doubt keeps writing `CLAUDE.md` exactly as before (a guide-less
 claude agent is worse than one identical extra file). It requires all of:
 
-1. `claude --version` (5 s timeout, cached per process) parses and is >= the floor.
+1. `claude --version` (5 s timeout, cached for 30 s only: a fresh container writes the guide on the installer's claude, which self-updates about a minute later) parses and is >= the floor.
 2. No settings file sets a blocking override. Checked: the agent's user config
    dir (`~/.claude` or `~/.claude-<profile>`) `settings.json`, the agent's
    `<workdir>/.claude/settings.json` and `settings.local.json`, and
@@ -81,7 +81,7 @@ at its next start.
 
 **What cannot be detected:** organisation/remote policy settings (not readable
 from files); settings added after the last check; a claude binary replaced
-under a running reconciler (the version is cached per process); the agent
+under a running reconciler (the version is cached for 30 s); the agent
 editing its own `.claude/settings.json`; settings passed on the command line
 (h-agent only passes a capture-hook `--settings`, but that is outside this
 module).

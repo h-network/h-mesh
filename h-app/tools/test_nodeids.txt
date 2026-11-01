@@ -731,13 +731,16 @@ h-app/tests/test_single_guide.py::test_migrate_does_nothing_when_fallback_cannot
 h-app/tests/test_single_guide.py::test_migrate_reports_absent
 h-app/tests/test_single_guide.py::test_reconciler_sweeps_each_agent_once_per_process
 h-app/tests/test_single_guide.py::test_reconciler_sweep_never_raises
-h-app/tests/test_single_guide.py::test_claude_version_parsing[2.1.316 (Claude Code)\n-0-expected0]
-h-app/tests/test_single_guide.py::test_claude_version_parsing[Claude Code v2.2.0\n-0-expected1]
+h-app/tests/test_single_guide.py::test_claude_version_parsing[2.1.302 (Claude Code)\n-0-expected0]
+h-app/tests/test_single_guide.py::test_claude_version_parsing[2.1.316 (Claude Code)\n-0-expected1]
+h-app/tests/test_single_guide.py::test_claude_version_parsing[Claude Code v2.2.0\n-0-expected2]
 h-app/tests/test_single_guide.py::test_claude_version_parsing[no version here\n-0-None]
 h-app/tests/test_single_guide.py::test_claude_version_parsing[2.1.316\n-1-None]
 h-app/tests/test_single_guide.py::test_claude_version_unavailable_is_none[exc0]
 h-app/tests/test_single_guide.py::test_claude_version_unavailable_is_none[exc1]
 h-app/tests/test_single_guide.py::test_claude_version_unavailable_is_none[exc2]
+h-app/tests/test_single_guide.py::test_claude_version_is_not_cached_for_the_process_lifetime
+h-app/tests/test_single_guide.py::test_reconciler_retries_a_sweep_blocked_by_claude_version
 h-app/tests/test_telegram_bot_launcher.py::test_telegram_bot_launcher_starts_and_stays_alive_against_a_real_api
 h-app/tests/test_telegram_bot_launcher.py::test_telegram_bot_launcher_exits_cleanly_with_a_clear_error_when_api_token_missing
 h-app/tests/test_telegram_client.py::test_enrol_retries_until_success_and_seeds_cursor
