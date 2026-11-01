@@ -19,6 +19,7 @@ from core.channels import send
 from core.envelope import build, encode, parse
 from clients.telegram.bot import TelegramBot
 from core.keys import incarnation_key, prefix
+from lib.coop_tokens import grant, revoke
 from lib.chat_memory import ChatMemory
 from modules.api import server as server_module
 from modules.api.port import deliver_api
@@ -865,6 +866,161 @@ class ApiTests(unittest.TestCase):
 
         combined = b"".join(body_chunks)
         self.assertIn(b": keepalive\n\n", combined)
+
+
+class CoopTokenApiTests(unittest.TestCase):
+    """A cooperation token (lib/coop_tokens.py) reaches exactly: POST envelopes
+    as its own participant (Message only, to a concrete agent) and GET its own
+    participant's mailbox. Everything else is refused."""
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.redis.registry.update({"coop-a": "api", "coop-b": "api", "host": "office", "bob": "claude_sdk"})
+        self.app = create_app(
+            settings=ApiSettings(pod="test", tenant="office", api_token="secret"),
+            redis_client=self.redis,
+        )
+        self.token_id, self.token = grant(self.redis, "test", "office", "coop-a")
+
+    def post(self, agent, body, token=None):
+        return request(self.app, "POST", f"/agents/{agent}/envelopes", token=token or self.token, body=body)
+
+    def egress(self, agent):
+        return self.redis.lists.get(prefix("test", "office", agent, "egress"), [])
+
+    def test_posts_message_as_its_participant(self):
+        status, body = self.post("alice", {"text": "hi", "as": "coop-a"})
+        self.assertEqual(status, 202)
+        self.assertEqual(len(body["stream_id"]), 32)
+        self.assertEqual(len(self.egress("coop-a")), 1)
+        self.assertEqual(parse(self.egress("coop-a")[0])["l2"]["source"], "coop-a")
+
+    def test_as_defaults_to_its_participant(self):
+        self.assertEqual(self.post("alice", {"text": "hi"})[0], 202)
+        self.assertEqual(parse(self.egress("coop-a")[0])["l2"]["source"], "coop-a")
+        self.assertEqual(self.egress("api"), [])
+
+    def test_explicit_message_kind_and_claude_sdk_destination(self):
+        self.assertEqual(self.post("bob", {"kind": "Message", "payload": {"text": "x"}})[0], 202)
+
+    def test_published_api_does_not_require_signature_for_coop_principal(self):
+        app = create_app(
+            settings=ApiSettings(pod="test", tenant="office", api_token="secret", api_published=True),
+            redis_client=self.redis,
+        )
+        status, _ = request(app, "POST", "/agents/alice/envelopes", token=self.token, body={"text": "hi", "as": "coop-a"})
+        self.assertEqual(status, 202)
+
+    def test_different_as_is_403_and_nothing_is_sent(self):
+        for other in ("coop-b", "telegram", "api", "alice", 5):
+            self.assertEqual(self.post("alice", {"text": "hi", "as": other})[0], 403, other)
+        self.assertEqual([k for k in self.redis.lists if k.endswith(":egress")], [])
+
+    def test_non_message_kinds_are_403(self):
+        for kind in ("Command", "StartAgent", "StopAgent", "PauseAgent", "ResumeAgent", "Attachment", "AddTicket", "Bogus"):
+            status, _ = self.post("alice", {"kind": kind, "payload": {"agent": "x", "text": "rm -rf /"}})
+            self.assertEqual(status, 403, kind)
+        self.assertEqual(self.post("alice", {"payload": {"text": "x"}})[0], 403)
+        # the text shorthand cannot smuggle a kind in
+        self.assertEqual(self.post("alice", {"text": "x", "kind": "Command"})[0], 403)
+        self.assertEqual([k for k in self.redis.lists if k.endswith(":egress")], [])
+
+    def test_forbidden_destinations_are_403(self):
+        for destination in ("all", "host", "api", "telegram", "coop-b", "coop-a", "test:office:host"):
+            status, _ = self.post(destination, {"text": "hi"})
+            self.assertEqual(status, 403, destination)
+        # a qualified broadcast address is not a valid destination at all
+        self.assertEqual(self.post("test:office:all", {"text": "hi"})[0], 404)
+        self.assertEqual([k for k in self.redis.lists if k.endswith(":egress")], [])
+
+    def test_unknown_destination_is_404_and_remote_is_422(self):
+        self.assertEqual(self.post("nobody", {"text": "hi"})[0], 404)
+        self.assertEqual(self.post("other:office:alice", {"text": "hi"})[0], 422)
+
+    def test_reads_only_its_own_mailbox(self):
+        inbox = prefix("test", "office", "coop-a", "inbox")
+        self.redis.xadd(inbox, {"envelope": json.dumps({"payload": {"text": "reply"}})})
+        status, body = request(self.app, "GET", "/agents/coop-a/messages", token=self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["messages"][0]["payload"], {"text": "reply"})
+        for other in ("coop-b", "telegram", "alice"):
+            self.assertEqual(request(self.app, "GET", f"/agents/{other}/messages", token=self.token)[0], 404, other)
+            self.assertEqual(request(self.app, "GET", f"/agents/{other}/messages/stream", token=self.token)[0], 404, other)
+
+    def test_everything_else_is_403(self):
+        paths = [
+            "/agents", "/agents/alice", "/agents/coop-a", "/agents/alice/board", "/agents/alice/activity",
+            "/agents/alice/activity/stream", "/agents/alice/contexts", "/agents/coop-a/activity", "/board", "/alerts",
+            "/alerts/stream", "/restdoc", "/docs", "/redoc", "/openapi.json", "/health",
+        ]
+        for path in paths:
+            self.assertEqual(request(self.app, "GET", path, token=self.token)[0], 403, path)
+        self.assertEqual(request(self.app, "POST", "/agents/coop-a/messages", token=self.token, body={})[0], 405)
+        self.assertEqual(request(self.app, "POST", "/agents/alice/board", token=self.token, body={})[0], 405)
+
+    def test_revoked_token_fails_immediately(self):
+        self.assertEqual(self.post("alice", {"text": "hi"})[0], 202)
+        self.assertTrue(revoke(self.redis, "test", "office", self.token_id))
+        self.assertEqual(self.post("alice", {"text": "hi"})[0], 401)
+        self.assertEqual(request(self.app, "GET", "/agents/coop-a/messages", token=self.token)[0], 401)
+
+    def test_malformed_tokens_are_401(self):
+        _, secret = self.token.rsplit(".", 1)
+        for bad in (
+            "coop.", "coop.x.y", f"coop.{self.token_id}.", f"coop.{self.token_id}.{'A' * 43}",
+            f"coop.{'0' * 16}.{secret}", f"{self.token}x", f"coop.{self.token_id}.{secret}.extra",
+        ):
+            self.assertEqual(self.post("alice", {"text": "hi"}, token=bad)[0], 401, bad)
+
+    def test_office_wide_token_keeps_full_power(self):
+        self.assertEqual(self.post("alice", {"text": "hi", "as": "telegram"}, token="secret")[0], 202)
+        self.assertEqual(request(self.app, "GET", "/agents", token="secret")[0], 200)
+
+    def test_storage_failure_fails_closed(self):
+        class Broken(FakeRedis):
+            def hget(self, key, field):
+                if "coop-tokens" in key:
+                    raise redis.exceptions.ConnectionError("down")
+                return super().hget(key, field)
+
+        broken = Broken()
+        broken.registry.update(self.redis.registry)
+        app = create_app(settings=ApiSettings(pod="test", tenant="office", api_token="secret"), redis_client=broken)
+        self.assertEqual(request(app, "POST", "/agents/alice/envelopes", token=self.token, body={"text": "hi"})[0], 401)
+
+    def test_token_value_never_appears_in_errors_or_stored_state(self):
+        secret = self.token.rsplit(".", 1)[1]
+        outputs = [
+            request(self.app, "POST", "/agents/all/envelopes", token=self.token, body={"text": "hi"}),
+            request(self.app, "GET", "/agents", token=self.token),
+            request(self.app, "POST", "/agents/alice/envelopes", token=f"coop.{self.token_id}.{'B' * 43}", body={}),
+        ]
+        self.assertNotIn(secret, json.dumps(outputs))
+        self.assertNotIn(secret, json.dumps(self.redis.hashes, default=str))
+
+    def test_open_stream_ends_when_token_is_revoked(self):
+        sent = []
+        revoked = []
+
+        async def receive():
+            await asyncio.sleep(30)
+
+        async def send(message):
+            sent.append(message)
+            if message["type"] == "http.response.start" and not revoked:
+                revoked.append(revoke(self.redis, "test", "office", self.token_id))
+
+        scope = {
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET",
+            "scheme": "http", "path": "/agents/coop-a/messages/stream", "raw_path": b"/agents/coop-a/messages/stream",
+            "query_string": b"", "headers": [(b"authorization", f"Bearer {self.token}".encode())],
+            "client": ("127.0.0.1", 1234), "server": ("127.0.0.1", 8080), "root_path": "",
+        }
+        with patch.object(server_module, "COOP_STREAM_RECHECK_INTERVAL_S", 0.0):
+            asyncio.run(asyncio.wait_for(self.app(scope, receive, send), timeout=10))
+        self.assertEqual(revoked, [True])
+        body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+        self.assertIn(b"token revoked", body)
 
 
 class RealApiPortSubprocessTests(unittest.TestCase):

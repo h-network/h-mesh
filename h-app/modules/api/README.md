@@ -48,6 +48,49 @@ direct `lib/chat_memory.py` read, not a round trip through the agent's own
 `ListContexts` envelope kind -- both doors read the same underlying store,
 this one just doesn't need the target agent's ingress to be drained first.
 
+## Authentication: office-wide token and cooperation tokens
+
+Two kinds of bearer token are accepted (`authorize` in `server.py`):
+
+- **`API_TOKEN`** (office-wide): full power over every route, including
+  `Command`, `StartAgent` and any `as`. Whoever holds it can paste into any
+  terminal and enrol or stop agents -- hand it only to clients you would give a
+  shell. Not meant for another office.
+- **Cooperation token** (`coop.<token-id>.<secret>`, minted by
+  `lib/coop_tokens.py`): lets ONE remote office act as ONE enrolled `api`
+  participant of this office. `token-id` is 16 hex characters (public: listing
+  and revocation), `secret` is 43 url-safe characters. The receiving office
+  stores only the SHA-256 of the secret in the `coop-tokens` hash
+  (`token-id -> {participant, sha256, kinds, created_ts, revoked}`); the full
+  token is shown once at grant time.
+
+A cooperation token may do exactly this, everything else is `403`:
+
+| allowed | rule |
+|---|---|
+| `POST /agents/{agent}/envelopes` | `kind` must be `Message` (the `{"text": ...}` shorthand included); `as` is forced to the bound participant -- omitted is filled in, a different value is `403`; destination must be a concrete agent: not `all`, `host`, `api`, nor any `api`-type participant's mailbox or the lifecycle `host` port |
+| `GET /agents/{participant}/messages`, `.../messages/stream` | only the bound participant's own mailbox (`after=` and `Last-Event-ID` resume as usual); any other mailbox is `404` |
+
+Not reachable with a cooperation token: `/agents`, `/agents/{agent}`, board,
+activity, contexts, `/alerts`, `/restdoc`, `/docs`, `/redoc`, `/openapi.json`,
+`/health`, and any non-`Message` kind (`Command`, `StartAgent`, `StopAgent`,
+`PauseAgent`, `ResumeAgent`, `Attachment`, ...).
+
+Cooperation tokens replace the HMAC `kid`/`sig` check for their principal: a
+published API does not demand a signature from them, because the token already
+binds the caller to its participant. They are read from Redis on every request,
+so `revoke` takes effect on the next request, and an open SSE stream is closed
+(`event: error`, `token revoked`) within about a second of revocation. A storage
+failure while verifying fails closed (`401`). A malformed, unknown, wrong or
+revoked token is an indistinguishable `401`.
+
+Limits to know: this is policy, not storage security -- every agent of an office
+shares one Redis with no ACL, so a hostile co-resident agent could write
+`coop-tokens`; hashing protects a leaked dump, not that. Use TLS between
+offices (the default the API enforces for non-loopback binds); plaintext is
+only for a lab test bed via the existing `H_MESH_ALLOW_PLAINTEXT=1` opt-in.
+Message-only means no attachments across offices in this version.
+
 ## SSE idle keepalive
 
 `/agents/{agent}/activity/stream` and `/alerts/stream` (both routed through

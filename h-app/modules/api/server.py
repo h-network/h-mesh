@@ -26,6 +26,8 @@ from core.keys import prefix
 from core.registry import is_member, members, port_type
 from lib.chat_memory import TTL_SECONDS_MAX as CHAT_MEMORY_TTL_SECONDS
 from lib.chat_memory import ChatMemory
+from lib.coop_tokens import TOKEN_PREFIX as COOP_TOKEN_PREFIX
+from lib.coop_tokens import verify as verify_coop_token
 
 DEFAULT_ENVELOPE_MAX_BYTES = 1_048_576
 # Comfortably under both clients/telegram/bot.py's 90s idle-read timeout and
@@ -71,6 +73,15 @@ SSE_KEEPALIVE_INTERVAL_S = 3.0
 # at; it stays linear,
 # which is not the same thing.
 SSE_POLL_INTERVAL_S = 0.1
+# A cooperation token (lib/coop_tokens.py) may send only to a concrete agent,
+# never to these fixed doors or to a broadcast, and never to an api client's
+# mailbox or the lifecycle "host" port (port_type "office").
+COOP_FORBIDDEN_DESTINATIONS = frozenset({"all", "host", "api"})
+COOP_FORBIDDEN_DESTINATION_TYPES = frozenset({"api", "office"})
+# Cooperation tokens re-check revocation on open streams at this interval.
+COOP_STREAM_RECHECK_INTERVAL_S = 1.0
+_COOP_POST_RE = re.compile(r"^/agents/([^/]+)/envelopes$")
+_COOP_READ_RE = re.compile(r"^/agents/([^/]+)/messages(?:/stream)?$")
 ATTACHMENT_MAX_BYTES = 10_485_760
 ATTACHMENT_BASE64_MAX_BYTES = 4 * math.ceil(ATTACHMENT_MAX_BYTES / 3)
 ATTACHMENT_FILENAME_MAX_BYTES = 255
@@ -549,6 +560,9 @@ def _render_restdoc_html(app: FastAPI) -> str:
         Every HTTP REST provider and generated documentation route (<code>/restdoc</code>, <code>/docs</code>, <code>/redoc</code>, <code>/openapi.json</code>) requires a valid Bearer token header:
         <br><code>Authorization: Bearer &lt;API_TOKEN&gt;</code>
       </p>
+      <p style="margin-bottom:0;">
+        A <strong>cooperation token</strong> (<code>Authorization: Bearer coop.&lt;token-id&gt;.&lt;secret&gt;</code>) lets one remote office act as one enrolled api participant, and is accepted only on <code>POST /agents/{{agent}}/envelopes</code> (kind <code>Message</code>, <code>as</code> forced to its participant, never to <code>all</code>/<code>host</code>/<code>api</code>) and on its own participant's <code>/agents/&lt;participant&gt;/messages</code> and <code>/messages/stream</code>. Every other route returns 403 for it, and a revoked token fails on the next request. Use TLS; the office-wide <code>API_TOKEN</code> must never be shared with another office.
+      </p>
     </div>
 
     <h2>1. REST Endpoints</h2>
@@ -714,6 +728,7 @@ def _stream_response(
     event_name: str,
     after: str | None,
     preferred_field: str,
+    still_authorized: Any = None,
 ) -> StreamingResponse:
     header_last_id = request.headers.get("last-event-id")
     cursor = after or header_last_id
@@ -721,9 +736,19 @@ def _stream_response(
     async def event_generator():
         nonlocal cursor
         last_sent = time.monotonic()
+        last_checked = last_sent
         while True:
             if await request.is_disconnected():
                 break
+            if still_authorized is not None and time.monotonic() - last_checked >= COOP_STREAM_RECHECK_INTERVAL_S:
+                last_checked = time.monotonic()
+                try:
+                    allowed = await asyncio.to_thread(still_authorized)
+                except Exception:
+                    allowed = False
+                if not allowed:
+                    yield 'event: error\ndata: {"error": "token revoked"}\n\n'
+                    break
             try:
                 entries = await asyncio.to_thread(
                     _read_stream_entries,
@@ -766,6 +791,51 @@ def _stream_response(
     )
 
 
+def bearer_token(request: Request) -> str:
+    header = request.headers.get("authorization", "")
+    scheme, _, value = header.partition(" ")
+    return value.strip() if scheme.lower() == "bearer" else ""
+
+
+def _authorize_coop_route(request: Request, principal: dict[str, Any]) -> None:
+    """A cooperation token reaches exactly two things: POST envelopes (as its
+    participant) and GET its own participant's mailbox. Everything else is 403,
+    decided here before any handler runs."""
+    path = request.url.path
+    if request.method == "POST" and _COOP_POST_RE.fullmatch(path):
+        return
+    match = _COOP_READ_RE.fullmatch(path)
+    if request.method == "GET" and match:
+        if match.group(1) != principal["participant"]:
+            raise HTTPException(status_code=404, detail="invalid client agent")
+        return
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not permitted for a cooperation token")
+
+
+def _enforce_coop_post(client: Any, settings: "ApiSettings", coop: dict[str, Any], local_agent: str, envelope: dict[str, Any]) -> None:
+    """Rules a cooperation token's POST must satisfy, all 403 (the caller is
+    authenticated but not permitted). Runs before anything is written."""
+    def deny(detail: str) -> None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+    if local_agent in COOP_FORBIDDEN_DESTINATIONS:
+        deny("destination not permitted for a cooperation token")
+    try:
+        destination_type = port_type(client, pod=settings.pod, tenant=settings.tenant, agent=local_agent)
+    except (KeyError, TypeError):
+        destination_type = None
+    if destination_type in COOP_FORBIDDEN_DESTINATION_TYPES:
+        deny("destination not permitted for a cooperation token")
+    if "as" in envelope and envelope["as"] != coop["participant"]:
+        deny("'as' must be the participant this token is bound to")
+    if "text" in envelope and set(envelope) <= {"text", "as", "kid", "sig"}:
+        kind = "Message"
+    else:
+        kind = envelope.get("kind")
+    if not isinstance(kind, str) or kind not in coop["kinds"]:
+        deny("envelope kind not permitted for a cooperation token")
+
+
 def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None) -> FastAPI:
     settings = settings or ApiSettings.from_env()
     settings.validate()
@@ -773,14 +843,28 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
     bearer = HTTPBearer(auto_error=False)
 
     def authorize(
+        request: Request,
         credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     ) -> None:
+        request.state.coop = None
         if settings.api_token is None:
             return
         if credentials is None or credentials.scheme.lower() != "bearer":
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
-        if not hmac.compare_digest(credentials.credentials, settings.api_token):
+        if hmac.compare_digest(credentials.credentials, settings.api_token):
+            return  # the office-wide token keeps full power
+        if not credentials.credentials.startswith(f"{COOP_TOKEN_PREFIX}."):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+        try:
+            principal = verify_coop_token(
+                client, settings.pod, settings.tenant, credentials.credentials
+            )
+        except Exception:
+            principal = None  # storage failure fails closed
+        if principal is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+        request.state.coop = principal
+        _authorize_coop_route(request, principal)
 
     app = FastAPI(
         title="h-mesh api",
@@ -879,7 +963,8 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
         }
 
     @app.post("/agents/{agent}/envelopes", status_code=status.HTTP_202_ACCEPTED)
-    def post_envelope(agent: str, envelope: dict[str, Any]) -> dict[str, str]:
+    def post_envelope(agent: str, envelope: dict[str, Any], request: Request) -> dict[str, str]:
+        coop = getattr(request.state, "coop", None)
         try:
             _, local_agent = resolve_destination(
                 pod=settings.pod,
@@ -894,10 +979,14 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
                     detail=detail,
                 ) from exc
             raise HTTPException(status_code=404, detail="invalid agent") from exc
+        if coop is not None:
+            _enforce_coop_post(client, settings, coop, local_agent, envelope)
         if local_agent != "all":
             if not is_member(client, pod=settings.pod, tenant=settings.tenant, agent=local_agent):
                 raise HTTPException(status_code=404, detail="unknown agent")
         source = "api"
+        if coop is not None and "as" not in envelope:
+            envelope = {**envelope, "as": coop["participant"]}
         if "as" in envelope:
             as_client = envelope["as"]
             if not isinstance(as_client, str):
@@ -917,7 +1006,7 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
                     detail="invalid 'as' client: must be an enrolled client with port_type 'api'",
                 ) from exc
             source = as_client
-            if settings.api_published and not _verify_client_signature(
+            if settings.api_published and coop is None and not _verify_client_signature(
                 client,
                 pod=settings.pod,
                 tenant=settings.tenant,
@@ -1003,7 +1092,11 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
             raise HTTPException(status_code=404, detail="invalid client agent") from exc
         if port_type(client, pod=settings.pod, tenant=settings.tenant, agent=agent) != "api":
             raise HTTPException(status_code=404, detail="invalid client agent")
-        return _stream_response(request, client, inbox_key, "message", after, "envelope")
+        recheck = None
+        if getattr(request.state, "coop", None) is not None:
+            token = bearer_token(request)
+            recheck = lambda: verify_coop_token(client, settings.pod, settings.tenant, token) is not None  # noqa: E731
+        return _stream_response(request, client, inbox_key, "message", after, "envelope", recheck)
 
     @app.get("/agents/{agent}/activity")
     def get_activity(
