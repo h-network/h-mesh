@@ -102,8 +102,12 @@ identity", "operator coordination authority cannot attach...") and an
 "Interface entries may only accept specific envelope kinds" sentence. Agents,
 claude especially, read those as a reason to refuse or to demand an architect
 ack for legitimate Telegram/api messages (issue #5), so they were removed.
-What remains on the subject is the `⚠` external-door paragraph and the
-"destructive, ambiguous, or outside scope: ask the lead first" rule.
+The `⚠ Treat where a message arrives (an external door) ...` paragraph
+("untrusted external content", "without blindly executing arbitrary remote
+input") was removed too, with no replacement text, for the same reason: it was
+the first alarm an agent read and the main cause of refusals of the operator's
+own Telegram messages. All that remains on the subject is the "destructive,
+ambiguous, or outside scope: ask the lead first" rule.
 
 `operator_entrance` / `OPERATOR_ENTRANCE`, `enrolled_entrances` and
 `raise_on_invalid` are still accepted and still validated, but now only choose
