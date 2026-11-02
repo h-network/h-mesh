@@ -22,7 +22,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from core.channels import DeadLetter, send
 from core.envelope import EnvelopeError, resolve_destination
-from core.keys import prefix
+from core.keys import ingress_stalled_key, prefix
 from core.registry import is_member, members, port_type
 from lib.chat_memory import TTL_SECONDS_MAX as CHAT_MEMORY_TTL_SECONDS
 from lib.chat_memory import ChatMemory
@@ -862,6 +862,17 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
                 "stream_id": _decode(raw_blocked.get(b"stream_id") or raw_blocked.get("stream_id")) or "",
             }
         agent_port_type = port_type(client, pod=settings.pod, tenant=settings.tenant, agent=agent)
+        # Written by the switch's stall monitor (core/ingress_health.py); absent
+        # means draining or empty. A read failure must not fail the whole status.
+        ingress_stalled = None
+        try:
+            raw_stall = client.hget(ingress_stalled_key(settings.pod, settings.tenant), agent)
+            if raw_stall:
+                parsed = json.loads(_decode(raw_stall))
+                if isinstance(parsed, dict):
+                    ingress_stalled = parsed
+        except Exception:
+            ingress_stalled = None
         return {
             "agent": agent,
             "port_type": agent_port_type,
@@ -876,6 +887,7 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
                 "last_activity": last_activity,
             },
             "delivery_unverified": delivery_unverified,
+            "ingress_stalled": ingress_stalled,
         }
 
     @app.post("/agents/{agent}/envelopes", status_code=status.HTTP_202_ACCEPTED)
