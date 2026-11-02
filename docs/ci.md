@@ -21,8 +21,10 @@ The authoritative GitHub Actions workflow is `.github/workflows/ci.yml` from
 branches do not run push CI: a green branch-push check is not evidence that the
 branch passed the current suite.
 
-Before asking for review or merge, run the same canonical suite locally from an
-installed development environment:
+Before asking for review or merge, run the canonical suite through
+`~/ci/run-suite.sh <branch>` on the approved h-lab test VM. Never execute tests
+or collection inside the live office host. The VM wrapper invokes this command
+from the installed worktree:
 
 ```bash
 python -m tools.run_tests
@@ -34,9 +36,9 @@ commands collect less than the complete suite.
 
 The complete-suite runner accepts no additional pytest arguments. Paths,
 selectors, verbosity flags, and configuration overrides are all refused because
-the harness must collect and execute one identical, reviewed node set. Use bare
-pytest directly for focused development runs, then use the argument-free command
-above for merge evidence.
+the harness must collect and execute one identical, reviewed node set. Nested
+regression harnesses may invoke focused pytest with private resources inside
+the VM run; those focused results are not merge evidence.
 
 The reviewed node set is checked in at `h-app/tools/test_nodeids.txt`. A plugin
 inside the pytest process compares its selected items to that manifest before
@@ -104,13 +106,12 @@ missing entry is evidence of possible lost coverage, not routine drift.
 Regenerating the file mechanically clears the mismatch whether or not anyone
 reviewed it. **Account first, regenerate second.** Explain every missing and
 added entry in independent review and preserve that accounting in the manifest
-update's commit message. Only then regenerate the manifest from the repository
-root and review its diff before running the harness again:
-
-```bash
-PYTHONPATH=h-app python -m pytest --collect-only -q \
-  | sed -n '/^h-app\/.*::/p' > h-app/tools/test_nodeids.txt
-```
+update's commit message. Obtain the added/missing node IDs from the canonical
+runner's guarded collection on the approved VM, account for each difference,
+then update the manifest and review its diff before rerunning. During an
+execution halt, prepare the manifest diff from the source for independent
+review and label counts as unverified. Never run bare collection on the live
+office host; collection imports code and must obey the same safety guards.
 
 The harness makes node-set drift visible; it cannot prove that a branch author
 reviewed or honestly accounted for a regenerated manifest. In this repository,
@@ -178,17 +179,62 @@ have already isolated, supply a loopback URL on another port. The runner does
 not start or stop explicitly supplied servers. An empty or malformed URL is
 an error; unset the variable to request automatic isolation.
 
-`H_MESH_ALLOW_SHARED_REDIS=1` explicitly overrides the shared-endpoint guard
-for an intentional shared-server run. Other values do not enable it. Such a
-run can block or modify that server, so leave this override unset for office
-verification. Alongside the tree, runner module, and pytest cwd lines, the
+The pytest safety guard always refuses port 6379 and non-loopback hosts,
+including when `H_MESH_ALLOW_SHARED_REDIS=1` is present. That older override
+only affects the Redis provisioning helper and cannot authorize suite
+execution against a shared server. Alongside the tree, runner module, and pytest cwd lines, the
 runner prints `test Redis: host:port` and whether the endpoint is private or
 explicit. These diagnostics never print URL usernames or passwords.
 
-Bare pytest does not use this provisioning or endpoint guard. For a focused
-run, explicitly set `REDIS_URL` to a private Redis on a nonstandard loopback
-port. Tests that default to localhost port 6379 can otherwise reach the live
-office Redis.
+Bare pytest does not provision Redis. Its session-start guard requires an
+explicit private loopback `REDIS_URL` on a port other than 6379, plus the
+private state environment described below. It refuses unsafe configuration
+before collection or orphan cleanup, including for collection-only commands.
+
+## Private state and office identity refusal
+
+An invocation with nonempty `AGENT_NAME` or `TENANT` is refused before any
+child process starts. The runner does not query the office to discover whether
+that identity is active: refusal of every supplied office identity avoids
+contacting live Redis and errs on the side of stopping. Use the approved VM
+wrapper, which supplies no office identity. Clearing variables on the live
+host is not authorization to run tests there.
+
+For every accepted run, the runner creates a private mode-0700 directory under
+`/tmp/h-mesh-test-state-*`. It exports `H_MESH_STATE_DIR`, `H_MESH_WORKDIR`,
+`H_MESH_RUN_DIR`, and `H_MESH_LOG_FILE` beneath that directory, with a temporary
+HOME and XDG config/cache/data paths. `HOME/.h-mesh` points to the private
+state directory, so default-home and explicit-state paths agree. This covers
+the first-party import probe, pytest, and test-spawned children. The runner
+prints the chosen state directory and removes it after success, failure, or a
+handled interrupt.
+
+Only a small allowlist of runtime/import settings reaches the suite.
+Inherited task/custody log overrides, tmux handles, office configuration,
+credentials, `VIRTUAL_ENV`, and `VENV_PATH` are discarded. In particular,
+setup subprocesses cannot select the shared office environment through an
+inherited virtualenv variable. Tests may supply explicit fixture settings
+within their own isolated resources.
+
+The tests' session-start hook independently requires a runner-owned
+`H_MESH_TEST_ROOT`, mode 0700 and owned by the current user, with the expected
+HOME/state/workdir/run/log/XDG paths beneath it. It rejects missing markers,
+paths redirected to ambient state, and symlink escapes. Explicit task/custody
+file overrides must also stay beneath that root. Unsafe direct pytest is
+refused rather than silently repaired; provisioning belongs to the runner.
+Autouse fixtures execute after session start and cannot protect collection or
+the orphan reaper.
+
+Regression fixtures represent ambient office task/window files with temporary
+sentinel files. Runner subprocesses and their children write through the real
+logging helpers; the tests compare sentinel bytes before/after both successful
+and failing runs and check private-directory cleanup. These fixtures never
+open the actual office's task or window log.
+
+These checks prevent accidental configuration leaks. They are not a security
+boundary against arbitrary test code, Docker access, or host networking.
+The VM's separate isolation requirements and any execution halt still apply;
+passing these guards alone does not authorize a run.
 
 ## Serialized runs on the test VM
 
@@ -203,6 +249,21 @@ worktree. Required host tools include Python 3 with venv support, Git, an
 advisory file lock utility, tmux, and a working user systemd manager. Provide
 `redis-server` on the clean
 system PATH or through an owned wrapper in `~/ci/bin`.
+
+Agent shells should invoke the approved wrapper without forwarding office
+identity variables:
+
+```bash
+env -u AGENT_NAME -u TENANT ssh h-lab@172.16.0.201 \
+  '~/ci/run-suite.sh architect/integration-test-batch'
+```
+
+The local environment removal applies only to the SSH client. Do not add
+office identity assignments to the remote command. The VM wrapper also unsets
+`AGENT_NAME` and `TENANT` at entry to discard SSH-configured values, and its
+build/test command uses an explicit `env -i` allowlist containing neither.
+Thus the approved wrapper does not pass an office identity to `tools.run_tests`,
+including when an SSH configuration supplies one to the wrapper itself.
 
 One advisory file lock covers fetching, installation, execution, and cleanup.
 Concurrent callers print a waiting message and time out after 900 seconds; set
