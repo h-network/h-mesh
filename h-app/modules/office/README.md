@@ -101,6 +101,21 @@ transport stream id—after the envelope is admitted. This is the allocated
 identity the board will use if downstream creation succeeds, not proof that a
 ticket was created. Transport and custody logs establish later delivery states.
 
+One piece of work keeps one ticket id across boards. `office add -a A,B,...`
+allocates the id once and sends the same id to every listed board (all
+destinations are checked before anything is sent; duplicates in the list are
+collapsed), and prints it once. `office add --id ID` reuses an existing 32-hex
+id instead of allocating one, to give the same work to another board later; it
+is refused if that board already holds the id in any state, and a send that
+fails midway prints the boards already served and the `--id` to re-run with.
+`office show ID -a all` is the office-wide lookup: it reads every enrolled
+board (read-only; unreadable entries are skipped, never quarantined) and prints
+one JSON line `{"agent", "state", "ticket"}` per match, so a `rel:<id>` or a
+quoted id resolves without guessing `-a`. Plain `office show ID [-a AGENT]` is
+unchanged, as are tickets already stored and the `-r/--related` option (related
+ids are still stored unvalidated). The id is already the first column of
+`office list` and what `add` prints; there is no notification on `add`.
+
 `office add --authority TEXT` sets the ticket's authoritative directive once, at
 creation: what the creator is instructing or approving, up to 2000 characters.
 The assignee reads it in `office take` / `office show` as

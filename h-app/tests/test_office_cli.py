@@ -1876,6 +1876,126 @@ def test_add_printed_id_is_created_and_takeable_on_assignees_board(monkeypatch, 
     assert taken["id"] == printed_id
 
 
+CANONICAL = "0123456789abcdef" * 2
+
+
+def _ticket_json(ticket_id, title="t", **extra):
+    return json.dumps({"v": 1, "id": ticket_id, "title": title, "description": "", "created_by": "architect",
+                       "status": "todo", **extra}, separators=(",", ":"))
+
+
+@patch("modules.office.cli.send")
+def test_add_to_several_boards_uses_one_canonical_id(mock_send, monkeypatch, capsys):
+    _env(monkeypatch)
+    mock_send.return_value = "stream-1"
+    r = FakeRedis(registry={"backend": "tmux", "frontend": "tmux"})
+    with (
+        patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")),
+        patch("modules.office.cli.os.urandom", return_value=bytes.fromhex(CANONICAL)) as urandom,
+    ):
+        office_main(["add", "-a", "backend,frontend,backend", "-t", "title", "-d", "desc"])
+    urandom.assert_called_once_with(16)
+    destinations = [call.kwargs["destination"] for call in mock_send.call_args_list]
+    assert destinations == ["backend", "frontend"]
+    assert {call.kwargs["payload"]["id"] for call in mock_send.call_args_list} == {CANONICAL}
+    assert capsys.readouterr().out.strip() == CANONICAL
+
+
+@patch("modules.office.cli.send")
+def test_add_with_id_reuses_it_and_validates_it(mock_send, monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis(registry={"backend": "tmux"})
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["add", "-a", "backend", "--id", CANONICAL, "-t", "t", "-d", "d"])
+        assert mock_send.call_args.kwargs["payload"]["id"] == CANONICAL
+        assert capsys.readouterr().out.strip() == CANONICAL
+        mock_send.reset_mock()
+        for bad in ("short", "G" * 32, CANONICAL.upper()):
+            with pytest.raises(SystemExit) as exc:
+                office_main(["add", "-a", "backend", "--id", bad, "-t", "t", "-d", "d"])
+            assert exc.value.code == 1
+    mock_send.assert_not_called()
+    assert "32-character lowercase hex" in capsys.readouterr().err
+
+
+@patch("modules.office.cli.send")
+def test_add_refuses_an_id_the_board_already_holds_and_unknown_targets(mock_send, monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis(registry={"backend": "tmux", "frontend": "tmux"})
+    r.lists[prefix(POD, TENANT, "frontend", "tasks.done")].append(_ticket_json(CANONICAL))
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit):
+            office_main(["add", "-a", "backend,frontend", "--id", CANONICAL, "-t", "t", "-d", "d"])
+        assert "frontend's board already holds ticket" in capsys.readouterr().err
+        with pytest.raises(SystemExit):
+            office_main(["add", "-a", "backend,nobody", "-t", "t", "-d", "d"])
+        assert "unknown destination agent 'nobody'" in capsys.readouterr().err
+        with pytest.raises(SystemExit):
+            office_main(["add", "-a", "backend,", "-t", "t", "-d", "d"])
+        assert "empty agent name" in capsys.readouterr().err
+    mock_send.assert_not_called()
+
+
+@patch("modules.office.cli.send")
+def test_add_reports_how_to_resume_after_a_partial_send(mock_send, monkeypatch, capsys):
+    _env(monkeypatch)
+    mock_send.side_effect = ["stream-1", RuntimeError("redis down")]
+    r = FakeRedis(registry={"backend": "tmux", "frontend": "tmux"})
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(RuntimeError):
+            office_main(["add", "-a", "backend,frontend", "--id", CANONICAL, "-t", "t", "-d", "d"])
+    err = capsys.readouterr().err
+    assert "stopped at 'frontend'" in err and "after sending ticket" in err and "backend" in err
+    assert f"--id {CANONICAL}" in err
+
+
+def test_same_canonical_id_lands_on_every_board_and_show_all_finds_them(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis(registry={"architect": "tmux", "backend": "tmux", "frontend": "tmux"})
+    with (
+        patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")),
+        patch("modules.office.cli.os.urandom", return_value=bytes.fromhex(CANONICAL)),
+    ):
+        office_main(["add", "-a", "backend,frontend", "-t", "checklist review", "-d", "ctx", "-r", "ab" * 16])
+    assert capsys.readouterr().out.strip() == CANONICAL
+    for target in ("backend", "frontend"):
+        envelope = parse(r.lists[prefix(POD, TENANT, "architect", "egress")].pop(0))
+        add_ticket(r, pod=POD, tenant=TENANT, agent=target, envelope=envelope)
+    capsys.readouterr()
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["show", CANONICAL[:8], "-a", "all"])
+        lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        before = {key: list(value) for key, value in r.lists.items()}
+        office_main(["show", CANONICAL, "-a", "all"])
+        capsys.readouterr()
+        assert {key: list(value) for key, value in r.lists.items()} == before
+    assert [(line["agent"], line["state"], line["ticket"]["id"]) for line in lines] == [
+        ("backend", "todo", CANONICAL),
+        ("frontend", "todo", CANONICAL),
+    ]
+    assert lines[0]["ticket"]["related"] == ["ab" * 16]
+    for target in ("backend", "frontend"):
+        with patch("modules.office.cli._context", return_value=(r, POD, TENANT, target)):
+            office_main(["take", CANONICAL])
+        assert json.loads(capsys.readouterr().out.splitlines()[-1])["id"] == CANONICAL
+
+
+def test_show_all_skips_unreadable_entries_and_reports_a_miss(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = FakeRedis(registry={"backend": "tmux", "frontend": "tmux"})
+    r.lists[prefix(POD, TENANT, "backend", "tasks.todo")].extend(["not json", _ticket_json("cd" * 16, "other")])
+    r.lists[prefix(POD, TENANT, "frontend", "tasks.hold")].append(_ticket_json(CANONICAL, status="hold"))
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        office_main(["show", CANONICAL, "-a", "all"])
+        out = json.loads(capsys.readouterr().out)
+        assert (out["agent"], out["state"]) == ("frontend", "hold")
+        with pytest.raises(SystemExit) as exc:
+            office_main(["show", "ee" * 4, "-a", "all"])
+    assert exc.value.code == 1
+    assert "no task matches id" in capsys.readouterr().err
+    assert r.lists[prefix(POD, TENANT, "backend", "tasks.todo")][0] == "not json"
+
+
 def _add_with_authority(monkeypatch, capsys, *extra, creator="architect"):
     _env(monkeypatch)
     r = FakeRedis(registry={"architect": "tmux", "reviewer": "tmux"})
