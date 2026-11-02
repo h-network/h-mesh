@@ -18,6 +18,15 @@ same as every module owning its own daemon logic.
 - `run_tmux()` and `ControlModeClient.start()` pass explicit `-S <socket>` if specified, and strip ambient `TMUX`/`TMUX_PANE` from the subprocess environment so tmux natively computes its socket path under `TMUX_TMPDIR` without preferring outer sessions.
 Never run anything in this module against an unset or ambient tmux server.
 
+`start_agent_command(cli, resume=False, model=None)` adds optional vendor
+model passthrough while preserving the existing argv when no model is chosen.
+Claude and agy use `--model <id>`; Codex uses `-c` with a quoted model string.
+The reconciler resolves `AGENT_MODELS` before `DEFAULT_MODEL` from its merged
+tenant environment for both the initial session window and later windows.
+An agent with a local provider receives no vendor-model argument: the provider
+model stays authoritative. The settings affect launches, not a CLI already
+running; restart the reconciler to reload changed tenant configuration.
+
 `message_opener` pastes `[message from {source}] {text}`, unchanged from
 before opt-in reply correlation existed, for every message. When `source`
 is an api-type participant, a second line follows:
