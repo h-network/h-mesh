@@ -288,6 +288,21 @@ runner's certificate in that log; partial counts from a failed run are not a
 certificate. Keep this runner and its dependencies under `~/ci/`, with short
 temporary worktree paths so test tmux sockets fit Unix socket path limits.
 
+## Setup subprocess test environments
+
+The h-agent installer tests use a temporary HOME, state directory, install
+prefix, and PATH containing individually selected prerequisite tools. No real
+h-agent is exposed on that PATH. Their redis-cli probe uses the runner's
+explicit private REDIS_URL, including during setup's dependency check.
+
+The wizard fixture also constructs its subprocess environment explicitly:
+roster, CLI, account, provider, credential, and shell startup settings come from
+the test's answers and saved configuration. Its fake h-agent, interpreter,
+tmux socket, working directory, and logs belong to the test. A shared fixture
+deliberately supplies synthetic ambient configuration and an existing h-agent
+to these tests, so isolation is exercised even in a clean runner shell. This
+does not change setup's documented environment-over-persisted-config behavior.
+
 ## There is no enforced merge gate, and that is deliberate
 
 Nothing in the repository prevents a change from reaching `main` without
