@@ -144,3 +144,12 @@ def test_notices_are_not_an_ack_loop(monkeypatch):
     _doing(r, "worker", created_by="architect")
     _run(r, "worker", ["done", "--outcome", "completed"])
     assert "no reply needed" in _sent(r, "worker")[0]["payload"]["text"]
+
+
+def test_a_multi_target_add_notifies_each_assignee_once(monkeypatch):
+    _env(monkeypatch)
+    r = FakeRedis(registry={"architect": "tmux", "backend": "tmux", "frontend": "tmux"})
+    _run(r, "architect", ["add", "-a", "backend,frontend", "-t", "t", "-d", "d"])
+    sent = _sent(r, "architect")
+    assert [e["kind"] for e in sent] == ["AddTicket", "Message", "AddTicket", "Message"]
+    assert [e["l2"]["destination"] for e in sent if e["kind"] == "Message"] == ["backend", "frontend"]

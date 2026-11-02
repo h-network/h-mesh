@@ -28,6 +28,31 @@ The first tmux hire becomes lead when the registry is empty; later hires
 preserve the incumbent. Registry membership and the lead selection are
 published atomically before tmuxhost creates panes and their guides.
 
+`office run NAME [--cwd PATH] [-- COMMAND ...]` opens a shell or raw command
+in the existing office tmux session, separately from `hire`. Omitting the
+command starts `bash -il`; use `--` before an explicit command and its literal
+arguments (`office run monitor -- top`). The working directory defaults to
+the caller's current directory. This local operation uses `TMUX_SESSION`
+(or `TENANT`) and the explicitly isolated tmux socket/tmpdir; it sends no
+envelope and enrolls no participant.
+
+Run it from the operator's shell outside the office. The shared tmux isolation
+guard remains in force: invocation from inside the office refuses an explicit
+socket that matches the caller's ambient `$TMUX` server. This command does not
+provide an override for that refusal.
+
+The physical window is named `__run__NAME`, which cannot be an envelope
+address. It receives no agent identity, custody hooks, or generated guides.
+Direct sends and broadcasts cannot target it, and tmux's message-paste helper
+refuses that namespace. Its process runs once: exited output and exit status
+stay in a dead pane for inspection, with no agent restart, resume, presence,
+or stall tracking. The reconciler preserves these windows even with an empty
+agent roster. Close it explicitly, for example
+`tmux -S "$TMUX_SOCKET" kill-window -t "$TMUX_SESSION:__run__monitor"`;
+closing it does not recreate it. Reusing an existing run name fails instead
+of replacing or restarting the process. Ordinary manual typing in a run shell
+remains available through tmux. Do not rename it into an agent window.
+
 Board transitions run in one isolated Lua script and preflight both Redis key
 types before mutation; `take` also checks destination emptiness before its
 first write. This keeps the one-doing-ticket invariant under concurrent
@@ -75,6 +100,21 @@ asynchronous envelope, includes that id in the payload, and prints it—not the
 transport stream id—after the envelope is admitted. This is the allocated
 identity the board will use if downstream creation succeeds, not proof that a
 ticket was created. Transport and custody logs establish later delivery states.
+
+One piece of work keeps one ticket id across boards. `office add -a A,B,...`
+allocates the id once and sends the same id to every listed board (all
+destinations are checked before anything is sent; duplicates in the list are
+collapsed), and prints it once. `office add --id ID` reuses an existing 32-hex
+id instead of allocating one, to give the same work to another board later; it
+is refused if that board already holds the id in any state, and a send that
+fails midway prints the boards already served and the `--id` to re-run with.
+`office show ID -a all` is the office-wide lookup: it reads every enrolled
+board (read-only; unreadable entries are skipped, never quarantined) and prints
+one JSON line `{"agent", "state", "ticket"}` per match, so a `rel:<id>` or a
+quoted id resolves without guessing `-a`. Plain `office show ID [-a AGENT]` is
+unchanged, as are tickets already stored and the `-r/--related` option (related
+ids are still stored unvalidated). The id is already the first column of
+`office list` and what `add` prints; there is no notification on `add`.
 
 `office add --authority TEXT` sets the ticket's authoritative directive once, at
 creation: what the creator is instructing or approving, up to 2000 characters.
@@ -210,6 +250,23 @@ already reads only the payload fields it recognizes and drops the rest.
 contexts, reading `lib/chat_memory.py`'s `ChatMemory` directly (same "own a
 Redis client, read state directly" shape `office status`/`office peers -v`
 already use, not a round trip through an envelope).
+
+`office doc` attaches a document once and refers to it by hash, so a
+versioned checklist or spec is not re-pasted into every message (and the
+reader cannot review the wrong version). `office doc put PATH [--name NAME]`
+stores the file's bytes under their SHA-256 in tenant-scoped Redis hashes
+(`docs`, `docs.meta`, `docs.names`; `lib/doc_store.py`) and prints
+`doc:<first 12 hex>`; put that reference in a message or ticket. Identical
+bytes dedupe to the same hash and keep the first upload's metadata.
+`office doc get REF [-o PATH]` writes the bytes to stdout or `PATH`,
+`office doc info REF` shows hash, filename, MIME type, size, author and
+upload time, and `office doc ls` lists everything. `REF` is `doc:<hash>`, any
+unique hash prefix of at least 8 hex characters, or a `--name`: re-putting a
+new version with the same name moves the name to it, while every older version
+stays reachable by its hash. Names may not look like a hash prefix. The size
+cap is `send-file`'s (10 MiB). This is direct Redis state like `office status`;
+nothing crosses the switch. There is no delete or expiry yet, so stored
+documents persist until the tenant's Redis state is cleared.
 
 Operational compatibility warning: the legacy `office` CLI deployed where
 this module was developed silently loses messages submitted with `office send

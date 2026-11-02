@@ -41,6 +41,8 @@ from lib.board_interaction import (
 from lib.chat_memory import TTL_SECONDS_MAX as _CHAT_MEMORY_TTL_SECONDS
 from lib.chat_memory import ChatMemory
 from lib.paths import ensure_workdir_ownership, get_workdir_root
+from lib import doc_store
+from lib.paths import get_workdir_root
 from lib.reply_correlation import is_valid_reply_id
 
 from .pricing import calculate_cost, load_pricing
@@ -381,6 +383,86 @@ def _send_file_command(argv: list[str]) -> None:
     )
     print(f"sent to {args.agent}: {len(raw_bytes)} bytes ({stream_id})")
 
+def _doc_command(argv: list[str]) -> None:
+    """`office doc put|get|ls|info`: store a document once, refer to it by hash."""
+    parser = _operation_parser("doc", "Store a document once and refer to it by hash.")
+    actions = parser.add_subparsers(dest="action", metavar="ACTION", required=True)
+
+    put_p = actions.add_parser("put", help="store a file; prints its doc:<hash> reference")
+    put_p.add_argument("path", type=Path, metavar="PATH", help="path to regular file")
+    put_p.add_argument("--name", metavar="NAME", help="mutable name that points at this version")
+    put_p.add_argument("--mime-type", metavar="TYPE", help="MIME type (guessed from extension if omitted)")
+
+    get_p = actions.add_parser("get", help="print a document's bytes, or write them with -o")
+    get_p.add_argument("ref", metavar="REF", help="doc:<hash>, a hash prefix (8+ hex), or a name")
+    get_p.add_argument("-o", "--output", type=Path, metavar="PATH", help="write to PATH instead of stdout")
+
+    actions.add_parser("ls", help="list stored documents")
+
+    info_p = actions.add_parser("info", help="show a document's metadata without its body")
+    info_p.add_argument("ref", metavar="REF", help="doc:<hash>, a hash prefix (8+ hex), or a name")
+
+    args = parser.parse_args(argv)
+    r, pod, tenant, source = _context()
+    try:
+        _doc_run(args, r, pod, tenant, source)
+    except doc_store.DocError as exc:
+        raise OfficeError(str(exc)) from exc
+
+
+def _doc_run(args, r, pod: str, tenant: str, source: str) -> None:
+    if args.action == "put":
+        path = args.path
+        if not path.exists():
+            raise OfficeError(f"document file does not exist: {str(path)!r}")
+        if not path.is_file():
+            raise OfficeError(f"document path {str(path)!r} is not a regular file")
+        _validate_filename(path.name)
+        if args.mime_type is not None:
+            _validate_mime_type(args.mime_type)
+            mime_type = args.mime_type
+        else:
+            guessed, _ = mimetypes.guess_type(path.name)
+            mime_type = guessed if guessed and MIME_TYPE_REGEX.match(guessed) else "application/octet-stream"
+        try:
+            if path.stat().st_size > ATTACHMENT_MAX_BYTES:
+                raise OfficeError(
+                    f"document file size exceeds maximum allowed size of {ATTACHMENT_MAX_BYTES} bytes"
+                )
+            data = path.read_bytes()
+        except OSError as exc:
+            raise OfficeError(f"cannot read document file {str(path)!r}: {exc}") from exc
+        doc_hash, created = doc_store.put(
+            r, pod=pod, tenant=tenant, author=source, data=data, filename=path.name,
+            mime_type=mime_type, name=args.name,
+        )
+        state = "stored" if created else "already stored"
+        label = f" as {args.name!r}" if args.name else ""
+        print(f"{state}: {doc_store.REF_SCHEME}{doc_store.short(doc_hash)} {len(data)} bytes{label}")
+    elif args.action == "get":
+        _, _, data = doc_store.get(r, pod=pod, tenant=tenant, ref=args.ref)
+        if args.output is None:
+            sys.stdout.flush()
+            sys.stdout.buffer.write(data)
+            return
+        try:
+            args.output.write_bytes(data)
+        except OSError as exc:
+            raise OfficeError(f"cannot write {str(args.output)!r}: {exc}") from exc
+        print(f"wrote {len(data)} bytes to {args.output}")
+    elif args.action == "info":
+        doc_hash, meta, _ = doc_store.get(r, pod=pod, tenant=tenant, ref=args.ref)
+        print(f"hash: {doc_hash}")
+        for field in ("filename", "mime_type", "size", "author", "created"):
+            print(f"{field}: {meta.get(field, 'unknown')}")
+    else:
+        for row in doc_store.listing(r, pod=pod, tenant=tenant):
+            names = f"  [{', '.join(row['names'])}]" if row["names"] else ""
+            print(
+                f"{doc_store.REF_SCHEME}{doc_store.short(row['hash'])}  {row.get('size', '?')} bytes  "
+                f"{row.get('filename', '?')}  {row.get('author', '?')}  {row.get('created', '?')}{names}"
+            )
+
 
 def _broadcast_command(argv: list[str]) -> None:
     parser = _operation_parser("broadcast", "Send a message to every peer agent.")
@@ -583,6 +665,33 @@ def _text(value) -> str:
     if value is None:
         return ""
     return value.decode() if isinstance(value, bytes) else str(value)
+
+
+def _run_command(argv: list[str]) -> None:
+    parser = _operation_parser(
+        "run", "Open a non-addressable process window; not an agent. "
+        "Use: office run NAME [--cwd PATH] [-- COMMAND ...]. "
+        "Default: bash -il. Exited commands stay visible and are never restarted.",
+    )
+    parser.add_argument("name", help="window label (lowercase office-name syntax)")
+    parser.add_argument("--cwd", type=Path, help="working directory (default: current directory)")
+    separator = argv.index("--") if "--" in argv else None
+    args = parser.parse_args(argv if separator is None else argv[:separator])
+    command = None if separator is None else argv[separator + 1:]
+    if command == []:
+        parser.error("provide a command after --, or omit -- for a shell")
+    session = os.environ.get("TMUX_SESSION") or os.environ.get("TENANT")
+    if not session:
+        raise OfficeError("run requires TMUX_SESSION or TENANT for an existing office session")
+    from modules.tmux.ops import create_run_window
+    try:
+        window = create_run_window(
+            session, args.name, command, cwd=str(args.cwd) if args.cwd else None,
+            socket=os.environ.get("TMUX_SOCKET"),
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise OfficeError(str(exc)) from exc
+    print(f"opened non-addressable window {window} in {session}")
 
 
 def _fields(raw: dict) -> dict[str, str]:
@@ -961,6 +1070,30 @@ def _send_board_notice(r, *, pod: str, tenant: str, source: str, destination: st
             file=sys.stderr,
         )
         return False
+
+
+def _announce_assignment(
+    r, *, pod: str, tenant: str, source: str, target: str, ticket_id: str, title: str
+) -> None:
+    """Notice to one assignee, queued behind the AddTicket on the same
+    source->destination path so the ticket is normally on the board before the
+    notice is read. SET NX EX is the debounce: only the first add per target
+    per window announces."""
+    window_key = prefix(pod, tenant, agent=target, resource="notice.add")
+    try:
+        first = bool(r.set(window_key, source, nx=True, ex=_ADD_NOTICE_WINDOW_SECONDS))
+    except Exception:
+        first = True
+    if first:
+        _send_board_notice(
+            r, pod=pod, tenant=tenant, source=source, destination=target,
+            text=(
+                f'[board] {source} assigned you ticket {ticket_id[:8]} '
+                f'"{_one_line(title)}". Run `{_OFFICE_CMD} list` to see your queue, '
+                f"`{_OFFICE_CMD} take` to start. Further tickets added within "
+                f"{_ADD_NOTICE_WINDOW_SECONDS}s are not announced. Notice only, no reply needed."
+            ),
+        )
 
 
 def _task_keys(pod: str, tenant: str, agent: str) -> dict[str, str]:
@@ -1606,13 +1739,43 @@ def _return_command(argv: list[str]) -> None:
     print(serialize_ticket(ticket))
 
 
+def _show_everywhere(r, *, pod: str, tenant: str, reference: str) -> None:
+    """Office-wide `show`: every enrolled board's matches for an id or prefix.
+
+    Read-only. An unreadable entry on some board is skipped rather than
+    quarantined -- this path never mutates another agent's board.
+    """
+    found = 0
+    for owner in sorted(members(r, pod=pod, tenant=tenant)):
+        try:
+            keys = _task_keys(pod, tenant, owner)
+        except KeyError:
+            continue
+        for state in ("todo", "doing", "hold", "done"):
+            for raw in r.lrange(keys[state], 0, -1):
+                try:
+                    ticket = normalize_ticket(raw, state=state)
+                except BoardError:
+                    continue
+                if ticket["id"].startswith(reference):
+                    found += 1
+                    print(json.dumps({"agent": owner, "state": state, "ticket": ticket}, separators=(",", ":")))
+    if not found:
+        raise OfficeError(f"no task matches id {reference!r} on any board")
+
+
 def _show_command(argv: list[str]) -> None:
     parser = _operation_parser("show", "Read one ticket without changing its board state.")
     parser.add_argument("id", help="ticket id or unique prefix")
-    parser.add_argument("-a", "--agent", metavar="AGENT", help="board owner (default: you)")
+    parser.add_argument("-a", "--agent", metavar="AGENT",
+                        help="board owner (default: you); 'all' searches every enrolled board and "
+                             "prints one JSON line {agent, state, ticket} per match")
     args = parser.parse_args(argv)
     r, pod, tenant, source = _context()
     agent = args.agent or source
+    if agent == "all":
+        _show_everywhere(r, pod=pod, tenant=tenant, reference=args.id)
+        return
     if agent != source and not is_member(r, pod=pod, tenant=tenant, agent=agent):
         raise OfficeError(f"unknown board owner {agent!r}")
     keys = _task_keys(pod, tenant, agent)
@@ -1752,11 +1915,29 @@ def _purge_command(argv: list[str]) -> None:
         raise OfficeError(f"purge failed: {exc}") from exc
     unit = "history line" if args.cli == "agy" else "session"
     print(f"purged {count} {unit}{'' if count == 1 else 's'} for {args.agent} ({args.cli})")
+def _board_state_holding(r, *, pod: str, tenant: str, agent: str, ticket_id: str) -> str | None:
+    """The state (todo/doing/hold/done) in which ``agent``'s board holds exactly
+    ``ticket_id``, else None. Unreadable entries are ignored."""
+    keys = _task_keys(pod, tenant, agent)
+    for state in ("todo", "doing", "hold", "done"):
+        for raw in r.lrange(keys[state], 0, -1):
+            try:
+                if normalize_ticket(raw, state=state)["id"] == ticket_id:
+                    return state
+            except BoardError:
+                continue
+    return None
 
 
 def _add_command(argv: list[str]) -> None:
     parser = _operation_parser("add", "Add a task to another agent's board.")
-    parser.add_argument("-a", "--agent", required=True, metavar="AGENT")
+    parser.add_argument("-a", "--agent", required=True, metavar="AGENT[,AGENT...]",
+                         help="board owner; several comma-separated owners get the SAME ticket id "
+                              "on each board")
+    parser.add_argument("--id", metavar="TICKET_ID", dest="ticket_id",
+                         help="reuse an existing 32-hex ticket id instead of allocating one (to give "
+                              "the same piece of work to another board later); refused if that "
+                              "board already holds the id")
     parser.add_argument("-t", "--title", required=True, metavar="TITLE")
     description = parser.add_mutually_exclusive_group(required=True)
     description.add_argument("-d", "--description", metavar="DESCRIPTION")
@@ -1776,6 +1957,11 @@ def _add_command(argv: list[str]) -> None:
                               f"the time; max {AUTHORITY_MAX_CHARS} chars. Set once at add time")
     args = parser.parse_args(argv)
 
+    targets = list(dict.fromkeys(value.strip() for value in args.agent.split(",")))
+    if not all(targets):
+        raise OfficeError("office add -a: empty agent name in the list")
+    if args.ticket_id is not None and not is_valid_reply_id(args.ticket_id):
+        raise OfficeError(f"--id {args.ticket_id!r} is not a 32-character lowercase hex ticket id")
     if args.description_stdin:
         args.description = sys.stdin.read()
         if not args.description.strip():
@@ -1800,12 +1986,19 @@ def _add_command(argv: list[str]) -> None:
             f"--authority must be non-empty text of at most {AUTHORITY_MAX_CHARS} characters"
         )
     r, pod, tenant, source = _context()
-    if not is_member(r, pod=pod, tenant=tenant, agent=args.agent):
-        raise OfficeError(f"unknown destination agent {args.agent!r}")
-    # Allocate the established 32-lowercase-hex identity locally. This state is
-    # ALLOCATED; send returning below advances the envelope to ADMITTED, while
-    # only downstream custody can prove the board ticket was CREATED.
-    ticket_id = os.urandom(16).hex()
+    for target in targets:
+        if not is_member(r, pod=pod, tenant=tenant, agent=target):
+            raise OfficeError(f"unknown destination agent {target!r}")
+    # Allocate the established 32-lowercase-hex identity locally (or reuse the
+    # caller's canonical one). This state is ALLOCATED; send returning below
+    # advances the envelope to ADMITTED, while only downstream custody can
+    # prove the board ticket was CREATED.
+    ticket_id = args.ticket_id or os.urandom(16).hex()
+    if args.ticket_id is not None:
+        for target in targets:
+            holder = _board_state_holding(r, pod=pod, tenant=tenant, agent=target, ticket_id=ticket_id)
+            if holder:
+                raise OfficeError(f"{target}'s board already holds ticket {ticket_id} ({holder})")
     payload = {
         "v": 1,
         "id": ticket_id,
@@ -1827,35 +2020,31 @@ def _add_command(argv: list[str]) -> None:
         # Only the text travels; the receiving board stamps who and when
         # (lib/board_interaction.authority_block), so it cannot be forged here.
         payload["authority"] = args.authority.strip()
-    send(
-        r,
-        pod=pod,
-        tenant=tenant,
-        source=source,
-        destination=args.agent,
-        payload=payload,
-        kind="AddTicket",
-        module="office",
-    )
-    if not args.no_notify and args.agent != source:
-        # Queued behind the AddTicket on the same source->destination path, so
-        # the ticket is normally on the board before the notice is read.
-        # SET NX EX is the debounce: only the first add per window notifies.
-        window_key = prefix(pod, tenant, agent=args.agent, resource="notice.add")
+    sent: list[str] = []
+    for target in targets:
         try:
-            first = bool(r.set(window_key, source, nx=True, ex=_ADD_NOTICE_WINDOW_SECONDS))
-        except Exception:
-            first = True
-        if first:
-            _send_board_notice(
-                r, pod=pod, tenant=tenant, source=source, destination=args.agent,
-                text=(
-                    f'[board] {source} assigned you ticket {ticket_id[:8]} '
-                    f'"{_one_line(args.title)}". Run `{_OFFICE_CMD} list` to see your queue, '
-                    f"`{_OFFICE_CMD} take` to start. Further tickets added within "
-                    f"{_ADD_NOTICE_WINDOW_SECONDS}s are not announced. Notice only, no reply needed."
-                ),
+            send(
+                r,
+                pod=pod,
+                tenant=tenant,
+                source=source,
+                destination=target,
+                payload=payload,
+                kind="AddTicket",
+                module="office",
             )
+        except Exception:
+            if sent:
+                print(
+                    f"office: add stopped at {target!r} after sending ticket {ticket_id} to "
+                    f"{', '.join(sent)}; re-run with --id {ticket_id} for the rest",
+                    file=sys.stderr,
+                )
+            raise
+        sent.append(target)
+        if not args.no_notify and target != source:
+            _announce_assignment(r, pod=pod, tenant=tenant, source=source, target=target,
+                                 ticket_id=ticket_id, title=args.title)
     print(ticket_id)
 
 
@@ -2151,11 +2340,13 @@ def _usage_command(argv: list[str]) -> None:
 _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("send",), "send a message to one agent", _send_command),
     (("send-file",), "send a file attachment to one agent", _send_file_command),
+    (("doc",), "store a document once and refer to it by hash", _doc_command),
     (("broadcast",), "send a message to every peer agent", _broadcast_command),
     (("peers",), "list peer agents", _peers_command),
     (("contexts",), "list a claude_sdk agent's live memory contexts", _contexts_command),
     (("status",), "show agent presence and open work", _status_command),
     (("hire",), "enrol a new agent", lambda argv: _lifecycle_command("hire", argv)),
+    (("run",), "open a non-addressable shell or command window", _run_command),
     (("let-go",), "retire an agent", lambda argv: _lifecycle_command("letGo", argv)),
     (("pause",), "pause an agent's CLI", lambda argv: _lifecycle_command("pause", argv)),
     (("resume",), "resume an agent's CLI and inbox", lambda argv: _lifecycle_command("resume", argv)),
