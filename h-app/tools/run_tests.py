@@ -44,7 +44,7 @@ def _refuse_office_identity(environment: dict[str, str]) -> None:
 
 def _state_paths(root: Path) -> dict[str, Path]:
     home = root / "home"
-    state = root / "state"
+    state = root / ".h-mesh"
     return {
         "HOME": home,
         "H_MESH_STATE_DIR": state,
@@ -112,7 +112,7 @@ def _require_safe_test_environment(environment: dict[str, str]) -> None:
             value = environment.get(name, "")
             if not value or not Path(value).is_absolute() or Path(value).resolve() != expected:
                 raise ValueError
-        if (root / "home" / ".h-mesh").resolve() != root / "state":
+        if (root / "home" / ".h-mesh").resolve() != _state_paths(root)["H_MESH_STATE_DIR"]:
             raise ValueError
         for name in ("TASK_RECORD", "H_MESH_CUSTODY_FILE"):
             if environment.get(name) and not Path(environment[name]).resolve().is_relative_to(root):
