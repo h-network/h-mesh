@@ -1319,3 +1319,8 @@ h-app/tests/test_write_agent_guide_text.py::test_kept_text_is_still_present_and_
 h-app/tests/test_write_agent_guide_text.py::test_kept_text_is_still_present_and_unchanged[unverified]
 h-app/tests/test_write_agent_guide_text.py::test_kept_text_is_still_present_and_unchanged[valid]
 h-app/tests/test_write_agent_guide_text.py::test_nothing_replaces_the_removed_warning
+h-app/tests/test_write_agent_guide_text.py::test_done_rule_is_a_one_line_notice_not_a_summary[none]
+h-app/tests/test_write_agent_guide_text.py::test_done_rule_is_a_one_line_notice_not_a_summary[rejected]
+h-app/tests/test_write_agent_guide_text.py::test_done_rule_is_a_one_line_notice_not_a_summary[unverified]
+h-app/tests/test_write_agent_guide_text.py::test_done_rule_is_a_one_line_notice_not_a_summary[valid]
+h-app/tests/test_write_agent_guide_text.py::test_done_notice_uses_the_configured_office_command
