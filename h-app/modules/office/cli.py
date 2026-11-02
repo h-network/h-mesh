@@ -891,6 +891,38 @@ def _await_hire_confirmation(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# board event notices (#18): ordinary Message envelopes, so they show in the
+# mesh log like any other. `add` tells the assignee, `done` tells the creator.
+# ---------------------------------------------------------------------------
+
+# One assignment notice per target per window: a bulk `add` of N tickets must
+# not paste N lines into one agent's pane. The suppressed tickets are still on
+# the board, and the notice that does go out points at `list`.
+_ADD_NOTICE_WINDOW_SECONDS = 30
+_OFFICE_CMD = os.environ.get("OFFICE_TOOLS", "h-mesh-office")
+
+
+def _one_line(value: str, limit: int = 100) -> str:
+    flat = " ".join(str(value).split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "\u2026"
+
+
+def _send_board_notice(r, *, pod: str, tenant: str, source: str, destination: str, text: str) -> bool:
+    """Send one notice; the board change it reports is already committed, so a
+    failure here is reported on stderr and never fails the command."""
+    try:
+        _message(r, pod=pod, tenant=tenant, source=source, destination=destination, text=text)
+        return True
+    except Exception as exc:
+        print(
+            f"office: warning: the board change succeeded but the notice to {destination} "
+            f"was not sent ({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return False
+
+
 def _task_keys(pod: str, tenant: str, agent: str) -> dict[str, str]:
     return {
         state: prefix(pod, tenant, agent=agent, resource=f"tasks.{state}")
@@ -1386,6 +1418,11 @@ def _done_command(argv: list[str]) -> None:
         action="store_true",
         help="print the full ticket as JSON instead of a one-line confirmation",
     )
+    parser.add_argument(
+        "--no-notify",
+        action="store_true",
+        help="do not send the completion notice to the ticket's creator",
+    )
     args = parser.parse_args(argv)
     if args.outcome is None:
         if sys.stdin.isatty():
@@ -1397,7 +1434,8 @@ def _done_command(argv: list[str]) -> None:
                 "done requires --outcome {completed,passed,failed}; "
                 "use completed for ordinary work"
             )
-    _finish_command("done", args.id, outcome=args.outcome, json_output=args.json)
+    _finish_command("done", args.id, outcome=args.outcome, json_output=args.json,
+                    notify=not args.no_notify)
 
 
 def _cancel_command(argv: list[str]) -> None:
@@ -1413,7 +1451,8 @@ def _cancel_command(argv: list[str]) -> None:
 
 
 def _finish_command(
-    action: str, task_id: str | None, *, outcome: str | None = None, json_output: bool = False
+    action: str, task_id: str | None, *, outcome: str | None = None, json_output: bool = False,
+    notify: bool = True,
 ) -> None:
     r, pod, tenant, source = _context()
     keys = _task_keys(pod, tenant, source)
@@ -1444,6 +1483,23 @@ def _finish_command(
     )
     log_event = "task_done" if action == "done" else "task_cancelled"
     _log_task(log_event, agent=source, ticket=ticket)
+    if action == "done" and notify:
+        creator = ticket.get("created_by")
+        # Not to oneself (a self-added ticket), and only to an agent that is
+        # still enrolled: a creator that retired or is not a participant has
+        # nowhere to receive it, and that is not an error for `done`.
+        if (
+            isinstance(creator, str) and creator and creator != source
+            and is_member(r, pod=pod, tenant=tenant, agent=creator)
+        ):
+            _send_board_notice(
+                r, pod=pod, tenant=tenant, source=source, destination=creator,
+                text=(
+                    f'[board] {source} finished ticket {ticket["id"][:8]} '
+                    f'"{_one_line(ticket["title"])}" ({outcome}). '
+                    "Notice only, no reply needed."
+                ),
+            )
     if json_output:
         print(serialize_ticket(ticket))
     else:
@@ -1591,6 +1647,8 @@ def _add_command(argv: list[str]) -> None:
     parser.add_argument("-r", "--related", metavar="ID[,ID...]",
                          help="ticket ids this one references -- stored, never validated "
                               "(a related ticket may live on another agent's board)")
+    parser.add_argument("--no-notify", action="store_true",
+                        help="do not send the assignment notice to the target agent")
     args = parser.parse_args(argv)
 
     r, pod, tenant, source = _context()
@@ -1627,6 +1685,25 @@ def _add_command(argv: list[str]) -> None:
         kind="AddTicket",
         module="office",
     )
+    if not args.no_notify and args.agent != source:
+        # Queued behind the AddTicket on the same source->destination path, so
+        # the ticket is normally on the board before the notice is read.
+        # SET NX EX is the debounce: only the first add per window notifies.
+        window_key = prefix(pod, tenant, agent=args.agent, resource="notice.add")
+        try:
+            first = bool(r.set(window_key, source, nx=True, ex=_ADD_NOTICE_WINDOW_SECONDS))
+        except Exception:
+            first = True
+        if first:
+            _send_board_notice(
+                r, pod=pod, tenant=tenant, source=source, destination=args.agent,
+                text=(
+                    f'[board] {source} assigned you ticket {ticket_id[:8]} '
+                    f'"{_one_line(args.title)}". Run `{_OFFICE_CMD} list` to see your queue, '
+                    f"`{_OFFICE_CMD} take` to start. Further tickets added within "
+                    f"{_ADD_NOTICE_WINDOW_SECONDS}s are not announced. Notice only, no reply needed."
+                ),
+            )
     print(ticket_id)
 
 
