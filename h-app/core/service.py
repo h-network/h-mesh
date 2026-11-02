@@ -28,6 +28,65 @@ from .retention import RetentionTrimmer
 from .windowlog import WindowLogTailer
 
 
+# Redis conditions that clear by themselves: the server is busy, loading, in
+# failover, or the link dropped. Anything else (WRONGTYPE from a corrupted key,
+# a script error, auth, OOM) means state or code is wrong and stays fatal -- a
+# loop that retried those would hide the defect behind a healthy-looking daemon.
+REDIS_BACKOFF_START = 0.2
+REDIS_BACKOFF_CAP = 5.0
+# Categories where Redis answered with an error BEFORE running the command, so
+# the write provably did not happen and the same frame may be retried. connection
+# and timeout are deliberately absent: the command may have executed, and core is
+# at-most-once, so those are never blindly retried.
+REJECTED_BEFORE_EXECUTION = frozenset(
+    {"busy", "loading", "readonly", "tryagain", "masterdown"}
+)
+FRAME_RETRY_ATTEMPTS = 8  # backoff 0.2+0.4+0.8+1.6+3.2+5+5 = ~16s before dead-letter
+_TRANSIENT_RESPONSE_PREFIXES = {
+    "BUSY": "busy",
+    "LOADING": "loading",
+    "READONLY": "readonly",
+    "TRYAGAIN": "tryagain",
+    "MASTERDOWN": "masterdown",
+}
+
+
+def transient_redis_category(exc: BaseException) -> str | None:
+    """Return a closed category name for a transient Redis error, else None."""
+    # BusyLoadingError subclasses ConnectionError; check it before the family.
+    if isinstance(exc, redis.exceptions.BusyLoadingError):
+        return "loading"
+    if isinstance(exc, redis.exceptions.ReadOnlyError):
+        return "readonly"
+    if isinstance(exc, redis.exceptions.TryAgainError):
+        return "tryagain"
+    if isinstance(exc, redis.exceptions.MasterDownError):
+        return "masterdown"
+    # Bad credentials subclass ConnectionError but never clear on their own.
+    if isinstance(exc, redis.exceptions.AuthenticationError):
+        return None
+    if isinstance(exc, redis.exceptions.ConnectionError):
+        return "connection"
+    if isinstance(exc, redis.exceptions.TimeoutError):
+        return "timeout"
+    # redis-py has no class for BUSY: it arrives as a bare ResponseError whose
+    # text starts with the code. Match the code word only, not arbitrary text.
+    if type(exc) is redis.exceptions.ResponseError:
+        code = str(exc).split(" ", 1)[0].upper()
+        return _TRANSIENT_RESPONSE_PREFIXES.get(code)
+    return None
+
+
+class RetryExhausted(Exception):
+    """A provably-rejected Redis command kept being rejected; the frame is unplaced."""
+
+    def __init__(self, category: str, cause: Exception, attempts: int):
+        super().__init__(f"{category} persisted through {attempts} attempts")
+        self.category = category
+        self.cause = cause
+        self.attempts = attempts
+
+
 def _emit_observation(event: str, envelope: dict, reason=None, count=None) -> None:
     """Keep stdout observation from changing switch custody decisions."""
     try:
@@ -134,9 +193,15 @@ class Switch:
         poll_seconds: int = 5,
         ingress_max: int = 300,
         kick: Callable[[str, str | None, dict], None] | None = None,
+        frame_retry_attempts: int = FRAME_RETRY_ATTEMPTS,
     ):
         if ingress_max < 1:
             raise ValueError("ingress_max must be positive")
+        if frame_retry_attempts < 1:
+            raise ValueError("frame_retry_attempts must be positive")
+        self.frame_retry_attempts = frame_retry_attempts
+        # Ambiguous write outcomes (connection reset, timeout) by closed category.
+        self.unknown_outcomes: dict[str, int] = {}
         self.r = r
         self.pod = pod
         self.tenant = tenant
@@ -166,7 +231,7 @@ class Switch:
     def _dead_letter_full(
         self, sender: str, destination: str, raw, envelope: dict, depth: int
     ) -> None:
-        self.r.rpush(prefix(self.pod, self.tenant, sender, "dead"), raw)
+        self._dead_letter(sender, raw)
         _log_observation(
             "dead_lettered",
             stream_id=envelope.get("stream_id"),
@@ -330,11 +395,89 @@ class Switch:
             source_key = source_key.decode()
         sender = source_key.split(":")[-2]
         self._record_popped(raw, sender)
+        return self._route(sender, raw)
+
+    def _backoff_sleep(self, previous: float) -> float:
+        delay = REDIS_BACKOFF_START if previous == 0.0 else min(previous * 2, REDIS_BACKOFF_CAP)
+        time.sleep(delay)
+        return delay
+
+    def _retrying(self, op, *, idempotent: bool = False):
+        """Run one post-pop Redis operation, retrying only when that is safe.
+
+        A popped frame exists nowhere else, so a failure here decides its fate.
+        Retried: errors Redis raised before executing the command (BUSY, LOADING,
+        READONLY, TRYAGAIN, MASTERDOWN), and -- for pure reads -- any transient
+        error, since repeating a read cannot duplicate anything. Not retried:
+        connection/timeout on a write, whose outcome is unknown (at-most-once).
+        After FRAME_RETRY_ATTEMPTS the caller dead-letters the frame.
+        """
+        delay = 0.0
+        for attempt in range(1, self.frame_retry_attempts + 1):
+            try:
+                return op()
+            except Exception as exc:
+                category = transient_redis_category(exc)
+                if category is None or not (
+                    category in REJECTED_BEFORE_EXECUTION or idempotent
+                ):
+                    raise
+                if attempt == self.frame_retry_attempts:
+                    raise RetryExhausted(category, exc, attempt) from exc
+                _emit_observation(
+                    "error", {},
+                    reason=(
+                        f"frame operation rejected [{category}] "
+                        f"attempt {attempt}/{self.frame_retry_attempts}; retrying"
+                    ),
+                )
+                delay = self._backoff_sleep(delay)
+
+    def _dead_letter(self, sender: str, raw) -> None:
+        """Append a frame to the sender's dead list, retrying rejected commands."""
+        key = prefix(self.pod, self.tenant, sender, "dead")
+        try:
+            self._retrying(lambda: self.r.rpush(key, raw))
+        except RetryExhausted as exc:
+            # Nothing is left to try: say so with the identity, then fail loudly.
+            _log_observation(
+                "dead_lettered",
+                **{
+                    **{k: v for k, v in header_record_fields(raw).items()
+                       if k in ("stream_id", "correlation_id") and isinstance(v, str)},
+                    "source": sender,
+                    "reason": f"frame LOST: dead-letter write rejected [{exc.category}] "
+                              f"through {exc.attempts} attempts",
+                },
+            )
+            raise exc.cause
+
+    def _note_unknown(self, exc: Exception) -> str:
+        category = transient_redis_category(exc) or "other"
+        self.unknown_outcomes[category] = self.unknown_outcomes.get(category, 0) + 1
+        return category
+
+    def _route(self, sender: str, raw) -> bool:
+        try:
+            return self._forward(sender, raw)
+        except RetryExhausted as exc:
+            reason = (
+                f"redis rejected the command [{exc.category}] through "
+                f"{exc.attempts} attempts; frame dead-lettered, not forwarded"
+            )
+            try:
+                envelope = parse_for_switch(raw)
+            except EnvelopeError:
+                envelope = {}
+            self._dead_letter(sender, raw)
+            _emit_observation("dead_lettered", envelope, reason)
+            return True
+
+    def _forward(self, sender: str, raw) -> bool:
         try:
             envelope = parse_for_switch(raw)
         except EnvelopeError as exc:
-            dead = prefix(self.pod, self.tenant, sender, "dead")
-            self.r.rpush(dead, raw)
+            self._dead_letter(sender, raw)
             _emit_observation("dead_lettered", {}, str(exc))
             return True
         # The forwarding decision reads L2 and the registry only. L3 rides through
@@ -355,27 +498,35 @@ class Switch:
         try:
             raw = advance_hop(raw, envelope)
         except EnvelopeError as exc:
-            self.r.rpush(prefix(self.pod, self.tenant, sender, "dead"), raw)
+            self._dead_letter(sender, raw)
             _emit_observation("dead_lettered", envelope, str(exc))
             return True
         if envelope["ttl"] == 0:
-            self.r.rpush(prefix(self.pod, self.tenant, sender, "dead"), raw)
+            self._dead_letter(sender, raw)
             _emit_observation("dead_lettered", envelope, "ttl expired at forward")
             return True
         destination = envelope["l2"]["destination"]
         if destination == "all":
-            recipient_types = member_types(self.r, pod=self.pod, tenant=self.tenant)
+            recipient_types = self._retrying(
+                lambda: member_types(self.r, pod=self.pod, tenant=self.tenant),
+                idempotent=True,
+            )
             sender_type = recipient_types.pop(sender, None)
             recipients = sorted(recipient_types)
             if not recipients:
                 _emit_observation("forwarded", envelope, count=0)
                 return True
             try:
-                admitted, _, depth = self._admit(recipients, raw)
+                admitted, _, depth = self._retrying(
+                    lambda: self._admit(recipients, raw)
+                )
+            except RetryExhausted:
+                raise
             except Exception as exc:
+                category = self._note_unknown(exc)
                 _emit_observation(
                     "forward_unknown", envelope,
-                    f"broadcast ingress write outcome UNKNOWN after {exc}",
+                    f"broadcast ingress write outcome UNKNOWN [{category}] after {exc}",
                 )
                 raise
             if not admitted:
@@ -392,19 +543,27 @@ class Switch:
                     envelope=envelope, skipped=skipped,
                 )
             return True
-        destination_type = port_type(
-            self.r, pod=self.pod, tenant=self.tenant, agent=destination
+        destination_type = self._retrying(
+            lambda: port_type(
+                self.r, pod=self.pod, tenant=self.tenant, agent=destination
+            ),
+            idempotent=True,
         )
         if destination_type is None:
-            self.r.rpush(prefix(self.pod, self.tenant, sender, "dead"), raw)
+            self._dead_letter(sender, raw)
             _emit_observation("dead_lettered", envelope, "destination is not in tenant registry")
             return True
         try:
-            admitted, _, depth = self._admit([destination], raw)
+            admitted, _, depth = self._retrying(
+                lambda: self._admit([destination], raw)
+            )
+        except RetryExhausted:
+            raise
         except Exception as exc:
+            category = self._note_unknown(exc)
             _emit_observation(
                 "forward_unknown", envelope,
-                f"ingress write outcome UNKNOWN after {exc}",
+                f"ingress write outcome UNKNOWN [{category}] after {exc}",
             )
             raise
         if not admitted:
@@ -427,6 +586,7 @@ class Switch:
         five-job block that was close to undiagnosable.
         """
         next_maintenance = 0.0
+        backoff = 0.0
         while True:
             now = time.monotonic()
             if now >= next_maintenance:
@@ -459,15 +619,29 @@ class Switch:
             timeout = min(self.poll_seconds, max(0.1, next_maintenance - time.monotonic()))
             try:
                 self.step(timeout=timeout)
-            except redis.exceptions.ConnectionError as exc:
+                backoff = 0.0
+            except Exception as exc:
                 # redis-py reconnects on the next command. Keep this bare-nohup
-                # daemon alive across a Redis restart, but avoid a hot retry loop
-                # while the server is still unavailable.
+                # daemon alive across a transient Redis fault (BUSY while a
+                # script runs, LOADING, failover, a dropped link) with a capped,
+                # doubling pause so a still-unavailable server is not hammered.
+                # Everything else is a defect and propagates.
+                category = transient_redis_category(exc)
+                if category is None:
+                    raise
+                backoff = (
+                    REDIS_BACKOFF_START if backoff == 0.0
+                    else min(backoff * 2, REDIS_BACKOFF_CAP)
+                )
                 _emit_observation(
                     "error", {},
-                    reason=f"forwarding pass failed: {type(exc).__name__}: {exc}",
+                    reason=(
+                        f"forwarding pass failed: transient redis error "
+                        f"[{category}] {type(exc).__name__}: {exc}; "
+                        f"retrying in {backoff:g}s"
+                    ),
                 )
-                time.sleep(timeout)
+                time.sleep(backoff)
 
 
 def main() -> None:
