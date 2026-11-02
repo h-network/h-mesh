@@ -1892,6 +1892,7 @@ def test_authority_is_stamped_by_the_board_and_shown_by_take_and_show(monkeypatc
     )
     assert envelope["payload"]["authority"] == "Approved by the operator: ship it, no gate."
     add_ticket(r, pod=POD, tenant=TENANT, agent="reviewer", envelope=envelope)
+    capsys.readouterr()  # add_ticket's board_write_confirmed record goes to stdout
     stored = json.loads(r.lists[prefix(POD, TENANT, "reviewer", "tasks.todo")][0])
     assert stored["authority"] == {
         "text": "Approved by the operator: ship it, no gate.",
@@ -1913,6 +1914,7 @@ def test_ticket_without_authority_has_no_authority_key(monkeypatch, capsys):
     r, ticket_id, envelope = _add_with_authority(monkeypatch, capsys)
     assert "authority" not in envelope["payload"]
     add_ticket(r, pod=POD, tenant=TENANT, agent="reviewer", envelope=envelope)
+    capsys.readouterr()
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "reviewer")):
         office_main(["take", ticket_id])
     assert "authority" not in json.loads(capsys.readouterr().out)
