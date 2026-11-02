@@ -138,6 +138,13 @@ To delete a retired agent's saved history for good, use
 `h-mesh-office purge <agent> --cli <claude|codex|agy> [--profile <account>] --confirm <agent>`
 (refused while the agent is still enrolled; see `h-app/modules/office/README.md`).
 
+From an operator shell outside the office, use `h-mesh-office run scratch` or
+`h-mesh-office run monitor -- top`. These open non-addressable tmux windows,
+separate from agents: messages are never pasted into them. Commands run once
+and retain their exited output; close the window manually when finished.
+See [raw process windows](h-app/modules/office/README.md) for working-directory
+selection and lifecycle details.
+
 ### Optional vendor models
 
 The host wizard accepts a free-text default model and per-agent model
