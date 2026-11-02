@@ -191,3 +191,32 @@ means "usage cannot be measured", not "usage was zero". It adds nothing to the
 total, so the total understates real spend whenever an agy agent is running.
 Collecting agy usage would need a new data source in the watchdog; no
 collection code exists in `office`.
+
+## Board event notices (#18)
+
+Two board events now also send an ordinary `Message` envelope (written through
+the same `send()` path as any message, so it shows in the mesh log), instead of
+leaving the other party to poll `office list` or write a summary by hand:
+
+- `office add -a TARGET ...` sends the `AddTicket`, then a notice to TARGET:
+  who assigned which ticket (short id and title) and how to see/start it. The
+  notice is queued behind the `AddTicket` on the same path, so the ticket is
+  normally on the board before the notice is read. **One notice per target per
+  30 seconds** (`notice.add` key, `SET NX EX`): a bulk add of N tickets
+  announces only the first and says so, and the rest are on the board. Never
+  sent to oneself.
+- `office done` sends a notice to the ticket's `created_by` with the outcome,
+  only when that is another agent still enrolled. A self-created ticket or a
+  retired/unknown creator sends nothing and is not an error. `cancel`, `return`
+  and `hold` stay silent.
+- `--no-notify` on `add` and on `done` suppresses the notice (scripted bulk
+  work, or when the creator was already told).
+- Notices end with "Notice only, no reply needed" and nothing in `add`/`done`
+  reads the inbox, so they cannot start an acknowledgment loop; the agent guide
+  already says acknowledgments are not answered.
+- The board change is committed first. If the notice cannot be sent, `add`
+  and `done` still succeed and print a warning on stderr.
+
+The guide's "send the lead ONE line when a ticket is done" rule is separate:
+when the lead created the ticket, it now receives this notice as well as that
+line. Whether to drop the manual line is the guide owner's call, not made here.
