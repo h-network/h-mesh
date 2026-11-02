@@ -21,6 +21,7 @@ from .envelope import (
     stamp_source,
 )
 from .keys import delivery_lock_key, prefix
+from .ingress_health import IngressStallMonitor
 from .logging import configure_logging, emit, log_record, publish
 from .queues import admit_ingress
 from .registry import member_types, members, port_type
@@ -578,6 +579,7 @@ class Switch:
         window_log_tailer: WindowLogTailer | None = None,
         retention_trimmer: RetentionTrimmer | None = None,
         maintenance_poll_seconds: float = 2.0,
+        stall_monitor: IngressStallMonitor | None = None,
     ) -> None:
         """Forward, with the switch's own housekeeping between blocking pops.
 
@@ -598,6 +600,16 @@ class Switch:
                         "error", {},
                         reason=f"ingress recovery pass failed: {type(exc).__name__}: {exc}",
                     )
+                if stall_monitor is not None:
+                    try:
+                        stall_monitor.poll(
+                            member_types(self.r, pod=self.pod, tenant=self.tenant)
+                        )
+                    except Exception as exc:
+                        _emit_observation(
+                            "error", {},
+                            reason=f"ingress stall pass failed: {type(exc).__name__}: {exc}",
+                        )
                 if retention_trimmer is not None:
                     try:
                         agents = self._agents()
@@ -681,6 +693,12 @@ def main() -> None:
             dead_max=int(os.environ.get("DEAD_MAX", "500")),
         ),
         maintenance_poll_seconds=float(os.environ.get("MAINTENANCE_POLL_SECONDS", "2")),
+        stall_monitor=IngressStallMonitor(
+            r,
+            pod=switch.pod,
+            tenant=switch.tenant,
+            stall_seconds=float(os.environ.get("INGRESS_STALL_SECONDS", "60")),
+        ),
     )
 
 
