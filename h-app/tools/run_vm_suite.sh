@@ -3,6 +3,10 @@
 set -Eeuo pipefail
 umask 077
 
+# Discard identities supplied by an agent shell or SSH configuration before
+# fetching/installing. The build/test child also starts with env -i below.
+unset AGENT_NAME TENANT
+
 refresh=0
 if [[ ${1:-} == --refresh ]]; then
     refresh=1

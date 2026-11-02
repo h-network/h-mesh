@@ -250,6 +250,21 @@ advisory file lock utility, tmux, and a working user systemd manager. Provide
 `redis-server` on the clean
 system PATH or through an owned wrapper in `~/ci/bin`.
 
+Agent shells should invoke the approved wrapper without forwarding office
+identity variables:
+
+```bash
+env -u AGENT_NAME -u TENANT ssh h-lab@172.16.0.201 \
+  '~/ci/run-suite.sh architect/integration-test-batch'
+```
+
+The local environment removal applies only to the SSH client. Do not add
+office identity assignments to the remote command. The VM wrapper also unsets
+`AGENT_NAME` and `TENANT` at entry to discard SSH-configured values, and its
+build/test command uses an explicit `env -i` allowlist containing neither.
+Thus the approved wrapper does not pass an office identity to `tools.run_tests`,
+including when an SSH configuration supplies one to the wrapper itself.
+
 One advisory file lock covers fetching, installation, execution, and cleanup.
 Concurrent callers print a waiting message and time out after 900 seconds; set
 `CI_LOCK_TIMEOUT` explicitly to change that wait. Runs abort before setup and
