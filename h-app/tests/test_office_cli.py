@@ -1896,7 +1896,7 @@ def test_add_to_several_boards_uses_one_canonical_id(mock_send, monkeypatch, cap
         patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")),
         patch("modules.office.cli.os.urandom", return_value=bytes.fromhex(CANONICAL)) as urandom,
     ):
-        office_main(["add", "-a", "backend,frontend,backend", "-t", "title", "-d", "desc"])
+        office_main(["add", "-a", "backend,frontend,backend", "-t", "title", "-d", "desc", "--no-notify"])
     urandom.assert_called_once_with(16)
     destinations = [call.kwargs["destination"] for call in mock_send.call_args_list]
     assert destinations == ["backend", "frontend"]
@@ -1909,7 +1909,7 @@ def test_add_with_id_reuses_it_and_validates_it(mock_send, monkeypatch, capsys):
     _env(monkeypatch)
     r = FakeRedis(registry={"backend": "tmux"})
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
-        office_main(["add", "-a", "backend", "--id", CANONICAL, "-t", "t", "-d", "d"])
+        office_main(["add", "-a", "backend", "--id", CANONICAL, "-t", "t", "-d", "d", "--no-notify"])
         assert mock_send.call_args.kwargs["payload"]["id"] == CANONICAL
         assert capsys.readouterr().out.strip() == CANONICAL
         mock_send.reset_mock()
@@ -1946,7 +1946,7 @@ def test_add_reports_how_to_resume_after_a_partial_send(mock_send, monkeypatch, 
     r = FakeRedis(registry={"backend": "tmux", "frontend": "tmux"})
     with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
         with pytest.raises(RuntimeError):
-            office_main(["add", "-a", "backend,frontend", "--id", CANONICAL, "-t", "t", "-d", "d"])
+            office_main(["add", "-a", "backend,frontend", "--id", CANONICAL, "-t", "t", "-d", "d", "--no-notify"])
     err = capsys.readouterr().err
     assert "stopped at 'frontend'" in err and "after sending ticket" in err and "backend" in err
     assert f"--id {CANONICAL}" in err
@@ -1959,7 +1959,7 @@ def test_same_canonical_id_lands_on_every_board_and_show_all_finds_them(monkeypa
         patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")),
         patch("modules.office.cli.os.urandom", return_value=bytes.fromhex(CANONICAL)),
     ):
-        office_main(["add", "-a", "backend,frontend", "-t", "checklist review", "-d", "ctx", "-r", "ab" * 16])
+        office_main(["add", "-a", "backend,frontend", "-t", "checklist review", "-d", "ctx", "-r", "ab" * 16, "--no-notify"])
     assert capsys.readouterr().out.strip() == CANONICAL
     for target in ("backend", "frontend"):
         envelope = parse(r.lists[prefix(POD, TENANT, "architect", "egress")].pop(0))
@@ -1981,6 +1981,33 @@ def test_same_canonical_id_lands_on_every_board_and_show_all_finds_them(monkeypa
         with patch("modules.office.cli._context", return_value=(r, POD, TENANT, target)):
             office_main(["take", CANONICAL])
         assert json.loads(capsys.readouterr().out.splitlines()[-1])["id"] == CANONICAL
+
+
+def test_notices_for_a_multi_board_add_carry_the_canonical_id(monkeypatch, capsys):
+    """#18 + #21: each assignee's notice follows its own AddTicket and names the
+    one canonical id; a later --id add to a third board names the same id."""
+    _env(monkeypatch)
+    r = FakeRedis(registry={"architect": "tmux", "backend": "tmux", "frontend": "tmux", "ops": "tmux"})
+    egress = prefix(POD, TENANT, "architect", "egress")
+    with (
+        patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")),
+        patch("modules.office.cli.os.urandom", return_value=bytes.fromhex(CANONICAL)),
+    ):
+        office_main(["add", "-a", "backend,frontend", "-t", "checklist review", "-d", "ctx"])
+        assert capsys.readouterr().out.strip() == CANONICAL
+        office_main(["add", "-a", "ops", "--id", CANONICAL, "-t", "checklist review", "-d", "ctx"])
+        assert capsys.readouterr().out.strip() == CANONICAL
+    sent = [parse(raw) for raw in r.lists[egress]]
+    assert [(e["kind"], e["l2"]["destination"]) for e in sent] == [
+        ("AddTicket", "backend"), ("Message", "backend"),
+        ("AddTicket", "frontend"), ("Message", "frontend"),
+        ("AddTicket", "ops"), ("Message", "ops"),
+    ]
+    for envelope in sent:
+        if envelope["kind"] == "AddTicket":
+            assert envelope["payload"]["id"] == CANONICAL
+        else:
+            assert f"ticket {CANONICAL[:8]} " in envelope["payload"]["text"]
 
 
 def test_show_all_skips_unreadable_entries_and_reports_a_miss(monkeypatch, capsys):
