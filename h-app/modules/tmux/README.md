@@ -47,6 +47,20 @@ that creation. Existing names are refused, never replaced.
 
 `message_opener` pastes `[message from {source}] {text}`, unchanged from
 before opt-in reply correlation existed, for every message. When `source`
+
+`message_opener` pastes `[message from {source}] {text}` for every message,
+led by a stamp from `message_stamp`: `<UTC send time> #<id> ` (#20), e.g.
+`2026-11-02T03:42:11Z #4f3a9c21 [message from alice] hello`. The time is the
+frame's own `ts` (when the sender built it, not when it was pasted, so a
+message that sat in a queue still reads as old), cut to whole seconds; the id
+is the first 8 hex of its `stream_id` (the full id is still what `--reply-to`
+takes). Both fields are checked against a strict pattern before use because
+the sender controls them and they land in a terminal; one that does not match
+is left out, and a frame with neither gets the old plain line. Delivery order
+is unchanged (queue order); the stamp makes it, and staleness, visible. The
+`[message from ...]` text itself is untouched, so guides already written for
+live agents stay accurate. Attachment notices (`[attachment from ...]`) are not
+stamped. When `source`
 is an api-type participant, a second line follows:
 `[reply to {source}: office send -a {source} --reply-to {stream_id} "..."]`
 -- the id lives only there, not on the primary line, because
