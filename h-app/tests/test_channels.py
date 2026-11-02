@@ -18,7 +18,7 @@ if str(H_APP) not in sys.path:
 from core.channels import DeadLetter, receive, send
 from core.envelope import build, encode, parse
 from core.keys import delivery_lock_key, prefix
-from core.service import Switch
+from core.service import Switch, transient_redis_category
 
 
 POD = "mesh"
@@ -145,6 +145,286 @@ class FakeRedis:
                     return [0, index, depth]
             return [1, *(self.rpush(key, raw) for key in keys)]
         raise AssertionError("unexpected Lua script")
+
+
+BUSY = "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE."
+
+
+class FaultingRedis(FakeRedis):
+    """FakeRedis whose blocking pop raises the queued errors, then recovers."""
+
+    def __init__(self, faults):
+        super().__init__()
+        self.faults = list(faults)
+
+    def blpop(self, keys, timeout=0):
+        if self.faults:
+            raise self.faults.pop(0)
+        return super().blpop(keys, timeout=timeout)
+
+
+class SwitchRedisFaultTests(unittest.TestCase):
+    def _run_until_delivered(self, r, sleeps):
+        r.hset(prefix(POD, TENANT, resource="registry"), "alice", "tmux")
+        r.hset(prefix(POD, TENANT, resource="registry"), "bob", "tmux")
+        send(r, pod=POD, tenant=TENANT, source="alice", destination="bob", payload={"text": "hi"})
+        delivered = []
+
+        def kick(agent, port_type_name, envelope):
+            delivered.append(agent)
+            raise KeyboardInterrupt  # BaseException: ends run() once delivery starts
+
+        switch = Switch(r, pod=POD, tenant=TENANT, poll_seconds=1, kick=kick)
+        with (
+            patch("core.service.time.sleep", side_effect=sleeps.append),
+            patch("core.service._emit_observation") as emit,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            switch.run()
+        return delivered, emit
+
+    def test_switch_survives_busy_then_delivers(self):
+        # The 23:04:30 incident: BUSY surfaced as a bare ResponseError and killed
+        # the switch. It must back off, keep running and deliver after recovery.
+        r = FaultingRedis([redis.exceptions.ResponseError(BUSY)] * 2)
+        sleeps = []
+        delivered, emit = self._run_until_delivered(r, sleeps)
+
+        self.assertEqual(delivered, ["bob"])
+        self.assertEqual(sleeps, [0.2, 0.4])
+        reasons = [c.kwargs["reason"] for c in emit.call_args_list if c.args[0] == "error"]
+        self.assertEqual(len(reasons), 2)
+        self.assertIn("[busy]", reasons[0])
+        self.assertIn("retrying in 0.2s", reasons[0])
+        self.assertEqual(r.lists[prefix(POD, TENANT, "alice", "dead")], deque())
+
+    def test_backoff_doubles_to_a_cap(self):
+        r = FaultingRedis([redis.exceptions.ConnectionError("down")] * 8)
+        sleeps = []
+        self._run_until_delivered(r, sleeps)
+        self.assertEqual(sleeps, [0.2, 0.4, 0.8, 1.6, 3.2, 5.0, 5.0, 5.0])
+
+    def test_backoff_resets_after_a_successful_pass(self):
+        r = FaultingRedis([redis.exceptions.ResponseError(BUSY)] * 3)
+        sleeps = []
+        r.hset(prefix(POD, TENANT, resource="registry"), "alice", "tmux")
+        switch = Switch(r, pod=POD, tenant=TENANT, poll_seconds=1)
+        # Three failures, then step() succeeds on an empty queue, then a new fault.
+        calls = {"n": 0}
+        real_step = switch.step
+
+        def step(timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 5:
+                r.faults.append(redis.exceptions.ResponseError(BUSY))
+            if calls["n"] == 7:
+                raise KeyboardInterrupt
+            return real_step(timeout=timeout)
+
+        switch.step = step
+        with (
+            patch("core.service.time.sleep", side_effect=sleeps.append),
+            patch("core.service._emit_observation"),
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            switch.run()
+        self.assertEqual(sleeps, [0.2, 0.4, 0.8, 0.2])
+
+    def test_non_transient_redis_errors_stay_fatal(self):
+        fatal = (
+            redis.exceptions.ResponseError(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            ),
+            redis.exceptions.ResponseError("ERR Error running script: user_script:3"),
+            redis.exceptions.NoScriptError("NOSCRIPT"),
+            redis.exceptions.AuthenticationError("invalid password"),
+            ValueError("code bug"),
+        )
+        for error in fatal:
+            with self.subTest(error=repr(error)):
+                r = FaultingRedis([error])
+                r.hset(prefix(POD, TENANT, resource="registry"), "alice", "tmux")
+                switch = Switch(r, pod=POD, tenant=TENANT, poll_seconds=1)
+                with (
+                    patch("core.service.time.sleep") as sleep,
+                    patch("core.service._emit_observation"),
+                    self.assertRaises(type(error)),
+                ):
+                    switch.run()
+                sleep.assert_not_called()
+
+    def test_transient_classification_is_a_closed_set(self):
+        cases = {
+            "connection": redis.exceptions.ConnectionError("reset"),
+            "timeout": redis.exceptions.TimeoutError("slow"),
+            "loading": redis.exceptions.BusyLoadingError("loading"),
+            "readonly": redis.exceptions.ReadOnlyError("READONLY"),
+            "tryagain": redis.exceptions.TryAgainError("TRYAGAIN"),
+            "masterdown": redis.exceptions.MasterDownError("MASTERDOWN"),
+            "busy": redis.exceptions.ResponseError(BUSY),
+        }
+        for category, error in cases.items():
+            with self.subTest(category=category):
+                self.assertEqual(transient_redis_category(error), category)
+        # The code must be the first word: prose that merely mentions BUSY is not it.
+        self.assertIsNone(
+            transient_redis_category(redis.exceptions.ResponseError("ERR the BUSY key"))
+        )
+        self.assertIsNone(transient_redis_category(KeyError("x")))
+
+
+class AdmitFaultingRedis(FakeRedis):
+    """FakeRedis whose ingress admission raises scripted errors.
+
+    Each fault is (exception, executed): ``executed=True`` means the script ran
+    and wrote before the connection failed, the ambiguous case.
+    """
+
+    def __init__(self, admit_faults=(), hget_faults=(), rpush_faults=()):
+        super().__init__()
+        self.admit_faults = list(admit_faults)
+        self.hget_faults = list(hget_faults)
+        self.rpush_faults = list(rpush_faults)
+        self.admit_calls = 0
+
+    def eval(self, script, key_count, *args):
+        if "core ingress admission" in script:
+            self.admit_calls += 1
+            if self.admit_faults:
+                error, executed = self.admit_faults.pop(0)
+                if executed:
+                    super().eval(script, key_count, *args)
+                raise error
+        return super().eval(script, key_count, *args)
+
+    def hget(self, key, field):
+        if self.hget_faults:
+            raise self.hget_faults.pop(0)
+        return super().hget(key, field)
+
+    def rpush(self, key, *values):
+        if self.rpush_faults and key.endswith(":dead"):
+            raise self.rpush_faults.pop(0)
+        return super().rpush(key, *values)
+
+
+class SwitchPoppedFrameTests(unittest.TestCase):
+    """A frame popped from egress exists nowhere else; its fate is decided here."""
+
+    def _switch(self, r, kicks, **kwargs):
+        r.hashes[prefix(POD, TENANT, resource="registry")].update(
+            {"alice": "tmux", "bob": "tmux"}
+        )
+        # Arm the scripted faults only after send(), which also reads and writes.
+        armed = (r.admit_faults, r.hget_faults, r.rpush_faults)
+        r.admit_faults, r.hget_faults, r.rpush_faults = [], [], []
+        send(r, pod=POD, tenant=TENANT, source="alice", destination="bob", payload={"text": "hi"})
+        r.admit_faults, r.hget_faults, r.rpush_faults = armed
+        return Switch(
+            r, pod=POD, tenant=TENANT, poll_seconds=1,
+            kick=lambda *args: kicks.append(args), **kwargs,
+        )
+
+    def _step(self, switch):
+        sleeps = []
+        with (
+            patch("core.service.time.sleep", side_effect=sleeps.append),
+            patch("core.service._emit_observation") as emit,
+            patch("core.service._log_observation") as log,
+        ):
+            try:
+                switch.step(timeout=0)
+                error = None
+            except Exception as exc:
+                error = exc
+        return sleeps, emit, log, error
+
+    def test_busy_during_admit_then_recovery_delivers_the_frame_once(self):
+        busy = redis.exceptions.ResponseError(BUSY)
+        r = AdmitFaultingRedis(admit_faults=[(busy, False), (busy, False)])
+        kicks = []
+        switch = self._switch(r, kicks)
+        sleeps, emit, _, error = self._step(switch)
+
+        self.assertIsNone(error)
+        self.assertEqual(sleeps, [0.2, 0.4])
+        self.assertEqual(r.admit_calls, 3)
+        self.assertEqual(len(r.lists[prefix(POD, TENANT, "bob", "ingress")]), 1)
+        self.assertEqual(len(kicks), 1)
+        self.assertEqual(len(r.lists[prefix(POD, TENANT, "alice", "dead")]), 0)
+        self.assertEqual(switch.unknown_outcomes, {})
+
+    def test_persistent_busy_dead_letters_the_frame_with_a_closed_reason(self):
+        busy = redis.exceptions.ResponseError(BUSY)
+        r = AdmitFaultingRedis(admit_faults=[(busy, False)] * 10)
+        kicks = []
+        switch = self._switch(r, kicks, frame_retry_attempts=3)
+        sleeps, emit, _, error = self._step(switch)
+
+        self.assertIsNone(error)
+        self.assertEqual(sleeps, [0.2, 0.4])
+        self.assertEqual(r.admit_calls, 3)
+        self.assertEqual(len(r.lists[prefix(POD, TENANT, "bob", "ingress")]), 0)
+        self.assertEqual(kicks, [])
+        self.assertEqual(len(r.lists[prefix(POD, TENANT, "alice", "dead")]), 1)
+        dead_events = [c for c in emit.call_args_list if c.args[0] == "dead_lettered"]
+        self.assertEqual(len(dead_events), 1)
+        self.assertIn("[busy] through 3 attempts", dead_events[0].args[2])
+
+    def test_connection_reset_mid_admit_is_not_retried_or_duplicated(self):
+        # The script executed and the reply was lost: retrying would duplicate.
+        reset = redis.exceptions.ConnectionError("connection reset by peer")
+        r = AdmitFaultingRedis(admit_faults=[(reset, True)])
+        kicks = []
+        switch = self._switch(r, kicks)
+        sleeps, emit, _, error = self._step(switch)
+
+        self.assertIs(error, reset)  # run() survives it; step itself does not swallow
+        self.assertEqual(r.admit_calls, 1)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(len(r.lists[prefix(POD, TENANT, "bob", "ingress")]), 1)
+        self.assertEqual(len(r.lists[prefix(POD, TENANT, "alice", "dead")]), 0)
+        self.assertEqual(switch.unknown_outcomes, {"connection": 1})
+        unknown = [c for c in emit.call_args_list if c.args[0] == "forward_unknown"]
+        self.assertEqual(len(unknown), 1)
+        self.assertIn("UNKNOWN [connection]", unknown[0].args[2])
+
+    def test_timeout_mid_admit_is_counted_under_its_own_category(self):
+        r = AdmitFaultingRedis(
+            admit_faults=[(redis.exceptions.TimeoutError("slow"), False)]
+        )
+        switch = self._switch(r, [])
+        self._step(switch)
+        self.assertEqual(r.admit_calls, 1)
+        self.assertEqual(switch.unknown_outcomes, {"timeout": 1})
+
+    def test_registry_read_is_retried_on_any_transient_error(self):
+        # Repeating a read cannot duplicate anything, so even a reset is retried.
+        r = AdmitFaultingRedis(
+            hget_faults=[
+                redis.exceptions.ConnectionError("reset"),
+                redis.exceptions.ResponseError(BUSY),
+            ]
+        )
+        kicks = []
+        switch = self._switch(r, kicks)
+        sleeps, _, _, error = self._step(switch)
+        self.assertIsNone(error)
+        self.assertEqual(sleeps, [0.2, 0.4])
+        self.assertEqual(len(kicks), 1)
+        self.assertEqual(len(r.lists[prefix(POD, TENANT, "bob", "ingress")]), 1)
+
+    def test_dead_letter_write_that_stays_rejected_is_logged_as_lost(self):
+        busy = redis.exceptions.ResponseError(BUSY)
+        r = AdmitFaultingRedis(admit_faults=[(busy, False)] * 10, rpush_faults=[busy] * 10)
+        switch = self._switch(r, [], frame_retry_attempts=2)
+        _, _, log, error = self._step(switch)
+
+        self.assertIsInstance(error, redis.exceptions.ResponseError)
+        lost = [c for c in log.call_args_list if "frame LOST" in c.kwargs.get("reason", "")]
+        self.assertEqual(len(lost), 1)
+        self.assertIn("[busy]", lost[0].kwargs["reason"])
+        self.assertIsInstance(lost[0].kwargs["stream_id"], str)
 
 
 class ChannelTests(unittest.TestCase):

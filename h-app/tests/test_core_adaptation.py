@@ -260,10 +260,13 @@ class CoreAdaptationTests(unittest.TestCase):
 
         self.assertEqual(switch.step.call_count, 2)
         switch._reconcile_ingress.assert_called_once_with()
-        sleep.assert_called_once_with(2.0)
+        sleep.assert_called_once_with(0.2)
         emit.assert_called_once_with(
             "error", {},
-            reason="forwarding pass failed: ConnectionError: redis restarting",
+            reason=(
+                "forwarding pass failed: transient redis error [connection] "
+                "ConnectionError: redis restarting; retrying in 0.2s"
+            ),
         )
 
     def test_broadcast_without_resolved_type_records_terminal_skip(self):

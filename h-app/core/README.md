@@ -143,6 +143,32 @@ argument rather than from root.
 The threshold is the verbosity knob and nothing else: a real failure keeps its
 own severity. Note that `basicConfig` sets the **root** level, so `DEBUG` also
 turns up third-party libraries (redis included) in that process.
-The forwarding loop survives transient Redis connection failures: it records
-the failure, waits for its current poll interval, and lets redis-py reconnect on
-the next forwarding attempt.
+The forwarding loop survives transient Redis failures: connection resets and
+timeouts, `LOADING`, `BUSY` (a long script running on the server), `READONLY`/
+`TRYAGAIN`/`MASTERDOWN` during failover. It records an `error` event whose reason
+names a closed category (`connection`, `timeout`, `loading`, `busy`, `readonly`,
+`tryagain`, `masterdown`), sleeps with a doubling backoff (0.2s up to a 5s cap,
+reset by the next successful pass), and lets redis-py reconnect. Anything else
+-- `WRONGTYPE` from a corrupt key, a script error, bad credentials, a code bug --
+stays fatal on purpose: retrying those would hide a defect behind a live-looking
+daemon. `transient_redis_category()` in `service.py` is the single classifier.
+
+A frame is popped from egress before it is admitted, so a Redis fault after the
+pop decides its fate. The switch splits those faults by whether the command
+could have run:
+
+- **Provably rejected before execution** -- `busy`, `loading`, `readonly`,
+  `tryagain`, `masterdown`. The write did not happen, so the same frame is
+  retried in memory with the same backoff for up to `FRAME_RETRY_ATTEMPTS` (8,
+  about 16s). If it is still rejected, the frame is moved to the sender's `dead`
+  list with a `dead_lettered` event whose reason names the category and attempt
+  count -- never dropped silently. If even that dead-letter write stays
+  rejected, a `frame LOST` event carrying the stream_id is logged before the
+  error propagates.
+- **Ambiguous** -- `connection`, `timeout` on a write. The command may have
+  executed, so core's at-most-once holds: no blind retry (it could duplicate).
+  The switch records `forward_unknown` with the closed category, counts it in
+  `Switch.unknown_outcomes`, and the loop survives; the frame is not re-queued.
+- **Reads** (registry lookups) are idempotent, so any transient category is
+  retried; repeating a read cannot duplicate anything.
+

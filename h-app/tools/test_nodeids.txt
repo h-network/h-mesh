@@ -142,6 +142,17 @@ h-app/tests/test_attachment_schema.py::AttachmentSchemaTests::test_payload_not_d
 h-app/tests/test_attachment_schema.py::AttachmentSchemaTests::test_unexpected_keys
 h-app/tests/test_attachment_schema.py::AttachmentSchemaTests::test_valid_attachment_payload
 h-app/tests/test_attachment_schema.py::AttachmentSchemaTests::test_validate_attachment_with_envelope
+h-app/tests/test_channels.py::SwitchRedisFaultTests::test_backoff_doubles_to_a_cap
+h-app/tests/test_channels.py::SwitchRedisFaultTests::test_backoff_resets_after_a_successful_pass
+h-app/tests/test_channels.py::SwitchRedisFaultTests::test_non_transient_redis_errors_stay_fatal
+h-app/tests/test_channels.py::SwitchRedisFaultTests::test_switch_survives_busy_then_delivers
+h-app/tests/test_channels.py::SwitchRedisFaultTests::test_transient_classification_is_a_closed_set
+h-app/tests/test_channels.py::SwitchPoppedFrameTests::test_busy_during_admit_then_recovery_delivers_the_frame_once
+h-app/tests/test_channels.py::SwitchPoppedFrameTests::test_connection_reset_mid_admit_is_not_retried_or_duplicated
+h-app/tests/test_channels.py::SwitchPoppedFrameTests::test_dead_letter_write_that_stays_rejected_is_logged_as_lost
+h-app/tests/test_channels.py::SwitchPoppedFrameTests::test_persistent_busy_dead_letters_the_frame_with_a_closed_reason
+h-app/tests/test_channels.py::SwitchPoppedFrameTests::test_registry_read_is_retried_on_any_transient_error
+h-app/tests/test_channels.py::SwitchPoppedFrameTests::test_timeout_mid_admit_is_counted_under_its_own_category
 h-app/tests/test_channels.py::ChannelTests::test_backlog_reconciliation_leaves_paused_agent_queued
 h-app/tests/test_channels.py::ChannelTests::test_backlog_reconciliation_rekicks_queue_after_delivery_lease_is_gone
 h-app/tests/test_channels.py::ChannelTests::test_backlog_reconciliation_waits_for_live_delivery_lease
