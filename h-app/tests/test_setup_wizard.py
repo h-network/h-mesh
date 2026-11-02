@@ -24,8 +24,9 @@ SETUP_SH = REPO_ROOT / "setup.sh"
 
 # One blank answer per prompt in the "accept every default" path: pod,
 # tenant, agent count, multiple-accounts?, default account's OAuth token,
-# default CLI, CLI/account exceptions, local provider?, Telegram bot?.
-DEFAULT_PATH_ANSWERS = ["", "", "", "", "", "", "", "", ""]
+# default CLI, CLI/account exceptions, default model, model exceptions,
+# local provider?, Telegram bot?.
+DEFAULT_PATH_ANSWERS = [""] * 11
 
 
 def _run_wizard(cwd: str, args: list[str], env: dict, answers: list[str], timeout: float = 60) -> tuple[str, int]:
@@ -171,6 +172,8 @@ def test_wizard_accepting_every_default_hires_a_single_architect_agent(wizard_en
     persisted = read_tenant_env(ctx["tenant"])
     assert persisted.get("AGENTS") == "architect"
     assert persisted.get("DEFAULT_CLI") == "claude"
+    assert "DEFAULT_MODEL" not in persisted
+    assert "AGENT_MODELS" not in persisted
 
     redis_url = ctx["env"]["REDIS_URL"]
     r = redis.Redis.from_url(redis_url)
@@ -257,6 +260,8 @@ def test_wizard_hires_a_per_agent_cli_exception_with_the_right_cli(wizard_env):
         "",       # default CLI -> claude
         "sme-2",  # any agents differing
         "codex",  # sme-2 -- CLI
+        "",       # default vendor model -> CLI default
+        "",       # model exceptions -> none
         "",       # local model provider? -> n
         "",       # Telegram bot? -> n
     ]
@@ -312,6 +317,8 @@ def test_wizard_rerun_preserves_a_per_agent_cli_exception(wizard_env, monkeypatc
         "",           # default CLI -> claude
         "observer",   # any agents differing
         "codex",      # observer -- CLI
+        "",           # default vendor model -> CLI default
+        "",           # model exceptions -> none
         "",           # local model provider? -> n
         "",           # Telegram bot? -> n
     ]
@@ -367,6 +374,8 @@ def test_wizard_rerun_preserves_a_per_agent_account_exception(wizard_env, monkey
         "observer",   # any agents differing
         "",           # observer -- CLI [claude] -> keep
         "backup",     # observer -- account
+        "",           # default vendor model -> CLI default
+        "",           # model exceptions -> none
         "",           # local model provider? -> n
         "",           # Telegram bot? -> n
     ]
@@ -398,6 +407,8 @@ def test_wizard_rerun_preserves_a_per_agent_account_exception(wizard_env, monkey
         "",  # default CLI -> claude
         "",  # default account for every agent [default] -> keep
         "",  # any agents differing -> blank, no exceptions re-typed
+        "",  # default vendor model -> CLI default
+        "",  # model exceptions -> none
         "",  # local model provider? -> n
         "",  # Telegram bot? -> n
     ]
@@ -430,6 +441,8 @@ def test_wizard_provided_token_reaches_the_daemon_hiring_the_first_agent_in_the_
         "test-token-abc",  # OAuth token for 'default'
         "",              # default CLI
         "",              # any agents differing
+        "",              # default vendor model -> CLI default
+        "",              # model exceptions -> none
         "",              # local model provider? -> n
         "",              # Telegram bot? -> n
     ]
@@ -489,6 +502,8 @@ def test_wizard_persists_telegram_config_and_generates_an_api_token(wizard_env, 
         "",                     # OAuth token for 'default'
         "",                     # default CLI
         "",                     # any agents differing
+        "",                     # default vendor model -> CLI default
+        "",                     # model exceptions -> none
         "",                     # local model provider? -> n
         "y",                    # Run the Telegram bot? -> y
         "fake-bot-token-123",   # Telegram Bot Token
@@ -519,7 +534,7 @@ def test_wizard_persists_telegram_config_and_generates_an_api_token(wizard_env, 
 def test_wizard_requires_both_bot_token_and_chat_id(wizard_env, monkeypatch):
     ctx = wizard_env
     answers = [
-        "", "", "", "", "", "", "", "",  # defaults through local provider
+        "", "", "", "", "", "", "", "", "", "",  # defaults through local provider
         "y",                    # Run the Telegram bot? -> y
         "fake-bot-token-123",   # Telegram Bot Token
         "",                     # Telegram Chat ID -- left blank
@@ -564,6 +579,8 @@ def test_wizard_round_trips_a_custom_provider_name_through_a_re_run(wizard_env, 
         "",                   # OAuth token for 'default'
         "",                   # default CLI
         "",                   # any agents differing
+        "",                   # default vendor model -> CLI default
+        "",                   # model exceptions -> none
         "y",                  # local model provider? -> y
         "",                   # endpoint type [vllm] -> vllm
         "http://127.0.0.1:1",  # endpoint base URL
@@ -605,6 +622,8 @@ def test_wizard_round_trips_a_custom_provider_name_through_a_re_run(wizard_env, 
         "",  # OAuth token for 'default'
         "",  # default CLI
         "",  # any agents differing
+        "",  # default vendor model -> CLI default
+        "",  # model exceptions -> none
         "n",  # local model provider? -> n this time (already configured, nothing to add)
         "",  # Telegram bot? -> n
     ]
