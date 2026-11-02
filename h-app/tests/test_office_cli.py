@@ -2014,6 +2014,26 @@ def test_clone_to_all_uses_host_workdir_fallback(monkeypatch, tmp_path):
     )
 
 
+def test_git_clone_restores_workspace_ownership_after_clone(monkeypatch, tmp_path):
+    target = tmp_path / "kvm-agent" / "glkvm"
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ["git", "clone"]:
+            target.mkdir(parents=True, exist_ok=True)
+        return office_cli.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    chowned = []
+    monkeypatch.setattr(office_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(office_cli, "ensure_workdir_ownership", lambda p: chowned.append(Path(p)) or True)
+
+    ok, detail = office_cli._git_clone("https://example.com/glkvm.git", target, "https://example.com/glkvm.git")
+    assert ok is True
+    assert detail == ""
+    assert chowned == [target]
+
+
 @pytest.mark.parametrize("alias", ["cloneToAll", "sendFile", "letGo"])
 def test_camel_case_command_aliases_are_rejected(alias, capsys):
     with pytest.raises(SystemExit) as exc:

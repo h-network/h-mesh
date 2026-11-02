@@ -134,6 +134,9 @@ h-mesh-office hire <agent-name>
 
 Hiring starts a fresh CLI session by default, even when that agent name has
 local session history. Pass `--resume` to opt into restoring prior history.
+To delete a retired agent's saved history for good, use
+`h-mesh-office purge <agent> --cli <claude|codex|agy> [--profile <account>] --confirm <agent>`
+(refused while the agent is still enrolled; see `h-app/modules/office/README.md`).
 
 ### Optional vendor models
 
