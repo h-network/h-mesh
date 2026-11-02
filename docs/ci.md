@@ -204,7 +204,8 @@ For every accepted run, the runner creates a private mode-0700 directory under
 `/tmp/h-mesh-test-state-*`. It exports `H_MESH_STATE_DIR`, `H_MESH_WORKDIR`,
 `H_MESH_RUN_DIR`, and `H_MESH_LOG_FILE` beneath that directory, with a temporary
 HOME and XDG config/cache/data paths. `HOME/.h-mesh` points to the private
-state directory, so default-home and explicit-state paths agree. This covers
+state directory, which retains the `.h-mesh` name for default cursor paths,
+so default-home and explicit-state paths agree. This covers
 the first-party import probe, pytest, and test-spawned children. The runner
 prints the chosen state directory and removes it after success, failure, or a
 handled interrupt.

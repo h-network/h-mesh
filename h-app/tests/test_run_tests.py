@@ -46,6 +46,7 @@ def test_runner_preserves_ambient_state_bytes_and_isolates_children(tmp_path: Pa
         "    log_record('fixture', 'opened', source='parent')\n"
         f"    subprocess.run([sys.executable, '-c', {child_code!r}], check=True)\n"
         "    state = Path(os.environ['H_MESH_STATE_DIR'])\n"
+        "    assert state.name == '.h-mesh'\n"
         "    assert 'child fixture' in (state / 'tasks.jsonl').read_text()\n"
         "    assert 'child' in (state / 'window.log.jsonl').read_text()\n"
         "    assert (Path.home() / '.h-mesh' / 'tasks.jsonl').resolve() == state / 'tasks.jsonl'\n"
