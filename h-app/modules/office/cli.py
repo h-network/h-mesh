@@ -34,7 +34,9 @@ from core.keys import (
 from core.logging import log_record, record_task_event
 from core.registry import is_member, members, port_type
 from lib.attachment_schema import ATTACHMENT_MAX_BYTES, MIME_TYPE_REGEX
-from lib.board_interaction import BoardError, normalize_ticket, serialize_ticket
+from lib.board_interaction import (
+    AUTHORITY_MAX_CHARS, BoardError, authority_block, normalize_ticket, serialize_ticket,
+)
 from lib.chat_memory import TTL_SECONDS_MAX as _CHAT_MEMORY_TTL_SECONDS
 from lib.chat_memory import ChatMemory
 from lib.paths import get_workdir_root
@@ -1633,6 +1635,10 @@ def _add_command(argv: list[str]) -> None:
     parser.add_argument("-r", "--related", metavar="ID[,ID...]",
                          help="ticket ids this one references -- stored, never validated "
                               "(a related ticket may live on another agent's board)")
+    parser.add_argument("--authority", metavar="TEXT",
+                         help="the authoritative directive for this ticket (what you, as creator, "
+                              "are instructing/approving), shown by take/show with your name and "
+                              f"the time; max {AUTHORITY_MAX_CHARS} chars. Set once at add time")
     args = parser.parse_args(argv)
 
     if args.description_stdin:
@@ -1654,6 +1660,10 @@ def _add_command(argv: list[str]) -> None:
         _warn_if_shell_mangled(args.description, "the description", "add")
     _warn_if_shell_mangled(args.title, "the title", "add")
 
+    if args.authority is not None and authority_block(args.authority, by="x", ts="x") is None:
+        raise OfficeError(
+            f"--authority must be non-empty text of at most {AUTHORITY_MAX_CHARS} characters"
+        )
     r, pod, tenant, source = _context()
     if not is_member(r, pod=pod, tenant=tenant, agent=args.agent):
         raise OfficeError(f"unknown destination agent {args.agent!r}")
@@ -1678,6 +1688,10 @@ def _add_command(argv: list[str]) -> None:
         related = list(dict.fromkeys(value.strip() for value in args.related.split(",") if value.strip()))
         if related:
             payload["related"] = related
+    if args.authority is not None:
+        # Only the text travels; the receiving board stamps who and when
+        # (lib/board_interaction.authority_block), so it cannot be forged here.
+        payload["authority"] = args.authority.strip()
     send(
         r,
         pod=pod,
