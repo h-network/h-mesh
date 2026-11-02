@@ -46,6 +46,7 @@ def run_office(managed_tmpdir, monkeypatch):
         yield dict(root=root, work=work, home=home, socket=socket, pod=pod, tenant=tenant,
                    r=r, registry=registry, reconciler=reconciler)
     finally:
+        monkeypatch.delenv("TMUX", raising=False)
         ops.run_tmux("kill-server", socket=socket)
         keys = list(r.scan_iter(match=f"pod:{pod}:tenant:{tenant}:*"))
         if keys:
@@ -143,7 +144,7 @@ def test_run_command_keeps_literal_argv_cwd_and_no_agent_identity(run_office):
     words = ["spaces in one argument", "$(false);literal", 'a"quote', "--model"]
     cli.main(["run", "literal", "--cwd", str(ctx["work"]), "--",
               sys.executable, "-c", script, str(output), *words])
-    _eventually(output.exists)
+    _eventually(lambda: _dead(ctx, "__run__literal"))
     result = json.loads(output.read_text())
     assert result == {"args": words, "cwd": str(ctx["work"]), "identity": []}
     assert not (ctx["work"] / "AGENTS.md").exists()
@@ -161,7 +162,7 @@ def test_run_default_shell_allows_operator_input_without_agent_identity(run_offi
     code, _, error = ops.run_tmux("send-keys", "-t", f"{ctx['tenant']}:{window}", command, "Enter",
                                   socket=ctx["socket"])
     assert code == 0, error
-    _eventually(marker.exists)
+    _eventually(lambda: marker.exists() and marker.read_text() == "shell-ok")
     assert marker.read_text() == "shell-ok"
     assert not _dead(ctx, window)
 
@@ -228,10 +229,15 @@ def test_run_window_cannot_be_an_envelope_destination(run_office, kind):
 
 
 @pytest.mark.parametrize("opener", ["message_opener", "command_opener"], ids=["message", "command"])
-def test_tmux_openers_cannot_paste_into_run_windows(run_office, opener):
+def test_tmux_openers_cannot_paste_into_run_windows(run_office, opener, monkeypatch):
     ctx = run_office
     cli.main(["run", "scratch"])
     marker = ctx["root"] / "must-not-execute"
+    real_tmux = ops.run_tmux
+    def forbid_paste(*args, **kwargs):
+        assert args[0] not in ("load-buffer", "paste-buffer", "send-keys"), "attempted raw-window delivery"
+        return real_tmux(*args, **kwargs)
+    monkeypatch.setattr(ops, "run_tmux", forbid_paste)
     with pytest.raises(ValueError, match="do not accept message delivery"):
         getattr(port, opener)(ctx["r"], ctx["pod"], ctx["tenant"], "__run__scratch",
                               {"payload": {"text": f"\ntouch {marker}\n"}}, ctx["tenant"], ctx["socket"])
