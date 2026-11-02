@@ -39,7 +39,7 @@ def test_add_sends_the_ticket_then_an_assignment_notice(monkeypatch, capsys):
     ticket_id = capsys.readouterr().out.strip()
     ticket, notice = _sent(r, "architect")
     assert ticket["kind"] == "AddTicket" and notice["kind"] == "Message"
-    assert notice["l2"]["destination"].endswith(":backend")
+    assert notice["l2"]["destination"] == "backend"
     text = notice["payload"]["text"]
     assert ticket_id[:8] in text and "fix the thing" in text and "architect assigned you" in text
     assert "no reply needed" in text
@@ -95,7 +95,7 @@ def test_done_notifies_the_creator_with_the_outcome(monkeypatch, capsys):
     _doing(r, "worker", created_by="architect", title="ship it")
     _run(r, "worker", ["done", "--outcome", "passed"])
     (notice,) = _sent(r, "worker")
-    assert notice["kind"] == "Message" and notice["l2"]["destination"].endswith(":architect")
+    assert notice["kind"] == "Message" and notice["l2"]["destination"] == "architect"
     text = notice["payload"]["text"]
     assert "worker finished ticket a1b2c3d4" in text and "ship it" in text and "(passed)" in text
     assert "no reply needed" in text
