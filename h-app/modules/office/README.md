@@ -191,3 +191,28 @@ means "usage cannot be measured", not "usage was zero". It adds nothing to the
 total, so the total understates real spend whenever an agy agent is running.
 Collecting agy usage would need a new data source in the watchdog; no
 collection code exists in `office`.
+
+## Shell-mangled text (#16)
+
+`office` cannot see what a shell removed: inside a double-quoted argument
+`` `name` ``, `$(cmd)` and `$VAR` are expanded before `office` starts, usually
+to nothing, and the shorter text is accepted like any other. The byte count
+printed on success is the count of what *arrived*, so it cannot reveal the loss.
+What `office` can do, and now does for text given as a command-line argument
+(`send`, `broadcast`, and `add`'s `-t` and `-d`):
+
+- **Warn on the hole** the removal leaves: two or more spaces between words
+  (`the  setting`, from ``the `x` setting``) print a warning on stderr that
+  points at `--stdin` / `--file`. It never blocks the send and does not change
+  the output or exit code. It is a heuristic: it does not see a word dropped at
+  a line edge or next to punctuation, it fires on aligned columns, and two
+  spaces after `.`, `!` or `?` and leading/trailing spaces are ignored.
+- **Refuse blank text** (`""`, whitespace only): this is what a body that was
+  entirely a substitution becomes, and sending an empty message helps no one.
+  `--stdin` already refused empty input.
+- **Never check `--stdin` / `--file`** text; it is never shell-parsed, which is
+  why it is the way to send anything containing backticks, `$` or quotes.
+
+`office add` previously took its description only from `-d`. It now also
+accepts `--description-stdin` and `--description-file PATH` (exactly one of the
+three), so a ticket description with code in it no longer needs shell quoting.

@@ -522,6 +522,28 @@ h-app/tests/test_office_cli.py::test_status_keeps_unknown_presence_unknown_with_
 h-app/tests/test_office_cli.py::test_status_keeps_delivery_marker_visible_when_its_age_is_malformed
 h-app/tests/test_office_cli.py::test_broadcast_resolves_tmux_peers_without_self
 h-app/tests/test_office_cli.py::test_broadcast_reads_stdin
+h-app/tests/test_office_shell_mangle.py::test_a_real_shell_substitution_that_empties_the_body_is_refused
+h-app/tests/test_office_shell_mangle.py::test_add_blank_inputs_are_refused
+h-app/tests/test_office_shell_mangle.py::test_add_description_from_stdin_and_file
+h-app/tests/test_office_shell_mangle.py::test_add_requires_exactly_one_description_source
+h-app/tests/test_office_shell_mangle.py::test_add_warns_for_title_and_description_but_still_adds
+h-app/tests/test_office_shell_mangle.py::test_blank_argv_text_is_refused_not_sent[   -argv0]
+h-app/tests/test_office_shell_mangle.py::test_blank_argv_text_is_refused_not_sent[   -argv1]
+h-app/tests/test_office_shell_mangle.py::test_blank_argv_text_is_refused_not_sent[-argv0]
+h-app/tests/test_office_shell_mangle.py::test_blank_argv_text_is_refused_not_sent[-argv1]
+h-app/tests/test_office_shell_mangle.py::test_blank_argv_text_is_refused_not_sent[\n-argv0]
+h-app/tests/test_office_shell_mangle.py::test_blank_argv_text_is_refused_not_sent[\n-argv1]
+h-app/tests/test_office_shell_mangle.py::test_double_space_from_argv_warns_but_still_sends[argv0]
+h-app/tests/test_office_shell_mangle.py::test_double_space_from_argv_warns_but_still_sends[argv1]
+h-app/tests/test_office_shell_mangle.py::test_ordinary_text_does_not_warn[   indented only]
+h-app/tests/test_office_shell_mangle.py::test_ordinary_text_does_not_warn[Two sentences.  Second one]
+h-app/tests/test_office_shell_mangle.py::test_ordinary_text_does_not_warn[a\nb]
+h-app/tests/test_office_shell_mangle.py::test_ordinary_text_does_not_warn[line one\n    code]
+h-app/tests/test_office_shell_mangle.py::test_ordinary_text_does_not_warn[plain text]
+h-app/tests/test_office_shell_mangle.py::test_ordinary_text_does_not_warn[trailing   ]
+h-app/tests/test_office_shell_mangle.py::test_stdin_text_is_never_checked[argv0]
+h-app/tests/test_office_shell_mangle.py::test_stdin_text_is_never_checked[argv1]
+h-app/tests/test_office_shell_mangle.py::test_the_hole_a_real_shell_leaves_is_what_we_detect
 h-app/tests/test_office_port.py::test_lifecycle_validation_failure_is_explicit_rejection
 h-app/tests/test_office_port.py::test_lifecycle_unknown_failure_is_not_misclassified_as_rejection
 h-app/tests/test_office_port.py::test_late_validation_rejection_writes_nothing_and_is_dead_letterable

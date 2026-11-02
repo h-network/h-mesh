@@ -126,6 +126,37 @@ def _message(
     )
 
 
+# A double-quoted shell argument is expanded BEFORE office sees it: `name` and
+# $(cmd) are executed and replaced by their output (usually nothing), $VAR by
+# its value (usually nothing). What office receives is already shorter, and a
+# shorter body is indistinguishable from a deliberate one -- the byte count
+# printed on success then matches what was received, not what was meant.
+# The one trace that is detectable is the hole left behind: "the `x` setting"
+# arrives as "the  setting". Two or more spaces between words is therefore
+# reported (stderr, never blocking). Heuristic and deliberately narrow: it
+# misses a dropped word at a line edge or next to punctuation, and fires on
+# aligned columns; the .!?-preceded "two spaces after a sentence" is exempt.
+_SHELL_HOLE_RE = re.compile(r"(?<=[^\s.!?])[ ]{2,}(?=\S)")
+
+
+def _warn_if_shell_mangled(text: str, what: str, command: str) -> None:
+    """Warn on stderr when argv text shows the hole a shell expansion leaves.
+
+    Only for text that arrived as a command-line argument; --stdin/--file text
+    is never shell-parsed and is not checked.
+    """
+    for line in text.split("\n"):
+        if _SHELL_HOLE_RE.search(line.strip()):
+            print(
+                f"office: warning: {what} has a double space; if a word is missing, the shell "
+                "removed it (backticks, $(...) and $VARS inside a double-quoted argument are "
+                f"expanded before office sees them). Resend with `office {command} ... --stdin` "
+                "or --file for exact text.",
+                file=sys.stderr,
+            )
+            return
+
+
 def _resolve_message_text(args, command: str) -> str:
     """Resolve one message body from positional text, --stdin, or --file.
 
@@ -147,6 +178,12 @@ def _resolve_message_text(args, command: str) -> str:
         except OSError as exc:
             raise OfficeError(f"cannot read message file {str(args.file)!r}: {exc}") from exc
     if args.text is not None:
+        if not args.text.strip():
+            raise OfficeError(
+                f"office {command} message text is empty -- if it was built with backticks, "
+                "$(...) or $VARS, the shell may have expanded it to nothing; use --stdin or --file"
+            )
+        _warn_if_shell_mangled(args.text, "the message text", command)
         return args.text
     raise OfficeError(f"office {command} requires message text, --stdin, or --file")
 
@@ -1586,12 +1623,36 @@ def _add_command(argv: list[str]) -> None:
     parser = _operation_parser("add", "Add a task to another agent's board.")
     parser.add_argument("-a", "--agent", required=True, metavar="AGENT")
     parser.add_argument("-t", "--title", required=True, metavar="TITLE")
-    parser.add_argument("-d", "--description", required=True, metavar="DESCRIPTION")
+    description = parser.add_mutually_exclusive_group(required=True)
+    description.add_argument("-d", "--description", metavar="DESCRIPTION")
+    description.add_argument("--description-stdin", action="store_true",
+                             help="read the description from stdin (never shell-parsed)")
+    description.add_argument("--description-file", type=Path, metavar="PATH",
+                             help="read the description from a file (never shell-parsed)")
     parser.add_argument("-p", "--priority", metavar="PRIORITY")
     parser.add_argument("-r", "--related", metavar="ID[,ID...]",
                          help="ticket ids this one references -- stored, never validated "
                               "(a related ticket may live on another agent's board)")
     args = parser.parse_args(argv)
+
+    if args.description_stdin:
+        args.description = sys.stdin.read()
+        if not args.description.strip():
+            raise OfficeError("office add --description-stdin received no description")
+    elif args.description_file is not None:
+        try:
+            args.description = args.description_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise OfficeError(f"cannot read description file {str(args.description_file)!r}: {exc}") from exc
+    else:
+        for value, what in ((args.title, "the title"), (args.description, "the description")):
+            if not value.strip():
+                raise OfficeError(
+                    f"office add {what} is empty -- the shell may have expanded it to nothing "
+                    "(backticks, $(...), $VARS); use --description-stdin or --description-file"
+                )
+        _warn_if_shell_mangled(args.description, "the description", "add")
+    _warn_if_shell_mangled(args.title, "the title", "add")
 
     r, pod, tenant, source = _context()
     if not is_member(r, pod=pod, tenant=tenant, agent=args.agent):
