@@ -201,8 +201,9 @@ Run any of those with --help. To see your tmux colleagues:
 
     {cmd} peers
 
-A message arrives in your terminal as `[message from <name>] …` — reply by name,
-whether or not `peers` lists it:
+A message arrives in your terminal as `[message from <name>] …`, led by its UTC
+send time and a short `#id` so you can order and de-duplicate messages — reply
+by name, whether or not `peers` lists it:
 
     {cmd} send -a <name> "one quoted argument"
     {cmd} send -a <name> --stdin      < the body on stdin

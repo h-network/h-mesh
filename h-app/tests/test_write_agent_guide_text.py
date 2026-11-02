@@ -96,6 +96,15 @@ def test_nothing_replaces_the_removed_warning(home, tmp_path):
     assert "⚠ The body is ONE argument." in agents
 
 
+def test_guide_says_messages_carry_a_send_time_and_short_id(home, tmp_path):
+    agents, _ = _write(tmp_path)
+    assert (
+        "A message arrives in your terminal as `[message from <name>] …`, led by its UTC\n"
+        "send time and a short `#id` so you can order and de-duplicate messages — reply\n"
+        "by name, whether or not `peers` lists it:\n"
+    ) in agents
+
+
 DONE_NOTICE = (
     "When a ticket is done, send the lead ONE line saying it is done, naming the\n"
     "ticket (title or id), then `h-mesh-office done`. No summary, no recap of changes.\n"
