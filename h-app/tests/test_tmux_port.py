@@ -27,6 +27,7 @@ from modules.tmux import (
     message_opener,
     messages_opener,
 )
+from modules.tmux.port import message_stamp
 
 
 POD = "testpod"
@@ -198,7 +199,7 @@ class TmuxPortTests(unittest.TestCase):
         deliver_tmux(self.redis, pod=POD, tenant=TENANT, agent="bob", session_name="testtenant")
 
         mock_submit.assert_called_once_with(
-            "testtenant", "bob", "[message from alice] hello bob\n",
+            "testtenant", "bob", f"{message_stamp(parse(raw))}[message from alice] hello bob\n",
             stream_id=stream_id, socket=None,
         )
 
@@ -252,7 +253,7 @@ class TmuxPortTests(unittest.TestCase):
         deliver_tmux(self.redis, pod=POD, tenant=TENANT, agent="bob", session_name="testtenant")
 
         expected_msg = (
-            f"[message from telegram] ping\n"
+            f"{message_stamp(parse(raw))}[message from telegram] ping\n"
             f'[reply to telegram: h-mesh-office send -a telegram --reply-to {stream_id} "..."]\n'
         )
         mock_submit.assert_called_once_with(
@@ -495,8 +496,8 @@ class TmuxPortTests(unittest.TestCase):
         self.assertEqual(
             [(call.args[2], call.kwargs["stream_id"]) for call in mock_submit.call_args_list],
             [
-                ("[message from alice] msg 1\n", id1),
-                ("[message from alice] msg 2\n", id2),
+                (f"{message_stamp(parse(raw1))}[message from alice] msg 1\n", id1),
+                (f"{message_stamp(parse(raw2))}[message from alice] msg 2\n", id2),
             ],
         )
         self.assertIsNone(self.redis.lpop(prefix(POD, TENANT, "bob", "ingress")))
