@@ -249,3 +249,12 @@ What `office` can do, and now does for text given as a command-line argument
 `office add` previously took its description only from `-d`. It now also
 accepts `--description-stdin` and `--description-file PATH` (exactly one of the
 three), so a ticket description with code in it no longer needs shell quoting.
+
+`office clone-to-all <repo-url> [-a AGENT,...] [--dry-run]` clones a repository
+into each selected tmux agent's workspace (`<workdir_root>/<agent>/<repo>`).
+When invoked as `root` (for example via `sudo h-mesh-office clone-to-all` or
+`docker exec -u 0`), it hands ownership of the cloned tree and any newly
+created workspace parent back to the unprivileged workspace user
+(`lib.paths.ensure_workdir_ownership`, using `os.lchown` without following
+symlinks) so agents do not hit git's `detected dubious ownership` check or
+permission errors when creating `.venv` or editing files in-repo (#28).

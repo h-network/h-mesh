@@ -40,7 +40,7 @@ from lib.board_interaction import (
 )
 from lib.chat_memory import TTL_SECONDS_MAX as _CHAT_MEMORY_TTL_SECONDS
 from lib.chat_memory import ChatMemory
-from lib.paths import get_workdir_root
+from lib.paths import ensure_workdir_ownership, get_workdir_root
 from lib.reply_correlation import is_valid_reply_id
 
 from .pricing import calculate_cost, load_pricing
@@ -1789,6 +1789,7 @@ def _git_clone(source: str, target: Path, upstream: str) -> tuple[bool, str]:
         if remote.returncode:
             detail = remote.stderr.strip() or remote.stdout.strip() or "could not set origin"
             return False, detail
+        ensure_workdir_ownership(target)
         return True, ""
     except OSError as exc:
         return False, str(exc)
