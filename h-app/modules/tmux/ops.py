@@ -205,6 +205,11 @@ You have a task board. Nothing will notify you about it — check it yourself:
     {cmd} show ID     read a ticket in full without taking or changing it
     {cmd} retitle --title TEXT [ID]
                       correct your own open ticket without changing its identity
+    {cmd} note "TEXT"  record a progress note on your open ticket (what you
+                      tried and found); read it later with `show`
+    {cmd} reopen ID   bring one of your done tickets back to doing
+                      (--todo to queue it instead); the old outcome stays
+                      on the ticket as a note
 
 Take a ticket *before* you start work, not after. `doing` is how the office
 knows what you are on.

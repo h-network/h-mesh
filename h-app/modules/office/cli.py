@@ -34,7 +34,9 @@ from core.keys import (
 from core.logging import log_record, record_task_event
 from core.registry import is_member, members, port_type
 from lib.attachment_schema import ATTACHMENT_MAX_BYTES, MIME_TYPE_REGEX
-from lib.board_interaction import BoardError, normalize_ticket, serialize_ticket
+from lib.board_interaction import (
+    NOTE_MAX_CHARS, NOTES_MAX, BoardError, normalize_ticket, serialize_ticket, valid_notes,
+)
 from lib.chat_memory import TTL_SECONDS_MAX as _CHAT_MEMORY_TTL_SECONDS
 from lib.chat_memory import ChatMemory
 from lib.paths import get_workdir_root
@@ -1138,6 +1140,8 @@ def _ticket_line(ticket: dict, *, state: str, now: datetime) -> str:
     related = ticket.get("related")
     if related:
         line += f"  rel:{','.join(item[:8] for item in related)}"
+    if ticket.get("notes"):
+        line += f"  notes:{len(ticket['notes'])}"
     age = _ticket_age(ticket, state=state, now=now)
     if age:
         line += f"  age:{age}"
@@ -1527,6 +1531,133 @@ def _retitle_command(argv: list[str]) -> None:
         old_title=old_title,
     )
     print(replacement.decode() if isinstance(replacement, bytes) else replacement)
+
+
+def _reject_duplicate_keys(pairs):
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        raise OfficeError("stored ticket has duplicate fields; refusing to rewrite it")
+    return dict(pairs)
+
+
+def _note_command(argv: list[str]) -> None:
+    parser = _operation_parser(
+        "note", "Append a progress note to one of your open tasks (kept on the ticket)."
+    )
+    parser.add_argument("-i", "--id", metavar="ID", help="ticket id or unique prefix (default: your doing task)")
+    sources = parser.add_mutually_exclusive_group()
+    sources.add_argument("--stdin", action="store_true", help="read the note from stdin")
+    sources.add_argument("--file", type=Path, metavar="PATH", help="read the note from a file")
+    parser.add_argument("text", nargs="?", help="one quoted note")
+    args = parser.parse_args(argv)
+    text = _resolve_message_text(args, "note").strip()
+    if not text:
+        raise OfficeError("note cannot be empty")
+    if len(text) > NOTE_MAX_CHARS:
+        raise OfficeError(
+            f"note is {len(text)} characters; the limit is {NOTE_MAX_CHARS}. "
+            "Keep the ticket to what was tried and found; send the rest as a message"
+        )
+    r, pod, tenant, source = _context()
+    keys = _task_keys(pod, tenant, source)
+    states = ("doing",) if args.id is None else ("todo", "doing", "hold")
+    state, raw, normalized = _select(
+        r, keys, states, args.id,
+        missing_message=(
+            f"no open task matches id {args.id!r}; a finished ticket must be "
+            "reopened first (office reopen ID)"
+        ) if args.id else None,
+    )
+    # Edit the stored object itself, not normalize_ticket's projection, so a
+    # field this CLI does not know about survives, as retitle guarantees.
+    try:
+        stored = json.loads(
+            raw.decode() if isinstance(raw, bytes) else raw,
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except json.JSONDecodeError as exc:
+        # OfficeError is a ValueError: let the duplicate-field refusal pass through.
+        raise OfficeError("stored ticket is not valid JSON; refusing to rewrite it") from exc
+    if not isinstance(stored, dict):
+        raise OfficeError("stored ticket is not a JSON object")
+    notes = stored.get("notes", [])
+    if not isinstance(notes, list):
+        raise OfficeError("stored ticket has a malformed notes field; refusing to rewrite it")
+    if len(notes) >= NOTES_MAX:
+        raise OfficeError(
+            f"ticket already has {len(notes)} notes (limit {NOTES_MAX}); "
+            "nothing was added or dropped"
+        )
+    notes.append({"ts": _now(), "by": source, "text": text})
+    stored["notes"] = notes
+    replacement = serialize_ticket(stored)
+    _rewrite_selected(r, key=keys[state], raw=raw, replacement=replacement)
+    record_task_event("note", id=normalized["id"], title=normalized["title"], agent=source, actor=source)
+    log_record(
+        "office", "task_noted", destination=source, task_id=normalized["id"],
+        title=normalized["title"],
+    )
+    print(f"noted {normalized['id']} ({len(notes)} on ticket)")
+
+
+def _reopen_command(argv: list[str]) -> None:
+    parser = _operation_parser(
+        "reopen",
+        "Reopen one of your finished tasks as doing (or queued with --todo).",
+    )
+    parser.add_argument("id", help="ticket id or unique prefix of a done or cancelled task")
+    parser.add_argument(
+        "--todo", action="store_true",
+        help="queue it in todo instead of taking it now (needed if you already have a doing task)",
+    )
+    args = parser.parse_args(argv)
+    r, pod, tenant, source = _context()
+    keys = _task_keys(pod, tenant, source)
+    _, raw, ticket = _select(
+        r, keys, ("done",), args.id,
+        missing_message=f"no finished task matches id {args.id!r}; reopen works on your own done or cancelled tasks",
+    )
+    previous = "cancelled" if ticket.get("status") == "cancelled" else (
+        f"done ({ticket['outcome']})" if ticket.get("outcome") else "done"
+    )
+    now = _now()
+    # The earlier verdict would otherwise vanish with the outcome field, so it is
+    # kept on the ticket as a note: reopening never erases what was decided.
+    ticket["notes"] = valid_notes(ticket.get("notes")) + [
+        {"ts": now, "by": source, "text": f"reopened; was {previous}"}
+    ]
+    ticket["done_ts"] = None
+    ticket["held_ts"] = None
+    ticket.pop("outcome", None)
+    ticket.pop("hold_reason", None)
+    if args.todo:
+        ticket["status"] = "todo"
+        ticket["started_ts"] = None
+    else:
+        ticket["status"] = "doing"
+        ticket["started_ts"] = now
+        if r.llen(keys["doing"]):
+            raise OfficeError(
+                "you already have one open task; reopen with --todo to queue it instead"
+            )
+    try:
+        _transition_selected(
+            r,
+            source_key=keys["done"],
+            destination_key=keys["todo" if args.todo else "doing"],
+            raw=raw,
+            replacement=serialize_ticket(ticket),
+            require_destination_empty=not args.todo,
+        )
+    except OfficeError as exc:
+        if str(exc) == "you already have one open task":
+            raise OfficeError(
+                "you already have one open task; reopen with --todo to queue it instead"
+            ) from exc
+        raise
+    record_task_event("reopen", id=ticket["id"], title=ticket["title"], agent=source, actor=source)
+    _log_task("task_reopened", agent=source, ticket=ticket)
+    print(serialize_ticket(ticket))
 
 
 def _hold_command(argv: list[str]) -> None:
@@ -1939,6 +2070,8 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("return",), "return your open task to todo", _return_command),
     (("show",), "read one ticket without changing it", _show_command),
     (("retitle",), "correct the title of your open task", _retitle_command),
+    (("reopen",), "reopen one of your done or cancelled tasks", _reopen_command),
+    (("note",), "append a progress note to one of your open tasks", _note_command),
     (("hold",), "pause (hold) an active or queued task; resume with take/unhold", _hold_command),
     (("delete",), "permanently remove a task from your own board", _delete_command),
     (("add",), "add a task to another agent's board", _add_command),

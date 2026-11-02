@@ -21,6 +21,26 @@ def _text(value) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
+NOTE_MAX_CHARS = 2000
+NOTES_MAX = 50
+
+
+def valid_notes(value) -> list[dict]:
+    """The well-formed progress notes in a stored ticket's ``notes`` field.
+
+    A note is ``{"ts", "by", "text"}``, all strings. Anything else in the list is
+    dropped rather than guessed at, the way every other optional field is.
+    """
+    if not isinstance(value, list):
+        return []
+    return [
+        {"ts": item["ts"], "by": item["by"], "text": item["text"]}
+        for item in value
+        if isinstance(item, dict)
+        and all(isinstance(item.get(key), str) for key in ("ts", "by", "text"))
+    ]
+
+
 def normalize_ticket(raw, *, state: str | None = None) -> dict:
     """Normalize a raw board-list entry (or an already-parsed dict) into the
     one ticket shape every board caller reads and writes.
@@ -62,6 +82,11 @@ def normalize_ticket(raw, *, state: str | None = None) -> dict:
         normalized["outcome"] = ticket["outcome"]
     if ticket.get("priority") is not None:
         normalized["priority"] = ticket["priority"]
+    notes = valid_notes(ticket.get("notes"))
+    if notes:
+        # Kept so take/done/hold/return/reopen carry the durable progress
+        # record through every re-serialization instead of silently dropping it.
+        normalized["notes"] = notes
     raw_related = ticket.get("related")
     if isinstance(raw_related, list):
         related = [value for value in raw_related if isinstance(value, str)]
