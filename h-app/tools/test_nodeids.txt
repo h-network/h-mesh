@@ -507,6 +507,7 @@ h-app/tests/test_office_cli.py::test_add_sends_envelope_and_prints_the_ticket_id
 h-app/tests/test_office_cli.py::test_add_printed_id_is_created_and_takeable_on_assignees_board
 h-app/tests/test_office_cli.py::test_clone_to_all_dry_run_reports_without_writing
 h-app/tests/test_office_cli.py::test_clone_to_all_uses_host_workdir_fallback
+h-app/tests/test_office_cli.py::test_git_clone_restores_workspace_ownership_after_clone
 h-app/tests/test_office_cli.py::test_camel_case_command_aliases_are_rejected[cloneToAll]
 h-app/tests/test_office_cli.py::test_camel_case_command_aliases_are_rejected[sendFile]
 h-app/tests/test_office_cli.py::test_camel_case_command_aliases_are_rejected[letGo]
@@ -546,10 +547,13 @@ h-app/tests/test_paths.py::PathsTests::test_build_pane_path_deduplication_and_or
 h-app/tests/test_paths.py::PathsTests::test_build_pane_path_includes_venv_and_user_and_system_locations
 h-app/tests/test_paths.py::PathsTests::test_build_pane_path_with_prefix_env
 h-app/tests/test_paths.py::PathsTests::test_build_pane_path_with_stripped_ambient_env
+h-app/tests/test_paths.py::PathsTests::test_ensure_workdir_ownership_chowns_tree_and_ancestors_without_following_symlinks
+h-app/tests/test_paths.py::PathsTests::test_ensure_workdir_ownership_noop_when_non_root
 h-app/tests/test_paths.py::PathsTests::test_get_agent_workdir_explicit_cwd
 h-app/tests/test_paths.py::PathsTests::test_h_mesh_state_dir_env
 h-app/tests/test_paths.py::PathsTests::test_h_mesh_workdir_env_precedence
 h-app/tests/test_paths.py::PathsTests::test_non_writable_workdir_falls_back_to_home
+h-app/tests/test_paths.py::PathsTests::test_resolve_workdir_owner_falls_back_to_sudo_uid
 h-app/tests/test_paths.py::PathsTests::test_writable_workdir_container_fallback
 h-app/tests/test_policy.py::PolicyTests::test_disjoint_export_and_import_deny_without_enqueue
 h-app/tests/test_policy.py::PolicyTests::test_invalid_export_data_is_rejected

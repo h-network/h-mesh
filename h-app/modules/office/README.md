@@ -191,3 +191,12 @@ means "usage cannot be measured", not "usage was zero". It adds nothing to the
 total, so the total understates real spend whenever an agy agent is running.
 Collecting agy usage would need a new data source in the watchdog; no
 collection code exists in `office`.
+
+`office clone-to-all <repo-url> [-a AGENT,...] [--dry-run]` clones a repository
+into each selected tmux agent's workspace (`<workdir_root>/<agent>/<repo>`).
+When invoked as `root` (for example via `sudo h-mesh-office clone-to-all` or
+`docker exec -u 0`), it hands ownership of the cloned tree and any newly
+created workspace parent back to the unprivileged workspace user
+(`lib.paths.ensure_workdir_ownership`, using `os.lchown` without following
+symlinks) so agents do not hit git's `detected dubious ownership` check or
+permission errors when creating `.venv` or editing files in-repo (#28).

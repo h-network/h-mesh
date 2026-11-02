@@ -9,7 +9,13 @@ H_APP = Path(__file__).resolve().parents[1]
 if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
-from lib.paths import build_pane_path, get_agent_workdir, get_workdir_root
+from lib.paths import (
+    build_pane_path,
+    ensure_workdir_ownership,
+    get_agent_workdir,
+    get_workdir_root,
+    resolve_workdir_owner,
+)
 
 
 class PathsTests(unittest.TestCase):
@@ -90,6 +96,63 @@ class PathsTests(unittest.TestCase):
             self.assertEqual(entries[0], "/custom/bin")
             # /home/tester/.local/bin present before ambient /usr/bin
             self.assertEqual(entries[1], "/home/tester/.local/bin")
+
+    def test_ensure_workdir_ownership_noop_when_non_root(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo_dir = Path(tmpdir) / "kvm-agent" / "glkvm"
+            repo_dir.mkdir(parents=True)
+            with patch("lib.paths.os.geteuid", return_value=1000), \
+                 patch("lib.paths.os.lchown") as mock_lchown:
+                self.assertIsNone(resolve_workdir_owner(repo_dir, workdir_root=tmpdir))
+                self.assertFalse(ensure_workdir_ownership(repo_dir, workdir_root=tmpdir))
+                mock_lchown.assert_not_called()
+
+    def test_ensure_workdir_ownership_chowns_tree_and_ancestors_without_following_symlinks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            agent_dir = root / "kvm-agent"
+            repo_dir = agent_dir / "glkvm"
+            git_dir = repo_dir / ".git"
+            git_dir.mkdir(parents=True)
+            (repo_dir / "README.md").write_text("hello\n")
+            (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+            outside = root / "outside.txt"
+            outside.write_text("secret\n")
+            symlink_path = repo_dir / "link_out"
+            symlink_path.symlink_to(outside)
+
+            def fake_lstat(path):
+                p = Path(path)
+                st = os.stat_result((0o040755, 1, 1, 1, 0, 0, 0, 0, 0, 0))
+                if p == root:
+                    return os.stat_result((0o040755, 1, 1, 1, 1000, 1000, 0, 0, 0, 0))
+                return st
+
+            chowned: list[tuple[str, int, int]] = []
+            with patch("lib.paths.os.geteuid", return_value=0), \
+                 patch("lib.paths.os.lstat", side_effect=fake_lstat), \
+                 patch("lib.paths.os.lchown", side_effect=lambda p, u, g: chowned.append((str(p), u, g))):
+                self.assertEqual(resolve_workdir_owner(repo_dir, workdir_root=root), (1000, 1000))
+                self.assertTrue(ensure_workdir_ownership(repo_dir, workdir_root=root))
+
+            chowned_paths = {p for p, u, g in chowned if (u, g) == (1000, 1000)}
+            self.assertIn(str(agent_dir), chowned_paths)
+            self.assertIn(str(repo_dir), chowned_paths)
+            self.assertIn(str(git_dir), chowned_paths)
+            self.assertIn(str(repo_dir / "README.md"), chowned_paths)
+            self.assertIn(str(git_dir / "HEAD"), chowned_paths)
+            self.assertIn(str(symlink_path), chowned_paths)
+            self.assertNotIn(str(outside), chowned_paths)
+
+    def test_resolve_workdir_owner_falls_back_to_sudo_uid(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo_dir = root / "kvm-agent" / "glkvm"
+            root_stat = os.stat_result((0o040755, 1, 1, 1, 0, 0, 0, 0, 0, 0))
+            with patch("lib.paths.os.geteuid", return_value=0), \
+                 patch("lib.paths.os.lstat", return_value=root_stat), \
+                 patch.dict(os.environ, {"SUDO_UID": "1042", "SUDO_GID": "1043"}, clear=False):
+                self.assertEqual(resolve_workdir_owner(repo_dir, workdir_root=root), (1042, 1043))
 
 
 if __name__ == "__main__":

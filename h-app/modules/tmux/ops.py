@@ -8,7 +8,9 @@ from typing import Set
 
 from core.config import state_path
 from core.logging import log_record
-from lib.paths import build_pane_path, get_agent_workdir, get_workdir_root, resolve_venv_bin
+from lib.paths import (
+    build_pane_path, ensure_workdir_ownership, get_agent_workdir, get_workdir_root, resolve_venv_bin,
+)
 from lib.profile_env import resolve_claude_profile_env
 from services.claude_statusline import install_statusline
 
@@ -884,6 +886,7 @@ def write_agent_guide(
             home_dir = os.environ.get("HOME", os.path.expanduser("~"))
             config_dir = Path(home_dir) / (f".claude-{profile}" if profile else ".claude")
             install_statusline(config_dir, log=lambda msg: None)
+        ensure_workdir_ownership(cwd)
     except Exception as exc:
         # ⚠ Never raise into a delivery path — but never vanish either.
         # Silence here is how the profile-blind trust bug hid: seeding
