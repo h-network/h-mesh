@@ -19,6 +19,7 @@ Everything else is a module that plugs into this.
 | `dispatch.py` | generic port_type -> handler registry and dispatch with renewable per-agent delivery leases, invoked only by whatever the switch's kick actually calls -- the switch itself never imports this |
 | `logging.py` | contract-shaped JSON event logging and durable stdout mirroring, plus `configure_logging()` — the stdlib logging threshold for entry points |
 | `retention.py` | count-based trimming for completed-task and dead-letter queues |
+| `receipts.py` | `trace()` — read-only lookup of one stream_id across the custody lists (queued / delivering / delivered / failed / unresolved) |
 | `windowlog.py` | agent-window custody-log validation, tailing, offset tracking, and bounded truncation |
 | `service.py` | the `Switch` class — BLPOP/forward/kick loop, is what "the switch" is |
 
@@ -82,6 +83,17 @@ Core logging uses the `H_MESH_WRITER`, `H_MESH_CUSTODY_FILE`,
 `H_MESH_LOG_FILE`, `H_MESH_LOG_QUIET`, and
 `H_MESH_LOG_FILE_AGENT_ONLY` environment variables. Switch registry refresh is
 configured with `REGISTRY_POLL_SECONDS`.
+
+## Delivery trace
+
+`receipts.trace()` reports where one `stream_id` is by scanning egress, ingress,
+`processing`, `opening`, `opened`, `dead`, the api `inbox`, and the tenant
+`unresolved`/`undeliverable` evidence in a single Lua call that compares only the
+fixed-header stream_id, so no payload is read or transferred. It is the engine
+behind `office delivery`. "Delivered" is a custody fact, never a read receipt, and
+a frame that has aged out of the 1,000-entry `opened` list is reported `unknown`,
+not guessed. The api port drains ingress and then writes the mailbox, so a
+frame can be briefly in neither during that hand-off.
 
 ## Two logging systems, one file
 

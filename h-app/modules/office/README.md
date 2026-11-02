@@ -88,6 +88,24 @@ non-blocking. Returned work joins the back of a nonempty `todo` queue.
 
 The receiving port delegates to the settled `lib.agentlifecycle` API.
 
+`office delivery STREAM_ID [--wait SECONDS]` answers "where is the message I
+just sent?" for the id `office send` prints. It prints one JSON line,
+`{"stream_id", "state", "locations": [{"agent", "stage"}], "confirmation"?}`, and
+changes nothing. `state` is `queued` (in egress, ingress or claimed but not
+started), `delivering` (the effect may have begun), `delivered`, `failed`
+(rejected, or the destination retired), `unresolved` (the effect may have
+happened but its outcome was not recorded), `partial` (a broadcast whose copies
+differ) or `unknown` (not in any custody list: never sent, or aged out of the
+1,000-entry `opened` receipt list). `--wait` polls every half second until
+`delivered`, `failed` or `unresolved`, or the timeout. ⚠ `delivered` means the
+text was pasted and submitted to the terminal, or stored in an api participant's
+mailbox -- it does **not** mean it was read; no component records that.
+`confirmation` is only what the watchdog still retains for a pasted delivery:
+`pending` (awaiting the agent's next activity), `unverified` (none seen), or
+`null`. The trace lives in `core/receipts.py` and reads the existing custody
+lists by the stream_id in the frame header; it adds no state and does not change
+custody semantics.
+
 Delivery evidence has three read paths because it has three different facts:
 `dead` contains raw envelopes explicitly rejected by a recipient;
 `office unresolved [--agent AGENT]` shows envelopes whose external effect may
