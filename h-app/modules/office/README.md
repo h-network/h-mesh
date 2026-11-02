@@ -95,6 +95,23 @@ is the inspection path; taking a ticket is reserved for actually starting it.
 board (`todo`, `doing`, or `hold`) without changing its identity, timestamps,
 state, or queue position. It does not edit another agent's board or closed
 work. Both audit channels record the old and replacement title.
+`office reopen ID [--todo]` brings one of the caller's own `done` or `cancelled`
+tickets back, so a short re-review reuses the ticket instead of a new one. By
+default it goes to `doing`, with a fresh `started_ts`, and refuses (changing
+nothing) if the caller already has a `doing` ticket -- the one-doing invariant is
+enforced by the same preflighted Lua transition as `take`. `--todo` queues it
+instead. `done_ts` and `outcome` are cleared, but the earlier verdict is kept as
+a note (`reopened; was done (failed)`), so reopening never erases what was
+decided. Another agent's board cannot be reopened.
+`office note [-i ID] TEXT` (or `--stdin`/`--file`) appends `{ts, by, text}` to a
+`todo`, `doing` or `hold` ticket (default: the `doing` one) so tried/found
+context lives on the ticket, readable with `show` and counted as `notes:N` in
+`list`. The append is an exact-entry `LSET`, so a concurrent transition makes it
+fail with "try again" rather than lose either change, and unknown fields on the
+stored ticket are preserved. A note is limited to 2,000 characters and a ticket
+to 50 notes; past either limit the command refuses rather than truncating or
+dropping history. Notes travel with the ticket through take/hold/return/done.
+Notes are the owner's: there is no way to annotate another agent's board.
 `office add` allocates a 32-lowercase-hex ticket id before sending its
 asynchronous envelope, includes that id in the payload, and prints it—not the
 transport stream id—after the envelope is admitted. This is the allocated
