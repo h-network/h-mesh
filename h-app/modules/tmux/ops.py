@@ -109,6 +109,39 @@ def list_windows(session_name: str, socket: str | None = None) -> Set[str]:
     return {w for w in stdout.splitlines() if w}
 
 
+# Commands the guide below explains in prose, with examples. Everything else in
+# the office CLI's command table is listed by `office_command_inventory`, so a
+# command added to the table reaches the guide without anyone editing it.
+# tests/test_guide_command_inventory.py fails if a name here stops appearing in
+# the prose, or if any table command appears in neither place.
+GUIDE_CURATED_COMMANDS = ("peers", "send", "list", "take", "done", "return", "show", "retitle")
+
+
+def office_command_inventory(cmd: str) -> str:
+    """The guide's list of every office command the prose does not already cover.
+
+    Generated from `modules.office.cli._COMMAND_TABLE` (name, description), the
+    single source of truth, imported lazily: office/cli.py is the heavier module
+    and the receiving office port already imports this one. Returns "" if the
+    table cannot be read, so a broken import never stops a guide being written.
+    """
+    try:
+        from modules.office.cli import _COMMAND_TABLE
+    except Exception:
+        return ""
+    rows: list[tuple[str, str]] = []
+    for names, description, _handler in _COMMAND_TABLE:
+        primary = names[0]
+        if primary not in GUIDE_CURATED_COMMANDS:
+            rows.append((primary, description))
+        rows.extend((alias, f"alias of {primary}") for alias in names[1:])
+    if not rows:
+        return ""
+    width = max(len(name) for name, _ in rows)
+    body = "\n".join(f"    {name.ljust(width)}  {description}" for name, description in rows)
+    return f"Other commands (`{cmd} NAME --help` for each):\n\n{body}\n\n"
+
+
 def generate_agents_md(
     agent_name: str,
     tenant: str = "default",
@@ -213,7 +246,7 @@ You have a task board. Nothing will notify you about it — check it yourself:
 Take a ticket *before* you start work, not after. `doing` is how the office
 knows what you are on.
 
-## Working in this office
+{office_command_inventory(cmd)}## Working in this office
 
 This directory is your own clone — work only here. Do not read or write
 another agent's files or state directly; `{cmd} send` is how you reach
