@@ -522,6 +522,14 @@ h-app/tests/test_office_cli.py::test_status_keeps_unknown_presence_unknown_with_
 h-app/tests/test_office_cli.py::test_status_keeps_delivery_marker_visible_when_its_age_is_malformed
 h-app/tests/test_office_cli.py::test_broadcast_resolves_tmux_peers_without_self
 h-app/tests/test_office_cli.py::test_broadcast_reads_stdin
+h-app/tests/test_office_doc.py::test_put_prints_short_ref_and_get_roundtrips_bytes
+h-app/tests/test_office_doc.py::test_put_same_bytes_dedupes_and_keeps_first_metadata
+h-app/tests/test_office_doc.py::test_name_points_at_newest_version_and_old_hash_still_resolves
+h-app/tests/test_office_doc.py::test_get_writes_output_file
+h-app/tests/test_office_doc.py::test_info_and_ls_show_metadata_without_body
+h-app/tests/test_office_doc.py::test_unknown_short_and_ambiguous_refs_are_rejected
+h-app/tests/test_office_doc.py::test_hash_lookalike_and_malformed_names_are_rejected
+h-app/tests/test_office_doc.py::test_put_rejects_missing_file_and_oversize
 h-app/tests/test_office_port.py::test_lifecycle_validation_failure_is_explicit_rejection
 h-app/tests/test_office_port.py::test_lifecycle_unknown_failure_is_not_misclassified_as_rejection
 h-app/tests/test_office_port.py::test_late_validation_rejection_writes_nothing_and_is_dead_letterable
