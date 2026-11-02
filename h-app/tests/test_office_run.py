@@ -196,7 +196,9 @@ def test_run_exits_once_retains_output_and_is_not_restarted(run_office, status):
     assert window not in ctx["reconciler"]._known_windows
     assert ops.run_tmux("display-message", "-p", "-t", f"{ctx['tenant']}:{window}",
                          "#{pane_dead_status}", socket=ctx["socket"])[1] == str(status)
-    assert "one-shot-output" in ops.run_tmux("capture-pane", "-p", "-t", f"{ctx['tenant']}:{window}",
+    # Reconciliation can resize an unattached window and move output out of
+    # the visible screen. Retention includes scrollback, not just the viewport.
+    assert "one-shot-output" in ops.run_tmux("capture-pane", "-p", "-J", "-S", "-", "-t", f"{ctx['tenant']}:{window}",
                                                socket=ctx["socket"])[1]
 
 
