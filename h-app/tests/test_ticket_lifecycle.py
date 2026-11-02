@@ -188,7 +188,10 @@ def test_empty_note_is_refused(monkeypatch, capsys, text):
     r.lists[key("doing")].append(json.dumps(_ticket(ME, task_id="work0001", status="doing")))
     with pytest.raises(SystemExit):
         run(r, ["note", text], monkeypatch)
-    assert "note cannot be empty" in capsys.readouterr().err
+    # The shared text resolver (since the lead branch's change) rejects an empty
+    # body itself, with its own wording; either refusal is the contract.
+    err = capsys.readouterr().err
+    assert "message text is empty" in err or "note cannot be empty" in err
     assert "notes" not in json.loads(r.lists[key("doing")][0])
 
 
