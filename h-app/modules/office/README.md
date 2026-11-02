@@ -76,6 +76,21 @@ transport stream id—after the envelope is admitted. This is the allocated
 identity the board will use if downstream creation succeeds, not proof that a
 ticket was created. Transport and custody logs establish later delivery states.
 
+`office add --authority TEXT` sets the ticket's authoritative directive once, at
+creation: what the creator is instructing or approving, up to 2000 characters.
+The assignee reads it in `office take` / `office show` as
+`"authority": {"text", "by", "ts"}` and reconciles from the ticket rather than
+from forwarded chat. Only the text travels in the envelope: `by` is the
+switch-stamped L2 source of the AddTicket and `ts` is the ticket's creation
+time, both written by `lib.board_interaction.add_ticket`, so a payload cannot
+claim another author (any `by`/`ts` it carries is discarded; a missing,
+blank, non-string or over-length text leaves the ticket without the field).
+The field is carried through take, hold, return and done like the other
+ticket fields, and an older reader simply omits it. It is deliberately not
+editable afterwards: to supersede a directive, add a new ticket with
+`--related <old-id>` and cancel or delete the old one. A quoted approval
+chain, expiry or per-directive history are not modelled.
+
 `office delete ID` is deliberately scoped to the caller's own board. Delegated
 creation is not authority to destroy another agent's queued or in-flight work,
 even when the caller originally raised it. A miss therefore names that scope
@@ -87,6 +102,24 @@ answers block the verdict; use `completed` only when its questions are
 non-blocking. Returned work joins the back of a nonempty `todo` queue.
 
 The receiving port delegates to the settled `lib.agentlifecycle` API.
+
+`office delivery STREAM_ID [--wait SECONDS]` answers "where is the message I
+just sent?" for the id `office send` prints. It prints one JSON line,
+`{"stream_id", "state", "locations": [{"agent", "stage"}], "confirmation"?}`, and
+changes nothing. `state` is `queued` (in egress, ingress or claimed but not
+started), `delivering` (the effect may have begun), `delivered`, `failed`
+(rejected, or the destination retired), `unresolved` (the effect may have
+happened but its outcome was not recorded), `partial` (a broadcast whose copies
+differ) or `unknown` (not in any custody list: never sent, or aged out of the
+1,000-entry `opened` receipt list). `--wait` polls every half second until
+`delivered`, `failed` or `unresolved`, or the timeout. ⚠ `delivered` means the
+text was pasted and submitted to the terminal, or stored in an api participant's
+mailbox -- it does **not** mean it was read; no component records that.
+`confirmation` is only what the watchdog still retains for a pasted delivery:
+`pending` (awaiting the agent's next activity), `unverified` (none seen), or
+`null`. The trace lives in `core/receipts.py` and reads the existing custody
+lists by the stream_id in the frame header; it adds no state and does not change
+custody semantics.
 
 Delivery evidence has three read paths because it has three different facts:
 `dead` contains raw envelopes explicitly rejected by a recipient;
@@ -191,3 +224,28 @@ means "usage cannot be measured", not "usage was zero". It adds nothing to the
 total, so the total understates real spend whenever an agy agent is running.
 Collecting agy usage would need a new data source in the watchdog; no
 collection code exists in `office`.
+
+## Shell-mangled text (#16)
+
+`office` cannot see what a shell removed: inside a double-quoted argument
+`` `name` ``, `$(cmd)` and `$VAR` are expanded before `office` starts, usually
+to nothing, and the shorter text is accepted like any other. The byte count
+printed on success is the count of what *arrived*, so it cannot reveal the loss.
+What `office` can do, and now does for text given as a command-line argument
+(`send`, `broadcast`, and `add`'s `-t` and `-d`):
+
+- **Warn on the hole** the removal leaves: two or more spaces between words
+  (`the  setting`, from ``the `x` setting``) print a warning on stderr that
+  points at `--stdin` / `--file`. It never blocks the send and does not change
+  the output or exit code. It is a heuristic: it does not see a word dropped at
+  a line edge or next to punctuation, it fires on aligned columns, and two
+  spaces after `.`, `!` or `?` and leading/trailing spaces are ignored.
+- **Refuse blank text** (`""`, whitespace only): this is what a body that was
+  entirely a substitution becomes, and sending an empty message helps no one.
+  `--stdin` already refused empty input.
+- **Never check `--stdin` / `--file`** text; it is never shell-parsed, which is
+  why it is the way to send anything containing backticks, `$` or quotes.
+
+`office add` previously took its description only from `-d`. It now also
+accepts `--description-stdin` and `--description-file PATH` (exactly one of the
+three), so a ticket description with code in it no longer needs shell quoting.

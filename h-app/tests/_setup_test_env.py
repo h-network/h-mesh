@@ -21,6 +21,8 @@ def ambient_setup_env(monkeypatch, tmp_path):
     for name, value in {
         "AGENTS": "ambient-agent",
         "DEFAULT_CLI": "codex",
+        "DEFAULT_MODEL": "ambient-model",
+        "AGENT_MODELS": "ambient-agent=ambient-other-model",
         "ACCOUNTS": "ambient-account",
         "DEFAULT_ACCOUNT": "ambient-account",
         "AGENT_CLIS": "ambient-agent=agy",

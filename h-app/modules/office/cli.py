@@ -32,9 +32,12 @@ from core.keys import (
     prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key, validate_segment,
 )
 from core.logging import log_record, record_task_event
+from core.receipts import trace as trace_delivery
 from core.registry import is_member, members, port_type
 from lib.attachment_schema import ATTACHMENT_MAX_BYTES, MIME_TYPE_REGEX
-from lib.board_interaction import BoardError, normalize_ticket, serialize_ticket
+from lib.board_interaction import (
+    AUTHORITY_MAX_CHARS, BoardError, authority_block, normalize_ticket, serialize_ticket,
+)
 from lib.chat_memory import TTL_SECONDS_MAX as _CHAT_MEMORY_TTL_SECONDS
 from lib.chat_memory import ChatMemory
 from lib.paths import get_workdir_root
@@ -126,6 +129,37 @@ def _message(
     )
 
 
+# A double-quoted shell argument is expanded BEFORE office sees it: `name` and
+# $(cmd) are executed and replaced by their output (usually nothing), $VAR by
+# its value (usually nothing). What office receives is already shorter, and a
+# shorter body is indistinguishable from a deliberate one -- the byte count
+# printed on success then matches what was received, not what was meant.
+# The one trace that is detectable is the hole left behind: "the `x` setting"
+# arrives as "the  setting". Two or more spaces between words is therefore
+# reported (stderr, never blocking). Heuristic and deliberately narrow: it
+# misses a dropped word at a line edge or next to punctuation, and fires on
+# aligned columns; the .!?-preceded "two spaces after a sentence" is exempt.
+_SHELL_HOLE_RE = re.compile(r"(?<=[^\s.!?])[ ]{2,}(?=\S)")
+
+
+def _warn_if_shell_mangled(text: str, what: str, command: str) -> None:
+    """Warn on stderr when argv text shows the hole a shell expansion leaves.
+
+    Only for text that arrived as a command-line argument; --stdin/--file text
+    is never shell-parsed and is not checked.
+    """
+    for line in text.split("\n"):
+        if _SHELL_HOLE_RE.search(line.strip()):
+            print(
+                f"office: warning: {what} has a double space; if a word is missing, the shell "
+                "removed it (backticks, $(...) and $VARS inside a double-quoted argument are "
+                f"expanded before office sees them). Resend with `office {command} ... --stdin` "
+                "or --file for exact text.",
+                file=sys.stderr,
+            )
+            return
+
+
 def _resolve_message_text(args, command: str) -> str:
     """Resolve one message body from positional text, --stdin, or --file.
 
@@ -147,6 +181,12 @@ def _resolve_message_text(args, command: str) -> str:
         except OSError as exc:
             raise OfficeError(f"cannot read message file {str(args.file)!r}: {exc}") from exc
     if args.text is not None:
+        if not args.text.strip():
+            raise OfficeError(
+                f"office {command} message text is empty -- if it was built with backticks, "
+                "$(...) or $VARS, the shell may have expanded it to nothing; use --stdin or --file"
+            )
+        _warn_if_shell_mangled(args.text, "the message text", command)
         return args.text
     raise OfficeError(f"office {command} requires message text, --stdin, or --file")
 
@@ -1194,6 +1234,37 @@ def _list_command(argv: list[str]) -> None:
         _list_one(r, pod=pod, tenant=tenant, agent=agent, heading=args.all, now=now)
 
 
+_DELIVERY_TERMINAL = frozenset({"delivered", "failed", "unresolved"})
+
+
+def _delivery_command(argv: list[str]) -> None:
+    parser = _operation_parser(
+        "delivery",
+        "Show where a sent message is: queued, delivering, delivered, failed, "
+        "unresolved or unknown. Read-only.",
+    )
+    parser.add_argument("stream_id", metavar="STREAM_ID", help="the id printed by office send")
+    parser.add_argument(
+        "--wait", type=float, default=0.0, metavar="SECONDS",
+        help="poll until the message is delivered, failed or unresolved, or SECONDS pass",
+    )
+    args = parser.parse_args(argv)
+    if not re.fullmatch(r"[0-9a-f]{32}", args.stream_id):
+        raise OfficeError(f"{args.stream_id!r} is not a 32-character lowercase hex stream_id")
+    if args.wait < 0 or not math.isfinite(args.wait):
+        raise OfficeError("--wait must be a non-negative number of seconds")
+    r, pod, tenant, source = _context()
+    deadline = time.monotonic() + args.wait
+    while True:
+        result = trace_delivery(
+            r, pod=pod, tenant=tenant, stream_id=args.stream_id, extra_agents=(source,)
+        )
+        if result["state"] in _DELIVERY_TERMINAL or time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+    print(json.dumps(result, separators=(",", ":")))
+
+
 def _unresolved_command(argv: list[str]) -> None:
     parser = _operation_parser(
         "unresolved",
@@ -1586,13 +1657,45 @@ def _add_command(argv: list[str]) -> None:
     parser = _operation_parser("add", "Add a task to another agent's board.")
     parser.add_argument("-a", "--agent", required=True, metavar="AGENT")
     parser.add_argument("-t", "--title", required=True, metavar="TITLE")
-    parser.add_argument("-d", "--description", required=True, metavar="DESCRIPTION")
+    description = parser.add_mutually_exclusive_group(required=True)
+    description.add_argument("-d", "--description", metavar="DESCRIPTION")
+    description.add_argument("--description-stdin", action="store_true",
+                             help="read the description from stdin (never shell-parsed)")
+    description.add_argument("--description-file", type=Path, metavar="PATH",
+                             help="read the description from a file (never shell-parsed)")
     parser.add_argument("-p", "--priority", metavar="PRIORITY")
     parser.add_argument("-r", "--related", metavar="ID[,ID...]",
                          help="ticket ids this one references -- stored, never validated "
                               "(a related ticket may live on another agent's board)")
+    parser.add_argument("--authority", metavar="TEXT",
+                         help="the authoritative directive for this ticket (what you, as creator, "
+                              "are instructing/approving), shown by take/show with your name and "
+                              f"the time; max {AUTHORITY_MAX_CHARS} chars. Set once at add time")
     args = parser.parse_args(argv)
 
+    if args.description_stdin:
+        args.description = sys.stdin.read()
+        if not args.description.strip():
+            raise OfficeError("office add --description-stdin received no description")
+    elif args.description_file is not None:
+        try:
+            args.description = args.description_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise OfficeError(f"cannot read description file {str(args.description_file)!r}: {exc}") from exc
+    else:
+        for value, what in ((args.title, "the title"), (args.description, "the description")):
+            if not value.strip():
+                raise OfficeError(
+                    f"office add {what} is empty -- the shell may have expanded it to nothing "
+                    "(backticks, $(...), $VARS); use --description-stdin or --description-file"
+                )
+        _warn_if_shell_mangled(args.description, "the description", "add")
+    _warn_if_shell_mangled(args.title, "the title", "add")
+
+    if args.authority is not None and authority_block(args.authority, by="x", ts="x") is None:
+        raise OfficeError(
+            f"--authority must be non-empty text of at most {AUTHORITY_MAX_CHARS} characters"
+        )
     r, pod, tenant, source = _context()
     if not is_member(r, pod=pod, tenant=tenant, agent=args.agent):
         raise OfficeError(f"unknown destination agent {args.agent!r}")
@@ -1617,6 +1720,10 @@ def _add_command(argv: list[str]) -> None:
         related = list(dict.fromkeys(value.strip() for value in args.related.split(",") if value.strip()))
         if related:
             payload["related"] = related
+    if args.authority is not None:
+        # Only the text travels; the receiving board stamps who and when
+        # (lib/board_interaction.authority_block), so it cannot be forged here.
+        payload["authority"] = args.authority.strip()
     send(
         r,
         pod=pod,
@@ -1930,6 +2037,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("pause",), "pause an agent's CLI", lambda argv: _lifecycle_command("pause", argv)),
     (("resume",), "resume an agent's CLI and inbox", lambda argv: _lifecycle_command("resume", argv)),
     (("list",), "show a task board", _list_command),
+    (("delivery",), "show where a sent message is (queued / delivered / failed)", _delivery_command),
     (("unresolved",), "show unresolved delivery outcomes", _unresolved_command),
     (("undeliverable",), "show messages not opened before retirement", _undeliverable_command),
     (("retired-inbox",), "show api agents' inbox content conserved at retirement", _retired_inbox_command),
