@@ -82,6 +82,36 @@ even when the caller originally raised it. A miss therefore names that scope
 and says that `delete` cannot withdraw a task assigned to another agent instead
 of implying that an otherwise valid cross-board id does not exist. Coordinate
 with the assignee to return, cancel, or delete work in their custody.
+
+`office purge AGENT --cli {claude,codex,agy} [--profile ACCOUNT] --confirm AGENT`
+permanently deletes a *retired* agent's on-disk CLI session history, the
+deliberate complement to `hire --fresh` (which only ignores it) and to `let-go`
+(which leaves it so a later `--resume` works). It is irreversible, so:
+
+- It refuses while `AGENT` is still in the registry (let it go first: a live
+  session may rewrite its own history), and refuses if the registry cannot be
+  read. `--confirm` must repeat the exact name; names are validated as one
+  agent segment, so no glob, prefix or path can reach it.
+- `--cli` and `--profile` are required inputs, not looked up: retirement
+  deletes the agent's `launch` and `profile` keys, so afterwards nothing records
+  which CLI or account it ran. Run it once per CLI/account that agent used.
+- It acts on the calling host's `$HOME` and the agent's own working directory
+  (`get_agent_workdir`), mirroring `has_session_history` location for location
+  (`modules.tmux.ops.purge_session_history`): claude deletes the
+  `~/.claude[-ACCOUNT]/projects/<cwd>` directory; codex deletes only the
+  `rollout-*.jsonl` files under `~/.codex[-ACCOUNT]/sessions` whose
+  `session_meta` cwd is the agent's; agy rewrites the shared
+  `~/.gemini/antigravity-cli/history.jsonl` without that workspace's lines
+  (other lines kept byte for byte) via temp file, fsync and atomic replace.
+  Symlinks are never followed.
+- agy's file is shared and agy takes none of our locks. The rewrite is retried
+  if the file changed while it was being built, and fails with nothing removed
+  after five tries. A line appended in the microseconds between the final check
+  and the replace can still be lost; closing that needs agy's cooperation.
+- Not covered: `claude_sdk` agents' memory contexts (`lib/chat_memory.py`), a
+  different store and a separate concern.
+
+It prints how many sessions (claude, codex) or history lines (agy) it removed.
 For review work, use `passed` or `failed`. Hold a QUESTIONS review while its
 answers block the verdict; use `completed` only when its questions are
 non-blocking. Returned work joins the back of a nonempty `todo` queue.

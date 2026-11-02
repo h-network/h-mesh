@@ -1,12 +1,14 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
 from typing import Set
 
 from core.config import state_path
+from core.keys import validate_segment
 from core.logging import log_record
 from lib.paths import build_pane_path, get_agent_workdir, get_workdir_root, resolve_venv_bin
 from lib.profile_env import resolve_claude_profile_env
@@ -566,6 +568,138 @@ def has_session_history(
         return False
 
     return False
+
+
+class PurgeError(Exception):
+    """A purge was refused or could not be completed safely."""
+
+
+def _agy_history_rewrite(history_file: Path, cwd: str) -> int:
+    """Drop this workspace's lines from agy's shared history file; return how many.
+
+    The file is shared by every agy agent, so it is rewritten (temp file in the
+    same directory, fsync, os.replace), never deleted. Lines that are not this
+    workspace's, including ones that do not parse, are kept byte for byte.
+
+    ⚠ agy does not take any lock of ours. A line appended between our read and
+    the replace would be lost, so the file's size and mtime are compared just
+    before the replace and the whole rewrite is retried if it moved. A write
+    landing in the few microseconds between that check and os.replace is the
+    residual window; it cannot be closed without agy's cooperation.
+    """
+    for _ in range(5):
+        try:
+            before = history_file.stat()
+            raw = history_file.read_bytes()
+        except FileNotFoundError:
+            return 0
+        kept: list[bytes] = []
+        dropped = 0
+        for line in raw.splitlines(keepends=True):
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                record = None
+            if isinstance(record, dict) and record.get("workspace") == cwd:
+                dropped += 1
+            else:
+                kept.append(line)
+        if not dropped:
+            return 0
+        tmp = history_file.with_name(f".{history_file.name}.purge-{os.getpid()}")
+        try:
+            with tmp.open("wb") as f:
+                f.write(b"".join(kept))
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, before.st_mode & 0o7777)
+            now = history_file.stat()
+            if (now.st_size, now.st_mtime_ns, now.st_ino) != (before.st_size, before.st_mtime_ns, before.st_ino):
+                continue
+            os.replace(tmp, history_file)
+            return dropped
+        finally:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+    raise PurgeError(f"{history_file} kept changing while it was being rewritten; nothing was removed, try again")
+
+
+def purge_session_history(
+    agent: str,
+    cli: str,
+    profile: str | None = None,
+    home_root: str | Path | None = None,
+    cwd: str | None = None,
+) -> int:
+    """Delete the agent's on-disk CLI session history; return how many sessions or lines went.
+
+    Mirrors `has_session_history` location for location, but deletes. Every
+    path is derived from (home, cli, profile, cwd) and checked to stay inside
+    the CLI's own history root; nothing is globbed outside it. The caller is
+    responsible for refusing a live agent: this function does not know about
+    the registry.
+    """
+    if cli not in ("claude", "codex", "agy"):
+        raise PurgeError(f"unknown cli {cli!r}")
+    if profile:
+        try:
+            validate_segment(profile)
+        except KeyError:
+            raise PurgeError(f"invalid profile {profile!r}") from None
+    home = Path(home_root) if home_root is not None else Path(os.environ.get("HOME", os.path.expanduser("~")))
+    suffix = f"-{profile}" if profile else ""
+    cwd = get_agent_workdir(agent, cwd)
+    if not os.path.isabs(cwd) or os.path.normpath(cwd) != cwd or cwd == "/":
+        raise PurgeError(f"refusing to purge for working directory {cwd!r}")
+
+    if cli == "claude":
+        projects = home / f".claude{suffix}" / "projects"
+        project_dir = projects / cwd.replace("/", "-")
+        if project_dir.parent != projects or project_dir.name in ("", ".", ".."):
+            raise PurgeError(f"refusing history path {project_dir}")
+        if project_dir.is_symlink():
+            raise PurgeError(f"{project_dir} is a symlink; not following it")
+        if not project_dir.is_dir():
+            return 0
+        sessions = sum(1 for p in project_dir.glob("*.jsonl") if p.is_file())
+        shutil.rmtree(project_dir)
+        return sessions
+
+    if cli == "codex":
+        sessions_dir = home / f".codex{suffix}" / "sessions"
+        if sessions_dir.is_symlink() or not sessions_dir.is_dir():
+            return 0
+        removed = 0
+        for root, _dirs, files in os.walk(sessions_dir, followlinks=False):
+            for name in files:
+                if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+                    continue
+                p = Path(root) / name
+                if p.is_symlink() or not p.is_file():
+                    continue
+                try:
+                    with p.open("rb") as f:
+                        record = json.loads(f.readline())
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                payload = record.get("payload")
+                if (
+                    record.get("type") == "session_meta"
+                    and isinstance(payload, dict)
+                    and payload.get("cwd") == cwd
+                ):
+                    p.unlink()
+                    removed += 1
+        return removed
+
+    history_file = home / ".gemini" / "antigravity-cli" / "history.jsonl"
+    if history_file.is_symlink() or not history_file.is_file():
+        return 0
+    return _agy_history_rewrite(history_file, cwd)
 
 
 def start_agent_command(

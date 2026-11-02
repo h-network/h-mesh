@@ -117,3 +117,14 @@ unenrolled entrance); they no longer add guide text of their own.
 ⚠ A guide is only (re)written when a window is created. Agents that are already
 running keep their old `AGENTS.md`/`CLAUDE.md` text until their window is next
 created (hire, or the reconciler recreating a missing window).
+
+## Session history
+
+`has_session_history` detects an agent's prior on-disk CLI session (claude:
+`~/.claude[-ACCOUNT]/projects/<cwd>/*.jsonl`; codex: `rollout-*.jsonl` whose
+`session_meta` cwd matches; agy: lines of the shared `history.jsonl` whose
+`workspace` matches). `purge_session_history` is its deleting twin, used by
+`office purge`; see `modules/office/README.md` for the safety contract (it does
+not know about liveness, so the caller must refuse an enrolled agent). It
+validates the account name, requires an absolute normalised cwd, never follows
+symlinks, and rewrites agy's shared file atomically instead of deleting it.
