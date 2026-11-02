@@ -60,6 +60,17 @@ class TmuxReconciler:
             return None
         return raw_prof.decode() if isinstance(raw_prof, bytes) else raw_prof
 
+    def get_agent_model(self, agent: str, provider: dict | None = None) -> str | None:
+        """Vendor selection from the merged tenant env; local providers win."""
+        if provider is not None:
+            return None
+        model = os.environ.get("DEFAULT_MODEL", "")
+        for pair in os.environ.get("AGENT_MODELS", "").split(","):
+            name, separator, value = pair.partition("=")
+            if separator and name == agent:
+                model = value
+        return model or None
+
     def get_agent_provider(self, r: redis.Redis, agent: str) -> dict | None:
         """The model provider this agent runs against, or None for the vendor's.
 
@@ -180,7 +191,9 @@ class TmuxReconciler:
                         should_resume = tmux_ops.has_session_history(initial_window, cli, profile=profile, cwd=cwd)
                     else:
                         should_resume = resume
-                    cmd_args = tmux_ops.start_agent_command(cli, resume=should_resume)
+                    cmd_args = tmux_ops.start_agent_command(
+                        cli, resume=should_resume, model=self.get_agent_model(initial_window, provider),
+                    )
                 else:
                     cmd_args = ["bash", "-il"]
                 cmd.extend(
@@ -241,7 +254,9 @@ class TmuxReconciler:
                 should_resume = tmux_ops.has_session_history(agent_name, cli, profile=profile, cwd=cwd)
             else:
                 should_resume = resume
-            command = env_args + tmux_ops.start_agent_command(cli, resume=should_resume)
+            command = env_args + tmux_ops.start_agent_command(
+                cli, resume=should_resume, model=self.get_agent_model(agent_name, provider),
+            )
         else:
             command = env_args + ["bash", "-il"]
 
