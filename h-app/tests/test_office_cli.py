@@ -1945,7 +1945,7 @@ def test_add_reports_how_to_resume_after_a_partial_send(mock_send, monkeypatch, 
         with pytest.raises(RuntimeError):
             office_main(["add", "-a", "backend,frontend", "--id", CANONICAL, "-t", "t", "-d", "d"])
     err = capsys.readouterr().err
-    assert "stopped at 'frontend'" in err and "sent ticket" in err and "backend" in err
+    assert "stopped at 'frontend'" in err and "after sending ticket" in err and "backend" in err
     assert f"--id {CANONICAL}" in err
 
 
