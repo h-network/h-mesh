@@ -462,10 +462,14 @@ class TmuxReconciler:
         # ⚠ The session must keep at least one window or tmux exits.
         # When the roster is empty, the placeholder __init__ must be preserved, and
         # any stale windows other than __init__ must be removed.
-        # When the roster has active agents, any window not in roster_agents
-        # (including __init__) is stale and should be removed.
+        # When the roster has active agents, any agent window not in
+        # roster_agents (including __init__) is stale. Reserved __run__
+        # windows are outside agent lifecycle and are always preserved.
         if not roster_agents:
-            active_windows = {w for w in existing_windows if w != "__init__"}
+            active_windows = {
+                w for w in existing_windows
+                if w != "__init__" and not tmux_ops.is_run_window(w)
+            }
             if active_windows and not self.allow_empty_roster:
                 msg = (
                     f"Refusing to reap {len(active_windows)} window(s) ({', '.join(sorted(active_windows))}) "
@@ -485,16 +489,18 @@ class TmuxReconciler:
                 else:
                     log_record("tmux_reconciler", "error", destination=placeholder,
                                reason=f"placeholder window failed, keeping stale window: {stderr}")
-            stale = [w for w in sorted(existing_windows) if w != placeholder]
+            stale = [w for w in sorted(existing_windows)
+                     if w != placeholder and not tmux_ops.is_run_window(w)]
         else:
-            stale = [w for w in sorted(existing_windows) if w not in roster_agents]
+            stale = [w for w in sorted(existing_windows)
+                     if w not in roster_agents and not tmux_ops.is_run_window(w)]
 
         for window in stale:
             if len(existing_windows) > 1:
                 if self.kill_window(window):
                     existing_windows.remove(window)
 
-        self._known_windows = set(existing_windows)
+        self._known_windows = {w for w in existing_windows if not tmux_ops.is_run_window(w)}
 
     def run_forever(self) -> None:
         r = redis.Redis.from_url(self.redis_url)
