@@ -27,7 +27,7 @@ from core.envelope import (
     resolve_source,
     stamp_source,
 )
-from core.keys import prefix
+from core.keys import ingress_stalled_key, prefix
 from core.queues import admit_ingress
 
 
@@ -268,6 +268,13 @@ class KeyTests(unittest.TestCase):
                     prefix(POD, TENANT, agent=value)
                 with self.assertRaises(KeyError):
                     prefix(POD, TENANT, resource=value)
+
+    def test_ingress_stalled_key_is_tenant_level_dotted_resource(self):
+        self.assertEqual(
+            ingress_stalled_key(POD, TENANT), "pod:mesh:tenant:office:ingress.stalled"
+        )
+        with self.assertRaises(KeyError):
+            ingress_stalled_key("Bad_Pod", TENANT)
 
     def test_prefix_rejects_empty_dotted_resource_parts(self):
         for resource in ("tasks.", ".tasks", "tasks..todo"):

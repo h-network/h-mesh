@@ -126,3 +126,13 @@ def retired_inbox_key(pod: str, tenant: str) -> str:
     agent name it belonged to was retired.
     """
     return prefix(pod, tenant, resource="retired-inbox")
+
+
+def ingress_stalled_key(pod: str, tenant: str) -> str:
+    """HASH agent -> JSON describing an ingress that has stopped draining.
+
+    Written only by the switch's stall monitor (core/ingress_health.py); read by
+    status surfaces. Tenant-level, so it carries no payload and survives nothing
+    but the stall it describes -- the entry is deleted when the queue drains.
+    """
+    return prefix(pod, tenant, resource="ingress.stalled")

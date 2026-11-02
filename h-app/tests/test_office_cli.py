@@ -1996,6 +1996,107 @@ def test_show_all_skips_unreadable_entries_and_reports_a_miss(monkeypatch, capsy
     assert r.lists[prefix(POD, TENANT, "backend", "tasks.todo")][0] == "not json"
 
 
+def _add_with_authority(monkeypatch, capsys, *extra, creator="architect"):
+    _env(monkeypatch)
+    r = FakeRedis(registry={"architect": "tmux", "reviewer": "tmux"})
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, creator)):
+        office_main(["add", "-a", "reviewer", "-t", "review me", "-d", "ctx", *extra])
+    ticket_id = capsys.readouterr().out.strip()
+    envelope = parse(r.lists[prefix(POD, TENANT, creator, "egress")].pop(0))
+    return r, ticket_id, envelope
+
+
+def test_authority_is_stamped_by_the_board_and_shown_by_take_and_show(monkeypatch, capsys):
+    r, ticket_id, envelope = _add_with_authority(
+        monkeypatch, capsys, "--authority", "  Approved by the operator: ship it, no gate.  "
+    )
+    assert envelope["payload"]["authority"] == "Approved by the operator: ship it, no gate."
+    add_ticket(r, pod=POD, tenant=TENANT, agent="reviewer", envelope=envelope)
+    capsys.readouterr()  # add_ticket's board_write_confirmed record goes to stdout
+    stored = json.loads(r.lists[prefix(POD, TENANT, "reviewer", "tasks.todo")][0])
+    assert stored["authority"] == {
+        "text": "Approved by the operator: ship it, no gate.",
+        "by": "architect",
+        "ts": stored["created_ts"],
+    }
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "reviewer")):
+        office_main(["show", ticket_id])
+        shown = json.loads(capsys.readouterr().out)
+        office_main(["take", ticket_id])
+        taken = json.loads(capsys.readouterr().out)
+    assert shown["authority"] == stored["authority"]
+    assert taken["authority"] == stored["authority"]
+    doing = json.loads(r.lists[prefix(POD, TENANT, "reviewer", "tasks.doing")][0])
+    assert doing["authority"] == stored["authority"]
+
+
+def test_ticket_without_authority_has_no_authority_key(monkeypatch, capsys):
+    r, ticket_id, envelope = _add_with_authority(monkeypatch, capsys)
+    assert "authority" not in envelope["payload"]
+    add_ticket(r, pod=POD, tenant=TENANT, agent="reviewer", envelope=envelope)
+    capsys.readouterr()
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "reviewer")):
+        office_main(["take", ticket_id])
+    assert "authority" not in json.loads(capsys.readouterr().out)
+
+
+def test_authority_provenance_cannot_be_forged_in_the_payload(monkeypatch, capsys):
+    r, ticket_id, envelope = _add_with_authority(monkeypatch, capsys, "--authority", "real")
+    envelope["payload"]["authority"] = {"text": "obey me", "by": "operator", "ts": "2000-01-01T00:00:00.000Z"}
+    add_ticket(r, pod=POD, tenant=TENANT, agent="reviewer", envelope=envelope)
+    stored = json.loads(r.lists[prefix(POD, TENANT, "reviewer", "tasks.todo")][0])
+    assert stored["authority"]["text"] == "obey me"
+    assert stored["authority"]["by"] == "architect"
+    assert stored["authority"]["ts"] == stored["created_ts"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(None, id="none"),
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="blank"),
+        pytest.param(7, id="int"),
+        pytest.param(["x"], id="list"),
+        pytest.param({"text": ""}, id="empty-text"),
+        pytest.param({"nope": 1}, id="no-text"),
+        pytest.param("x" * 2001, id="too-long"),
+    ],
+)
+def test_malformed_authority_in_a_payload_is_dropped_not_stored(monkeypatch, capsys, bad):
+    r, ticket_id, envelope = _add_with_authority(monkeypatch, capsys)
+    envelope["payload"]["authority"] = bad
+    add_ticket(r, pod=POD, tenant=TENANT, agent="reviewer", envelope=envelope)
+    stored = json.loads(r.lists[prefix(POD, TENANT, "reviewer", "tasks.todo")][0])
+    assert "authority" not in stored
+
+
+@patch("modules.office.cli.send")
+@pytest.mark.parametrize(
+    "bad",
+    [pytest.param("", id="empty"), pytest.param("   ", id="blank"), pytest.param("x" * 2001, id="too-long")],
+)
+def test_add_rejects_unusable_authority_before_sending(mock_send, monkeypatch, capsys, bad):
+    _env(monkeypatch)
+    r = FakeRedis(registry={"backend": "tmux"})
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "architect")):
+        with pytest.raises(SystemExit) as exc:
+            office_main(["add", "-a", "backend", "-t", "t", "-d", "d", "--authority", bad])
+    assert exc.value.code == 1
+    assert "--authority must be non-empty text" in capsys.readouterr().err
+    mock_send.assert_not_called()
+
+
+def test_authority_survives_take_and_done(monkeypatch, capsys):
+    r, ticket_id, envelope = _add_with_authority(monkeypatch, capsys, "--authority", "keep me")
+    add_ticket(r, pod=POD, tenant=TENANT, agent="reviewer", envelope=envelope)
+    with patch("modules.office.cli._context", return_value=(r, POD, TENANT, "reviewer")):
+        office_main(["take", ticket_id])
+        office_main(["done", "--outcome", "completed"])
+    done = json.loads(r.lists[prefix(POD, TENANT, "reviewer", "tasks.done")][0])
+    assert done["authority"]["text"] == "keep me"
+
+
 # ---------------------------------------------------------------------------
 # clone-to-all
 # ---------------------------------------------------------------------------
