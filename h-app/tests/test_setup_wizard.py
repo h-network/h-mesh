@@ -17,6 +17,7 @@ from core.registry import port_type
 from modules.tmux.ops import list_windows, run_tmux
 from services.daemons import enabled_daemon_modules
 from services.tenant_config import read_tenant_env
+from _setup_test_env import ambient_setup_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SETUP_SH = REPO_ROOT / "setup.sh"
@@ -77,7 +78,7 @@ def _run_wizard(cwd: str, args: list[str], env: dict, answers: list[str], timeou
 
 
 @pytest.fixture
-def wizard_env():
+def wizard_env(ambient_setup_env):
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
     r = redis.Redis.from_url(redis_url)
     try:
@@ -101,22 +102,26 @@ def wizard_env():
         f.write("#!/usr/bin/env bash\nexec bash -il\n")
     os.chmod(fake_h_agent, 0o755)
 
-    env = dict(os.environ)
-    env["HOME"] = home_dir
-    env["H_MESH_STATE_DIR"] = os.path.join(home_dir, ".h-mesh")
-    env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
-    env["PYTHONPATH"] = str(REPO_ROOT / "h-app")
-    env["H_MESH_RUN_DIR"] = run_dir
-    env["AGENT_NAME"] = "architect"
-    env["POD"] = pod
-    env["TENANT"] = tenant
-    env["REDIS_URL"] = redis_url
-    env["TMUX_SESSION"] = session_name
-    env["TMUX_SOCKET"] = socket_path
-
-    for k in list(env.keys()):
-        if k.startswith("CLAUDE_OAUTH_TOKEN_") or k == "CLAUDE_CODE_OAUTH_TOKEN":
-            del env[k]
+    # Only explicit runtime inputs: ambient roster/account/provider settings
+    # override persisted defaults by design and would invalidate rerun tests.
+    env = {
+        "HOME": home_dir,
+        "H_MESH_STATE_DIR": os.path.join(home_dir, ".h-mesh"),
+        "PATH": f"{fake_bin}:{sys.prefix}/bin:{os.defpath}",
+        "LANG": "C.UTF-8",
+        "TERM": "dumb",
+        "PYTHONPATH": str(REPO_ROOT / "h-app"),
+        "H_MESH_RUN_DIR": run_dir,
+        "H_MESH_WORKDIR": os.path.join(tmpdir, "workdir"),
+        "H_MESH_LOG_FILE": os.path.join(tmpdir, "window.log.jsonl"),
+        "AGENT_NAME": "architect",
+        "POD": pod,
+        "TENANT": tenant,
+        "REDIS_URL": redis_url,
+        "TMUX_SESSION": session_name,
+        "TMUX_SOCKET": socket_path,
+        "TMUX_TMPDIR": os.path.join(tmpdir, "tmux"),
+    }
 
     ctx = {
         "tmpdir": tmpdir, "home_dir": home_dir, "socket_path": socket_path,
