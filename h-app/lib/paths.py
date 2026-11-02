@@ -1,6 +1,7 @@
 """Filesystem paths and workdir resolution for h-mesh."""
 
 import os
+import pwd
 import sys
 from pathlib import Path
 
@@ -42,6 +43,129 @@ def get_agent_workdir(agent_name: str, cwd: str | None = None) -> str:
     if cwd:
         return cwd
     return os.path.join(get_workdir_root(), agent_name)
+
+
+def resolve_workdir_owner(
+    target: str | Path,
+    workdir_root: str | Path | None = None,
+) -> tuple[int, int] | None:
+    """Return the non-root (uid, gid) that should own workspace paths when running as root.
+
+    When a workspace provisioning step (`h-mesh-office clone-to-all`, a root
+    setup/hire invocation, or `docker exec -u 0`) runs as root (`euid == 0`),
+    creating directories or cloning a repository leaves them owned by `0:0`.
+    Agents run as the unprivileged workspace user (e.g. `ubuntu`), so a
+    root-owned clone triggers git's `detected dubious ownership` error and
+    prevents creating `.venv` or editing files in-repo (issue #28).
+
+    Resolution order when `os.geteuid() == 0`:
+    1. Existing non-root owner of the nearest existing directory on the chain
+       from `target` up through `workdir_root` (and its parent, e.g. `$HOME`).
+    2. `SUDO_UID` / `SUDO_GID` environment variables if set to a non-root uid.
+    3. The `ubuntu` user in the passwd database if present and non-root.
+    """
+    if os.geteuid() != 0:
+        return None
+
+    root_path = Path(workdir_root) if workdir_root is not None else Path(get_workdir_root())
+    target_path = Path(target)
+
+    candidates: list[Path] = []
+    cur = target_path
+    while True:
+        candidates.append(cur)
+        if cur == root_path or cur.parent == cur:
+            break
+        cur = cur.parent
+    if root_path not in candidates:
+        candidates.append(root_path)
+    if root_path.parent != root_path:
+        candidates.append(root_path.parent)
+
+    for candidate in candidates:
+        try:
+            if os.path.islink(candidate) or not os.path.exists(candidate):
+                continue
+            st = os.lstat(candidate)
+            if st.st_uid != 0:
+                return (st.st_uid, st.st_gid)
+        except OSError:
+            continue
+
+    raw_sudo_uid = os.environ.get("SUDO_UID", "").strip()
+    if raw_sudo_uid.isdigit():
+        sudo_uid = int(raw_sudo_uid)
+        if sudo_uid > 0:
+            raw_sudo_gid = os.environ.get("SUDO_GID", "").strip()
+            if raw_sudo_gid.isdigit():
+                return (sudo_uid, int(raw_sudo_gid))
+            try:
+                return (sudo_uid, pwd.getpwuid(sudo_uid).pw_gid)
+            except KeyError:
+                return (sudo_uid, sudo_uid)
+
+    try:
+        pw = pwd.getpwnam("ubuntu")
+        if pw.pw_uid != 0:
+            return (pw.pw_uid, pw.pw_gid)
+    except KeyError:
+        pass
+
+    return None
+
+
+def ensure_workdir_ownership(
+    target: str | Path,
+    workdir_root: str | Path | None = None,
+) -> bool:
+    """Ensure `target` (and any root-owned workspace ancestors) is owned by the workspace user.
+
+    No-op (returns False) when not running as root or when no non-root
+    workspace owner can be resolved. Uses `os.lchown` with `followlinks=False`
+    so symlinks inside a repository are never followed outside `target`.
+    """
+    owner = resolve_workdir_owner(target, workdir_root=workdir_root)
+    if owner is None:
+        return False
+    uid, gid = owner
+
+    root_path = Path(workdir_root) if workdir_root is not None else Path(get_workdir_root())
+    target_path = Path(target)
+
+    ancestors: list[Path] = []
+    cur = target_path.parent
+    while cur != cur.parent:
+        ancestors.append(cur)
+        if cur == root_path:
+            break
+        cur = cur.parent
+    for anc in reversed(ancestors):
+        try:
+            if not os.path.islink(anc) and os.path.exists(anc) and os.lstat(anc).st_uid == 0:
+                os.lchown(anc, uid, gid)
+        except OSError:
+            pass
+
+    if not os.path.lexists(target_path):
+        return False
+
+    changed = False
+    try:
+        os.lchown(target_path, uid, gid)
+        changed = True
+    except OSError:
+        return False
+
+    if os.path.isdir(target_path) and not os.path.islink(target_path):
+        for dirpath, dirnames, filenames in os.walk(target_path, followlinks=False):
+            for name in (*dirnames, *filenames):
+                entry = os.path.join(dirpath, name)
+                try:
+                    os.lchown(entry, uid, gid)
+                except OSError:
+                    pass
+
+    return changed
 
 
 def resolve_venv_bin(venv_dir: str | Path | None = None) -> str:

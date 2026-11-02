@@ -58,6 +58,14 @@ REDIS_URL="redis://127.0.0.1:6379/0"
 REDIS_DATA_DIR="${REDIS_DATA_DIR:-$HOME/.h-mesh/redis}"
 mkdir -p "$REDIS_DATA_DIR"
 
+# If the container or a pre-populated /workdir mount was touched by root
+# (e.g. docker cp or a root provisioning step), hand root-owned entries under
+# /workdir back to ubuntu without following symlinks so agents do not hit
+# git's dubious-ownership refusal or permission errors (#28).
+if [ "$(id -u)" -eq 0 ] && [ -d /workdir ] && id -u ubuntu >/dev/null 2>&1; then
+    find /workdir -user 0 -exec chown -h ubuntu:ubuntu {} + 2>/dev/null || true
+fi
+
 redis_pid=""
 tail_pid=""
 setup_ran=0

@@ -40,7 +40,7 @@ from lib.board_interaction import (
 )
 from lib.chat_memory import TTL_SECONDS_MAX as _CHAT_MEMORY_TTL_SECONDS
 from lib.chat_memory import ChatMemory
-from lib.paths import get_workdir_root
+from lib.paths import ensure_workdir_ownership, get_workdir_root
 from lib.reply_correlation import is_valid_reply_id
 
 from .pricing import calculate_cost, load_pricing
@@ -1709,6 +1709,51 @@ def _delete_command(argv: list[str]) -> None:
     print(serialize_ticket(ticket))
 
 
+def _purge_command(argv: list[str]) -> None:
+    # Imported here: only this command needs the tmux mechanics, and the other
+    # commands run inside agent windows where a lighter import is the norm.
+    from modules.tmux.ops import PurgeError, purge_session_history
+
+    parser = _operation_parser(
+        "purge",
+        "Permanently delete a RETIRED agent's on-disk CLI session history (irreversible).",
+    )
+    parser.add_argument("agent", help="exact name of the retired agent")
+    # ⚠ Required, not defaulted: retirement deletes the agent's launch and
+    # profile keys, so once it is gone nothing records which CLI or account it
+    # ran. Guessing would purge the wrong store or miss the right one.
+    parser.add_argument("--cli", required=True, choices=("claude", "codex", "agy"),
+                        help="which CLI's history to delete")
+    parser.add_argument("--profile", metavar="ACCOUNT",
+                        help="the account it ran under (default: the default account)")
+    parser.add_argument("--confirm", required=True, metavar="AGENT",
+                        help="the agent's exact name again, to confirm the deletion")
+    args = parser.parse_args(argv)
+
+    try:
+        validate_segment(args.agent)
+    except KeyError:
+        raise OfficeError(f"invalid agent name {args.agent!r}") from None
+    if args.confirm != args.agent:
+        raise OfficeError(f"--confirm must repeat the agent name exactly ({args.agent!r}); nothing was removed")
+    r, pod, tenant, _source = _context()
+    # Fail closed: if the registry cannot be read, liveness is unknown.
+    try:
+        enrolled = is_member(r, pod=pod, tenant=tenant, agent=args.agent)
+    except redis.RedisError as exc:
+        raise OfficeError(f"cannot confirm {args.agent!r} is retired ({exc}); nothing was removed") from exc
+    if enrolled:
+        raise OfficeError(
+            f"{args.agent!r} is still enrolled; let-go it first. A live session may rewrite its history"
+        )
+    try:
+        count = purge_session_history(args.agent, args.cli, profile=args.profile)
+    except (PurgeError, OSError) as exc:
+        raise OfficeError(f"purge failed: {exc}") from exc
+    unit = "history line" if args.cli == "agy" else "session"
+    print(f"purged {count} {unit}{'' if count == 1 else 's'} for {args.agent} ({args.cli})")
+
+
 def _add_command(argv: list[str]) -> None:
     parser = _operation_parser("add", "Add a task to another agent's board.")
     parser.add_argument("-a", "--agent", required=True, metavar="AGENT")
@@ -1866,6 +1911,7 @@ def _git_clone(source: str, target: Path, upstream: str) -> tuple[bool, str]:
         if remote.returncode:
             detail = remote.stderr.strip() or remote.stdout.strip() or "could not set origin"
             return False, detail
+        ensure_workdir_ownership(target)
         return True, ""
     except OSError as exc:
         return False, str(exc)
@@ -2127,6 +2173,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("hold",), "pause (hold) an active or queued task; resume with take/unhold", _hold_command),
     (("delete",), "permanently remove a task from your own board", _delete_command),
     (("add",), "add a task to another agent's board", _add_command),
+    (("purge",), "delete a retired agent's on-disk CLI session history", _purge_command),
     (("clone-to-all",), "clone a repository into agent workspaces", _clone_to_all_command),
     (("usage",), "show token usage and estimated cost", _usage_command),
 )
