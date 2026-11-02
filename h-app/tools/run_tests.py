@@ -12,6 +12,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,102 @@ FIRST_PARTY_PROBE = "services.daemons"
 
 class RedisSetupError(Exception):
     """A safe Redis endpoint could not be prepared."""
+
+
+class UnsafeTestEnvironment(Exception):
+    """The invocation could inherit an office identity or state path."""
+
+
+def _refuse_office_identity(environment: dict[str, str]) -> None:
+    names = [name for name in ("AGENT_NAME", "TENANT") if environment.get(name)]
+    if names:
+        raise UnsafeTestEnvironment(
+            "refusing an office identity (" + ", ".join(names) + "); "
+            "run suites only through ~/ci/run-suite.sh on the approved test VM"
+        )
+
+
+def _state_paths(root: Path) -> dict[str, Path]:
+    home = root / "home"
+    state = root / "state"
+    return {
+        "HOME": home,
+        "H_MESH_STATE_DIR": state,
+        "H_MESH_WORKDIR": root / "workdir",
+        "H_MESH_RUN_DIR": state / "run",
+        "H_MESH_LOG_FILE": state / "window.log.jsonl",
+        "XDG_CONFIG_HOME": home / ".config",
+        "XDG_CACHE_HOME": home / ".cache",
+        "XDG_DATA_HOME": home / ".local" / "share",
+    }
+
+
+@contextmanager
+def _state_environment(environment: dict[str, str]):
+    """Give probes, pytest, and their children a disposable home and state."""
+    original = environment.copy()
+    with tempfile.TemporaryDirectory(prefix="h-mesh-test-state-", dir="/tmp") as directory:
+        root = Path(directory).resolve()
+        paths = _state_paths(root)
+        for name, path in paths.items():
+            if name != "H_MESH_LOG_FILE":
+                path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        (paths["HOME"] / ".h-mesh").symlink_to(paths["H_MESH_STATE_DIR"], target_is_directory=True)
+        try:
+            for name in ("TASK_RECORD", "H_MESH_CUSTODY_FILE", "H_MESH_WRITER",
+                         "VIRTUAL_ENV", "VENV_PATH", "PREFIX"):
+                environment.pop(name, None)
+            environment.update({name: str(path) for name, path in paths.items()})
+            environment["H_MESH_TEST_ROOT"] = str(root)
+            environment["TMPDIR"] = str(Path("/tmp").resolve())
+            print(f"test state: {paths['H_MESH_STATE_DIR']} (private, ephemeral)", flush=True)
+            yield
+        finally:
+            environment.clear()
+            environment.update(original)
+
+
+def _require_safe_test_environment(environment: dict[str, str]) -> None:
+    """Validate configuration before pytest collection or orphan cleanup."""
+    _refuse_office_identity(environment)
+    if not environment.get("REDIS_URL"):
+        raise UnsafeTestEnvironment(
+            "pytest requires an explicit private REDIS_URL; use the approved VM runner"
+        )
+    try:
+        _redis_endpoint(environment["REDIS_URL"], allow_shared=False)
+    except RedisSetupError:
+        raise UnsafeTestEnvironment(
+            "pytest refuses REDIS_URL unless it uses a loopback host on a port "
+            "other than 6379; H_MESH_ALLOW_SHARED_REDIS does not disable this guard"
+        ) from None
+
+    raw_root = environment.get("H_MESH_TEST_ROOT", "")
+    root = Path(raw_root)
+    try:
+        info = root.lstat()
+        if (not raw_root or not root.is_absolute() or root.is_symlink()
+                or root.resolve().parent != Path("/tmp").resolve()
+                or not root.name.startswith("h-mesh-test-state-")
+                or not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700):
+            raise ValueError
+        root = root.resolve()
+        for name, expected in _state_paths(root).items():
+            value = environment.get(name, "")
+            if not value or not Path(value).is_absolute() or Path(value).resolve() != expected:
+                raise ValueError
+        if (root / "home" / ".h-mesh").resolve() != root / "state":
+            raise ValueError
+        for name in ("TASK_RECORD", "H_MESH_CUSTODY_FILE"):
+            if environment.get(name) and not Path(environment[name]).resolve().is_relative_to(root):
+                raise ValueError
+    except (OSError, RuntimeError, ValueError):
+        raise UnsafeTestEnvironment(
+            "pytest refuses non-private HOME/state/workdir/log paths; "
+            "a fresh runner-owned H_MESH_TEST_ROOT and H_MESH_STATE_DIR are required. "
+            "Use ~/ci/run-suite.sh on the approved test VM"
+        ) from None
 
 
 class RunnerInterrupted(BaseException):
@@ -174,9 +271,14 @@ def _print_provenance(tree: Path | None) -> None:
 
 
 def _suite_environment() -> dict[str, str]:
-    environment = os.environ.copy()
-    environment.pop("PYTEST_ADDOPTS", None)
-    environment.pop("PYTEST_PLUGINS", None)
+    # Keep import/runtime inputs; office settings, credentials, state overrides,
+    # tmux handles, and the caller's active virtualenv must not reach tests.
+    allowed = {"PATH", "PYTHONPATH", "LANG", "LANGUAGE", "TZ", "TERM",
+               "REDIS_URL", "H_MESH_ALLOW_SHARED_REDIS"}
+    environment = {
+        name: value for name, value in os.environ.items()
+        if name in allowed or name.startswith("LC_")
+    }
     environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     return environment
 
@@ -206,6 +308,11 @@ def _child_import_path(
 
 
 def main() -> int:
+    try:
+        _refuse_office_identity(os.environ)
+    except UnsafeTestEnvironment as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     repo_root = _find_invoked_tree(Path.cwd())
     _print_provenance(repo_root)
     if repo_root is None:
@@ -235,6 +342,28 @@ def main() -> int:
         return 1
 
     pytest_env = _suite_environment()
+    previous_handlers = {}
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, _interrupt)
+        with _state_environment(pytest_env):
+            if not _check_child_imports(repo_root, pytest_env):
+                return 1
+            with _redis_environment(pytest_env):
+                _require_safe_test_environment(pytest_env)
+                return _run_suite(repo_root, pytest_env)
+    except (RedisSetupError, UnsafeTestEnvironment) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except RunnerInterrupted as exc:
+        print(f"test runner interrupted by signal {exc.signum}", file=sys.stderr)
+        return 128 + exc.signum
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
+def _check_child_imports(repo_root: Path, pytest_env: dict[str, str]) -> bool:
     imported_path, import_error = _child_import_path(
         FIRST_PARTY_PROBE, cwd=repo_root, env=pytest_env
     )
@@ -259,23 +388,8 @@ def main() -> int:
             f"  {shlex.join([str(isolated_python), '-m', 'tools.run_tests'])}",
             file=sys.stderr,
         )
-        return 1
-
-    previous_handlers = {}
-    try:
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            previous_handlers[signum] = signal.signal(signum, _interrupt)
-        with _redis_environment(pytest_env):
-            return _run_suite(repo_root, pytest_env)
-    except RedisSetupError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    except RunnerInterrupted as exc:
-        print(f"test runner interrupted by signal {exc.signum}", file=sys.stderr)
-        return 128 + exc.signum
-    finally:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
+        return False
+    return True
 
 
 def _run_suite(repo_root: Path, pytest_env: dict[str, str]) -> int:
