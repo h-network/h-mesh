@@ -1479,13 +1479,43 @@ def _return_command(argv: list[str]) -> None:
     print(serialize_ticket(ticket))
 
 
+def _show_everywhere(r, *, pod: str, tenant: str, reference: str) -> None:
+    """Office-wide `show`: every enrolled board's matches for an id or prefix.
+
+    Read-only. An unreadable entry on some board is skipped rather than
+    quarantined -- this path never mutates another agent's board.
+    """
+    found = 0
+    for owner in sorted(members(r, pod=pod, tenant=tenant)):
+        try:
+            keys = _task_keys(pod, tenant, owner)
+        except KeyError:
+            continue
+        for state in ("todo", "doing", "hold", "done"):
+            for raw in r.lrange(keys[state], 0, -1):
+                try:
+                    ticket = normalize_ticket(raw, state=state)
+                except BoardError:
+                    continue
+                if ticket["id"].startswith(reference):
+                    found += 1
+                    print(json.dumps({"agent": owner, "state": state, "ticket": ticket}, separators=(",", ":")))
+    if not found:
+        raise OfficeError(f"no task matches id {reference!r} on any board")
+
+
 def _show_command(argv: list[str]) -> None:
     parser = _operation_parser("show", "Read one ticket without changing its board state.")
     parser.add_argument("id", help="ticket id or unique prefix")
-    parser.add_argument("-a", "--agent", metavar="AGENT", help="board owner (default: you)")
+    parser.add_argument("-a", "--agent", metavar="AGENT",
+                        help="board owner (default: you); 'all' searches every enrolled board and "
+                             "prints one JSON line {agent, state, ticket} per match")
     args = parser.parse_args(argv)
     r, pod, tenant, source = _context()
     agent = args.agent or source
+    if agent == "all":
+        _show_everywhere(r, pod=pod, tenant=tenant, reference=args.id)
+        return
     if agent != source and not is_member(r, pod=pod, tenant=tenant, agent=agent):
         raise OfficeError(f"unknown board owner {agent!r}")
     keys = _task_keys(pod, tenant, agent)
@@ -1582,9 +1612,29 @@ def _delete_command(argv: list[str]) -> None:
     print(serialize_ticket(ticket))
 
 
+def _board_state_holding(r, *, pod: str, tenant: str, agent: str, ticket_id: str) -> str | None:
+    """The state (todo/doing/hold/done) in which ``agent``'s board holds exactly
+    ``ticket_id``, else None. Unreadable entries are ignored."""
+    keys = _task_keys(pod, tenant, agent)
+    for state in ("todo", "doing", "hold", "done"):
+        for raw in r.lrange(keys[state], 0, -1):
+            try:
+                if normalize_ticket(raw, state=state)["id"] == ticket_id:
+                    return state
+            except BoardError:
+                continue
+    return None
+
+
 def _add_command(argv: list[str]) -> None:
     parser = _operation_parser("add", "Add a task to another agent's board.")
-    parser.add_argument("-a", "--agent", required=True, metavar="AGENT")
+    parser.add_argument("-a", "--agent", required=True, metavar="AGENT[,AGENT...]",
+                         help="board owner; several comma-separated owners get the SAME ticket id "
+                              "on each board")
+    parser.add_argument("--id", metavar="TICKET_ID", dest="ticket_id",
+                         help="reuse an existing 32-hex ticket id instead of allocating one (to give "
+                              "the same piece of work to another board later); refused if that "
+                              "board already holds the id")
     parser.add_argument("-t", "--title", required=True, metavar="TITLE")
     parser.add_argument("-d", "--description", required=True, metavar="DESCRIPTION")
     parser.add_argument("-p", "--priority", metavar="PRIORITY")
@@ -1593,13 +1643,25 @@ def _add_command(argv: list[str]) -> None:
                               "(a related ticket may live on another agent's board)")
     args = parser.parse_args(argv)
 
+    targets = list(dict.fromkeys(value.strip() for value in args.agent.split(",")))
+    if not all(targets):
+        raise OfficeError("office add -a: empty agent name in the list")
+    if args.ticket_id is not None and not is_valid_reply_id(args.ticket_id):
+        raise OfficeError(f"--id {args.ticket_id!r} is not a 32-character lowercase hex ticket id")
     r, pod, tenant, source = _context()
-    if not is_member(r, pod=pod, tenant=tenant, agent=args.agent):
-        raise OfficeError(f"unknown destination agent {args.agent!r}")
-    # Allocate the established 32-lowercase-hex identity locally. This state is
-    # ALLOCATED; send returning below advances the envelope to ADMITTED, while
-    # only downstream custody can prove the board ticket was CREATED.
-    ticket_id = os.urandom(16).hex()
+    for target in targets:
+        if not is_member(r, pod=pod, tenant=tenant, agent=target):
+            raise OfficeError(f"unknown destination agent {target!r}")
+    # Allocate the established 32-lowercase-hex identity locally (or reuse the
+    # caller's canonical one). This state is ALLOCATED; send returning below
+    # advances the envelope to ADMITTED, while only downstream custody can
+    # prove the board ticket was CREATED.
+    ticket_id = args.ticket_id or os.urandom(16).hex()
+    if args.ticket_id is not None:
+        for target in targets:
+            holder = _board_state_holding(r, pod=pod, tenant=tenant, agent=target, ticket_id=ticket_id)
+            if holder:
+                raise OfficeError(f"{target}'s board already holds ticket {ticket_id} ({holder})")
     payload = {
         "v": 1,
         "id": ticket_id,
@@ -1617,16 +1679,28 @@ def _add_command(argv: list[str]) -> None:
         related = list(dict.fromkeys(value.strip() for value in args.related.split(",") if value.strip()))
         if related:
             payload["related"] = related
-    send(
-        r,
-        pod=pod,
-        tenant=tenant,
-        source=source,
-        destination=args.agent,
-        payload=payload,
-        kind="AddTicket",
-        module="office",
-    )
+    sent: list[str] = []
+    for target in targets:
+        try:
+            send(
+                r,
+                pod=pod,
+                tenant=tenant,
+                source=source,
+                destination=target,
+                payload=payload,
+                kind="AddTicket",
+                module="office",
+            )
+        except Exception:
+            if sent:
+                print(
+                    f"office: add stopped at {target!r} after sending ticket {ticket_id} to "
+                    f"{', '.join(sent)}; re-run with --id {ticket_id} for the rest",
+                    file=sys.stderr,
+                )
+            raise
+        sent.append(target)
     print(ticket_id)
 
 
