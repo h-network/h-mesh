@@ -32,6 +32,7 @@ from core.keys import (
     prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key, validate_segment,
 )
 from core.logging import log_record, record_task_event
+from core.receipts import trace as trace_delivery
 from core.registry import is_member, members, port_type
 from lib.attachment_schema import ATTACHMENT_MAX_BYTES, MIME_TYPE_REGEX
 from lib.board_interaction import (
@@ -1233,6 +1234,37 @@ def _list_command(argv: list[str]) -> None:
         _list_one(r, pod=pod, tenant=tenant, agent=agent, heading=args.all, now=now)
 
 
+_DELIVERY_TERMINAL = frozenset({"delivered", "failed", "unresolved"})
+
+
+def _delivery_command(argv: list[str]) -> None:
+    parser = _operation_parser(
+        "delivery",
+        "Show where a sent message is: queued, delivering, delivered, failed, "
+        "unresolved or unknown. Read-only.",
+    )
+    parser.add_argument("stream_id", metavar="STREAM_ID", help="the id printed by office send")
+    parser.add_argument(
+        "--wait", type=float, default=0.0, metavar="SECONDS",
+        help="poll until the message is delivered, failed or unresolved, or SECONDS pass",
+    )
+    args = parser.parse_args(argv)
+    if not re.fullmatch(r"[0-9a-f]{32}", args.stream_id):
+        raise OfficeError(f"{args.stream_id!r} is not a 32-character lowercase hex stream_id")
+    if args.wait < 0 or not math.isfinite(args.wait):
+        raise OfficeError("--wait must be a non-negative number of seconds")
+    r, pod, tenant, source = _context()
+    deadline = time.monotonic() + args.wait
+    while True:
+        result = trace_delivery(
+            r, pod=pod, tenant=tenant, stream_id=args.stream_id, extra_agents=(source,)
+        )
+        if result["state"] in _DELIVERY_TERMINAL or time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+    print(json.dumps(result, separators=(",", ":")))
+
+
 def _unresolved_command(argv: list[str]) -> None:
     parser = _operation_parser(
         "unresolved",
@@ -2005,6 +2037,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("pause",), "pause an agent's CLI", lambda argv: _lifecycle_command("pause", argv)),
     (("resume",), "resume an agent's CLI and inbox", lambda argv: _lifecycle_command("resume", argv)),
     (("list",), "show a task board", _list_command),
+    (("delivery",), "show where a sent message is (queued / delivered / failed)", _delivery_command),
     (("unresolved",), "show unresolved delivery outcomes", _unresolved_command),
     (("undeliverable",), "show messages not opened before retirement", _undeliverable_command),
     (("retired-inbox",), "show api agents' inbox content conserved at retirement", _retired_inbox_command),

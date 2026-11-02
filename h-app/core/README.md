@@ -20,6 +20,8 @@ Everything else is a module that plugs into this.
 | `logging.py` | contract-shaped JSON event logging and durable stdout mirroring, plus `configure_logging()` — the stdlib logging threshold for entry points |
 | `retention.py` | count-based trimming for completed-task and dead-letter queues |
 | `ingress_health.py` | `IngressStallMonitor` — payload-free detection of an ingress whose consumer stopped draining |
+
+| `receipts.py` | `trace()` — read-only lookup of one stream_id across the custody lists (queued / delivering / delivered / failed / unresolved) |
 | `windowlog.py` | agent-window custody-log validation, tailing, offset tracking, and bounded truncation |
 | `service.py` | the `Switch` class — BLPOP/forward/kick loop, is what "the switch" is |
 
@@ -106,6 +108,17 @@ and a switch restart restarts the clock. Not covered: an `api` participant's
 *client* (e.g. the Telegram bot) that stops reading its `inbox` stream -- the api
 port keeps draining ingress into `inbox` (capped at 1,000), so the queue never
 stalls; that needs a client-side heartbeat and is a separate design.
+
+## Delivery trace
+
+`receipts.trace()` reports where one `stream_id` is by scanning egress, ingress,
+`processing`, `opening`, `opened`, `dead`, the api `inbox`, and the tenant
+`unresolved`/`undeliverable` evidence in a single Lua call that compares only the
+fixed-header stream_id, so no payload is read or transferred. It is the engine
+behind `office delivery`. "Delivered" is a custody fact, never a read receipt, and
+a frame that has aged out of the 1,000-entry `opened` list is reported `unknown`,
+not guessed. The api port drains ingress and then writes the mailbox, so a
+frame can be briefly in neither during that hand-off.
 
 ## Two logging systems, one file
 
