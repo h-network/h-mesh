@@ -16,6 +16,12 @@ REMOVED_GUIDE_TEXT = (
     "no declared operator entrance configured",
     "Interface entries may only accept",
     "not arbitrary messages",
+    # The "That's colleagues only ..." peers paragraph (removed afterwards).
+    "That's colleagues only",
+    "lifecycle provider",
+    "peers -i",
+    "external entrance",
+    "configured entrance",
 )
 
 
@@ -85,7 +91,6 @@ def test_write_agent_guide_with_valid_enrolled_operator_entrance(tmp_path, monke
     write_agent_guide(str(cwd), "testagent", operator_entrance="web", enrolled_entrances={"web", "telegram"})
 
     agents_md = (cwd / "AGENTS.md").read_text(encoding="utf-8")
-    assert "the operator's external entrance (`web`)" in agents_md
     for gone in REMOVED_GUIDE_TEXT:
         assert gone not in agents_md
 
@@ -102,7 +107,6 @@ def test_write_agent_guide_with_nonexistent_operator_entrance_falls_back_to_reje
     )
 
     agents_md = (cwd / "AGENTS.md").read_text(encoding="utf-8")
-    assert "external entrances (configured entrance `telegrma` is not currently enrolled)" in agents_md
     for gone in REMOVED_GUIDE_TEXT:
         assert gone not in agents_md
 
@@ -127,7 +131,8 @@ def test_write_agent_guide_with_broken_logger_and_unenrolled_entrance_still_writ
     assert (cwd / "AGENTS.md").exists()
     assert (cwd / "CLAUDE.md").exists()
     agents_md = (cwd / "AGENTS.md").read_text(encoding="utf-8")
-    assert "external entrances (configured entrance `telegrma` is not currently enrolled)" in agents_md
+    for gone in REMOVED_GUIDE_TEXT:
+        assert gone not in agents_md
 
 
 def test_write_agent_guide_with_env_operator_entrance_and_enrolled(tmp_path, monkeypatch):
@@ -140,7 +145,6 @@ def test_write_agent_guide_with_env_operator_entrance_and_enrolled(tmp_path, mon
     write_agent_guide(str(cwd), "testagent", enrolled_entrances={"telegram"})
 
     agents_md = (cwd / "AGENTS.md").read_text(encoding="utf-8")
-    assert "the operator's external entrance (`telegram`)" in agents_md
     for gone in REMOVED_GUIDE_TEXT:
         assert gone not in agents_md
 
@@ -156,7 +160,6 @@ def test_write_agent_guide_with_env_operator_entrance_validation_unavailable_use
     write_agent_guide(str(cwd), "testagent")
 
     agents_md = (cwd / "AGENTS.md").read_text(encoding="utf-8")
-    assert "external entrances (configured entrance `telegram` unverified)" in agents_md
     for gone in REMOVED_GUIDE_TEXT:
         assert gone not in agents_md
 
@@ -171,6 +174,5 @@ def test_write_agent_guide_with_no_operator_entrance(tmp_path, monkeypatch):
     write_agent_guide(str(cwd), "testagent")
 
     agents_md = (cwd / "AGENTS.md").read_text(encoding="utf-8")
-    assert "external entrances" in agents_md
     for gone in REMOVED_GUIDE_TEXT:
         assert gone not in agents_md

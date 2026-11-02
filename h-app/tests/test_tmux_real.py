@@ -43,6 +43,12 @@ REMOVED_GUIDE_TEXT = (
     "no declared operator entrance configured",
     "Interface entries may only accept",
     "not arbitrary messages",
+    # The "That's colleagues only ..." peers paragraph (removed afterwards).
+    "That's colleagues only",
+    "lifecycle provider",
+    "peers -i",
+    "external entrance",
+    "configured entrance",
 )
 
 
@@ -526,7 +532,6 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             )
             self.assertIn("architect is the lead of this office", agent_guide)
             self.assertIn("h-mesh-office peers", agent_guide)
-            self.assertIn("the operator's external entrance (`telegram`)", agent_guide)
             self.assertNotIn("an external door", agent_guide)
             self.assertNotIn("untrusted external content", agent_guide)
             # Operator-authority text and the envelope-kinds sentence were removed (#5).
@@ -549,7 +554,6 @@ class RealTmuxIntegrationTests(unittest.TestCase):
 
         # No operator entrance declared
         guide_none = generate_agents_md("worker")
-        self.assertIn("external entrances", guide_none)
         for gone in REMOVED_GUIDE_TEXT:
             self.assertNotIn(gone, guide_none)
 
@@ -559,13 +563,11 @@ class RealTmuxIntegrationTests(unittest.TestCase):
 
         # Nonexistent operator entrance formats rejected notice when raise_on_invalid=False
         guide_rejected = generate_agents_md("worker", operator_entrance="telegrma", enrolled_entrances={"telegram"}, raise_on_invalid=False)
-        self.assertIn("external entrances (configured entrance `telegrma` is not currently enrolled)", guide_rejected)
         for gone in REMOVED_GUIDE_TEXT:
             self.assertNotIn(gone, guide_rejected)
 
         # Unverified operator entrance formats unverified notice
         guide_unverified = generate_agents_md("worker", operator_entrance="telegram")
-        self.assertIn("external entrances (configured entrance `telegram` unverified)", guide_unverified)
         for gone in REMOVED_GUIDE_TEXT:
             self.assertNotIn(gone, guide_unverified)
 
@@ -574,7 +576,8 @@ class RealTmuxIntegrationTests(unittest.TestCase):
             guide = generate_agents_md("worker", enrolled_entrances={"telegram"})
             self.assertIn("custom-office peers", guide)
             self.assertIn("custom-office send", guide)
-            self.assertIn("the operator's external entrance (`telegram`)", guide)
+            for gone in REMOVED_GUIDE_TEXT:
+                self.assertNotIn(gone, guide)
             env = window_env("worker")
             self.assertIn("OFFICE_TOOLS=custom-office", env)
 
@@ -582,7 +585,6 @@ class RealTmuxIntegrationTests(unittest.TestCase):
         guide_arg = generate_agents_md("worker", office_cmd="arg-office", operator_entrance="web", enrolled_entrances={"web"})
         self.assertIn("arg-office peers", guide_arg)
         self.assertIn("arg-office send", guide_arg)
-        self.assertIn("the operator's external entrance (`web`)", guide_arg)
         for gone in REMOVED_GUIDE_TEXT:
             self.assertNotIn(gone, guide_arg)
 
