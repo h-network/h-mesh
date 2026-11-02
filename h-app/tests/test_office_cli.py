@@ -72,7 +72,9 @@ class FakeRedis:
     def get(self, key):
         return self.values.get(key)
 
-    def set(self, key, value, ex=None):
+    def set(self, key, value, ex=None, nx=False):
+        if nx and key in self.values:
+            return None
         self.values[key] = value
         return True
 
@@ -1837,7 +1839,8 @@ def test_add_sends_envelope_and_prints_the_ticket_id(mock_send, monkeypatch, cap
         patch("modules.office.cli.os.urandom", return_value=allocated_bytes) as urandom,
     ):
         office_main(["add", "-a", "backend", "-t", "title", "-d", "desc"])
-    kwargs = mock_send.call_args[1]
+    # First send is the AddTicket; the assignment notice (#18) follows it.
+    kwargs = mock_send.call_args_list[0].kwargs
     assert kwargs["kind"] == "AddTicket"
     assert kwargs["payload"]["title"] == "title"
     ticket_id = kwargs["payload"]["id"]

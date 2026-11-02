@@ -58,7 +58,7 @@ def test_add_warns_for_title_and_description_but_still_adds(monkeypatch, capsys)
     send = _run(["add", "-a", "backend", "-t", "fix the  thing", "-d", "see  below"], monkeypatch)
     err = capsys.readouterr().err
     assert "the title" in err and "the description" in err
-    assert send.call_args.kwargs["payload"]["title"] == "fix the  thing"
+    assert send.call_args_list[0].kwargs["payload"]["title"] == "fix the  thing"
 
 
 @pytest.mark.parametrize("text", [
@@ -97,12 +97,12 @@ def test_add_description_from_stdin_and_file(monkeypatch, capsys, tmp_path):
     send = _run(["add", "-a", "backend", "-t", "t", "--description-stdin"], monkeypatch,
                 stdin="full  text\nwith `code`\n")
     assert capsys.readouterr().err == ""
-    assert send.call_args.kwargs["payload"]["description"] == "full  text\nwith `code`\n"
+    assert send.call_args_list[0].kwargs["payload"]["description"] == "full  text\nwith `code`\n"
 
     path = tmp_path / "d.txt"
     path.write_text("from a file  here", encoding="utf-8")
     send = _run(["add", "-a", "backend", "-t", "t", "--description-file", str(path)], monkeypatch)
-    assert send.call_args.kwargs["payload"]["description"] == "from a file  here"
+    assert send.call_args_list[0].kwargs["payload"]["description"] == "from a file  here"
 
 
 def test_add_requires_exactly_one_description_source(monkeypatch, capsys, tmp_path):
