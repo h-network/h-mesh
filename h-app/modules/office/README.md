@@ -236,6 +236,23 @@ contexts, reading `lib/chat_memory.py`'s `ChatMemory` directly (same "own a
 Redis client, read state directly" shape `office status`/`office peers -v`
 already use, not a round trip through an envelope).
 
+`office doc` attaches a document once and refers to it by hash, so a
+versioned checklist or spec is not re-pasted into every message (and the
+reader cannot review the wrong version). `office doc put PATH [--name NAME]`
+stores the file's bytes under their SHA-256 in tenant-scoped Redis hashes
+(`docs`, `docs.meta`, `docs.names`; `lib/doc_store.py`) and prints
+`doc:<first 12 hex>`; put that reference in a message or ticket. Identical
+bytes dedupe to the same hash and keep the first upload's metadata.
+`office doc get REF [-o PATH]` writes the bytes to stdout or `PATH`,
+`office doc info REF` shows hash, filename, MIME type, size, author and
+upload time, and `office doc ls` lists everything. `REF` is `doc:<hash>`, any
+unique hash prefix of at least 8 hex characters, or a `--name`: re-putting a
+new version with the same name moves the name to it, while every older version
+stays reachable by its hash. Names may not look like a hash prefix. The size
+cap is `send-file`'s (10 MiB). This is direct Redis state like `office status`;
+nothing crosses the switch. There is no delete or expiry yet, so stored
+documents persist until the tenant's Redis state is cleared.
+
 Operational compatibility warning: the legacy `office` CLI deployed where
 this module was developed silently loses messages submitted with `office send
 --stdin`. It still reports success and prints the submitted byte count, but the

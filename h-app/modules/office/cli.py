@@ -41,6 +41,8 @@ from lib.board_interaction import (
 from lib.chat_memory import TTL_SECONDS_MAX as _CHAT_MEMORY_TTL_SECONDS
 from lib.chat_memory import ChatMemory
 from lib.paths import ensure_workdir_ownership, get_workdir_root
+from lib import doc_store
+from lib.paths import get_workdir_root
 from lib.reply_correlation import is_valid_reply_id
 
 from .pricing import calculate_cost, load_pricing
@@ -380,6 +382,86 @@ def _send_file_command(argv: list[str]) -> None:
         module="office",
     )
     print(f"sent to {args.agent}: {len(raw_bytes)} bytes ({stream_id})")
+
+def _doc_command(argv: list[str]) -> None:
+    """`office doc put|get|ls|info`: store a document once, refer to it by hash."""
+    parser = _operation_parser("doc", "Store a document once and refer to it by hash.")
+    actions = parser.add_subparsers(dest="action", metavar="ACTION", required=True)
+
+    put_p = actions.add_parser("put", help="store a file; prints its doc:<hash> reference")
+    put_p.add_argument("path", type=Path, metavar="PATH", help="path to regular file")
+    put_p.add_argument("--name", metavar="NAME", help="mutable name that points at this version")
+    put_p.add_argument("--mime-type", metavar="TYPE", help="MIME type (guessed from extension if omitted)")
+
+    get_p = actions.add_parser("get", help="print a document's bytes, or write them with -o")
+    get_p.add_argument("ref", metavar="REF", help="doc:<hash>, a hash prefix (8+ hex), or a name")
+    get_p.add_argument("-o", "--output", type=Path, metavar="PATH", help="write to PATH instead of stdout")
+
+    actions.add_parser("ls", help="list stored documents")
+
+    info_p = actions.add_parser("info", help="show a document's metadata without its body")
+    info_p.add_argument("ref", metavar="REF", help="doc:<hash>, a hash prefix (8+ hex), or a name")
+
+    args = parser.parse_args(argv)
+    r, pod, tenant, source = _context()
+    try:
+        _doc_run(args, r, pod, tenant, source)
+    except doc_store.DocError as exc:
+        raise OfficeError(str(exc)) from exc
+
+
+def _doc_run(args, r, pod: str, tenant: str, source: str) -> None:
+    if args.action == "put":
+        path = args.path
+        if not path.exists():
+            raise OfficeError(f"document file does not exist: {str(path)!r}")
+        if not path.is_file():
+            raise OfficeError(f"document path {str(path)!r} is not a regular file")
+        _validate_filename(path.name)
+        if args.mime_type is not None:
+            _validate_mime_type(args.mime_type)
+            mime_type = args.mime_type
+        else:
+            guessed, _ = mimetypes.guess_type(path.name)
+            mime_type = guessed if guessed and MIME_TYPE_REGEX.match(guessed) else "application/octet-stream"
+        try:
+            if path.stat().st_size > ATTACHMENT_MAX_BYTES:
+                raise OfficeError(
+                    f"document file size exceeds maximum allowed size of {ATTACHMENT_MAX_BYTES} bytes"
+                )
+            data = path.read_bytes()
+        except OSError as exc:
+            raise OfficeError(f"cannot read document file {str(path)!r}: {exc}") from exc
+        doc_hash, created = doc_store.put(
+            r, pod=pod, tenant=tenant, author=source, data=data, filename=path.name,
+            mime_type=mime_type, name=args.name,
+        )
+        state = "stored" if created else "already stored"
+        label = f" as {args.name!r}" if args.name else ""
+        print(f"{state}: {doc_store.REF_SCHEME}{doc_store.short(doc_hash)} {len(data)} bytes{label}")
+    elif args.action == "get":
+        _, _, data = doc_store.get(r, pod=pod, tenant=tenant, ref=args.ref)
+        if args.output is None:
+            sys.stdout.flush()
+            sys.stdout.buffer.write(data)
+            return
+        try:
+            args.output.write_bytes(data)
+        except OSError as exc:
+            raise OfficeError(f"cannot write {str(args.output)!r}: {exc}") from exc
+        print(f"wrote {len(data)} bytes to {args.output}")
+    elif args.action == "info":
+        doc_hash, meta, _ = doc_store.get(r, pod=pod, tenant=tenant, ref=args.ref)
+        print(f"hash: {doc_hash}")
+        for field in ("filename", "mime_type", "size", "author", "created"):
+            print(f"{field}: {meta.get(field, 'unknown')}")
+    else:
+        for row in doc_store.listing(r, pod=pod, tenant=tenant):
+            names = f"  [{', '.join(row['names'])}]" if row["names"] else ""
+            print(
+                f"{doc_store.REF_SCHEME}{doc_store.short(row['hash'])}  {row.get('size', '?')} bytes  "
+                f"{row.get('filename', '?')}  {row.get('author', '?')}  {row.get('created', '?')}{names}"
+            )
 
 
 def _broadcast_command(argv: list[str]) -> None:
@@ -2101,6 +2183,7 @@ def _usage_command(argv: list[str]) -> None:
 _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("send",), "send a message to one agent", _send_command),
     (("send-file",), "send a file attachment to one agent", _send_file_command),
+    (("doc",), "store a document once and refer to it by hash", _doc_command),
     (("broadcast",), "send a message to every peer agent", _broadcast_command),
     (("peers",), "list peer agents", _peers_command),
     (("contexts",), "list a claude_sdk agent's live memory contexts", _contexts_command),
