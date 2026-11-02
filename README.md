@@ -134,6 +134,13 @@ h-mesh-office hire <agent-name>
 Hiring starts a fresh CLI session by default, even when that agent name has
 local session history. Pass `--resume` to opt into restoring prior history.
 
+From an operator shell outside the office, use `h-mesh-office run scratch` or
+`h-mesh-office run monitor -- top`. These open non-addressable tmux windows,
+separate from agents: messages are never pasted into them. Commands run once
+and retain their exited output; close the window manually when finished.
+See [raw process windows](h-app/modules/office/README.md) for working-directory
+selection and lifecycle details.
+
 ## Container
 
 `container/Dockerfile`, `container/compose.yaml`, and the optional

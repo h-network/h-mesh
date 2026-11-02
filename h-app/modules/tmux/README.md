@@ -18,6 +18,22 @@ same as every module owning its own daemon logic.
 - `run_tmux()` and `ControlModeClient.start()` pass explicit `-S <socket>` if specified, and strip ambient `TMUX`/`TMUX_PANE` from the subprocess environment so tmux natively computes its socket path under `TMUX_TMPDIR` without preferring outer sessions.
 Never run anything in this module against an unset or ambient tmux server.
 
+## Raw process windows
+
+`create_run_window` backs `office run` and bypasses agent enrollment, guide
+generation, and `window_env`. Raw windows use the reserved `__run__` prefix:
+underscores are invalid in participant addresses, and `submit_text` also
+rejects this namespace before issuing a tmux command. The reconciler excludes
+these windows from stale-window cleanup and agent restart tracking, including
+when the registry has no tmux agents.
+
+A new window initially holds a private placeholder process while
+`remain-on-exit` and rename protection are set. Only then is the requested
+literal argv launched, with agent identity and custody variables removed.
+This preserves even a command that exits immediately; no automatic respawn
+is registered. Failure cleanup targets only the unique window id returned by
+that creation. Existing names are refused, never replaced.
+
 `message_opener` pastes `[message from {source}] {text}`, unchanged from
 before opt-in reply correlation existed, for every message. When `source`
 is an api-type participant, a second line follows:

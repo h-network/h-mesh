@@ -28,6 +28,31 @@ The first tmux hire becomes lead when the registry is empty; later hires
 preserve the incumbent. Registry membership and the lead selection are
 published atomically before tmuxhost creates panes and their guides.
 
+`office run NAME [--cwd PATH] [-- COMMAND ...]` opens a shell or raw command
+in the existing office tmux session, separately from `hire`. Omitting the
+command starts `bash -il`; use `--` before an explicit command and its literal
+arguments (`office run monitor -- top`). The working directory defaults to
+the caller's current directory. This local operation uses `TMUX_SESSION`
+(or `TENANT`) and the explicitly isolated tmux socket/tmpdir; it sends no
+envelope and enrolls no participant.
+
+Run it from the operator's shell outside the office. The shared tmux isolation
+guard remains in force: invocation from inside the office refuses an explicit
+socket that matches the caller's ambient `$TMUX` server. This command does not
+provide an override for that refusal.
+
+The physical window is named `__run__NAME`, which cannot be an envelope
+address. It receives no agent identity, custody hooks, or generated guides.
+Direct sends and broadcasts cannot target it, and tmux's message-paste helper
+refuses that namespace. Its process runs once: exited output and exit status
+stay in a dead pane for inspection, with no agent restart, resume, presence,
+or stall tracking. The reconciler preserves these windows even with an empty
+agent roster. Close it explicitly, for example
+`tmux -S "$TMUX_SOCKET" kill-window -t "$TMUX_SESSION:__run__monitor"`;
+closing it does not recreate it. Reusing an existing run name fails instead
+of replacing or restarting the process. Ordinary manual typing in a run shell
+remains available through tmux. Do not rename it into an agent window.
+
 Board transitions run in one isolated Lua script and preflight both Redis key
 types before mutation; `take` also checks destination emptiness before its
 first write. This keeps the one-doing-ticket invariant under concurrent

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Set
 
 from core.config import state_path
+from core.keys import validate_segment
 from core.logging import log_record
 from lib.paths import build_pane_path, get_agent_workdir, get_workdir_root, resolve_venv_bin
 from lib.profile_env import resolve_claude_profile_env
@@ -39,6 +40,22 @@ class TmuxCommandError(RuntimeError):
         self.code = code
         self.stderr = stderr
         super().__init__(f"{command} failed ({code}): {stderr or 'no error output'}")
+
+
+RUN_WINDOW_PREFIX = "__run__"
+
+
+def is_run_window(name: str) -> bool:
+    """Reserved tmux names, deliberately invalid as envelope addresses."""
+    return name.startswith(RUN_WINDOW_PREFIX)
+
+
+def run_window_name(name: str) -> str:
+    try:
+        validate_segment(name)
+    except KeyError:
+        raise ValueError("run name must be a valid lowercase, non-numeric office name") from None
+    return RUN_WINDOW_PREFIX + name
 
 
 def require_isolated_tmux(socket: str | None = None) -> None:
@@ -968,6 +985,66 @@ def kill_window(session_name: str, window_name: str, socket: str | None = None) 
     return ret, out, err
 
 
+def create_run_window(
+    session_name: str,
+    name: str,
+    command: list[str] | None = None,
+    *,
+    cwd: str | None = None,
+    socket: str | None = None,
+) -> str:
+    """Launch once, outside agent enrollment, guides, delivery, and restart."""
+    window_name = run_window_name(name)
+    command = ["bash", "-il"] if command is None else command
+    if not command or any(not isinstance(arg, str) or "\0" in arg for arg in command):
+        raise ValueError("run requires a non-empty command argv without NUL characters")
+    directory = Path(cwd or os.getcwd()).expanduser().resolve()
+    if not directory.is_dir():
+        raise ValueError("run working directory must exist")
+    if window_name in list_windows(session_name, socket=socket):
+        raise ValueError(f"run window {window_name!r} already exists; close it before reusing the name")
+
+    def checked(*args: str) -> str:
+        code, out, err = run_tmux(*args, socket=socket)
+        if code != 0:
+            raise TmuxCommandError(args[0], code, err)
+        return out
+
+    # Hold this new window until retention and rename protection are set.
+    # Otherwise a short command can exit before remain-on-exit is enabled.
+    raw_ids = checked(
+        "new-window", "-d", "-P", "-F", "#{window_id} #{pane_id}",
+        "-t", f"{session_name}:", "-n", window_name, "-c", str(directory),
+        "/bin/sleep", "86400",
+    ).split()
+    if len(raw_ids) != 2 or not re.fullmatch(r"@[0-9]+", raw_ids[0]) or not re.fullmatch(r"%[0-9]+", raw_ids[1]):
+        raise RuntimeError("tmux returned invalid identifiers for the new run window")
+    window_id, pane_id = raw_ids
+    try:
+        # Concurrent creators may both pass the first name check. Only our
+        # returned window id is ever removed on failure, never a name match.
+        names = checked("list-windows", "-t", session_name, "-F", "#{window_name}").splitlines()
+        if names.count(window_name) != 1:
+            raise ValueError(f"run window {window_name!r} was created concurrently")
+        checked("set-window-option", "-t", window_id, "remain-on-exit", "on")
+        checked("set-window-option", "-t", window_id, "automatic-rename", "off")
+        checked("set-window-option", "-t", window_id, "allow-rename", "off")
+        # No window_env(): a raw process gets neither an agent identity nor
+        # the invoking agent's custody hooks. argv is passed without a shell.
+        env_args = ["env"]
+        for key in ("AGENT_NAME", "TASK_RECORD", "H_MESH_CUSTODY_FILE", "H_MESH_WRITER"):
+            env_args.extend(["-u", key])
+        env_args.append(f"PATH={build_pane_path()}")
+        checked("respawn-pane", "-k", "-t", pane_id, *env_args, *command)
+    except Exception:
+        try:
+            run_tmux("kill-window", "-t", window_id, socket=socket)
+        except Exception:
+            pass
+        raise
+    return window_name
+
+
 def submit_text(
     session_name: str,
     agent_name: str,
@@ -975,6 +1052,8 @@ def submit_text(
     stream_id: str = "",
     socket: str | None = None,
 ) -> None:
+    if is_run_window(agent_name):
+        raise ValueError("raw process windows do not accept message delivery")
     target = f"{session_name}:{agent_name}"
     nonce = os.urandom(8).hex()
     sid_part = f"_{stream_id}" if stream_id else ""

@@ -545,6 +545,33 @@ def _text(value) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
+def _run_command(argv: list[str]) -> None:
+    parser = _operation_parser(
+        "run", "Open a non-addressable process window; not an agent. "
+        "Use: office run NAME [--cwd PATH] [-- COMMAND ...]. "
+        "Default: bash -il. Exited commands stay visible and are never restarted.",
+    )
+    parser.add_argument("name", help="window label (lowercase office-name syntax)")
+    parser.add_argument("--cwd", type=Path, help="working directory (default: current directory)")
+    separator = argv.index("--") if "--" in argv else None
+    args = parser.parse_args(argv if separator is None else argv[:separator])
+    command = None if separator is None else argv[separator + 1:]
+    if command == []:
+        parser.error("provide a command after --, or omit -- for a shell")
+    session = os.environ.get("TMUX_SESSION") or os.environ.get("TENANT")
+    if not session:
+        raise OfficeError("run requires TMUX_SESSION or TENANT for an existing office session")
+    from modules.tmux.ops import create_run_window
+    try:
+        window = create_run_window(
+            session, args.name, command, cwd=str(args.cwd) if args.cwd else None,
+            socket=os.environ.get("TMUX_SOCKET"),
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise OfficeError(str(exc)) from exc
+    print(f"opened non-addressable window {window} in {session}")
+
+
 def _fields(raw: dict) -> dict[str, str]:
     return {_text(key): _text(value) for key, value in raw.items()}
 
@@ -1926,6 +1953,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("contexts",), "list a claude_sdk agent's live memory contexts", _contexts_command),
     (("status",), "show agent presence and open work", _status_command),
     (("hire",), "enrol a new agent", lambda argv: _lifecycle_command("hire", argv)),
+    (("run",), "open a non-addressable shell or command window", _run_command),
     (("let-go",), "retire an agent", lambda argv: _lifecycle_command("letGo", argv)),
     (("pause",), "pause an agent's CLI", lambda argv: _lifecycle_command("pause", argv)),
     (("resume",), "resume an agent's CLI and inbox", lambda argv: _lifecycle_command("resume", argv)),
