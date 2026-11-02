@@ -76,6 +76,21 @@ transport stream id—after the envelope is admitted. This is the allocated
 identity the board will use if downstream creation succeeds, not proof that a
 ticket was created. Transport and custody logs establish later delivery states.
 
+`office add --authority TEXT` sets the ticket's authoritative directive once, at
+creation: what the creator is instructing or approving, up to 2000 characters.
+The assignee reads it in `office take` / `office show` as
+`"authority": {"text", "by", "ts"}` and reconciles from the ticket rather than
+from forwarded chat. Only the text travels in the envelope: `by` is the
+switch-stamped L2 source of the AddTicket and `ts` is the ticket's creation
+time, both written by `lib.board_interaction.add_ticket`, so a payload cannot
+claim another author (any `by`/`ts` it carries is discarded; a missing,
+blank, non-string or over-length text leaves the ticket without the field).
+The field is carried through take, hold, return and done like the other
+ticket fields, and an older reader simply omits it. It is deliberately not
+editable afterwards: to supersede a directive, add a new ticket with
+`--related <old-id>` and cancel or delete the old one. A quoted approval
+chain, expiry or per-directive history are not modelled.
+
 `office delete ID` is deliberately scoped to the caller's own board. Delegated
 creation is not authority to destroy another agent's queued or in-flight work,
 even when the caller originally raised it. A miss therefore names that scope
