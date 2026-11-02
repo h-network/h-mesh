@@ -1921,7 +1921,7 @@ def test_git_clone_restores_workspace_ownership_after_clone(monkeypatch, tmp_pat
         calls.append(cmd)
         if cmd[:2] == ["git", "clone"]:
             target.mkdir(parents=True, exist_ok=True)
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return office_cli.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     chowned = []
     monkeypatch.setattr(office_cli.subprocess, "run", fake_run)
