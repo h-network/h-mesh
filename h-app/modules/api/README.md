@@ -40,6 +40,15 @@ that the agent currently cannot accept a prompt, so clients must not use it as
 an admission gate. They may show it as a warning; the attempted send's own
 result is the evidence for whether new work was admitted.
 
+`ingress_stalled` is `null` while the destination's ingress is empty or draining.
+When the switch's stall monitor sees the same frame at the head of a non-empty,
+unpaused ingress for `INGRESS_STALL_SECONDS` (default 60) it becomes an object
+`{since, depth, head_stream_id, lease, port_type}`: nothing is consuming that
+queue. `lease` is `held` when a port holds the delivery lease but is not
+draining (hung) and `absent` when nothing runs or each kick dies (crash loop,
+missing handler). It is evidence, not a verdict on the agent, and clears when
+the queue drains. See `core/README.md`.
+
 `GET /agents/{agent}/contexts` lists the hot-tier memory contexts a
 `claude_sdk` agent (see `modules/claude_sdk/README.md`) currently has live
 turns for -- `{"agent": "...", "contexts": [...]}`. 404 for an unknown agent

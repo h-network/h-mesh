@@ -11,6 +11,11 @@ from core.keys import prefix
 from core.logging import log_record, record_task_event
 
 
+# Longest directive text a ticket will carry. Longer instructions belong in
+# `description` or an attachment; this field is the short, authoritative line.
+AUTHORITY_MAX_CHARS = 2000
+
+
 class BoardError(ValueError):
     """A stored board entry could not be read as a ticket."""
 
@@ -39,6 +44,31 @@ def valid_notes(value) -> list[dict]:
         if isinstance(item, dict)
         and all(isinstance(item.get(key), str) for key in ("ts", "by", "text"))
     ]
+
+
+def authority_block(text, *, by: str, ts: str) -> dict | None:
+    """The ticket's authoritative directive, or None if ``text`` is not one.
+
+    ``by`` and ``ts`` come from the receiving side (the switch-stamped L2
+    source and the creation time), never from the payload: the field exists so
+    an agent can tell who actually issued the instruction, and a creator-supplied
+    "by" would let the field lie about exactly that.
+    """
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    if not text or len(text) > AUTHORITY_MAX_CHARS:
+        return None
+    return {"text": text, "by": by, "ts": ts}
+
+
+def _valid_authority(value) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    text, by, ts = value.get("text"), value.get("by"), value.get("ts")
+    if not (isinstance(text, str) and text and isinstance(by, str) and isinstance(ts, str)):
+        return None
+    return {"text": text, "by": by, "ts": ts}
 
 
 def normalize_ticket(raw, *, state: str | None = None) -> dict:
@@ -87,6 +117,9 @@ def normalize_ticket(raw, *, state: str | None = None) -> dict:
         # Kept so take/done/hold/return/reopen carry the durable progress
         # record through every re-serialization instead of silently dropping it.
         normalized["notes"] = notes
+    authority = _valid_authority(ticket.get("authority"))
+    if authority is not None:
+        normalized["authority"] = authority
     raw_related = ticket.get("related")
     if isinstance(raw_related, list):
         related = [value for value in raw_related if isinstance(value, str)]
@@ -119,7 +152,7 @@ def add_ticket(r, *, pod: str, tenant: str, agent: str, envelope: dict) -> None:
         return [value for value in raw if isinstance(value, str)] if isinstance(raw, list) else []
 
     if isinstance(payload, dict) and "v" in payload and "id" in payload:
-        ticket_obj = payload
+        ticket_obj = dict(payload)
     elif isinstance(payload, dict) and "id" in payload:
         ticket_obj = {
             "v": 1,
@@ -157,6 +190,15 @@ def add_ticket(r, *, pod: str, tenant: str, agent: str, envelope: dict) -> None:
         related = _related(payload)
         if related:
             ticket_obj["related"] = related
+
+    # Whatever the payload claimed, `authority` is rebuilt from the requested
+    # text with receiver-stamped provenance (see authority_block).
+    requested = payload.get("authority") if isinstance(payload, dict) else None
+    requested_text = requested.get("text") if isinstance(requested, dict) else requested
+    ticket_obj.pop("authority", None)
+    authority = authority_block(requested_text, by=source, ts=ticket_obj.get("created_ts") or "")
+    if authority is not None:
+        ticket_obj["authority"] = authority
 
     todo_key = prefix(pod, tenant, agent=agent, resource="tasks.todo")
     try:

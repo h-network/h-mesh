@@ -572,19 +572,26 @@ def has_session_history(
 def start_agent_command(
     cli: str,
     resume: bool = False,
+    model: str | None = None,
 ) -> list[str]:
-    """Construct the h-agent argv list for the given CLI and resume mode."""
+    """Construct h-agent argv; the optional vendor model is CLI passthrough."""
+    model_args = []
+    if model:
+        if cli == "codex":
+            model_args = ["-c", f"model={json.dumps(model, ensure_ascii=False)}"]
+        else:
+            model_args = ["--model", model]
     if not resume:
-        return ["h-agent", cli]
+        return ["h-agent", cli, *model_args]
 
     if cli == "claude":
-        return ["h-agent", "claude", "--continue"]
+        return ["h-agent", "claude", "--continue", *model_args]
     elif cli == "codex":
-        return ["h-agent", "codex", "resume", "--last"]
+        return ["h-agent", "codex", "resume", "--last", *model_args]
     elif cli == "agy":
-        return ["h-agent", "agy", "--continue"]
+        return ["h-agent", "agy", "--continue", *model_args]
     else:
-        return ["h-agent", cli, "--continue"]
+        return ["h-agent", cli, "--continue", *model_args]
 
 
 def _seed_profile_dirs(profile: str | None) -> None:
