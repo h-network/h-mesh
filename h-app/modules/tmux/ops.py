@@ -532,7 +532,9 @@ def has_session_history(
                 with p.open("rb") as f:
                     raw = f.readline()
                 record = json.loads(raw)
-                payload = record.get("payload") if isinstance(record, dict) else None
+                if not isinstance(record, dict):
+                    continue
+                payload = record.get("payload")
                 if (
                     record.get("type") == "session_meta"
                     and isinstance(payload, dict)
