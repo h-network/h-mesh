@@ -18,6 +18,11 @@ separate reconciler daemon as two different things.
 Nothing per-request (e.g. `agentlifecycle`) and nothing CLI-invoked (e.g.
 `office`) belongs here.
 
+`services.daemons` enables the REST API when `API_TOKEN` is non-empty, even
+without Telegram. A complete `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` pair also
+enables the API and continues to gate the Telegram bot and session daemon.
+An API-only opt-in does not start those companions or relax API bind/TLS checks.
+
 `services.daemons` writes a numeric `.pid` file for compatibility and a paired
 `.pid.identity` record containing the process's Linux `/proc` start time. Stop
 opens a Linux pidfd before checking that identity and sends every signal through

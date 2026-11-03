@@ -351,6 +351,9 @@ h-app/tests/test_daemons.py::test_resolve_config_live_env_overrides_persisted_te
 h-app/tests/test_daemons.py::test_merged_daemon_env_includes_persisted_token_not_in_base_env
 h-app/tests/test_daemons.py::test_merged_daemon_env_base_env_overrides_persisted
 h-app/tests/test_daemons.py::test_enabled_daemon_modules_is_just_the_base_set_without_telegram_config
+h-app/tests/test_daemons.py::test_api_token_enables_only_the_api_without_telegram[token-only]
+h-app/tests/test_daemons.py::test_api_token_enables_only_the_api_without_telegram[empty-token]
+h-app/tests/test_daemons.py::test_api_token_enables_only_the_api_without_telegram[partial-telegram]
 h-app/tests/test_daemons.py::test_enabled_daemon_modules_adds_api_telegram_bot_and_session_when_both_present
 h-app/tests/test_daemons.py::test_enabled_daemon_modules_requires_both_token_and_chat_id
 h-app/tests/test_daemons.py::test_start_daemons_starts_an_optional_daemon_when_requested_in_daemon_modules
