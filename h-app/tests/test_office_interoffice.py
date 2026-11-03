@@ -134,6 +134,7 @@ def test_send_office_posts_the_contract_and_records_the_sender(monkeypatch, caps
         "sender": "architect", "sender_incarnation": "inc-1", "office": "beta", "agent": "scout",
     }
     assert stored["ts"]
+    assert stored["correlation_id"] == "c" * 32
     assert r.set_ttls[key] == 86400
     # Nothing went onto the local bus.
     assert not r.lists
@@ -147,6 +148,19 @@ def test_send_office_without_known_incarnation_records_null(monkeypatch, remote)
     run(r, ["send", "--office", "beta", "-a", "scout", "hi"], monkeypatch)
     stored = json.loads(r.values[prefix(POD, TENANT, resource=f"xsent.s{STREAM_ID}")])
     assert stored["sender_incarnation"] is None
+    assert stored["correlation_id"] is None
+
+
+@pytest.mark.parametrize("fields", [{}, {"correlation_id": "invalid"}], ids=["missing", "malformed"])
+def test_send_office_invalid_or_missing_correlation_is_not_trusted(monkeypatch, remote, fields):
+    _env(monkeypatch)
+    rem = remote(reply(202, {"stream_id": STREAM_ID, **fields}))
+    r = Redis(registry={"architect": "tmux"})
+    book(r, rem.url)
+    run(r, ["send", "--office", "beta", "-a", "scout", "hi"], monkeypatch)
+    stored = json.loads(r.values[prefix(POD, TENANT, resource=f"xsent.s{STREAM_ID}")])
+    assert stored["correlation_id"] is None
+    assert stored["sender"] == "architect"
 
 
 @pytest.mark.parametrize("argv, fragment", [

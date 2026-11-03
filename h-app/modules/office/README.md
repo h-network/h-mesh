@@ -219,7 +219,7 @@ Redirects are never followed (urllib would replay the Authorization header).
 Error output never contains the token, including text echoed by the server.
 
 **Reply routing.** After a 202 the CLI writes `xsent.s<stream_id>` =
-`{sender, sender_incarnation, office, agent, ts}` with a 24h TTL; the relay
+`{sender, sender_incarnation, correlation_id, office, agent, ts}` with a 24h TTL; the relay
 uses it to hand a reply back to the sender. `sender_incarnation` is read
 before the POST so a same-named successor never inherits a reply (absent means
 the relay treats the reply as uncorrelated). If this write fails the message
@@ -227,6 +227,13 @@ was still sent: the CLI exits 0, warns on stderr, and that one message's reply
 cannot be routed back. A remote agent's reply is only correlated when it
 answers with `--reply-to <stream_id>`, which its pasted message shows because
 the cooperation participant is an api-type source.
+The stored `correlation_id` comes from that accepted outbound envelope's
+202 response, and the reply relay reuses it for local admission after the
+same office/agent/incarnation validation. A missing or invalid response
+correlation is stored as null without changing the already-accepted send's
+outcome; legacy/null correlations preserve reply routing but cannot join the
+original conversation trace. The remote reply's own correlation is not used
+as a substitute.
 
 **Address book (sending side).** Redis, via `core.keys.prefix`:
 

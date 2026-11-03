@@ -86,7 +86,8 @@ class OfficeWorker:
             if not self.store.current(self.office):
                 return False
             self.store.require_relay()
-            destination = self.store.sender(self.office, reply_id, agent) if reply_id is not None else None
+            target = self.store.reply_target(self.office, reply_id, agent) if reply_id is not None else None
+            destination = target.sender if target is not None else None
             if destination is None and time.monotonic() < deadline:
                 self.stop.wait(min(0.1, max(0, deadline - time.monotonic())))
                 continue
@@ -98,6 +99,7 @@ class OfficeWorker:
                 self.store.r, pod=self.store.pod, tenant=self.store.tenant,
                 source="relay", destination=destination, kind="Message",
                 payload={"text": f"[from {self.office.name}/{agent}] {payload['text']}"},
+                correlation_id=target.correlation_id if target is not None else None,
                 module="interoffice",
             )
             logger.info(
