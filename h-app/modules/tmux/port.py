@@ -1,6 +1,7 @@
 """Tmux port: terminal delivery handlers, ingress dispatch, and executable entrypoint."""
 
 import os
+import re
 import signal
 import sys
 from datetime import datetime, timezone
@@ -9,7 +10,7 @@ import redis
 
 from core.channels import DeadLetter, receive
 from core.dispatch import delivery_lock
-from core.keys import prefix
+from core.keys import prefix, validate_segment
 from core.logging import configure_logging
 from core.registry import port_type
 from lib.attachment_schema import validate_attachment_payload
@@ -28,6 +29,35 @@ from .ops import list_windows, submit_text, OFFICE_TOOLS_CMD
 # same "input after the marker" aliveness check that verifies claude/codex now
 # applies to agy too.
 VERIFIABLE_CLIS = frozenset({"claude", "codex", "agy"})
+
+
+# The inter-office relay (modules/interoffice/relay.py) delivers a remote
+# agent's message as local source "relay" with this text prefix.
+RELAY_SOURCE = "relay"
+_RELAY_HEADER = re.compile(r"\[from ([^/\]\s]+)/([^/\]\s]+)\] ")
+
+
+def relayed_reply_hint(text: str) -> str | None:
+    """The working reply command for a relayed message, from its `[from office/agent]` header.
+
+    A reply addressed to the local `relay` participant only lands in its API
+    inbox and never crosses back, so for relayed messages the hint names the
+    remote agent instead. Both names are re-validated as agent segments here:
+    the header is the relay's own prefix at the very start of the text, but the
+    rest of the text is the remote's and this line is read as a command.
+    Returns None for a relay message without a usable header.
+
+    ⚠ No `--reply-to`: `send --office` rejects it (the office-sent record
+    already routes the remote's answer back to whoever sent).
+    """
+    match = _RELAY_HEADER.match(text)
+    if not match:
+        return None
+    try:
+        office, agent = (validate_segment(name) for name in match.groups())
+    except KeyError:
+        return None
+    return f"[reply to {office}/{agent}: {OFFICE_TOOLS_CMD} send --office {office} -a {agent} \"...\"]"
 
 
 def mark_delivery_pending(
@@ -118,7 +148,14 @@ def message_opener(
         # message (tmux-to-tmux included, where nothing would ever read it)
         # would be a permanent width tax on the line every agent actually
         # reads, for a benefit that only exists here. See lib/reply_correlation.py.
-        blocks.append(f"[reply to {source}: {OFFICE_TOOLS_CMD} send -a {source} --reply-to {stream_id} \"...\"]\n")
+        if source == RELAY_SOURCE:
+            # Not the generic hint below: it would send the answer to the local
+            # relay's inbox, not back to the remote agent. No usable header, no hint.
+            relayed = relayed_reply_hint(text)
+            if relayed:
+                blocks.append(relayed + "\n")
+        else:
+            blocks.append(f"[reply to {source}: {OFFICE_TOOLS_CMD} send -a {source} --reply-to {stream_id} \"...\"]\n")
 
     msg = "".join(blocks)
     corr_id = envelope.get("correlation_id")

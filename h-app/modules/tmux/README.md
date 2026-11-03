@@ -30,6 +30,19 @@ existed. `record_delivered()` (`lib/reply_correlation.py`) runs on every
 delivery regardless of source type, so a later `--reply-to` can be
 validated against real provenance.
 
+**Relayed inter-office messages.** The relay delivers a remote agent's message
+as local source `relay` (an api-type participant) with the text prefix
+`[from <office>/<agent>]`. The generic hint above would point the answer at the
+local `relay`, whose API inbox keeps it and nothing crosses back (seen in the
+live laba/labb run). So for source `relay` the hint is instead
+`[reply to <office>/<agent>: office send --office <office> -a <agent> "..."]`,
+taken from that leading header by `relayed_reply_hint`; both names are
+re-validated as agent segments before they reach a line the agent reads as a
+command, only the leading header counts, and a relay message without a usable
+header gets no hint at all. There is no `--reply-to` in it: `send --office`
+rejects that flag, and the office-sent record already routes the remote's answer
+back to the sender. Hints for every other api-type source are unchanged.
+
 ## Agent guide
 
 `write_agent_guide` (called by `create_window` on every hire/reconcile, and by

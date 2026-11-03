@@ -37,7 +37,10 @@ the event stays pending and its cursor does not advance.
 
 Admission uses `core.channels.send`, with local source `relay`, kind `Message`,
 and text prefixed `[from <office>/<agent>]`. Remote names remain untrusted text;
-they never become local source identities. No remote `Command`, lifecycle or
+they never become local source identities. The tmux port reads that
+prefix to print the working reply command
+(`office send --office <office> -a <agent> "..."`) instead of a reply hint at
+the local `relay`; see `modules/tmux/README.md`. No remote `Command`, lifecycle or
 attachment kind is admitted. Unsupported kinds are explicitly rejected and
 checkpointed so one bad entry cannot block later messages. Malformed SSE data,
 policy denials and storage failures leave the cursor unchanged for retry.
