@@ -103,10 +103,14 @@ also:
 - starts the `h-mesh-switch`, `h-mesh-tmux-reconciler` and `h-mesh-watchdog`
   daemons (always-on -- watchdog needs no credentials, and every
   multi-agent office wants presence sampling and stall/silence alerting
-  from the first hire on), and -- only if a Telegram bot was configured --
-  the REST API, Telegram bot, and session daemons too (the bot needs the
+  from the first hire on). A non-empty `API_TOKEN` also enables the REST API
+  without Telegram, for example for inter-office cooperation. Configuring
+  both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` enables the REST API,
+  Telegram bot, and session daemons too (the bot needs the
   API to talk to and session to back its `/watch` command; there's no
   separate "enable the API" question, a configured bot enables all three).
+  An API-only opt-in starts neither Telegram nor session; existing bind/TLS
+  validation still applies to the API.
   All duplicate-safe: a re-run against an already-running install restarts
   nothing that's already up, and a daemon disabled since a previous run
   gets stopped, not orphaned

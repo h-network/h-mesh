@@ -81,11 +81,10 @@ DAEMON_MODULES = {
 # ⚠ session (the WebSocket terminal-streaming door behind the Telegram
 # bot's "watch" command, and the web console's terminal view) is NOT
 # always-on like watchdog: modules.session.app.SessionSettings.from_env()
-# hard-raises RuntimeError without API_TOKEN, and today API_TOKEN is only
-# ever set when Telegram is configured (see the API_TOKEN auto-generation
-# in setup.sh) -- an always-on session would just crash-loop on every
-# install that never configured Telegram. Gated on the same condition as
-# api/telegram_bot for that reason, not folded into DAEMON_MODULES.
+# hard-raises RuntimeError without API_TOKEN. setup.sh generates that token
+# for Telegram, while an operator can opt into the API alone by setting it
+# explicitly. Session remains a Telegram companion, not part of API-only
+# startup, and is not folded into DAEMON_MODULES.
 OPTIONAL_DAEMON_MODULES = {
     "api": "services.api",
     "telegram_bot": "services.telegram_bot",
@@ -103,18 +102,19 @@ def enabled_daemon_modules(env: dict) -> dict[str, str]:
     """The daemons this run should have running: the always-on set, plus the
     optional ones whose required config is actually present in env.
 
-    The Telegram bot needs h-mesh's own REST API to talk to (see
-    clients.telegram.bot's README) -- there's no separate "enable the API"
-    question in the wizard, so a configured Telegram bot enables both.
+    A non-empty API_TOKEN explicitly enables the REST API independently of
+    Telegram. A configured Telegram bot also enables the API it talks to;
+    the bot and session daemon still require both Telegram settings.
     """
     modules = dict(DAEMON_MODULES)
-    if env.get("TELEGRAM_BOT_TOKEN") and env.get("TELEGRAM_CHAT_ID"):
+    telegram_enabled = bool(env.get("TELEGRAM_BOT_TOKEN") and env.get("TELEGRAM_CHAT_ID"))
+    if env.get("API_TOKEN") or telegram_enabled:
         modules["api"] = OPTIONAL_DAEMON_MODULES["api"]
+    if telegram_enabled:
         modules["telegram_bot"] = OPTIONAL_DAEMON_MODULES["telegram_bot"]
         # session backs the bot's "watch" command -- needs API_TOKEN, which
-        # only exists once Telegram is configured (see the module docstring
-        # above), so it rides the same condition rather than getting one of
-        # its own.
+        # is generated when Telegram is configured. An API-only opt-in does
+        # not enable the bot's terminal-streaming companion.
         modules["session"] = OPTIONAL_DAEMON_MODULES["session"]
     return modules
 
