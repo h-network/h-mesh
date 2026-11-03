@@ -15,23 +15,43 @@ Two containerised offices run alongside the untouched default office on `h-lab@1
 | `laba` / `default` | `h-mesh-laba-default` | `/home/h-lab/lab/laba` | `18080` (`http://172.16.0.201:18080`) | `18081` | `architect` (lead), `worker` |
 | `labb` / `default` | `h-mesh-labb-default` | `/home/h-lab/lab/labb` | `18082` (`http://172.16.0.201:18082`) | `18083` | `architect` (lead), `worker` |
 
-To attach interactively to either office on `h-lab`:
+To attach interactively or manage either office container via `docker compose` on `h-lab`:
 
 ```bash
-# Attach to laba (tmux session: default)
+# Attach to laba / labb (tmux session: default)
 /home/h-lab/lab/laba/offices/laba/default/attach.sh
-
-# Attach to labb (tmux session: default)
 /home/h-lab/lab/labb/offices/labb/default/attach.sh
+
+# Start / recreate laba (pass H_MESH_TENANT_ENV_FILE alongside --env-file when driving compose.yaml directly)
+H_MESH_TENANT_ENV_FILE=/home/h-lab/lab/laba/offices/laba/default/.env \
+  docker compose -p h-mesh-laba-default \
+  -f /home/h-lab/lab/laba/container/compose.yaml \
+  -f /home/h-lab/lab/laba/container/compose.ports.yaml \
+  --env-file /home/h-lab/lab/laba/offices/laba/default/.env up -d --build
+
+# Start / recreate labb
+H_MESH_TENANT_ENV_FILE=/home/h-lab/lab/labb/offices/labb/default/.env \
+  docker compose -p h-mesh-labb-default \
+  -f /home/h-lab/lab/labb/container/compose.yaml \
+  -f /home/h-lab/lab/labb/container/compose.ports.yaml \
+  --env-file /home/h-lab/lab/labb/offices/labb/default/.env up -d --build
+
+# Tail logs or stop (keeping state)
+H_MESH_TENANT_ENV_FILE=/home/h-lab/lab/laba/offices/laba/default/.env \
+  docker compose -p h-mesh-laba-default \
+  -f /home/h-lab/lab/laba/container/compose.yaml \
+  -f /home/h-lab/lab/laba/container/compose.ports.yaml \
+  --env-file /home/h-lab/lab/laba/offices/laba/default/.env logs -f
+H_MESH_TENANT_ENV_FILE=/home/h-lab/lab/laba/offices/laba/default/.env \
+  docker compose -p h-mesh-laba-default \
+  -f /home/h-lab/lab/laba/container/compose.yaml \
+  -f /home/h-lab/lab/laba/container/compose.ports.yaml \
+  --env-file /home/h-lab/lab/laba/offices/laba/default/.env down
 ```
 
-> **Pre-check (`services.api` daemon):** Until `setup-agent`'s API-without-Telegram change lands in `services/daemons.py`, verify `services.api` is running in both containers before starting:
-> ```bash
-> for c in h-mesh-laba-default-h-mesh-1 h-mesh-labb-default-h-mesh-1; do
->   docker exec "$c" pgrep -f "services.api" >/dev/null || \
->     docker exec -d "$c" bash -c "cd /app/h-app && /opt/h-mesh/bin/python -u -m services.api >> /home/ubuntu/.h-mesh/run/default/api.log 2>&1"
-> done
-> ```
+> **Note (`H_MESH_TENANT_ENV_FILE` and `services.api` startup):**
+> - `container/compose.yaml` resolves the container's `env_file` from `${H_MESH_TENANT_ENV_FILE:-.env}`. `container/bootstrap.sh` exports `H_MESH_TENANT_ENV_FILE="$ENV_FILE"` automatically; when invoking `docker compose` directly from the CLI, always set `H_MESH_TENANT_ENV_FILE=<env-path>` alongside `--env-file <env-path>` (the generated `SUMMARY.md` snippets currently omit `H_MESH_TENANT_ENV_FILE`).
+> - With `origin/setup-agent/api-daemon-without-telegram` (`3bc4e96`, merged in `12d1a8a`), a non-empty `API_TOKEN` in the office `.env` automatically enables and starts `services.api` on container boot via `services.daemons.enabled_daemon_modules()` without requiring Telegram credentials or a manual `docker exec` start step.
 
 ---
 
@@ -390,9 +410,13 @@ And polling `GET /agents/laba-peer/messages` with the revoked token immediately 
 - **Secret hygiene**: Verified across `/home/ubuntu/.h-mesh/run/default/*.log`, `window.log.jsonl`, `h-mesh-office offices`, `h-mesh-office coops`, error outputs, and `ps -ef` on both containers — zero token secret occurrences in any log, CLI listing, or process argument list.
 
 ### Findings by Lane (Not Modified in This Branch)
-1. **`setup` / `services/daemons.py` (`enabled_daemon_modules`, line 111)**:
-   - `services.api` is currently gated on `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` (`setup-agent/api-daemon-without-telegram` is still pending merge). On an office configured with `API_TOKEN` (and `H_MESH_BIND_PORTS=1`) without Telegram, `setup.sh` starts `switch`, `tmux_reconciler`, `watchdog`, and `interoffice_relay`, but does not start `services.api` automatically. Worked around live on `laba` and `labb` by starting `python -u -m services.api` inside both containers.
-2. **`tmux` / `interoffice` (`modules/tmux/port.py` reply hint on relayed messages)**:
+1. **`setup` / `services/daemons.py` (`enabled_daemon_modules`) — resolved in `12d1a8a`**:
+   - During the initial `98018f6` / `5734b70` testbed runs, `services.api` was still gated on `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` and had to be started manually inside Telegram-free containers. Merging `origin/setup-agent/api-daemon-without-telegram` (`3bc4e96` -> `12d1a8a`) into `origin/architect/inter-office-poc` enables `services.api` automatically whenever `API_TOKEN` is set in `.env`.
+2. **`container/bootstrap.sh` (`SUMMARY.md` compose snippets vs `H_MESH_TENANT_ENV_FILE`)**:
+   - `container/compose.yaml` uses `env_file: - ${H_MESH_TENANT_ENV_FILE:-.env}`. `container/bootstrap.sh` sets `H_MESH_TENANT_ENV_FILE="$ENV_FILE"` when it invokes `docker compose`, but the raw `docker compose -p ... --env-file ...` commands written into `offices/<pod>/<tenant>/SUMMARY.md` omit `H_MESH_TENANT_ENV_FILE=<env-path>`, causing `env file .../container/.env not found` unless `H_MESH_TENANT_ENV_FILE` is provided in the environment (as shown in Section 0 above).
+3. **`tmux` / `interoffice` (`modules/tmux/port.py` reply hint on relayed messages)**:
    - Because `relay` is registered locally as `port_type="api"`, `modules/tmux/port.py` formats every message delivered by `relay` with a second line:
      `[reply to relay: h-mesh-office send -a relay --reply-to <local_stream_id> "..."]`
    - However, `relay` is an inbound-only local participant (outbound inter-office sends go through `h-mesh-office send --office <office> -a <agent> "..."`). If an agent follows the `[reply to relay: h-mesh-office send -a relay ...]` hint literally, the message is queued into the local `pod:<pod>:tenant:<tenant>:agent:relay:mailbox` stream where nothing reads or forwards it. Suppressing the `[reply to relay: ...]` hint for `source == "relay"` (or rendering `[reply to <office>/<agent>: h-mesh-office send --office <office> -a <agent> "..."]`) in `modules/tmux/port.py` would prevent agents from sending replies into the local `relay` mailbox.
+
+See [`docs/inter-office-proof.md`](inter-office-proof.md) for the `2026-11-03` fresh live proof and negative test transcripts on `laba` ↔ `labb`.
