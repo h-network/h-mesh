@@ -43,6 +43,12 @@ class Office:
     token: str = field(repr=False)
 
 
+@dataclass(frozen=True)
+class ReplyTarget:
+    sender: str
+    correlation_id: str | None
+
+
 def parse_office(name, raw, token, *, allow_plaintext: bool) -> Office:
     try:
         name = validate_segment(text(name))
@@ -136,7 +142,8 @@ class Store:
                 except WatchError:
                     continue
 
-    def sender(self, office: Office, reply_id: str, remote_agent: str) -> str | None:
+    def reply_target(self, office: Office, reply_id: str, remote_agent: str) -> ReplyTarget | None:
+        """Bind routing and trace metadata to the same validated local receipt."""
         if not isinstance(reply_id, str) or not _REPLY_ID.fullmatch(reply_id):
             return None
         raw = self.r.get(office_sent_key(self.pod, self.tenant, reply_id))
@@ -155,7 +162,10 @@ class Store:
                 self.r, pod=self.pod, tenant=self.tenant, agent=sender,
             ):
                 return None
-            return sender
+            correlation_id = record.get("correlation_id")
+            if not isinstance(correlation_id, str) or not _REPLY_ID.fullmatch(correlation_id):
+                correlation_id = None
+            return ReplyTarget(sender, correlation_id)
         except (KeyError, TypeError, ValueError, UnicodeError):
             return None
 

@@ -18,7 +18,7 @@ All Redis keys are local to `POD`/`TENANT` through `core.keys.prefix`:
 | `offices` | Hash: office name to JSON `{url, participant, added_by, added_ts}` |
 | `offices.tokens` | Hash: office name to its secret cooperation token |
 | `offices.cursor` | Hash: office name to the last committed SSE entry ID |
-| `xsent.s<stream_id>` | Sender CLI receipt: `{sender, sender_incarnation, office, agent, ts}`, TTL 24 hours |
+| `xsent.s<stream_id>` | Sender CLI receipt: `{sender, sender_incarnation, correlation_id, office, agent, ts}`, TTL 24 hours |
 
 Only the local lead can manage cooperation addresses and credentials through
 the office commands. `office-add` enrolls the local api-type participant
@@ -34,6 +34,24 @@ incarnation, and routes to that enrolled local sender. Missing, expired or
 mismatched provenance falls back to the current local lead. Unsolicited
 messages without `in_reply_to` go straight to the lead. With no enrolled lead,
 the event stays pending and its cursor does not advance.
+
+The receipt's `correlation_id` is the accepted outbound envelope's ID from
+the remote POST's 202 response. For a validated sender mapping the relay
+passes that ID to local `core.channels.send`, so the outbound request and
+locally admitted reply share one correlation across the office boundary.
+The remote reply's own correlation ID is not trusted or copied. Missing,
+expired or mismatched mappings (including stale sender incarnations) use a
+fresh local correlation when falling back to the lead. Legacy receipts
+without a valid 32-character lowercase hex correlation still route to their
+validated sender, but use a fresh correlation; these old IDs cannot be
+reconstructed from a stream ID or SSE cursor.
+
+This does not change stream or reply identifiers: the POST receipt remains
+keyed by the remote outbound `stream_id`, remote `in_reply_to` still selects
+that receipt, and normal local admission creates a new local `stream_id`.
+As before, the relay does not copy the remote `in_reply_to` into the local
+envelope. A replay after the enqueue/checkpoint crash window can therefore
+produce separate local stream IDs with the same original correlation ID.
 
 Admission uses `core.channels.send`, with local source `relay`, kind `Message`,
 and text prefixed `[from <office>/<agent>]`. Remote names remain untrusted text;

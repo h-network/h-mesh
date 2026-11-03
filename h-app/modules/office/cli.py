@@ -2165,6 +2165,9 @@ def _send_to_office(office: str, agent: str, text: str) -> None:
         record["url"], token, agent, {"text": text, "as": record["participant"]},
     )
     stream_id = reply["stream_id"]
+    correlation_id = reply.get("correlation_id")
+    if not is_valid_reply_id(correlation_id):
+        correlation_id = None
     # The message is already accepted: a failed bookkeeping write must not
     # make this look failed (a retry would duplicate it). It only costs reply
     # routing for this one message, which we say out loud.
@@ -2173,6 +2176,7 @@ def _send_to_office(office: str, agent: str, text: str) -> None:
             _key("office_sent", pod, tenant, stream_id),
             json.dumps({
                 "sender": source, "sender_incarnation": sender_incarnation,
+                "correlation_id": correlation_id,
                 "office": office, "agent": agent, "ts": _now(),
             }),
             ex=_OFFICE_SENT_TTL_SECONDS,

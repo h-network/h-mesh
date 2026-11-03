@@ -18,12 +18,15 @@ from core.keys import incarnation_key, office_sent_key, prefix
 from core.service import Switch
 from lib.agentlifecycle.lifecycle import start_agent
 from modules.api.port import deliver_api
+from modules.office import cli as office_cli
 from modules.interoffice.relay import InterofficeRelay, OfficeWorker, sse_events
 from modules.interoffice.store import RelayStateError, Store, cursor_order, parse_office
 from services.daemons import pid_alive, start_daemons, stop_daemons
 
 TOKEN = "coop." + "a" * 16 + "." + "b" * 43
 REPLY_ID = "c" * 32
+OUTBOUND_CORRELATION = "e" * 32
+REMOTE_REPLY_CORRELATION = "f" * 32
 
 
 @pytest.fixture
@@ -65,6 +68,7 @@ def sender_record(store, **changes):
     data = {
         "sender": "alice", "office": "remote", "agent": "worker", "ts": "now",
         "sender_incarnation": store.r.get(incarnation_key(store.pod, store.tenant, "alice")).decode(),
+        "correlation_id": OUTBOUND_CORRELATION,
     }
     data.update(changes)
     store.r.set(office_sent_key(store.pod, store.tenant, REPLY_ID), json.dumps(data), ex=86400)
@@ -75,6 +79,7 @@ def message(cursor="10-0", **changes):
         "kind": "Message", "stream_id": "d" * 32, "cursor": cursor,
         "l2": {"source": "worker", "destination": "visitor"},
         "payload": {"text": "hello from the remote office"}, "in_reply_to": REPLY_ID,
+        "correlation_id": REMOTE_REPLY_CORRELATION,
     }
     data.update(changes)
     return data
@@ -104,12 +109,23 @@ def sse_server():
         responses = []
         status = 200
         location = None
+        posts = []
+        post_reply = {"stream_id": REPLY_ID, "correlation_id": OUTBOUND_CORRELATION}
 
     state = State()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
+
+        def do_POST(self):
+            state.posts.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            body = json.dumps(state.post_reply).encode()
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_GET(self):
             number = len(state.requests)
@@ -164,6 +180,7 @@ def test_fake_sse_reconnect_resumes_and_admits_through_the_local_switch(store, s
     local = json.loads(inbox[0][1][b"envelope"])
     assert local["l2"] == {"source": "relay", "destination": "alice"}
     assert local["kind"] == "Message"
+    assert local["correlation_id"] == OUTBOUND_CORRELATION
     assert local["payload"]["text"] == "[from remote/worker] hello from the remote office"
     assert "in_reply_to" not in local
     assert TOKEN not in caplog.text
@@ -179,6 +196,60 @@ def test_early_reply_waits_for_the_post_receipt_mapping(store):
     OfficeWorker(store, office, mapping_wait=0.4).receive(io.BytesIO(frame(message())))
     writer.join()
     assert egress(store)[0]["l2"]["destination"] == "alice"
+    assert egress(store)[0]["correlation_id"] == OUTBOUND_CORRELATION
+    assert store.cursor(office) == "10-0"
+
+
+def test_post_receipt_correlation_survives_sse_and_local_switch(store, sse_server, monkeypatch):
+    office = add_office(store, sse_server.url)
+    monkeypatch.setattr(office_cli, "_context", lambda: (store.r, store.pod, store.tenant, "alice"))
+    office_cli.main(["send", "--office", "remote", "-a", "worker", "outbound question"])
+    receipt = json.loads(store.r.get(office_sent_key(store.pod, store.tenant, REPLY_ID)))
+    assert receipt["correlation_id"] == OUTBOUND_CORRELATION
+    assert receipt["sender"] == "alice"
+    assert sse_server.posts == [{"text": "outbound question", "as": "visitor"}]
+
+    remote_reply = message()
+    sse_server.responses = [frame(remote_reply)]
+    worker = OfficeWorker(store, office, mapping_wait=0)
+    worker.thread.start()
+    try:
+        wait_until(lambda: store.cursor(office) == "10-0")
+    finally:
+        worker.stop.set()
+        worker.thread.join(timeout=6)
+    assert not worker.thread.is_alive()
+    switch = Switch(
+        store.r, pod=store.pod, tenant=store.tenant,
+        kick=lambda agent, *_: deliver_api(r=store.r, pod=store.pod, tenant=store.tenant, agent=agent),
+    )
+    assert switch.step(timeout=0.1)
+    inbox = store.r.xrange(prefix(store.pod, store.tenant, "alice", "inbox"))
+    assert len(inbox) == 1
+    local = json.loads(inbox[0][1][b"envelope"])
+    assert local["correlation_id"] == receipt["correlation_id"]
+    assert local["correlation_id"] != REMOTE_REPLY_CORRELATION
+    assert local["stream_id"] not in (REPLY_ID, remote_reply["stream_id"])
+    assert local["l2"] == {"source": "relay", "destination": "alice"}
+    assert local["payload"]["text"] == "[from remote/worker] hello from the remote office"
+    assert "in_reply_to" not in local
+
+
+@pytest.mark.parametrize("fields", [
+    {}, {"correlation_id": None}, {"correlation_id": "invalid"}, {"correlation_id": ["invalid"]},
+], ids=["missing", "null", "invalid", "nonstring"])
+def test_legacy_or_invalid_receipt_correlation_keeps_sender_route(store, fields):
+    office = add_office(store)
+    sender_record(store)
+    key = office_sent_key(store.pod, store.tenant, REPLY_ID)
+    receipt = json.loads(store.r.get(key))
+    del receipt["correlation_id"]
+    receipt.update(fields)
+    store.r.set(key, json.dumps(receipt), ex=86400)
+    OfficeWorker(store, office, mapping_wait=0).receive(io.BytesIO(frame(message())))
+    local = egress(store)[0]
+    assert local["l2"]["destination"] == "alice"
+    assert local["correlation_id"] not in (OUTBOUND_CORRELATION, REMOTE_REPLY_CORRELATION)
     assert store.cursor(office) == "10-0"
 
 
@@ -226,6 +297,7 @@ def test_unmatched_or_stale_correlation_falls_back_to_the_current_lead(store, re
         sender_record(store, **record)
     OfficeWorker(store, office, mapping_wait=0).receive(io.BytesIO(frame(message())))
     assert egress(store)[0]["l2"]["destination"] == "lead"
+    assert egress(store)[0]["correlation_id"] not in (OUTBOUND_CORRELATION, REMOTE_REPLY_CORRELATION)
 
 
 def test_unsolicited_message_without_a_lead_remains_uncheckpointed_until_retry(store):
@@ -267,6 +339,7 @@ def test_unenrolled_relay_does_not_create_an_unmanaged_egress_queue(store):
 
 def test_post_admission_checkpoint_failure_has_documented_at_least_once_semantics(store, monkeypatch):
     office = add_office(store)
+    sender_record(store)
     worker = OfficeWorker(store, office, mapping_wait=0)
     checkpoint = store.checkpoint
     monkeypatch.setattr(store, "checkpoint", lambda *_: (_ for _ in ()).throw(redis.ConnectionError()))
@@ -277,6 +350,8 @@ def test_post_admission_checkpoint_failure_has_documented_at_least_once_semantic
     monkeypatch.setattr(store, "checkpoint", checkpoint)
     worker.receive(io.BytesIO(frame(message())))
     assert len(egress(store)) == 2
+    assert {item["correlation_id"] for item in egress(store)} == {OUTBOUND_CORRELATION}
+    assert len({item["stream_id"] for item in egress(store)}) == 2
     assert store.cursor(office) == "10-0"
 
 
