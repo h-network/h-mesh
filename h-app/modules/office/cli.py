@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -52,6 +53,7 @@ from lib.chat_memory import ChatMemory
 from lib.paths import ensure_workdir_ownership, get_workdir_root
 from lib import doc_store
 from lib.paths import get_workdir_root
+from lib.tls_context import TlsConfigError, build_context, check_ca_file, resolve_ca_file
 from lib.reply_correlation import is_valid_reply_id
 
 from .pricing import calculate_cost, load_pricing
@@ -2605,7 +2607,8 @@ def _office_record(r, *, pod: str, tenant: str, name: str) -> dict | None:
     except json.JSONDecodeError:
         record = None
     if not isinstance(record, dict) or not isinstance(record.get("url"), str) \
-            or not isinstance(record.get("participant"), str):
+            or not isinstance(record.get("participant"), str) \
+            or not isinstance(record.get("ca_cert", ""), str):
         raise OfficeError(f"address book entry for office {name!r} is unreadable; re-add it")
     return record
 
@@ -2616,6 +2619,68 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, *args, **kwargs):
         return None
+
+
+def _tls_handler(context: ssl.SSLContext, state: dict) -> urllib.request.HTTPSHandler:
+    """An https handler that records when the TLS handshake finished.
+
+    No application byte is written before it does, so a failure while
+    state["tls"] is still False proves the request was never sent.
+    """
+    class _Connection(http.client.HTTPSConnection):
+        def connect(self):
+            super().connect()
+            state["tls"] = True
+
+    class _Handler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(_Connection, req, context=context)
+
+    return _Handler(context=context)
+
+
+def _office_opener(url: str, ca_cert: str | None):
+    """(opener, state) for one request: no redirects, verifying TLS for https.
+
+    ca_cert is the office's own CA file (address book); H_MESH_CA_CERT is the
+    fallback. Verification is never relaxed.
+    """
+    state = {"tls": False}
+    handlers: list = [_NoRedirect]
+    if url.lower().startswith("https://"):
+        try:
+            context = build_context(resolve_ca_file(ca_cert))
+        except TlsConfigError as exc:
+            raise OfficeError(f"{exc}; fix --ca-cert / H_MESH_CA_CERT") from None
+        handlers.append(_tls_handler(context, state))
+    return urllib.request.build_opener(*handlers), state
+
+
+def _tls_failure(reason: BaseException, url: str, ca_cert: str | None) -> tuple[str, str]:
+    """(what failed, what to do) for an error raised before TLS was established."""
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        why = " ".join((reason.verify_message or str(reason)).split())
+        low, code = why.lower(), reason.verify_code
+        if "mismatch" in low or code in (62, 64):
+            fix = ("use the host name the certificate was issued for, or have the remote "
+                   "office reissue it for this name")
+        elif "expired" in low or code == 10:
+            fix = "the remote office must renew its certificate"
+        elif "not yet valid" in low or code == 9:
+            fix = "check the clock on both sides, or wait until the certificate is valid"
+        else:
+            fix = ("if the remote office uses a private CA, trust it with --ca-cert PATH "
+                   "(or H_MESH_CA_CERT)")
+            if ca_cert:
+                fix += f"; the CA currently configured for this office is {ca_cert}"
+        return f"TLS verification failed: {why}", fix
+    if isinstance(reason, ssl.SSLError):
+        why = " ".join(str(getattr(reason, "reason", None) or reason).split())
+        return (f"TLS handshake with {url} failed: {why}",
+                "check that the url is the https door of an h-mesh office (the other end may be plain http)")
+    why = reason.strerror if isinstance(reason, OSError) and reason.strerror else type(reason).__name__
+    return (f"the connection to {url} broke before the TLS handshake finished: {why}",
+            "check the url, the port and any proxy in between")
 
 
 def _server_body(exc: urllib.error.HTTPError) -> str:
@@ -2666,7 +2731,7 @@ _TOKEN_REASON_TEXT = {
 _NOT_SENT_ERRORS = (ConnectionRefusedError, socket.gaierror)
 
 
-def _post_to_office(url: str, token: str, agent: str, body: dict) -> dict:
+def _post_to_office(url: str, token: str, agent: str, body: dict, ca_cert: str | None = None) -> dict:
     """POST one envelope; return the parsed 202 body.
 
     Raises OfficeError when the failure proves nothing was accepted and
@@ -2679,7 +2744,7 @@ def _post_to_office(url: str, token: str, agent: str, body: dict) -> dict:
         method="POST",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener, tls = _office_opener(url, ca_cert)
     try:
         with opener.open(request, timeout=_OFFICE_HTTP_TIMEOUT_SECONDS) as response:
             status = response.status
@@ -2709,6 +2774,11 @@ def _post_to_office(url: str, token: str, agent: str, body: dict) -> dict:
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, _NOT_SENT_ERRORS):
             raise OfficeError(f"cannot reach the remote office at {url}: {exc.reason}") from None
+        if url.lower().startswith("https://") and not tls["tls"]:
+            # Nothing is written before the handshake completes, so this is
+            # provably NOT sent -- verification and handshake failures included.
+            what, fix = _tls_failure(exc.reason, url, ca_cert)
+            raise OfficeError(f"{what}; the message was NOT sent -- {fix}") from None
         raise OfficeUnknownOutcome(
             f"request to the remote office failed mid-flight ({exc.reason}) -- the message "
             "may have been accepted; do not blindly retry"
@@ -2739,7 +2809,7 @@ class _Link:
     """Result of probing a remote office with a saved/proposed token.
 
     state is one of: ok, mismatch, token_problem, unsupported, unreachable,
-    error. message is one plain line (never carries the token).
+    tls, error. message is one plain line (never carries the token).
     """
     state: str
     message: str
@@ -2747,13 +2817,17 @@ class _Link:
     office: str | None = None
 
 
-def _probe_office(url: str, token: str, expect_participant: str | None) -> _Link:
+def _probe_office(url: str, token: str, expect_participant: str | None,
+                  ca_cert: str | None = None) -> _Link:
     """GET {url}/whoami with the token. Never raises, never follows redirects."""
     request = urllib.request.Request(
         f"{url}/whoami", method="GET",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
     )
-    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        opener, tls = _office_opener(url, ca_cert)
+    except OfficeError as exc:
+        return _Link("tls", str(exc))
     try:
         with opener.open(request, timeout=_OFFICE_PROBE_TIMEOUT_SECONDS) as response:
             status = response.status
@@ -2778,6 +2852,10 @@ def _probe_office(url: str, token: str, expect_participant: str | None) -> _Link
         return _Link("error", (
             f"the remote office answered HTTP {exc.code}{': ' + detail if detail else ''}"))
     except urllib.error.URLError as exc:
+        if url.lower().startswith("https://") and not tls["tls"] \
+                and not isinstance(exc.reason, _NOT_SENT_ERRORS):
+            what, fix = _tls_failure(exc.reason, url, ca_cert)
+            return _Link("tls", f"{what} -- {fix}")
         return _Link("unreachable", f"cannot reach the remote office at {url}: {exc.reason}")
     except (OSError, http.client.HTTPException) as exc:
         return _Link("unreachable", (
@@ -2831,6 +2909,7 @@ def _send_to_office(office: str, agent: str, text: str) -> None:
 
     reply = _post_to_office(
         record["url"], token, agent, {"text": text, "as": record["participant"]},
+        ca_cert=record.get("ca_cert"),
     )
     stream_id = reply["stream_id"]
     correlation_id = reply.get("correlation_id")
@@ -2874,6 +2953,11 @@ def _office_add_command(argv: list[str]) -> None:
     parser.add_argument("--allow-plaintext", action="store_true",
                         help="permit http:// to a non-loopback host (lab test beds only; "
                              "the token then travels in the clear)")
+    parser.add_argument("--ca-cert", metavar="PATH",
+                        help="PEM file (inside this container) of the CA that issued the remote "
+                             "office's https certificate, for a private CA; only that CA is "
+                             "trusted for this office. Default: H_MESH_CA_CERT, else the system "
+                             "trust store. Verification is never turned off")
     parser.add_argument("--no-verify", action="store_true",
                         help="save without asking the remote office (GET /whoami) first; "
                              "for offline use. A wrong participant or token then only "
@@ -2887,6 +2971,14 @@ def _office_add_command(argv: list[str]) -> None:
     if participant in _FIXED_PARTICIPANTS:
         raise OfficeError(f"participant {participant!r} is reserved")
     url, plaintext = _validated_office_url(args.url, allow_plaintext=args.allow_plaintext)
+    ca_cert = None
+    if args.ca_cert is not None:
+        if not url.startswith("https://"):
+            raise OfficeError("--ca-cert only applies to an https:// url")
+        try:
+            ca_cert = check_ca_file(args.ca_cert)
+        except TlsConfigError as exc:
+            raise OfficeError(str(exc)) from None
     token = sys.stdin.read().strip()
     if not _COOP_TOKEN_RE.fullmatch(token):
         raise OfficeError("stdin did not carry a cooperation token of the form coop.<16 hex>.<43 chars>")
@@ -2901,7 +2993,7 @@ def _office_add_command(argv: list[str]) -> None:
         raise OfficeError(f"{_RELAY_PARTICIPANT!r} exists but is not an api participant; it is reserved for the relay")
     verified_as = None
     if not args.no_verify:
-        link = _probe_office(url, token, participant)
+        link = _probe_office(url, token, participant, ca_cert)
         if link.state == "mismatch" and link.participant in _FIXED_PARTICIPANTS:
             raise OfficeError(f"nothing saved: the remote office reports the reserved participant {link.participant!r}")
         if link.state != "ok":
@@ -2912,6 +3004,8 @@ def _office_add_command(argv: list[str]) -> None:
                 raise OfficeError(f"nothing saved: the remote office reports the reserved participant {participant!r}")
         verified_as = link.office or "?"
     record = {"url": url, "participant": participant, "added_by": source, "added_ts": _now()}
+    if ca_cert:
+        record["ca_cert"] = ca_cert
     try:
         existed = r.hexists(_key("offices", pod, tenant), name)
         # Token first: the book never names an office whose token is missing.
@@ -2955,6 +3049,8 @@ def _offices_command(argv: list[str]) -> None:
         try:
             rec = json.loads(_text(value))
             line = f"{name}\t{rec['url']}\tas {rec['participant']}\tadded by {rec.get('added_by', '?')}"
+            if isinstance(rec.get("ca_cert"), str) and rec["ca_cert"]:
+                line += f"\tCA {rec['ca_cert']}"
         except (json.JSONDecodeError, KeyError, TypeError):
             print(f"{name}\t(unreadable entry)" + ("\tlink: unreadable entry; re-add it" if args.check else ""))
             bad += 1 if args.check else 0
@@ -2967,12 +3063,13 @@ def _offices_command(argv: list[str]) -> None:
             if not token:
                 link = _Link("token_problem", "no token saved; the lead must re-add it")
             else:
-                link = _probe_office(rec["url"], token, rec["participant"])
+                link = _probe_office(rec["url"], token, rec["participant"], rec.get("ca_cert"))
             if link.state != "ok":
                 bad += 1
             label = {"ok": "ok", "mismatch": "participant mismatch",
                      "token_problem": "token problem", "unsupported": "cannot verify",
-                     "unreachable": "unreachable", "error": "error"}[link.state]
+                     "unreachable": "unreachable", "tls": "TLS problem",
+                     "error": "error"}[link.state]
             line += f"\tlink: {label}" + ("" if link.state == "ok" else f" -- {link.message}")
         print(line)
     if bad:

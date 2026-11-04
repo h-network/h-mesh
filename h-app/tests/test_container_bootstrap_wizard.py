@@ -73,7 +73,8 @@ def _env(bin_dir: Path) -> dict:
     for key in list(env):
         if (key.startswith(("CLAUDE_OAUTH_TOKEN_", "TELEGRAM_"))
                 or key in ("CLAUDE_CODE_OAUTH_TOKEN", "API_TOKEN", "API_TLS_CERT",
-                           "API_TLS_KEY", "H_MESH_ALLOW_PLAINTEXT")):
+                           "API_TLS_KEY", "H_MESH_ALLOW_PLAINTEXT", "H_MESH_CA_CERT",
+                           "SESSION_TLS_CERT", "SESSION_TLS_KEY", "H_MESH_TLS_DIR")):
             del env[key]
     return env
 
@@ -176,6 +177,8 @@ def test_enabling_telegram_forces_a_plaintext_or_tls_decision(tmp_path):
 
 
 def test_telegram_with_a_real_cert_path_persists_cert_and_key_not_plaintext(tmp_path):
+    from _tls_test_material import certificate_pair
+    cert, key = certificate_pair(tmp_path)
     _fake_docker(tmp_path)
     env_file = tmp_path / "office.env"
     output, code = _run_wizard(
@@ -183,13 +186,13 @@ def test_telegram_with_a_real_cert_path_persists_cert_and_key_not_plaintext(tmp_
         env=_env(tmp_path),
         answers=_with_defaults([
             "", "", "", "y", "tg-token-xyz", "12345", "n",
-            "/home/ubuntu/tlscerts/tls.crt", "/home/ubuntu/tlscerts/tls.key",
+            str(cert), str(key), "",
         ]),
     )
     assert code == 0, output
     text = _env_file_text(env_file)
-    assert "API_TLS_CERT=/home/ubuntu/tlscerts/tls.crt" in text
-    assert "API_TLS_KEY=/home/ubuntu/tlscerts/tls.key" in text
+    assert "API_TLS_CERT=/run/h-mesh/tls/api.crt" in text
+    assert "API_TLS_KEY=/run/h-mesh/tls/api.key" in text
     assert "H_MESH_ALLOW_PLAINTEXT" not in text
 
 

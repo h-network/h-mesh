@@ -43,7 +43,7 @@ class Redis(FakeRedis):
 class Remote:
     """A throwaway remote office api door."""
 
-    def __init__(self, handler):
+    def __init__(self, handler, tls=None):
         self.requests = []
         remote = self
 
@@ -67,7 +67,14 @@ class Remote:
                 handler(self)
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
-        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        scheme = "http"
+        if tls is not None:
+            import ssl
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(*tls)
+            self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
+            scheme = "https"
+        self.url = f"{scheme}://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def close(self):
@@ -92,8 +99,8 @@ def reply(code, payload=None, raw=None, headers=()):
 def remote():
     made = []
 
-    def make(handler):
-        rem = Remote(handler)
+    def make(handler, tls=None):
+        rem = Remote(handler, tls=tls)
         made.append(rem)
         return rem
     yield make

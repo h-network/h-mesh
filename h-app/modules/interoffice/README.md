@@ -11,11 +11,23 @@ supported default. For the lab only, `H_MESH_ALLOW_PLAINTEXT=1` explicitly permi
 HTTP. Redirects and URLs containing credentials, queries or fragments are
 refused; tokens never enter process arguments, log messages or tenant env files.
 
+HTTPS uses `lib.tls_context`, shared with the office CLI. Trust precedence is
+the optional record `ca_cert`, then `H_MESH_CA_CERT`, then system roots. A
+specified CA bundle replaces system roots; certificate and hostname checks
+stay enabled. Paths must be readable inside the relay's container. Container
+bootstrap stages an optional host CA at `/run/h-mesh/tls/ca.crt`, mounts it
+read-only, and persists this path into both office and tenant configuration.
+Reconnect rebuilds the context from current files, so repaired CA material can
+recover without weaker verification. TLS failures log a closed reason once per
+state change (invalid CA, untrusted certificate, hostname, validity or handshake),
+and successful reconnection clears that state. Paths, exception text and remote
+certificate subjects never enter relay logs.
+
 All Redis keys are local to `POD`/`TENANT` through `core.keys.prefix`:
 
 | Resource | Contents |
 |---|---|
-| `offices` | Hash: office name to JSON `{url, participant, added_by, added_ts}` |
+| `offices` | Hash: office name to JSON `{url, participant, added_by, added_ts[, ca_cert]}` |
 | `offices.tokens` | Hash: office name to its secret cooperation token |
 | `offices.cursor` | Hash: office name to the last committed SSE entry ID |
 | `relay-seen.o<digest>` | ZSET: newest 4,000 remote stream IDs, ordered by padded numeric SSE cursor |
@@ -112,7 +124,7 @@ cannot be inferred without evidence.
 
 New cooperations start at the oldest retained entry, without tail-seeding.
 `office-add` writes the record and token; **the running relay supervisor** notices
-URL, participant or token changes, replaces the old worker and clears its
+URL, participant, token or per-office CA-path changes, replaces the old worker and clears its
 cursor. `office-add` itself does not clear a cursor, and a supervisor starting
 after an offline configuration change cannot infer its previous in-memory
 settings. A superseded worker cannot append or checkpoint against changed
