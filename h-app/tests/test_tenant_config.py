@@ -2,6 +2,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from services.tenant_config import read_tenant_env, tenant_env_path, write_tenant_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -21,6 +23,26 @@ def test_write_tenant_env_is_chmod_600(monkeypatch, tmp_path):
 
     mode = tenant_env_path("mytenant").stat().st_mode & 0o777
     assert mode == 0o600
+
+
+@pytest.mark.parametrize("existing", [False, True], ids=["new", "existing"])
+def test_tenant_env_is_private_before_secret_write(monkeypatch, tmp_path, existing):
+    monkeypatch.setenv("H_MESH_STATE_DIR", str(tmp_path))
+    path = tenant_env_path("mytenant")
+    if existing:
+        path.parent.mkdir(parents=True)
+        path.write_text("OLD=value\n")
+        path.chmod(0o644)
+    original = Path.write_text
+
+    def checked_write(target, data, *args, **kwargs):
+        if target == path:
+            assert target.stat().st_mode & 0o777 == 0o600
+        return original(target, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", checked_write)
+    write_tenant_env("mytenant", {"API_TOKEN": "fake-secret"})
+    assert read_tenant_env("mytenant")["API_TOKEN"] == "fake-secret"
 
 
 def test_write_tenant_env_overwrites_whole_file(monkeypatch, tmp_path):

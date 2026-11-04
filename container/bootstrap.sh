@@ -6,7 +6,7 @@
 # a separate, smaller wizard than setup.sh's own: it collects what a
 # tenant's env file needs (POD, TENANT, AGENTS, DEFAULT_CLI, Claude account
 # names and OAuth tokens, host port-publishing choice, optional Telegram bot
-# config, and -- if Telegram is enabled -- a TLS-or-plaintext decision),
+# config, and a TLS-or-plaintext decision),
 # writes/updates that file, and
 # hands off to `docker compose up --build` -- setup.sh's own non-interactive
 # path, roster seeding, hire, and daemon-start logic still run, just inside
@@ -60,7 +60,7 @@ Usage: ./setup.sh --container [options]
 
 Collects what an office's env file needs (POD, TENANT, AGENTS,
 DEFAULT_CLI, Claude account names and OAuth tokens, host port publishing,
-optional Telegram bot config, and -- if Telegram is enabled -- a
+optional Telegram bot config, and a
 TLS-or-plaintext decision),
 writes it to offices/<pod>/<tenant>/.env (alongside a regenerated
 SUMMARY.md and executable attach.sh containing no secrets), then runs
@@ -264,7 +264,8 @@ esac
 upsert_env_line() {
     local key="$1" value="$2" tmp
     mkdir -p "$(dirname "$ENV_FILE")"
-    touch "$ENV_FILE"
+    (umask 077; touch "$ENV_FILE") || return 1
+    chmod 0600 "$ENV_FILE" || return 1
     tmp="$(mktemp "${ENV_FILE}.XXXXXX")"
     if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
         sed "s|^${key}=.*|${key}=${value}|" "$ENV_FILE" > "$tmp"
@@ -279,6 +280,21 @@ upsert_env_line POD "$POD"
 upsert_env_line TENANT "$TENANT"
 upsert_env_line AGENTS "$AGENTS"
 upsert_env_line DEFAULT_CLI "$DEFAULT_CLI"
+
+# Bootstrap runs before the container has a tenant config. Persist the API
+# identity here, so Compose and every later recreate inherit the same one.
+# Existing office values win over ambient credentials from another office.
+RESOLVED_API_TOKEN="$(env_file_get API_TOKEN)"
+if [ -z "$RESOLVED_API_TOKEN" ]; then
+    RESOLVED_API_TOKEN="${API_TOKEN:-}"
+    if [ -z "$RESOLVED_API_TOKEN" ]; then
+        RESOLVED_API_TOKEN="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" || exit 1
+        [[ "$RESOLVED_API_TOKEN" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "error: could not generate API_TOKEN" >&2; exit 1;
+        }
+    fi
+    upsert_env_line API_TOKEN "$RESOLVED_API_TOKEN" || exit 1
+fi
 
 check_bool() {
     local val="$1" def="$2"
@@ -441,57 +457,46 @@ if [ "$INTERACTIVE" -eq 1 ]; then
             upsert_env_line TELEGRAM_CHAT_ID "$TELEGRAM_CHAT_ID"
             upsert_env_line TELEGRAM_VOICE "$TELEGRAM_VOICE"
 
-            # ⚠ Telegram unconditionally turns on the api/session doors,
-            # both bound 0.0.0.0 *inside* this container (Dockerfile's
-            # API_BIND/SESSION_BIND) -- container/entrypoint.sh refuses to
-            # start at all without either real TLS certs or an explicit
-            # H_MESH_ALLOW_PLAINTEXT=1. The predecessor project's own
-            # wizard asks exactly this (real cert path / self-signed
-            # generation / explicit plaintext) whenever a door is being
-            # exposed; this container exposes these two the moment
-            # Telegram is on, so the same decision is always required here
-            # too -- forced now, not left to surface as a crash-loop after
-            # the fact (a real outage, not a hypothetical -- see ticket
-            # b87f9f0a's own follow-up).
-            #
-            # Self-signed generation isn't offered here the way the
-            # predecessor project's is: that needs a compose.yaml bind
-            # mount to actually deliver generated cert files into the
-            # container, which doesn't exist yet -- real, separate scope,
-            # not something to improvise under this fix. A real cert path
-            # is still accepted for an operator who has already arranged
-            # to get one into the container themselves (e.g. a manual
-            # compose.yaml volume
-            # edit); this only records the in-container paths.
-            EXISTING_TLS_CERT="$(env_file_get API_TLS_CERT)"
-            EXISTING_PLAINTEXT="$(env_file_get H_MESH_ALLOW_PLAINTEXT)"
-            if [ -z "$EXISTING_TLS_CERT" ] && [ "$EXISTING_PLAINTEXT" != "1" ]; then
-                echo
-                echo "  Telegram turns on the API and session doors, both bound 0.0.0.0"
-                echo "  inside this container -- it will not start without deciding how"
-                echo "  they're reached."
-                read -rp "  Path to a TLS certificate already reachable inside the container (blank to accept plaintext instead): " IN_TLS_CERT
-                if [ -n "$IN_TLS_CERT" ]; then
-                    read -rp "  Path to its key: " IN_TLS_KEY
-                    if [ -z "$IN_TLS_KEY" ]; then
-                        echo "  error: a TLS certificate requires its key" >&2
-                        exit 1
-                    fi
-                    upsert_env_line API_TLS_CERT "$IN_TLS_CERT"
-                    upsert_env_line API_TLS_KEY "$IN_TLS_KEY"
-                else
-                    echo "  ⚠ Plain HTTP inside the container: the api token and everything"
-                    echo "    typed crosses the network unencrypted between the host and this"
-                    echo "    container. Recorded as H_MESH_ALLOW_PLAINTEXT=1 in $ENV_FILE."
-                    upsert_env_line H_MESH_ALLOW_PLAINTEXT 1
-                fi
-            fi
         else
             echo "  ⚠ Both a Telegram Bot Token and Chat ID are required -- Telegram bot not enabled." >&2
             TELEGRAM_BOT_TOKEN=""
             TELEGRAM_CHAT_ID=""
         fi
     fi
+fi
+
+# Compose's env_file is the durable input; persist explicitly supplied
+# transport settings too, so later recreates work from a clean shell.
+for transport_key in API_TLS_CERT API_TLS_KEY SESSION_TLS_CERT SESSION_TLS_KEY H_MESH_ALLOW_PLAINTEXT; do
+    [ -n "${!transport_key:-}" ] && upsert_env_line "$transport_key" "${!transport_key}"
+done
+TLS_CERT="$(env_file_get API_TLS_CERT)"
+TLS_KEY="$(env_file_get API_TLS_KEY)"
+PLAINTEXT="$(env_file_get H_MESH_ALLOW_PLAINTEXT)"
+if [ "$INTERACTIVE" -eq 1 ] && { [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; } && [ "$PLAINTEXT" != "1" ]; then
+    echo
+    echo "  Every office starts the API. Choose how to reach its published port."
+    echo "  TLS paths must already be reachable inside the container."
+    read -rp "  TLS certificate path (blank to explicitly accept plaintext): " TLS_CERT
+    if [ -n "$TLS_CERT" ]; then
+        read -rp "  TLS key path: " TLS_KEY
+        [ -n "$TLS_KEY" ] || { echo "error: a TLS certificate requires its key" >&2; exit 1; }
+        upsert_env_line API_TLS_CERT "$TLS_CERT"
+        upsert_env_line API_TLS_KEY "$TLS_KEY"
+    else
+        echo "  Plaintext sends bearer tokens and messages unencrypted."
+        read -rp "  Accept plaintext for this container? [y/N]: " ACCEPT_PLAINTEXT
+        if ! check_bool "$ACCEPT_PLAINTEXT" n; then
+            echo "error: choose TLS or explicitly accept plaintext to finish the guided install" >&2
+            exit 1
+        fi
+        PLAINTEXT=1
+        upsert_env_line H_MESH_ALLOW_PLAINTEXT 1
+    fi
+fi
+API_ENABLEMENT=""
+if { [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; } && [ "$PLAINTEXT" != "1" ]; then
+    API_ENABLEMENT="API is loopback-only inside the container; published API port $API_PORT is closed. To open it, rerun bootstrap with API_TLS_CERT and API_TLS_KEY (in-container paths), or H_MESH_ALLOW_PLAINTEXT=1 to explicitly accept plaintext."
 fi
 
 echo
@@ -514,10 +519,12 @@ SUMMARY_TG_CHAT="$(env_file_get TELEGRAM_CHAT_ID)"
 SUMMARY_API_TOKEN="$(env_file_get API_TOKEN)"
 echo "  Telegram:     $([ -n "$SUMMARY_TG_TOKEN" ] && [ -n "$SUMMARY_TG_CHAT" ] && echo "enabled, chat id $SUMMARY_TG_CHAT" || echo "not enabled")"
 if { [ -n "$SUMMARY_TG_TOKEN" ] && [ -n "$SUMMARY_TG_CHAT" ]; } || [ -n "$SUMMARY_API_TOKEN" ]; then
-    if [ -n "$(env_file_get API_TLS_CERT)" ]; then
+    if [ -n "$TLS_CERT" ] && [ -n "$TLS_KEY" ]; then
         echo "  API/session:  TLS ($(env_file_get API_TLS_CERT))"
-    else
+    elif [ "$PLAINTEXT" = "1" ]; then
         echo "  API/session:  plaintext (H_MESH_ALLOW_PLAINTEXT=1)"
+    else
+        echo "  API/session:  loopback-only inside the container"
     fi
 fi
 echo "  Env file:     $ENV_FILE"
@@ -544,10 +551,12 @@ else
     SUMMARY_TELEGRAM="not enabled (disabled)"
 fi
 if { [ -n "$SUMMARY_TG_TOKEN" ] && [ -n "$SUMMARY_TG_CHAT" ]; } || [ -n "$SUMMARY_API_TOKEN" ]; then
-    if [ -n "$(env_file_get API_TLS_CERT)" ]; then
+    if [ -n "$TLS_CERT" ] && [ -n "$TLS_KEY" ]; then
         SUMMARY_TLS="TLS ($(env_file_get API_TLS_CERT))"
-    else
+    elif [ "$PLAINTEXT" = "1" ]; then
         SUMMARY_TLS="plaintext (H_MESH_ALLOW_PLAINTEXT=1)"
+    else
+        SUMMARY_TLS="loopback-only inside the container"
     fi
 else
     SUMMARY_TLS="not enabled"
@@ -575,6 +584,8 @@ cat > "$SUMMARY_FILE" <<EOF
 - **Telegram:** $SUMMARY_TELEGRAM
 - **API/session transport:** $SUMMARY_TLS
 - **Compose project name:** $PROJECT_NAME
+
+$API_ENABLEMENT
 
 ## Commands
 
@@ -629,3 +640,7 @@ echo "  Logs:    docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_
 echo "  Status:  docker ps --filter name=$PROJECT_NAME"
 echo "  Stop:    docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE down       # keeps state"
 echo "           docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE down -v    # also drops it"
+
+# Keep the action for a closed published port last, after Compose output.
+[ -z "$API_ENABLEMENT" ] || echo "$API_ENABLEMENT"
+exit 0

@@ -17,6 +17,7 @@ to "work by accident" again.
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -93,6 +94,33 @@ def _read_persisted(ctx: dict, monkeypatch) -> dict:
     return read_tenant_env(ctx["tenant"])
 
 
+@pytest.mark.parametrize("initial", [None, ""], ids=["missing", "empty"])
+def test_host_setup_generates_private_api_token_without_telegram_and_keeps_it(noninteractive_env, monkeypatch, initial):
+    ctx = noninteractive_env
+    from services.tenant_config import tenant_env_path
+
+    monkeypatch.setenv("H_MESH_STATE_DIR", ctx["env"]["H_MESH_STATE_DIR"])
+    path = tenant_env_path(ctx["tenant"])
+    if initial is not None:
+        path.parent.mkdir(parents=True)
+        path.write_text("API_TOKEN=\n")
+        path.chmod(0o644)
+    output, code = _run_setup(ctx)
+    assert code == 0, output
+    token = _read_persisted(ctx, monkeypatch)["API_TOKEN"]
+    assert re.fullmatch(r"[0-9a-f]{64}", token)
+    assert token not in output
+    assert path.stat().st_mode & 0o777 == 0o600
+    persisted = _read_persisted(ctx, monkeypatch)
+    modules = enabled_daemon_modules(persisted)
+    assert "api" in modules and "interoffice_relay" in modules
+    assert "session" not in modules and "telegram_bot" not in modules
+    second_output, second_code = _run_setup(ctx)
+    assert second_code == 0, second_output
+    assert _read_persisted(ctx, monkeypatch)["API_TOKEN"] == token
+    assert token not in second_output
+
+
 def test_non_interactive_reads_the_full_wizard_setting_set_from_env_and_persists_it(noninteractive_env, monkeypatch):
     ctx = noninteractive_env
     output, code = _run_setup(ctx, {
@@ -145,8 +173,6 @@ def test_non_interactive_reads_the_full_wizard_setting_set_from_env_and_persists
 def test_non_interactive_explicit_api_token_env_is_persisted_verbatim_not_regenerated(noninteractive_env, monkeypatch):
     ctx = noninteractive_env
     output, code = _run_setup(ctx, {
-        "TELEGRAM_BOT_TOKEN": "fake-bot-token",
-        "TELEGRAM_CHAT_ID": "555444333",
         "API_TOKEN": "caller-supplied-api-token",
     })
     assert code == 0, f"setup.sh exited {code}:\n{output}"
@@ -204,7 +230,7 @@ def test_non_interactive_partial_telegram_env_warns_and_persists_neither(noninte
     persisted = _read_persisted(ctx, monkeypatch)
     assert "TELEGRAM_BOT_TOKEN" not in persisted
     assert "TELEGRAM_CHAT_ID" not in persisted
-    assert "API_TOKEN" not in persisted
+    assert persisted.get("API_TOKEN"), "API is enabled independently of Telegram"
 
 
 def test_non_interactive_agy_with_non_default_account_env_falls_back_to_default(noninteractive_env, monkeypatch):

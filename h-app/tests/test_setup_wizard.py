@@ -166,6 +166,8 @@ def test_wizard_accepting_every_default_hires_a_single_architect_agent(wizard_en
     persisted = read_tenant_env(ctx["tenant"])
     assert persisted.get("AGENTS") == "architect"
     assert persisted.get("DEFAULT_CLI") == "claude"
+    assert persisted.get("API_TOKEN"), "the guided host setup enables API without Telegram"
+    assert persisted["API_TOKEN"] not in output
 
     redis_url = ctx["env"]["REDIS_URL"]
     r = redis.Redis.from_url(redis_url)
@@ -533,7 +535,7 @@ def test_wizard_requires_both_bot_token_and_chat_id(wizard_env, monkeypatch):
     persisted = read_tenant_env(ctx["tenant"])
     assert "TELEGRAM_BOT_TOKEN" not in persisted
     assert "TELEGRAM_CHAT_ID" not in persisted
-    assert "API_TOKEN" not in persisted
+    assert persisted.get("API_TOKEN"), "API is enabled independently of Telegram"
 
 
 def test_wizard_round_trips_a_custom_provider_name_through_a_re_run(wizard_env, monkeypatch):

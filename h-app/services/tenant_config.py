@@ -52,8 +52,10 @@ def write_tenant_env(tenant: str, values: dict[str, str]) -> None:
     content = "\n".join(lines)
     if content:
         content += "\n"
-    path.write_text(content)
+    # Restrict a new or previously permissive file before writing secrets.
+    path.touch(mode=0o600)
     path.chmod(0o600)
+    path.write_text(content)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

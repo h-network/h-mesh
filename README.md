@@ -103,13 +103,13 @@ also:
 - starts the `h-mesh-switch`, `h-mesh-tmux-reconciler` and `h-mesh-watchdog`
   daemons (always-on -- watchdog needs no credentials, and every
   multi-agent office wants presence sampling and stall/silence alerting
-  from the first hire on). A non-empty `API_TOKEN` also enables the REST API
-  without Telegram, for example for inter-office cooperation. Configuring
+  from the first hire on). Setup generates a random `API_TOKEN` once and
+  starts the REST API even without Telegram, for example for inter-office cooperation. Configuring
   both `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` enables the REST API,
   Telegram bot, and session daemons too (the bot needs the
   API to talk to and session to back its `/watch` command; there's no
   separate "enable the API" question, a configured bot enables all three).
-  An API-only opt-in starts neither Telegram nor session; existing bind/TLS
+  The API alone starts neither Telegram nor session; existing bind/TLS
   validation still applies to the API.
   All duplicate-safe: a re-run against an already-running install restarts
   nothing that's already up, and a daemon disabled since a previous run
@@ -172,10 +172,10 @@ container operator can actually do that), and optional Telegram bot config,
 writes them to `offices/<pod>/<tenant>/.env` (alongside a regenerated
 `SUMMARY.md` and executable `attach.sh`, neither of which contains secret
 values), and runs `docker compose up
---build`. Enabling Telegram here also forces the TLS-or-plaintext decision
-described below on the spot -- it can no longer ship silently unresolved
-the way it originally could, which produced a container that refused to
-start with no interactive warning beforehand. Run `./container/bootstrap.sh
+--build`. The interactive wizard always requires a TLS-or-plaintext choice
+for the API, including when Telegram is declined. A certificate path requires
+its key; plaintext requires an explicit yes, so completing the guided install
+with published ports leaves the API reachable. Run `./container/bootstrap.sh
 --help` for its full flag/env surface.
 
 **One office, one directory, one explicit Compose project.** Docker
@@ -240,39 +240,50 @@ always needs some credential, and the choice to enable Telegram is one the
 host wizard already offered. Per-agent account assignment and other
 exceptions (`AGENT_CLIS`/`AGENT_PROFILES`/`AGENT_PROVIDERS`) and local model
 provider config (`PROVIDER_LOCAL_*`) remain file-only. `API_TOKEN` is never
-prompted anywhere, even on a bare host --
-always generated when Telegram is enabled, or set directly in the office
-`.env` to run the REST API without Telegram. `H_MESH_BIND_PORTS=1` selects the ports overlay, while
+prompted anywhere. Both host setup and container bootstrap generate 32 random
+bytes (64 hex characters) when no token is configured, including without
+Telegram. Container bootstrap persists it in `offices/<pod>/<tenant>/.env`
+**before** starting Compose; reruns preserve the existing office token even
+if a different `API_TOKEN` is ambient. A supplied `API_TOKEN` seeds a fresh
+container office. Host setup keeps its existing explicit-env-over-persisted
+precedence and stores the resolved token in `~/.h-mesh/<tenant>/env` (or
+`$H_MESH_STATE_DIR/<tenant>/env`). Neither path regenerates an existing token
+on an ordinary rerun. Both secret files are created/restricted to mode `0600`
+before secrets are written; token values never appear in bootstrap output,
+`SUMMARY.md`, or `attach.sh`. `H_MESH_BIND_PORTS=1` selects the ports overlay, while
 `API_PORT`/`SESSION_PORT` choose the **host** side of that mapping only; the
-api and session doors always bind
-`0.0.0.0:8080`/`0.0.0.0:8081` inside the container (`compose.yaml` and
+api and session doors use fixed internal ports
+`8080`/`8081` inside the container (`compose.yaml` and
 `entrypoint.sh` pin the internal `API_PORT=8080` and `SESSION_PORT=8081` so
 custom host ports in `.env` never move the container's internal listen ports
 away from `compose.ports.yaml`'s `:8080`/`:8081` targets; see the Dockerfile's
 own comment on why), so publishing them is compose's decision, not the
 process's.
 
-As on a bare host, setting `API_TOKEN` starts the `api` daemon, and setting
-`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` together starts the `api`,
-`telegram_bot`, and `session` daemons -- and because
-those doors bind `0.0.0.0` inside the container unconditionally, enabling
-them via `API_TOKEN` or `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` also requires
-either `API_TLS_CERT`/`API_TLS_KEY` or an explicit
-`H_MESH_ALLOW_PLAINTEXT=1` (see `container/.env.example`'s own comment on
-the tradeoff); the entrypoint refuses to start at all with a single clear
-message if neither is set, rather than crash-looping the container with the
-real reason buried in a per-daemon log. This same `API_TLS_CERT`/
-`H_MESH_ALLOW_PLAINTEXT` check is app-level (`modules/api/server.py`,
-`modules/session/app.py`), not container-specific -- it applies to a bare
-host too whenever `API_BIND`/`SESSION_BIND` isn't loopback, though that's
-rare on a host since those default to loopback there. `setup.sh`'s own host
-wizard has no interactive handling of this either; `bootstrap.sh`'s wizard
-is the first place in this project that actually prompts for it, forcing
-the decision the moment Telegram is enabled rather than leaving it to
-surface as a crash-loop afterward: a real cert path (for an operator who
-has already arranged to get one into the container themselves -- there is
-no built-in delivery mechanism for a *generated* one yet) or explicit,
-warned plaintext.
+Each bootstrap starts `api` and the idle `interoffice_relay` without Telegram.
+Setting `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` together additionally starts
+`telegram_bot` and `session`. With `API_TLS_CERT`/`API_TLS_KEY` or explicit
+`H_MESH_ALLOW_PLAINTEXT=1`, the container API listens on `0.0.0.0:8080` and
+can be reached through its published host port. TLS paths refer to files
+already delivered inside the container; bootstrap does not mount or generate
+certificates. Explicitly supplied TLS/plaintext environment settings are
+persisted to the office `.env` for later recreates.
+
+A **non-interactive** bootstrap with neither TLS nor plaintext opt-in still
+starts the office and API. The entrypoint restricts the API (and an enabled
+session door without TLS) to **container loopback**. The published API port
+then remains closed from the host. The last bootstrap output line and the
+office's `SUMMARY.md` explain how to open it: rerun bootstrap with
+`API_TLS_CERT` and `API_TLS_KEY`, or explicitly accept plaintext, for example:
+
+```bash
+H_MESH_ALLOW_PLAINTEXT=1 ./container/bootstrap.sh --pod mypod --tenant mytenant --non-interactive
+```
+
+The app-level refusal of plaintext on non-loopback binds remains in force.
+On bare hosts the API defaults to loopback; configuring a non-loopback host
+bind still requires TLS or the same explicit plaintext opt-in. Session starts
+only with complete Telegram settings, and otherwise stays off.
 
 Three named volumes per office carry state that must survive a container
 recreate: Redis's AOF file, the persisted tenant config, and daemon

@@ -6,7 +6,7 @@
 # terminal, seeds the fixed lifecycle participants (host->office, api->api)
 # in the Redis registry, starts the required daemons (h-mesh-switch,
 # h-mesh-tmux-reconciler, h-mesh-watchdog, the idle inter-office reply relay,
-# h-mesh-api when API_TOKEN is set or Telegram is configured, and the
+# h-mesh-api with a generated/persisted API_TOKEN, and the
 # Telegram bot and h-mesh-session only when Telegram is configured), and
 # hires any agent from the wizard's roster that isn't already running.
 #
@@ -521,7 +521,7 @@ LOCAL_KIND="$(ENV_TENANT_GET "${PROVIDER_KEY_PREFIX}_KIND" vllm)"
 TELEGRAM_BOT_TOKEN="$(ENV_TENANT_GET TELEGRAM_BOT_TOKEN "")"
 TELEGRAM_CHAT_ID="$(ENV_TENANT_GET TELEGRAM_CHAT_ID "")"
 TELEGRAM_VOICE="$(ENV_TENANT_GET TELEGRAM_VOICE "")"
-API_TOKEN="$(ENV_TENANT_GET API_TOKEN "")"
+RESOLVED_API_TOKEN="$(ENV_TENANT_GET API_TOKEN "")"
 
 # Shared by both modes -- interactive only reaches this after a human opts
 # in via "Run the Telegram bot?"; non-interactive has no such prompt, so it
@@ -532,12 +532,7 @@ finalize_telegram() {
     if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
         # ⚠ The bot talks to h-mesh's own REST API (see
         # clients/telegram/README.md) -- there's no separate "enable the
-        # API" setting, a configured bot enables both. A bare-token
-        # API_TOKEN, generated once and persisted like every other secret
-        # here, not typed/exported by anyone.
-        if [ -z "$API_TOKEN" ]; then
-            API_TOKEN="$("$PYTHON" -c 'import secrets; print(secrets.token_hex(16))')"
-        fi
+        # API" setting, a configured bot enables both.
         echo "  (h-mesh's REST API will be started too -- the Telegram bot talks to it)"
     elif [ -n "$TELEGRAM_BOT_TOKEN" ] || [ -n "$TELEGRAM_CHAT_ID" ]; then
         echo "  ⚠ Both a Telegram Bot Token and Chat ID are required -- Telegram bot not enabled." >&2
@@ -690,7 +685,7 @@ if [ "$INTERACTIVE" -eq 1 ]; then
                 if check_bool "$WANT_VOICE" "n"; then TELEGRAM_VOICE=1; else TELEGRAM_VOICE=0; fi
             fi
         fi
-        # Validation (both required), and API_TOKEN generation if so, happen
+        # Validation (both required) happens
         # below unconditionally, in finalize_telegram -- same call non-
         # interactive mode uses, so a human declining here can't diverge
         # from what a non-interactive run with the same env would resolve to.
@@ -728,6 +723,15 @@ if [ "$INTERACTIVE" -eq 0 ]; then
 fi
 
 finalize_telegram
+
+# Every office needs an API identity, including those without Telegram.
+# Keep the resolved env/persisted token on reruns; never print the value.
+# Use a separate variable so generated/persisted values are not mistakenly
+# reported by persist_line as coming from the caller's live environment.
+if [ -z "$RESOLVED_API_TOKEN" ]; then
+    RESOLVED_API_TOKEN="$("$PYTHON" -c 'import secrets; print(secrets.token_hex(32))')" || exit 1
+    [ -n "$RESOLVED_API_TOKEN" ] || exit 1
+fi
 
 # Persist everything resolved above -- only exceptions travel for
 # CLI/account/provider, so the file stays small and readable. Runs every
@@ -788,7 +792,7 @@ fi
 [ -n "$TELEGRAM_BOT_TOKEN" ] && persist_line TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN"
 [ -n "$TELEGRAM_CHAT_ID" ] && persist_line TELEGRAM_CHAT_ID "$TELEGRAM_CHAT_ID"
 [ "$TELEGRAM_VOICE" = "1" ] && persist_line TELEGRAM_VOICE "1"
-[ -n "$API_TOKEN" ] && persist_line API_TOKEN "$API_TOKEN"
+persist_line API_TOKEN "$RESOLVED_API_TOKEN"
 
 if [ -n "$ENV_SOURCED_KEYS" ]; then
     echo "Persisting from live environment:${ENV_SOURCED_KEYS}"

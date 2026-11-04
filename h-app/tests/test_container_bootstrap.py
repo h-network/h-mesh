@@ -6,15 +6,179 @@ scripts in this tree.
 """
 
 import os
+import pty
+import re
+import select
 import stat
 import subprocess
+import time
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = REPO_ROOT / "container" / "bootstrap.sh"
 ENTRYPOINT = REPO_ROOT / "container" / "entrypoint.sh"
 COMPOSE_YAML = REPO_ROOT / "container" / "compose.yaml"
 COMPOSE_PORTS_YAML = REPO_ROOT / "container" / "compose.ports.yaml"
+
+
+def _bootstrap_args(env_file):
+    return ["bash", str(BOOTSTRAP), "--pod", "testpod", "--tenant", "testtenant",
+            "--env-file", str(env_file), "--skip-build"]
+
+
+def _api_token(env_file):
+    return next(line.partition("=")[2] for line in env_file.read_text().splitlines()
+                if line.startswith("API_TOKEN="))
+
+
+@pytest.mark.parametrize("initial", [None, ""], ids=["missing", "empty"])
+def test_bootstrap_generates_private_api_token_without_telegram_and_keeps_it(tmp_path, initial):
+    log = tmp_path / "docker.log"
+    _fake_docker(tmp_path, log)
+    env_file = tmp_path / ".env"
+    if initial is not None:
+        env_file.write_text("API_TOKEN=\nCUSTOM=keep-me\n")
+        env_file.chmod(0o644)
+    env = _env_with_fake_docker(tmp_path)
+    first = subprocess.run([*_bootstrap_args(env_file), "--non-interactive"],
+                           env=env, capture_output=True, text=True, timeout=10)
+    assert first.returncode == 0, first.stderr
+    token = _api_token(env_file)
+    assert re.fullmatch(r"[0-9a-f]{64}", token)
+    assert token not in first.stdout + first.stderr + log.read_text()
+    assert token not in (tmp_path / "SUMMARY.md").read_text()
+    assert token not in (tmp_path / "attach.sh").read_text()
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert "TELEGRAM_BOT_TOKEN=" not in env_file.read_text()
+    # A live credential from another office must not rotate this identity.
+    env["API_TOKEN"] = "different-ambient-office-token"
+    second = subprocess.run([*_bootstrap_args(env_file), "--non-interactive"],
+                            env=env, capture_output=True, text=True, timeout=10)
+    assert second.returncode == 0, second.stderr
+    assert _api_token(env_file) == token
+    assert token not in second.stdout + second.stderr
+    if initial is not None:
+        assert "CUSTOM=keep-me" in env_file.read_text()
+
+
+@pytest.mark.parametrize("source", ["file", "environment"])
+def test_bootstrap_preserves_supplied_api_token_without_printing_it(tmp_path, source):
+    _fake_docker(tmp_path, tmp_path / "docker.log")
+    env_file = tmp_path / ".env"
+    env = _env_with_fake_docker(tmp_path)
+    token = "explicit-test-api-secret"
+    env["H_MESH_ALLOW_PLAINTEXT"] = "1"
+    if source == "file":
+        env_file.write_text(f"API_TOKEN={token}\n")
+    else:
+        env["API_TOKEN"] = token
+    res = subprocess.run([*_bootstrap_args(env_file), "--non-interactive"],
+                         env=env, capture_output=True, text=True, timeout=10)
+    assert res.returncode == 0, res.stderr
+    assert _api_token(env_file) == token
+    assert token not in res.stdout + res.stderr
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert "H_MESH_ALLOW_PLAINTEXT=1" in env_file.read_text()
+
+
+def test_bootstrap_noninteractive_loopback_enablement_is_last_and_in_summary(tmp_path):
+    log = tmp_path / "docker.log"
+    _fake_docker(tmp_path, log)
+    env_file = tmp_path / ".env"
+    res = subprocess.run([*_bootstrap_args(env_file), "--non-interactive", "--api-port", "18090"],
+                         env=_env_with_fake_docker(tmp_path), capture_output=True, text=True, timeout=10)
+    assert res.returncode == 0, res.stderr
+    assert "up -d" in log.read_text()
+    last = res.stdout.strip().splitlines()[-1]
+    assert "published API port 18090 is closed" in last
+    assert "API_TLS_CERT and API_TLS_KEY" in last
+    assert "H_MESH_ALLOW_PLAINTEXT=1" in last
+    assert last in (tmp_path / "SUMMARY.md").read_text()
+    assert "H_MESH_ALLOW_PLAINTEXT=" not in env_file.read_text()
+
+
+def test_bootstrap_random_source_failure_never_starts_without_api_token(tmp_path):
+    log = tmp_path / "docker.log"
+    _fake_docker(tmp_path, log)
+    od = tmp_path / "od"
+    od.write_text("#!/bin/sh\nexit 1\n")
+    od.chmod(0o755)
+    env_file = tmp_path / ".env"
+    res = subprocess.run([*_bootstrap_args(env_file), "--non-interactive"],
+                         env=_env_with_fake_docker(tmp_path), capture_output=True, text=True, timeout=10)
+    assert res.returncode != 0
+    assert "up -d" not in log.read_text()
+    assert "API_TOKEN=" not in env_file.read_text()
+
+
+def _bootstrap_wizard(env_file, env, answers):
+    master, slave = pty.openpty()
+    proc = subprocess.Popen(_bootstrap_args(env_file), env=env,
+                            stdin=slave, stdout=slave, stderr=slave)
+    os.close(slave)
+    output = b""
+    index = 0
+    deadline = time.monotonic() + 15
+    try:
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master], [], [], 0.1)
+            if ready:
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                output += chunk
+                if output.rstrip().endswith(b":") and index < len(answers):
+                    os.write(master, (answers[index] + "\n").encode())
+                    index += 1
+            elif proc.poll() is not None:
+                break
+        proc.wait(timeout=1)
+    finally:
+        os.close(master)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+    return output.decode(errors="replace"), proc.returncode
+
+
+@pytest.mark.parametrize("transport", ["plaintext", "tls"])
+def test_bootstrap_interactive_without_telegram_explicitly_selects_transport(tmp_path, transport):
+    log = tmp_path / "docker.log"
+    _fake_docker(tmp_path, log)
+    env_file = tmp_path / ".env"
+    # agents, CLI, publish, API port, session port, accounts, OAuth, Telegram
+    answers = ["", "", "", "", "", "", "", ""]
+    answers += ["", "y"] if transport == "plaintext" else ["/cert.pem", "/key.pem"]
+    output, code = _bootstrap_wizard(env_file, _env_with_fake_docker(tmp_path), answers)
+    assert code == 0, output
+    assert "Choose how to reach its published port" in output
+    assert "up -d" in log.read_text()
+    assert "TELEGRAM_BOT_TOKEN=" not in env_file.read_text()
+    assert _api_token(env_file) not in output
+    assert "loopback-only" not in output
+    if transport == "plaintext":
+        assert "H_MESH_ALLOW_PLAINTEXT=1" in env_file.read_text()
+        assert "Accept plaintext for this container?" in output
+    else:
+        assert "API_TLS_CERT=/cert.pem" in env_file.read_text()
+        assert "API_TLS_KEY=/key.pem" in env_file.read_text()
+        assert "H_MESH_ALLOW_PLAINTEXT=" not in env_file.read_text()
+
+
+def test_bootstrap_interactive_declining_plaintext_requires_tls(tmp_path):
+    log = tmp_path / "docker.log"
+    _fake_docker(tmp_path, log)
+    env_file = tmp_path / ".env"
+    output, code = _bootstrap_wizard(env_file, _env_with_fake_docker(tmp_path), [""] * 10)
+    assert code != 0
+    assert "choose TLS or explicitly accept plaintext" in output
+    assert "up -d" not in log.read_text()
+    assert "H_MESH_ALLOW_PLAINTEXT=" not in env_file.read_text()
 
 
 def _fake_docker(bin_dir: Path, log_path: Path) -> None:
@@ -39,6 +203,12 @@ _SCRUBBED_BOOTSTRAP_ENV_VARS = (
     "ACCOUNTS",
     "DEFAULT_ACCOUNT",
     "CLAUDE_CODE_OAUTH_TOKEN",
+    "API_TOKEN",
+    "API_TLS_CERT",
+    "API_TLS_KEY",
+    "SESSION_TLS_CERT",
+    "SESSION_TLS_KEY",
+    "H_MESH_ALLOW_PLAINTEXT",
 )
 
 
@@ -48,7 +218,7 @@ def _env_with_fake_docker(bin_dir: Path) -> dict:
     for key in _SCRUBBED_BOOTSTRAP_ENV_VARS:
         env.pop(key, None)
     for key in list(env):
-        if key.startswith("CLAUDE_OAUTH_TOKEN_"):
+        if key.startswith(("CLAUDE_OAUTH_TOKEN_", "TELEGRAM_")):
             del env[key]
     return env
 
@@ -446,7 +616,7 @@ def test_entrypoint_preflight_applies_when_api_token_is_set_without_telegram(tmp
     fake_redis_server = tmp_path / "redis-server"
     fake_redis_server.write_text(
         "#!/usr/bin/env bash\n"
-        f'echo "started" > "{redis_called}"\n'
+        f'printf "%s:%s\\n" "$API_BIND" "$SESSION_BIND" > "{redis_called}"\n'
         "exit 0\n"
     )
     fake_redis_server.chmod(0o755)
@@ -459,6 +629,8 @@ def test_entrypoint_preflight_applies_when_api_token_is_set_without_telegram(tmp
         "POD": "testpod",
         "TENANT": "testtenant",
         "API_TOKEN": "standalone-api-secret",
+        "API_BIND": "0.0.0.0",
+        "SESSION_BIND": "0.0.0.0",
         "REDIS_DATA_DIR": str(tmp_path / "redis-data"),
         "H_MESH_RUN_DIR": str(tmp_path / "run"),
     })
@@ -468,15 +640,17 @@ def test_entrypoint_preflight_applies_when_api_token_is_set_without_telegram(tmp
     base_env.pop("API_TLS_CERT", None)
     base_env.pop("API_TLS_KEY", None)
 
-    refused = subprocess.run(
+    loopback = subprocess.run(
         ["bash", str(ENTRYPOINT)],
         capture_output=True, text=True, timeout=10,
         env=base_env, stdin=subprocess.DEVNULL,
     )
-    assert refused.returncode == 1
-    assert "refusing to start" in refused.stdout
-    assert "API_TOKEN" in refused.stdout
-    assert not redis_called.exists()
+    # The fake Redis exits, but transport preflight must allow the office
+    # to start, selecting safe loopback listeners before Redis is reached.
+    assert "loopback-only" in loopback.stdout
+    assert "H_MESH_ALLOW_PLAINTEXT=1" in loopback.stdout
+    assert redis_called.read_text().strip() == "127.0.0.1:127.0.0.1"
+    redis_called.unlink()
 
     plaintext_env = {**base_env, "H_MESH_ALLOW_PLAINTEXT": "1"}
     allowed_plaintext = subprocess.run(
@@ -485,7 +659,8 @@ def test_entrypoint_preflight_applies_when_api_token_is_set_without_telegram(tmp
         env=plaintext_env, stdin=subprocess.DEVNULL,
     )
     assert "refusing to start" not in allowed_plaintext.stdout
-    assert redis_called.exists()
+    assert "loopback-only" not in allowed_plaintext.stdout
+    assert redis_called.read_text().strip() == "0.0.0.0:0.0.0.0"
 
     redis_called.unlink()
     tls_env = {
@@ -499,7 +674,8 @@ def test_entrypoint_preflight_applies_when_api_token_is_set_without_telegram(tmp
         env=tls_env, stdin=subprocess.DEVNULL,
     )
     assert "refusing to start" not in allowed_tls.stdout
-    assert redis_called.exists()
+    assert "loopback-only" not in allowed_tls.stdout
+    assert redis_called.read_text().strip() == "0.0.0.0:0.0.0.0"
 
     log = tmp_path / "docker_calls.log"
     _fake_docker(tmp_path, log)
