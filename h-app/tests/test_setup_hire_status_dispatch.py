@@ -106,6 +106,7 @@ def _run_setup_with_forced_hire_exits(
     tmpdir = tempfile.mkdtemp(prefix="h_mesh_test_hire_status_dispatch_")
     home_dir = os.path.join(tmpdir, "home")
     os.makedirs(home_dir, exist_ok=True)
+    run_dir = Path(tmpdir) / "run"
     pod = f"testpod-{os.urandom(4).hex()}"
     tenant = f"testtenant-{os.urandom(4).hex()}"
 
@@ -130,6 +131,8 @@ def _run_setup_with_forced_hire_exits(
                 or k.startswith("TELEGRAM_") or k in ("API_TOKEN", "H_MESH_API_TOKEN")):
             del env[k]
     env["HOME"] = home_dir
+    env["H_MESH_RUN_DIR"] = str(run_dir)
+    env["H_MESH_STATE_DIR"] = str(Path(tmpdir) / "state")
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
     env["PYTHONPATH"] = str(REPO_ROOT / "h-app")
     env["POD"] = pod
@@ -153,7 +156,6 @@ def _run_setup_with_forced_hire_exits(
     finally:
         # Include the newly always-enabled API and the relay, rather
         # than leaking any daemon omitted by a fixed name list.
-        run_dir = Path(home_dir) / ".h-mesh" / "run" / tenant
         for pidfile in run_dir.glob("*.pid"):
             try:
                 os.kill(int(pidfile.read_text().strip()), 9)
