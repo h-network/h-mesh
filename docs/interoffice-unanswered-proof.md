@@ -88,8 +88,8 @@ Image `h-mesh-nua-proof:a16a05e` (unique tag). The operator offices
 - The watchdog's pruning of entries written before the fix (offices `home`/`ef`
   upgrading) is covered by `test_unreplied_duration_drops_an_inter_office_entry_without_alerting`
   only.
-- No before/after control on the unfixed commit was run; the bug itself is
-  reproduced by the unit tests failing without the marker check.
+- No before/after control on the unfixed commit was run, so this document proves
+  the fixed behaviour only; the old behaviour is as reported by the operator.
 
 ## Environment notes
 
