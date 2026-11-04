@@ -158,3 +158,28 @@ def verify(r, pod: str, tenant: str, bearer: str) -> dict | None:
     if not isinstance(participant, str) or not isinstance(kinds, list):
         return None
     return {"token_id": token_id, "participant": participant, "kinds": kinds}
+
+
+def diagnose(r, pod: str, tenant: str, bearer: str) -> str:
+    """Why :func:`verify` refused ``bearer``: ``"revoked"`` or ``"unknown_token"``.
+
+    ``"revoked"`` is only reported to a caller that proved the secret (digest
+    matches a revoked record); a wrong secret or unknown id is always
+    ``"unknown_token"``, so this cannot be used to probe which ids exist.
+    Meant for ``GET /whoami`` only. Never returns anything derived from the token.
+    """
+    if not isinstance(bearer, str):
+        return "unknown_token"
+    parts = bearer.split(".")
+    if len(parts) != 3 or parts[0] != TOKEN_PREFIX:
+        return "unknown_token"
+    _, token_id, secret = parts
+    if not _TOKEN_ID_RE.fullmatch(token_id) or not _SECRET_RE.fullmatch(secret):
+        return "unknown_token"
+    record = _load(r.hget(coop_tokens_key(pod, tenant), token_id))
+    expected = (record or {}).get("sha256")
+    if not isinstance(expected, str):
+        return "unknown_token"
+    if hmac.compare_digest(_digest(secret), expected) and record.get("revoked") is True:
+        return "revoked"
+    return "unknown_token"

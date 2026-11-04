@@ -998,6 +998,56 @@ class CoopTokenApiTests(unittest.TestCase):
         self.assertNotIn(secret, json.dumps(outputs))
         self.assertNotIn(secret, json.dumps(self.redis.hashes, default=str))
 
+    def whoami(self, token):
+        return request(self.app, "GET", "/whoami", token=token)
+
+    def test_whoami_reports_the_bound_participant(self):
+        status, body = self.whoami(self.token)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"office": "test/office", "participant": "coop-a", "kinds": ["Message"], "api": 1})
+        self.assertNotIn(self.token.rsplit(".", 1)[1], json.dumps(body))
+
+    def test_whoami_office_wide_token_is_unbound(self):
+        status, body = self.whoami("secret")
+        self.assertEqual(status, 200)
+        self.assertEqual((body["office"], body["participant"], body["api"]), ("test/office", None, 1))
+        self.assertIsInstance(body["kinds"], list)
+
+    def test_whoami_says_why_a_token_is_refused(self):
+        secret = self.token.rsplit(".", 1)[1]
+        wrong = f"coop.{self.token_id}.{'B' * 43}"
+        for token, reason in (
+            (wrong, "unknown_token"),
+            (f"coop.{'0' * 16}.{secret}", "unknown_token"),
+            ("coop.x.y", "unknown_token"),
+            ("nonsense", "unknown_token"),
+            (None, "unknown_token"),
+        ):
+            status, body = self.whoami(token)
+            self.assertEqual((status, body.get("reason")), (401, reason), token)
+            self.assertIsInstance(body["detail"], str)
+        # participant not enrolled (any more) as an api participant
+        del self.redis.registry["coop-a"]
+        status, body = self.whoami(self.token)
+        self.assertEqual((status, body["reason"]), (401, "participant_not_enrolled"))
+        self.redis.registry["coop-a"] = "tmux"
+        self.assertEqual(self.whoami(self.token)[1]["reason"], "participant_not_enrolled")
+        self.redis.registry["coop-a"] = "api"
+        self.assertEqual(self.whoami(self.token)[0], 200)
+        # revoked is reported only to the holder of the real secret
+        self.assertTrue(revoke(self.redis, "test", "office", self.token_id))
+        status, body = self.whoami(self.token)
+        self.assertEqual((status, body["reason"]), (401, "revoked"))
+        self.assertEqual(self.whoami(wrong)[1]["reason"], "unknown_token")
+        self.assertNotIn(secret, json.dumps(body))
+
+    def test_other_routes_keep_a_reasonless_401(self):
+        status, body = request(self.app, "GET", "/agents", token="coop.x.y")
+        self.assertEqual(status, 401)
+        self.assertNotIn("reason", body)
+        revoke(self.redis, "test", "office", self.token_id)
+        self.assertNotIn("reason", self.post("alice", {"text": "hi"})[1])
+
     def test_open_stream_ends_when_token_is_revoked(self):
         sent = []
         revoked = []
