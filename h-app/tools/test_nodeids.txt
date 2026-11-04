@@ -134,6 +134,7 @@ h-app/tests/test_api.py::CoopTokenApiTests::test_malformed_tokens_are_401
 h-app/tests/test_api.py::CoopTokenApiTests::test_non_message_kinds_are_403
 h-app/tests/test_api.py::CoopTokenApiTests::test_office_wide_token_keeps_full_power
 h-app/tests/test_api.py::CoopTokenApiTests::test_open_stream_ends_when_token_is_revoked
+h-app/tests/test_api.py::CoopTokenApiTests::test_other_routes_keep_a_reasonless_401
 h-app/tests/test_api.py::CoopTokenApiTests::test_posts_message_as_its_participant
 h-app/tests/test_api.py::CoopTokenApiTests::test_published_api_does_not_require_signature_for_coop_principal
 h-app/tests/test_api.py::CoopTokenApiTests::test_reads_only_its_own_mailbox
@@ -141,6 +142,9 @@ h-app/tests/test_api.py::CoopTokenApiTests::test_revoked_token_fails_immediately
 h-app/tests/test_api.py::CoopTokenApiTests::test_storage_failure_fails_closed
 h-app/tests/test_api.py::CoopTokenApiTests::test_token_value_never_appears_in_errors_or_stored_state
 h-app/tests/test_api.py::CoopTokenApiTests::test_unknown_destination_is_404_and_remote_is_422
+h-app/tests/test_api.py::CoopTokenApiTests::test_whoami_office_wide_token_is_unbound
+h-app/tests/test_api.py::CoopTokenApiTests::test_whoami_reports_the_bound_participant
+h-app/tests/test_api.py::CoopTokenApiTests::test_whoami_says_why_a_token_is_refused
 h-app/tests/test_api.py::RealApiPortSubprocessTests::test_real_api_module_subprocess_invocation
 h-app/tests/test_api.py::AgentContextsRealRedisTests::test_claude_sdk_agent_with_no_contexts_yet
 h-app/tests/test_api.py::AgentContextsRealRedisTests::test_lists_live_contexts_for_the_agent
@@ -274,6 +278,7 @@ h-app/tests/test_container_bootstrap_wizard.py::test_port_prompt_can_disable_hos
 h-app/tests/test_container_bootstrap_wizard.py::test_multiple_accounts_and_oauth_tokens_are_persisted
 h-app/tests/test_container_bootstrap_wizard.py::test_multiple_account_rerun_keeps_existing_names_and_tokens
 h-app/tests/test_coop_tokens.py::CoopTokensTests::test_corrupt_record_fails_closed
+h-app/tests/test_coop_tokens.py::CoopTokensTests::test_diagnose_says_revoked_only_to_the_secret_holder
 h-app/tests/test_coop_tokens.py::CoopTokensTests::test_grant_shape_and_only_digest_is_stored
 h-app/tests/test_coop_tokens.py::CoopTokensTests::test_grant_validates_participant_and_kinds
 h-app/tests/test_coop_tokens.py::CoopTokensTests::test_list_has_no_secrets
