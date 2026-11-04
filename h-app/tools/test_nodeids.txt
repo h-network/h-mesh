@@ -687,6 +687,11 @@ h-app/tests/test_office_link_verify.py::test_send_office_failures_name_the_cause
 h-app/tests/test_office_link_verify.py::test_send_office_failures_name_the_cause[401_plain]
 h-app/tests/test_office_link_verify.py::test_send_office_failures_name_the_cause[403]
 h-app/tests/test_office_link_verify.py::test_send_office_failures_name_the_cause[404]
+h-app/tests/test_office_link_verify.py::test_real_app_add_succeeds_and_defaults_the_participant
+h-app/tests/test_office_link_verify.py::test_real_app_add_wrong_participant_names_the_right_one
+h-app/tests/test_office_link_verify.py::test_real_app_add_every_refusal_reason
+h-app/tests/test_office_link_verify.py::test_real_app_offices_check_tracks_the_token_lifecycle
+h-app/tests/test_office_link_verify.py::test_real_app_send_names_403_and_404_causes
 h-app/tests/test_office_port.py::test_lifecycle_validation_failure_is_explicit_rejection
 h-app/tests/test_office_port.py::test_lifecycle_unknown_failure_is_not_misclassified_as_rejection
 h-app/tests/test_office_port.py::test_late_validation_rejection_writes_nothing_and_is_dead_letterable

@@ -5,12 +5,20 @@ The remote is a real local http.server speaking the GET /whoami contract:
 of revoked | unknown_token | participant_not_enrolled.
 """
 
+import io
 import json
+import types
+import urllib.error
 from unittest.mock import patch
 
 import pytest
 
 from core.keys import prefix
+from lib.coop_tokens import grant, revoke
+from modules.api.server import ApiSettings, create_app
+from modules.office import cli as office_cli
+from test_api import FakeRedis as ApiRedis
+from test_api import request as asgi_request
 from test_office_cli import POD, TENANT, _env
 from test_office_interoffice import (  # noqa: F401 -- fixtures + helpers
     LEAD, OFFICES, OFFICE_TOKENS, SECRET, TOKEN, Redis, book, exit_code, remote, reply, run,
@@ -250,3 +258,127 @@ def test_send_office_failures_name_the_cause(code, payload, fragment, monkeypatc
     assert exit_code(r, ["send", "--office", "beta", "-a", "scout", "x"], monkeypatch) == 1
     err = capsys.readouterr().err
     assert f"HTTP {code}" in err and fragment in err and TOKEN not in err
+
+
+# ------------------------------------------- against the REAL api app (ASGI)
+# The office CLI is driven against modules.api.server.create_app in-process:
+# urllib's opener is replaced by one that runs the request through the real
+# app, so the 401 reasons, the /whoami body and the coop routing are the
+# server's own, not a re-statement of the contract.
+
+class _Resp:
+    def __init__(self, status, raw):
+        self.status, self._raw = status, raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self, n=-1):
+        return self._raw
+
+
+class _AppOpener:
+    def __init__(self, app):
+        self.app = app
+
+    def open(self, req, timeout=None):
+        from urllib.parse import urlsplit
+        auth = req.get_header("Authorization") or ""
+        status, payload = asgi_request(
+            self.app, req.get_method(), urlsplit(req.full_url).path,
+            token=auth.removeprefix("Bearer ") or None,
+            body=json.loads(req.data) if req.data else None,
+        )
+        raw = json.dumps(payload).encode()
+        if status >= 400:
+            raise urllib.error.HTTPError(req.full_url, status, "err", {}, io.BytesIO(raw))
+        return _Resp(status, raw)
+
+
+@pytest.fixture
+def real_office(monkeypatch):
+    server_redis = ApiRedis()
+    server_redis.registry.update({"coop-a": "api", "alice": "tmux", "telegram": "api"})
+    app = create_app(settings=ApiSettings(pod="test", tenant="office", api_token="secret"),
+                     redis_client=server_redis)
+    monkeypatch.setattr(office_cli.urllib.request, "build_opener",
+                        lambda *handlers: _AppOpener(app))
+    token_id, token = grant(server_redis, "test", "office", "coop-a")
+    return types.SimpleNamespace(redis=server_redis, token_id=token_id, token=token)
+
+
+
+def add_real(r, monkeypatch, token, *extra, participant="coop-a"):
+    argv = ["office-add", "beta", "https://beta.example", "--token-stdin", *extra]
+    if participant:
+        argv += ["--participant", participant]
+    with patch("modules.office.cli.send"):
+        return exit_code(r, argv, monkeypatch, token)
+
+
+def test_real_app_add_succeeds_and_defaults_the_participant(real_office, monkeypatch, capsys):
+    _env(monkeypatch)
+    r = lead_redis()
+    with patch("modules.office.cli.send"):
+        run(r, ["office-add", "beta", "https://beta.example", "--token-stdin"],
+            monkeypatch, real_office.token)
+    assert json.loads(r.hashes[OFFICES]["beta"])["participant"] == "coop-a"
+    assert "verified with the remote office (test/office)" in capsys.readouterr().out
+
+
+def test_real_app_add_wrong_participant_names_the_right_one(real_office, monkeypatch, capsys):
+    _env(monkeypatch)
+    r = lead_redis()
+    assert add_real(r, monkeypatch, real_office.token, participant="someone-else") == 1
+    err = capsys.readouterr().err
+    assert "belongs to participant 'coop-a'" in err and "--participant coop-a" in err
+    assert not r.hashes[OFFICES]
+
+
+def test_real_app_add_every_refusal_reason(real_office, monkeypatch, capsys):
+    _env(monkeypatch)
+    secret = real_office.token.rsplit(".", 1)[1]
+    wrong_secret = f"coop.{real_office.token_id}.{'B' * 43}"
+    r = lead_redis()
+    assert add_real(r, monkeypatch, wrong_secret) == 1
+    assert "does not recognise this token" in capsys.readouterr().err
+    real_office.redis.registry["coop-a"] = "tmux"
+    assert add_real(r, monkeypatch, real_office.token) == 1
+    assert "no longer enrolled" in capsys.readouterr().err
+    real_office.redis.registry["coop-a"] = "api"
+    assert revoke(real_office.redis, "test", "office", real_office.token_id)
+    assert add_real(r, monkeypatch, real_office.token) == 1
+    err = capsys.readouterr().err
+    assert "revoked" in err and secret not in err
+    assert not r.hashes[OFFICES] and not r.hashes[OFFICE_TOKENS]
+
+
+def test_real_app_offices_check_tracks_the_token_lifecycle(real_office, monkeypatch, capsys):
+    _env(monkeypatch)
+    r = Redis()
+    book(r, "https://beta.example", participant="coop-a", token=real_office.token)
+    run(r, ["offices", "--check"], monkeypatch)
+    assert "link: ok" in capsys.readouterr().out
+    book(r, "https://beta.example", participant="other", token=real_office.token)
+    assert exit_code(r, ["offices", "--check"], monkeypatch) == 1
+    assert "link: participant mismatch" in capsys.readouterr().out
+    revoke(real_office.redis, "test", "office", real_office.token_id)
+    book(r, "https://beta.example", participant="coop-a", token=real_office.token)
+    assert exit_code(r, ["offices", "--check"], monkeypatch) == 1
+    assert "link: token problem -- the cooperation token was revoked" in capsys.readouterr().out
+
+
+def test_real_app_send_names_403_and_404_causes(real_office, monkeypatch, capsys):
+    _env(monkeypatch)
+    r = Redis()
+    book(r, "https://beta.example", participant="coop-a", token=real_office.token)
+    assert exit_code(r, ["send", "--office", "beta", "-a", "ghost", "x"], monkeypatch) == 1
+    assert "has no agent 'ghost'" in capsys.readouterr().err
+    assert exit_code(r, ["send", "--office", "beta", "-a", "telegram", "x"], monkeypatch) == 1
+    assert "does not allow this token to send to 'telegram'" in capsys.readouterr().err
+    revoke(real_office.redis, "test", "office", real_office.token_id)
+    assert exit_code(r, ["send", "--office", "beta", "-a", "alice", "x"], monkeypatch) == 1
+    assert "HTTP 401" in capsys.readouterr().err
