@@ -60,6 +60,17 @@ class TmuxReconciler:
             return None
         return raw_prof.decode() if isinstance(raw_prof, bytes) else raw_prof
 
+    def get_agent_model(self, agent: str, provider: dict | None = None) -> str | None:
+        """Vendor selection from the merged tenant env; local providers win."""
+        if provider is not None:
+            return None
+        model = os.environ.get("DEFAULT_MODEL", "")
+        for pair in os.environ.get("AGENT_MODELS", "").split(","):
+            name, separator, value = pair.partition("=")
+            if separator and name == agent:
+                model = value
+        return model or None
+
     def get_agent_provider(self, r: redis.Redis, agent: str) -> dict | None:
         """The model provider this agent runs against, or None for the vendor's.
 
@@ -180,7 +191,9 @@ class TmuxReconciler:
                         should_resume = tmux_ops.has_session_history(initial_window, cli, profile=profile, cwd=cwd)
                     else:
                         should_resume = resume
-                    cmd_args = tmux_ops.start_agent_command(cli, resume=should_resume)
+                    cmd_args = tmux_ops.start_agent_command(
+                        cli, resume=should_resume, model=self.get_agent_model(initial_window, provider),
+                    )
                 else:
                     cmd_args = ["bash", "-il"]
                 cmd.extend(
@@ -241,7 +254,9 @@ class TmuxReconciler:
                 should_resume = tmux_ops.has_session_history(agent_name, cli, profile=profile, cwd=cwd)
             else:
                 should_resume = resume
-            command = env_args + tmux_ops.start_agent_command(cli, resume=should_resume)
+            command = env_args + tmux_ops.start_agent_command(
+                cli, resume=should_resume, model=self.get_agent_model(agent_name, provider),
+            )
         else:
             command = env_args + ["bash", "-il"]
 
@@ -447,10 +462,14 @@ class TmuxReconciler:
         # ⚠ The session must keep at least one window or tmux exits.
         # When the roster is empty, the placeholder __init__ must be preserved, and
         # any stale windows other than __init__ must be removed.
-        # When the roster has active agents, any window not in roster_agents
-        # (including __init__) is stale and should be removed.
+        # When the roster has active agents, any agent window not in
+        # roster_agents (including __init__) is stale. Reserved __run__
+        # windows are outside agent lifecycle and are always preserved.
         if not roster_agents:
-            active_windows = {w for w in existing_windows if w != "__init__"}
+            active_windows = {
+                w for w in existing_windows
+                if w != "__init__" and not tmux_ops.is_run_window(w)
+            }
             if active_windows and not self.allow_empty_roster:
                 msg = (
                     f"Refusing to reap {len(active_windows)} window(s) ({', '.join(sorted(active_windows))}) "
@@ -470,16 +489,18 @@ class TmuxReconciler:
                 else:
                     log_record("tmux_reconciler", "error", destination=placeholder,
                                reason=f"placeholder window failed, keeping stale window: {stderr}")
-            stale = [w for w in sorted(existing_windows) if w != placeholder]
+            stale = [w for w in sorted(existing_windows)
+                     if w != placeholder and not tmux_ops.is_run_window(w)]
         else:
-            stale = [w for w in sorted(existing_windows) if w not in roster_agents]
+            stale = [w for w in sorted(existing_windows)
+                     if w not in roster_agents and not tmux_ops.is_run_window(w)]
 
         for window in stale:
             if len(existing_windows) > 1:
                 if self.kill_window(window):
                     existing_windows.remove(window)
 
-        self._known_windows = set(existing_windows)
+        self._known_windows = {w for w in existing_windows if not tmux_ops.is_run_window(w)}
 
     def run_forever(self) -> None:
         r = redis.Redis.from_url(self.redis_url)

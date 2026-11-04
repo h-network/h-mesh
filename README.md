@@ -65,6 +65,7 @@ container or type `host` for the host path. `--host` skips that picker and
 opens the interactive host wizard: pod/tenant name, how many agents and
 their names (`architect` is agent #1 by default), which CLI each runs
 (claude/codex/agy), account setup if more than one credential is needed,
+optional vendor-model choice (a default and per-agent exceptions),
 optional local model provider config (endpoint URL and model id, verified
 with a real probe against the endpoint before it's accepted), and optional
 Telegram bot config (bot token, chat ID, spoken voice replies). Re-running
@@ -75,7 +76,7 @@ Piped, scripted, or passed `--non-interactive`, it defaults to host unless
 `--container` or `H_MESH_INSTALL_MODE=container` selects container explicitly.
 It never prompts -- flags,
 environment, and whatever's already been configured for that tenant are all
-it uses. Per-agent exceptions (`AGENT_CLIS`, `AGENT_PROFILES`,
+it uses. Per-agent exceptions (`AGENT_CLIS`, `AGENT_MODELS`, `AGENT_PROFILES`,
 `AGENT_PROVIDERS`) are each set as a comma-separated list of `agent=value`
 pairs, e.g. `AGENT_CLIS=worker1=codex,worker2=agy` -- exactly one `=` per
 pair, agent name on the left. A malformed entry (wrong separator, a missing
@@ -142,6 +143,41 @@ h-mesh-office hire <agent-name>
 
 Hiring starts a fresh CLI session by default, even when that agent name has
 local session history. Pass `--resume` to opt into restoring prior history.
+To delete a retired agent's saved history for good, use
+`h-mesh-office purge <agent> --cli <claude|codex|agy> [--profile <account>] --confirm <agent>`
+(refused while the agent is still enrolled; see `h-app/modules/office/README.md`).
+
+From an operator shell outside the office, use `h-mesh-office run scratch` or
+`h-mesh-office run monitor -- top`. These open non-addressable tmux windows,
+separate from agents: messages are never pasted into them. Commands run once
+and retain their exited output; close the window manually when finished.
+See [raw process windows](h-app/modules/office/README.md) for working-directory
+selection and lifecycle details.
+
+### Optional vendor models
+
+The host wizard accepts a free-text default model and per-agent model
+exceptions. Hints depend on the chosen CLI; they are examples, not a list of
+allowed IDs. Leave the model unconfigured to keep each CLI's own default.
+On a rerun, blank keeps a saved choice; changing the default preserves agents
+whose model differed from the previous default.
+
+The same settings work without prompts:
+
+```bash
+AGENTS=architect,worker DEFAULT_MODEL=sonnet AGENT_MODELS=worker=opus \
+  ./setup.sh --host --non-interactive
+```
+
+`DEFAULT_MODEL` and `AGENT_MODELS` are saved with the tenant configuration.
+Model IDs retain their spelling and may not contain whitespace or commas.
+They are not probed: an unavailable or incompatible vendor ID is reported by
+the CLI at launch. Claude and agy receive `--model <id>`; Codex receives a
+quoted `-c model="<id>"` override, including when resuming. Local-provider
+agents use `PROVIDER_<NAME>_MODEL` instead and receive no vendor-model flag.
+Settings are loaded when the reconciler starts and apply to subsequent
+launches; changing them does not switch an already-running CLI session.
+Restart the office daemons to reload settings after changing them on a rerun.
 
 ## Container
 

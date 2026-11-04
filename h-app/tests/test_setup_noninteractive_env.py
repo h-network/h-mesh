@@ -64,7 +64,7 @@ def noninteractive_env():
     for k in list(env.keys()):
         if (k.startswith("CLAUDE_OAUTH_TOKEN_") or k == "CLAUDE_CODE_OAUTH_TOKEN"
                 or k.startswith("TELEGRAM_") or k in ("API_TOKEN", "AGENTS", "DEFAULT_CLI",
-                "ACCOUNTS", "DEFAULT_ACCOUNT", "AGENT_CLIS", "AGENT_PROFILES", "AGENT_PROVIDERS",
+                "ACCOUNTS", "DEFAULT_ACCOUNT", "AGENT_CLIS", "DEFAULT_MODEL", "AGENT_MODELS", "AGENT_PROFILES", "AGENT_PROVIDERS",
                 "PROVIDER_LOCAL_URL", "PROVIDER_LOCAL_MODEL", "PROVIDER_LOCAL_KIND")):
             del env[k]
 

@@ -19,6 +19,9 @@ Everything else is a module that plugs into this.
 | `dispatch.py` | generic port_type -> handler registry and dispatch with renewable per-agent delivery leases, invoked only by whatever the switch's kick actually calls -- the switch itself never imports this |
 | `logging.py` | contract-shaped JSON event logging and durable stdout mirroring, plus `configure_logging()` — the stdlib logging threshold for entry points |
 | `retention.py` | count-based trimming for completed-task and dead-letter queues |
+| `ingress_health.py` | `IngressStallMonitor` — payload-free detection of an ingress whose consumer stopped draining |
+
+| `receipts.py` | `trace()` — read-only lookup of one stream_id across the custody lists (queued / delivering / delivered / failed / unresolved) |
 | `windowlog.py` | agent-window custody-log validation, tailing, offset tracking, and bounded truncation |
 | `service.py` | the `Switch` class — BLPOP/forward/kick loop, is what "the switch" is |
 
@@ -101,6 +104,40 @@ a-f character is all digits, which `validate_segment` rejects. It also refuses
 an empty id or one containing `.`, because the id comes from a remote office's
 response and `prefix()` would otherwise split it into extra resource segments.
 
+## Dead-consumer detection (ingress stalls)
+
+`admit_ingress` accepts frames until `INGRESS_MAX` whether or not anything is
+draining the queue, so a consumer that died used to be visible only as senders
+being rejected. Ports (not clients) drain ingress, and a port can fail in three
+ways: crash on every kick, hang while its renewing lease stays held, or have no
+resolvable handler. `IngressStallMonitor` runs in the switch's maintenance pass
+and watches *progress*: if the same frame stays at the head of a non-empty,
+unpaused ingress for `INGRESS_STALL_SECONDS` (default 60), it writes
+`ingress.stalled` (HASH agent -> JSON `{since, depth, head_stream_id, lease,
+port_type}`), logs one `ingress_stalled` record (reason names the lease state,
+`count` is the depth, `waited` the seconds) and shows it as `ingress_stalled` in
+`GET /agents/{agent}`. When the head changes or the queue empties the entry is
+deleted and `ingress_recovered` is logged. A paused agent is never flagged.
+
+The head is identified by the stream_id in the fixed v4 header -- the same bytes
+the switch already reads to forward -- so no payload is parsed. Detection only
+surfaces: recovery remains the existing `kick_restarted` re-kick plus operators,
+and a switch restart restarts the clock. Not covered: an `api` participant's
+*client* (e.g. the Telegram bot) that stops reading its `inbox` stream -- the api
+port keeps draining ingress into `inbox` (capped at 1,000), so the queue never
+stalls; that needs a client-side heartbeat and is a separate design.
+
+## Delivery trace
+
+`receipts.trace()` reports where one `stream_id` is by scanning egress, ingress,
+`processing`, `opening`, `opened`, `dead`, the api `inbox`, and the tenant
+`unresolved`/`undeliverable` evidence in a single Lua call that compares only the
+fixed-header stream_id, so no payload is read or transferred. It is the engine
+behind `office delivery`. "Delivered" is a custody fact, never a read receipt, and
+a frame that has aged out of the 1,000-entry `opened` list is reported `unknown`,
+not guessed. The api port drains ingress and then writes the mailbox, so a
+frame can be briefly in neither during that hand-off.
+
 ## Two logging systems, one file
 
 `logging.py` holds both, and they are not interchangeable:
@@ -161,6 +198,32 @@ argument rather than from root.
 The threshold is the verbosity knob and nothing else: a real failure keeps its
 own severity. Note that `basicConfig` sets the **root** level, so `DEBUG` also
 turns up third-party libraries (redis included) in that process.
-The forwarding loop survives transient Redis connection failures: it records
-the failure, waits for its current poll interval, and lets redis-py reconnect on
-the next forwarding attempt.
+The forwarding loop survives transient Redis failures: connection resets and
+timeouts, `LOADING`, `BUSY` (a long script running on the server), `READONLY`/
+`TRYAGAIN`/`MASTERDOWN` during failover. It records an `error` event whose reason
+names a closed category (`connection`, `timeout`, `loading`, `busy`, `readonly`,
+`tryagain`, `masterdown`), sleeps with a doubling backoff (0.2s up to a 5s cap,
+reset by the next successful pass), and lets redis-py reconnect. Anything else
+-- `WRONGTYPE` from a corrupt key, a script error, bad credentials, a code bug --
+stays fatal on purpose: retrying those would hide a defect behind a live-looking
+daemon. `transient_redis_category()` in `service.py` is the single classifier.
+
+A frame is popped from egress before it is admitted, so a Redis fault after the
+pop decides its fate. The switch splits those faults by whether the command
+could have run:
+
+- **Provably rejected before execution** -- `busy`, `loading`, `readonly`,
+  `tryagain`, `masterdown`. The write did not happen, so the same frame is
+  retried in memory with the same backoff for up to `FRAME_RETRY_ATTEMPTS` (8,
+  about 16s). If it is still rejected, the frame is moved to the sender's `dead`
+  list with a `dead_lettered` event whose reason names the category and attempt
+  count -- never dropped silently. If even that dead-letter write stays
+  rejected, a `frame LOST` event carrying the stream_id is logged before the
+  error propagates.
+- **Ambiguous** -- `connection`, `timeout` on a write. The command may have
+  executed, so core's at-most-once holds: no blind retry (it could duplicate).
+  The switch records `forward_unknown` with the closed category, counts it in
+  `Switch.unknown_outcomes`, and the loop survives; the frame is not re-queued.
+- **Reads** (registry lookups) are idempotent, so any transient category is
+  retried; repeating a read cannot duplicate anything.
+

@@ -1,14 +1,18 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
 from typing import Set
 
 from core.config import state_path
+from core.keys import validate_segment
 from core.logging import log_record
-from lib.paths import build_pane_path, get_agent_workdir, get_workdir_root, resolve_venv_bin
+from lib.paths import (
+    build_pane_path, ensure_workdir_ownership, get_agent_workdir, get_workdir_root, resolve_venv_bin,
+)
 from lib.profile_env import resolve_claude_profile_env
 from services.claude_statusline import install_statusline
 
@@ -39,6 +43,22 @@ class TmuxCommandError(RuntimeError):
         self.code = code
         self.stderr = stderr
         super().__init__(f"{command} failed ({code}): {stderr or 'no error output'}")
+
+
+RUN_WINDOW_PREFIX = "__run__"
+
+
+def is_run_window(name: str) -> bool:
+    """Reserved tmux names, deliberately invalid as envelope addresses."""
+    return name.startswith(RUN_WINDOW_PREFIX)
+
+
+def run_window_name(name: str) -> str:
+    try:
+        validate_segment(name)
+    except KeyError:
+        raise ValueError("run name must be a valid lowercase, non-numeric office name") from None
+    return RUN_WINDOW_PREFIX + name
 
 
 def require_isolated_tmux(socket: str | None = None) -> None:
@@ -103,6 +123,39 @@ def list_windows(session_name: str, socket: str | None = None) -> Set[str]:
     if ret != 0:
         raise TmuxCommandError("list-windows", ret, stderr)
     return {w for w in stdout.splitlines() if w}
+
+
+# Commands the guide below explains in prose, with examples. Everything else in
+# the office CLI's command table is listed by `office_command_inventory`, so a
+# command added to the table reaches the guide without anyone editing it.
+# tests/test_guide_command_inventory.py fails if a name here stops appearing in
+# the prose, or if any table command appears in neither place.
+GUIDE_CURATED_COMMANDS = ("peers", "send", "list", "take", "done", "return", "show", "retitle")
+
+
+def office_command_inventory(cmd: str) -> str:
+    """The guide's list of every office command the prose does not already cover.
+
+    Generated from `modules.office.cli._COMMAND_TABLE` (name, description), the
+    single source of truth, imported lazily: office/cli.py is the heavier module
+    and the receiving office port already imports this one. Returns "" if the
+    table cannot be read, so a broken import never stops a guide being written.
+    """
+    try:
+        from modules.office.cli import _COMMAND_TABLE
+    except Exception:
+        return ""
+    rows: list[tuple[str, str]] = []
+    for names, description, _handler in _COMMAND_TABLE:
+        primary = names[0]
+        if primary not in GUIDE_CURATED_COMMANDS:
+            rows.append((primary, description))
+        rows.extend((alias, f"alias of {primary}") for alias in names[1:])
+    if not rows:
+        return ""
+    width = max(len(name) for name, _ in rows)
+    body = "\n".join(f"    {name.ljust(width)}  {description}" for name, description in rows)
+    return f"Other commands (`{cmd} NAME --help` for each):\n\n{body}\n\n"
 
 
 def generate_agents_md(
@@ -181,12 +234,9 @@ Run any of those with --help. To see your tmux colleagues:
 
     {cmd} peers
 
-That's colleagues only — {entrance_peers_desc}
-or the tenant's lifecycle provider won't be on it; `{cmd} peers -i` lists those
-too, labeled apart from colleagues.
-
-A message arrives in your terminal as `[message from <name>] …` — reply by name,
-whether or not `peers` lists it:
+A message arrives in your terminal as `[message from <name>] …`, led by its UTC
+send time and a short `#id` so you can order and de-duplicate messages — reply
+by name, whether or not `peers` lists it:
 
     {cmd} send -a <name> "one quoted argument"
     {cmd} send -a <name> --stdin      < the body on stdin
@@ -209,11 +259,16 @@ You have a task board. Nothing will notify you about it — check it yourself:
     {cmd} show ID     read a ticket in full without taking or changing it
     {cmd} retitle --title TEXT [ID]
                       correct your own open ticket without changing its identity
+    {cmd} note "TEXT"  record a progress note on your open ticket (what you
+                      tried and found); read it later with `show`
+    {cmd} reopen ID   bring one of your done tickets back to doing
+                      (--todo to queue it instead); the old outcome stays
+                      on the ticket as a note
 
 Take a ticket *before* you start work, not after. `doing` is how the office
 knows what you are on.
 
-## Working in this office
+{office_command_inventory(cmd)}## Working in this office
 
 This directory is your own clone — work only here. Do not read or write
 another agent's files or state directly; `{cmd} send` is how you reach
@@ -257,8 +312,8 @@ Your git identity is your own agent name — that is how the office knows
 which agent did which work. No co-author line, no "generated with" trailer,
 no other identity in a commit: only the one you are authenticated as.
 
-When a ticket is done, message the lead a summary before or alongside
-`{cmd} done`. A closed ticket with no report is invisible to the lead.
+When a ticket is done, send the lead ONE line saying it is done, naming the
+ticket (title or id), then `{cmd} done`. No summary, no recap of changes.
 
 Long-running work: don't go silent. Background it, or answer a check-in
 with real status — not silence until you're finished.
@@ -534,7 +589,9 @@ def has_session_history(
                 with p.open("rb") as f:
                     raw = f.readline()
                 record = json.loads(raw)
-                payload = record.get("payload") if isinstance(record, dict) else None
+                if not isinstance(record, dict):
+                    continue
+                payload = record.get("payload")
                 if (
                     record.get("type") == "session_meta"
                     and isinstance(payload, dict)
@@ -568,22 +625,161 @@ def has_session_history(
     return False
 
 
+class PurgeError(Exception):
+    """A purge was refused or could not be completed safely."""
+
+
+def _agy_history_rewrite(history_file: Path, cwd: str) -> int:
+    """Drop this workspace's lines from agy's shared history file; return how many.
+
+    The file is shared by every agy agent, so it is rewritten (temp file in the
+    same directory, fsync, os.replace), never deleted. Lines that are not this
+    workspace's, including ones that do not parse, are kept byte for byte.
+
+    ⚠ agy does not take any lock of ours. A line appended between our read and
+    the replace would be lost, so the file's size and mtime are compared just
+    before the replace and the whole rewrite is retried if it moved. A write
+    landing in the few microseconds between that check and os.replace is the
+    residual window; it cannot be closed without agy's cooperation.
+    """
+    for _ in range(5):
+        try:
+            before = history_file.stat()
+            raw = history_file.read_bytes()
+        except FileNotFoundError:
+            return 0
+        kept: list[bytes] = []
+        dropped = 0
+        for line in raw.splitlines(keepends=True):
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                record = None
+            if isinstance(record, dict) and record.get("workspace") == cwd:
+                dropped += 1
+            else:
+                kept.append(line)
+        if not dropped:
+            return 0
+        tmp = history_file.with_name(f".{history_file.name}.purge-{os.getpid()}")
+        try:
+            with tmp.open("wb") as f:
+                f.write(b"".join(kept))
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, before.st_mode & 0o7777)
+            now = history_file.stat()
+            if (now.st_size, now.st_mtime_ns, now.st_ino) != (before.st_size, before.st_mtime_ns, before.st_ino):
+                continue
+            os.replace(tmp, history_file)
+            return dropped
+        finally:
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
+    raise PurgeError(f"{history_file} kept changing while it was being rewritten; nothing was removed, try again")
+
+
+def purge_session_history(
+    agent: str,
+    cli: str,
+    profile: str | None = None,
+    home_root: str | Path | None = None,
+    cwd: str | None = None,
+) -> int:
+    """Delete the agent's on-disk CLI session history; return how many sessions or lines went.
+
+    Mirrors `has_session_history` location for location, but deletes. Every
+    path is derived from (home, cli, profile, cwd) and checked to stay inside
+    the CLI's own history root; nothing is globbed outside it. The caller is
+    responsible for refusing a live agent: this function does not know about
+    the registry.
+    """
+    if cli not in ("claude", "codex", "agy"):
+        raise PurgeError(f"unknown cli {cli!r}")
+    if profile:
+        try:
+            validate_segment(profile)
+        except KeyError:
+            raise PurgeError(f"invalid profile {profile!r}") from None
+    home = Path(home_root) if home_root is not None else Path(os.environ.get("HOME", os.path.expanduser("~")))
+    suffix = f"-{profile}" if profile else ""
+    cwd = get_agent_workdir(agent, cwd)
+    if not os.path.isabs(cwd) or os.path.normpath(cwd) != cwd or cwd == "/":
+        raise PurgeError(f"refusing to purge for working directory {cwd!r}")
+
+    if cli == "claude":
+        projects = home / f".claude{suffix}" / "projects"
+        project_dir = projects / cwd.replace("/", "-")
+        if project_dir.parent != projects or project_dir.name in ("", ".", ".."):
+            raise PurgeError(f"refusing history path {project_dir}")
+        if project_dir.is_symlink():
+            raise PurgeError(f"{project_dir} is a symlink; not following it")
+        if not project_dir.is_dir():
+            return 0
+        sessions = sum(1 for p in project_dir.glob("*.jsonl") if p.is_file())
+        shutil.rmtree(project_dir)
+        return sessions
+
+    if cli == "codex":
+        sessions_dir = home / f".codex{suffix}" / "sessions"
+        if sessions_dir.is_symlink() or not sessions_dir.is_dir():
+            return 0
+        removed = 0
+        for root, _dirs, files in os.walk(sessions_dir, followlinks=False):
+            for name in files:
+                if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+                    continue
+                p = Path(root) / name
+                if p.is_symlink() or not p.is_file():
+                    continue
+                try:
+                    with p.open("rb") as f:
+                        record = json.loads(f.readline())
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                payload = record.get("payload")
+                if (
+                    record.get("type") == "session_meta"
+                    and isinstance(payload, dict)
+                    and payload.get("cwd") == cwd
+                ):
+                    p.unlink()
+                    removed += 1
+        return removed
+
+    history_file = home / ".gemini" / "antigravity-cli" / "history.jsonl"
+    if history_file.is_symlink() or not history_file.is_file():
+        return 0
+    return _agy_history_rewrite(history_file, cwd)
+
+
 def start_agent_command(
     cli: str,
     resume: bool = False,
+    model: str | None = None,
 ) -> list[str]:
-    """Construct the h-agent argv list for the given CLI and resume mode."""
+    """Construct h-agent argv; the optional vendor model is CLI passthrough."""
+    model_args = []
+    if model:
+        if cli == "codex":
+            model_args = ["-c", f"model={json.dumps(model, ensure_ascii=False)}"]
+        else:
+            model_args = ["--model", model]
     if not resume:
-        return ["h-agent", cli]
+        return ["h-agent", cli, *model_args]
 
     if cli == "claude":
-        return ["h-agent", "claude", "--continue"]
+        return ["h-agent", "claude", "--continue", *model_args]
     elif cli == "codex":
-        return ["h-agent", "codex", "resume", "--last"]
+        return ["h-agent", "codex", "resume", "--last", *model_args]
     elif cli == "agy":
-        return ["h-agent", "agy", "--continue"]
+        return ["h-agent", "agy", "--continue", *model_args]
     else:
-        return ["h-agent", cli, "--continue"]
+        return ["h-agent", cli, "--continue", *model_args]
 
 
 def _seed_profile_dirs(profile: str | None) -> None:
@@ -888,6 +1084,7 @@ def write_agent_guide(
             home_dir = os.environ.get("HOME", os.path.expanduser("~"))
             config_dir = Path(home_dir) / (f".claude-{profile}" if profile else ".claude")
             install_statusline(config_dir, log=lambda msg: None)
+        ensure_workdir_ownership(cwd)
     except Exception as exc:
         # ⚠ Never raise into a delivery path — but never vanish either.
         # Silence here is how the profile-blind trust bug hid: seeding
@@ -972,6 +1169,66 @@ def kill_window(session_name: str, window_name: str, socket: str | None = None) 
     return ret, out, err
 
 
+def create_run_window(
+    session_name: str,
+    name: str,
+    command: list[str] | None = None,
+    *,
+    cwd: str | None = None,
+    socket: str | None = None,
+) -> str:
+    """Launch once, outside agent enrollment, guides, delivery, and restart."""
+    window_name = run_window_name(name)
+    command = ["bash", "-il"] if command is None else command
+    if not command or any(not isinstance(arg, str) or "\0" in arg for arg in command):
+        raise ValueError("run requires a non-empty command argv without NUL characters")
+    directory = Path(cwd or os.getcwd()).expanduser().resolve()
+    if not directory.is_dir():
+        raise ValueError("run working directory must exist")
+    if window_name in list_windows(session_name, socket=socket):
+        raise ValueError(f"run window {window_name!r} already exists; close it before reusing the name")
+
+    def checked(*args: str) -> str:
+        code, out, err = run_tmux(*args, socket=socket)
+        if code != 0:
+            raise TmuxCommandError(args[0], code, err)
+        return out
+
+    # Hold this new window until retention and rename protection are set.
+    # Otherwise a short command can exit before remain-on-exit is enabled.
+    raw_ids = checked(
+        "new-window", "-d", "-P", "-F", "#{window_id} #{pane_id}",
+        "-t", f"{session_name}:", "-n", window_name, "-c", str(directory),
+        "/bin/sleep", "86400",
+    ).split()
+    if len(raw_ids) != 2 or not re.fullmatch(r"@[0-9]+", raw_ids[0]) or not re.fullmatch(r"%[0-9]+", raw_ids[1]):
+        raise RuntimeError("tmux returned invalid identifiers for the new run window")
+    window_id, pane_id = raw_ids
+    try:
+        # Concurrent creators may both pass the first name check. Only our
+        # returned window id is ever removed on failure, never a name match.
+        names = checked("list-windows", "-t", session_name, "-F", "#{window_name}").splitlines()
+        if names.count(window_name) != 1:
+            raise ValueError(f"run window {window_name!r} was created concurrently")
+        checked("set-window-option", "-t", window_id, "remain-on-exit", "on")
+        checked("set-window-option", "-t", window_id, "automatic-rename", "off")
+        checked("set-window-option", "-t", window_id, "allow-rename", "off")
+        # No window_env(): a raw process gets neither an agent identity nor
+        # the invoking agent's custody hooks. argv is passed without a shell.
+        env_args = ["env"]
+        for key in ("AGENT_NAME", "TASK_RECORD", "H_MESH_CUSTODY_FILE", "H_MESH_WRITER"):
+            env_args.extend(["-u", key])
+        env_args.append(f"PATH={build_pane_path()}")
+        checked("respawn-pane", "-k", "-t", pane_id, *env_args, *command)
+    except Exception:
+        try:
+            run_tmux("kill-window", "-t", window_id, socket=socket)
+        except Exception:
+            pass
+        raise
+    return window_name
+
+
 def submit_text(
     session_name: str,
     agent_name: str,
@@ -979,6 +1236,8 @@ def submit_text(
     stream_id: str = "",
     socket: str | None = None,
 ) -> None:
+    if is_run_window(agent_name):
+        raise ValueError("raw process windows do not accept message delivery")
     target = f"{session_name}:{agent_name}"
     nonce = os.urandom(8).hex()
     sid_part = f"_{stream_id}" if stream_id else ""

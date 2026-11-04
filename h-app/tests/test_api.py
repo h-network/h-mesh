@@ -263,6 +263,26 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(body["presence"]["state"], "unknown")
         self.assertEqual(body["delivery_unverified"], {"since": "", "stream_id": ""})
 
+    def test_status_reports_ingress_stalled_only_when_the_switch_flagged_it(self):
+        status, body = request(self.app, "GET", "/agents/alice", token="secret")
+        self.assertEqual(status, 200)
+        self.assertIsNone(body["ingress_stalled"])
+
+        stalled = prefix("test", "office", resource="ingress.stalled")
+        record = {
+            "since": "2026-11-02T00:00:00.000Z", "depth": 4,
+            "head_stream_id": "b" * 32, "lease": "absent", "port_type": "tmux",
+        }
+        self.redis.hashes[stalled] = {"alice": json.dumps(record)}
+        status, body = request(self.app, "GET", "/agents/alice", token="secret")
+        self.assertEqual(body["ingress_stalled"], record)
+
+        # Another agent's entry, or a corrupt one, never leaks into this status.
+        self.redis.hashes[stalled] = {"telegram": json.dumps(record), "alice": "{not json"}
+        status, body = request(self.app, "GET", "/agents/alice", token="secret")
+        self.assertEqual(status, 200)
+        self.assertIsNone(body["ingress_stalled"])
+
     def test_qualified_destination_routes_through_core_channel(self):
         status, body = request(
             self.app,

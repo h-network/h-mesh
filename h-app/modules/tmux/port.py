@@ -60,6 +60,33 @@ def relayed_reply_hint(text: str) -> str | None:
     return f"[reply to {office}/{agent}: {OFFICE_TOOLS_CMD} send --office {office} -a {agent} \"...\"]"
 
 
+# What a message line may carry before its "[message from ...]" header. Both
+# fields are validated, not trusted: ts is whatever the sender's frame says and
+# a pasted newline or control byte would land in the recipient's terminal.
+_STAMP_TS = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?Z")
+_STAMP_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def message_stamp(envelope: dict) -> str:
+    """`<UTC send time> #<id> ` for the front of a message line, or "" if neither is usable.
+
+    The time is the frame's own `ts` (when the SENDER built it, not when it was
+    pasted), cut to whole seconds, so a message that waited in a queue still
+    reads as old. The id is the first 8 hex of the frame's `stream_id`; the full
+    id stays the one `--reply-to` uses. Queue order is unchanged: this makes the
+    order and staleness visible, it does not reorder anything.
+    """
+    parts = []
+    ts = envelope.get("ts")
+    match = _STAMP_TS.fullmatch(ts) if isinstance(ts, str) else None
+    if match:
+        parts.append(match.group(1) + "Z")
+    stream_id = envelope.get("stream_id")
+    if isinstance(stream_id, str) and _STAMP_ID.fullmatch(stream_id):
+        parts.append("#" + stream_id[:8])
+    return " ".join(parts) + " " if parts else ""
+
+
 def mark_delivery_pending(
     r,
     pod: str,
@@ -135,7 +162,7 @@ def message_opener(
     payload = envelope.get("payload", {})
     text = payload.get("text", "") if isinstance(payload, dict) else str(payload)
     stream_id = envelope.get("stream_id", "")
-    blocks = [f"[message from {source}] {text}\n"]
+    blocks = [f"{message_stamp(envelope)}[message from {source}] {text}\n"]
     try:
         pt = port_type(r, pod=pod, tenant=tenant, agent=source)
     except Exception:

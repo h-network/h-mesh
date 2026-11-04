@@ -28,6 +28,31 @@ The first tmux hire becomes lead when the registry is empty; later hires
 preserve the incumbent. Registry membership and the lead selection are
 published atomically before tmuxhost creates panes and their guides.
 
+`office run NAME [--cwd PATH] [-- COMMAND ...]` opens a shell or raw command
+in the existing office tmux session, separately from `hire`. Omitting the
+command starts `bash -il`; use `--` before an explicit command and its literal
+arguments (`office run monitor -- top`). The working directory defaults to
+the caller's current directory. This local operation uses `TMUX_SESSION`
+(or `TENANT`) and the explicitly isolated tmux socket/tmpdir; it sends no
+envelope and enrolls no participant.
+
+Run it from the operator's shell outside the office. The shared tmux isolation
+guard remains in force: invocation from inside the office refuses an explicit
+socket that matches the caller's ambient `$TMUX` server. This command does not
+provide an override for that refusal.
+
+The physical window is named `__run__NAME`, which cannot be an envelope
+address. It receives no agent identity, custody hooks, or generated guides.
+Direct sends and broadcasts cannot target it, and tmux's message-paste helper
+refuses that namespace. Its process runs once: exited output and exit status
+stay in a dead pane for inspection, with no agent restart, resume, presence,
+or stall tracking. The reconciler preserves these windows even with an empty
+agent roster. Close it explicitly, for example
+`tmux -S "$TMUX_SOCKET" kill-window -t "$TMUX_SESSION:__run__monitor"`;
+closing it does not recreate it. Reusing an existing run name fails instead
+of replacing or restarting the process. Ordinary manual typing in a run shell
+remains available through tmux. Do not rename it into an agent window.
+
 Board transitions run in one isolated Lua script and preflight both Redis key
 types before mutation; `take` also checks destination emptiness before its
 first write. This keeps the one-doing-ticket invariant under concurrent
@@ -70,11 +95,58 @@ is the inspection path; taking a ticket is reserved for actually starting it.
 board (`todo`, `doing`, or `hold`) without changing its identity, timestamps,
 state, or queue position. It does not edit another agent's board or closed
 work. Both audit channels record the old and replacement title.
+`office reopen ID [--todo]` brings one of the caller's own `done` or `cancelled`
+tickets back, so a short re-review reuses the ticket instead of a new one. By
+default it goes to `doing`, with a fresh `started_ts`, and refuses (changing
+nothing) if the caller already has a `doing` ticket -- the one-doing invariant is
+enforced by the same preflighted Lua transition as `take`. `--todo` queues it
+instead. `done_ts` and `outcome` are cleared, but the earlier verdict is kept as
+a note (`reopened; was done (failed)`), so reopening never erases what was
+decided. Another agent's board cannot be reopened.
+`office note [-i ID] TEXT` (or `--stdin`/`--file`) appends `{ts, by, text}` to a
+`todo`, `doing` or `hold` ticket (default: the `doing` one) so tried/found
+context lives on the ticket, readable with `show` and counted as `notes:N` in
+`list`. The append is an exact-entry `LSET`, so a concurrent transition makes it
+fail with "try again" rather than lose either change, and unknown fields on the
+stored ticket are preserved. A note is limited to 2,000 characters and a ticket
+to 50 notes; past either limit the command refuses rather than truncating or
+dropping history. Notes travel with the ticket through take/hold/return/done.
+Notes are the owner's: there is no way to annotate another agent's board.
 `office add` allocates a 32-lowercase-hex ticket id before sending its
 asynchronous envelope, includes that id in the payload, and prints it—not the
 transport stream id—after the envelope is admitted. This is the allocated
 identity the board will use if downstream creation succeeds, not proof that a
 ticket was created. Transport and custody logs establish later delivery states.
+
+One piece of work keeps one ticket id across boards. `office add -a A,B,...`
+allocates the id once and sends the same id to every listed board (all
+destinations are checked before anything is sent; duplicates in the list are
+collapsed), and prints it once. `office add --id ID` reuses an existing 32-hex
+id instead of allocating one, to give the same work to another board later; it
+is refused if that board already holds the id in any state, and a send that
+fails midway prints the boards already served and the `--id` to re-run with.
+`office show ID -a all` is the office-wide lookup: it reads every enrolled
+board (read-only; unreadable entries are skipped, never quarantined) and prints
+one JSON line `{"agent", "state", "ticket"}` per match, so a `rel:<id>` or a
+quoted id resolves without guessing `-a`. Plain `office show ID [-a AGENT]` is
+unchanged, as are tickets already stored and the `-r/--related` option (related
+ids are still stored unvalidated). The id is already the first column of
+`office list` and what `add` prints; there is no notification on `add`.
+
+`office add --authority TEXT` sets the ticket's authoritative directive once, at
+creation: what the creator is instructing or approving, up to 2000 characters.
+The assignee reads it in `office take` / `office show` as
+`"authority": {"text", "by", "ts"}` and reconciles from the ticket rather than
+from forwarded chat. Only the text travels in the envelope: `by` is the
+switch-stamped L2 source of the AddTicket and `ts` is the ticket's creation
+time, both written by `lib.board_interaction.add_ticket`, so a payload cannot
+claim another author (any `by`/`ts` it carries is discarded; a missing,
+blank, non-string or over-length text leaves the ticket without the field).
+The field is carried through take, hold, return and done like the other
+ticket fields, and an older reader simply omits it. It is deliberately not
+editable afterwards: to supersede a directive, add a new ticket with
+`--related <old-id>` and cancel or delete the old one. A quoted approval
+chain, expiry or per-directive history are not modelled.
 
 `office delete ID` is deliberately scoped to the caller's own board. Delegated
 creation is not authority to destroy another agent's queued or in-flight work,
@@ -82,11 +154,59 @@ even when the caller originally raised it. A miss therefore names that scope
 and says that `delete` cannot withdraw a task assigned to another agent instead
 of implying that an otherwise valid cross-board id does not exist. Coordinate
 with the assignee to return, cancel, or delete work in their custody.
+
+`office purge AGENT --cli {claude,codex,agy} [--profile ACCOUNT] --confirm AGENT`
+permanently deletes a *retired* agent's on-disk CLI session history, the
+deliberate complement to `hire --fresh` (which only ignores it) and to `let-go`
+(which leaves it so a later `--resume` works). It is irreversible, so:
+
+- It refuses while `AGENT` is still in the registry (let it go first: a live
+  session may rewrite its own history), and refuses if the registry cannot be
+  read. `--confirm` must repeat the exact name; names are validated as one
+  agent segment, so no glob, prefix or path can reach it.
+- `--cli` and `--profile` are required inputs, not looked up: retirement
+  deletes the agent's `launch` and `profile` keys, so afterwards nothing records
+  which CLI or account it ran. Run it once per CLI/account that agent used.
+- It acts on the calling host's `$HOME` and the agent's own working directory
+  (`get_agent_workdir`), mirroring `has_session_history` location for location
+  (`modules.tmux.ops.purge_session_history`): claude deletes the
+  `~/.claude[-ACCOUNT]/projects/<cwd>` directory; codex deletes only the
+  `rollout-*.jsonl` files under `~/.codex[-ACCOUNT]/sessions` whose
+  `session_meta` cwd is the agent's; agy rewrites the shared
+  `~/.gemini/antigravity-cli/history.jsonl` without that workspace's lines
+  (other lines kept byte for byte) via temp file, fsync and atomic replace.
+  Symlinks are never followed.
+- agy's file is shared and agy takes none of our locks. The rewrite is retried
+  if the file changed while it was being built, and fails with nothing removed
+  after five tries. A line appended in the microseconds between the final check
+  and the replace can still be lost; closing that needs agy's cooperation.
+- Not covered: `claude_sdk` agents' memory contexts (`lib/chat_memory.py`), a
+  different store and a separate concern.
+
+It prints how many sessions (claude, codex) or history lines (agy) it removed.
 For review work, use `passed` or `failed`. Hold a QUESTIONS review while its
 answers block the verdict; use `completed` only when its questions are
 non-blocking. Returned work joins the back of a nonempty `todo` queue.
 
 The receiving port delegates to the settled `lib.agentlifecycle` API.
+
+`office delivery STREAM_ID [--wait SECONDS]` answers "where is the message I
+just sent?" for the id `office send` prints. It prints one JSON line,
+`{"stream_id", "state", "locations": [{"agent", "stage"}], "confirmation"?}`, and
+changes nothing. `state` is `queued` (in egress, ingress or claimed but not
+started), `delivering` (the effect may have begun), `delivered`, `failed`
+(rejected, or the destination retired), `unresolved` (the effect may have
+happened but its outcome was not recorded), `partial` (a broadcast whose copies
+differ) or `unknown` (not in any custody list: never sent, or aged out of the
+1,000-entry `opened` receipt list). `--wait` polls every half second until
+`delivered`, `failed` or `unresolved`, or the timeout. ⚠ `delivered` means the
+text was pasted and submitted to the terminal, or stored in an api participant's
+mailbox -- it does **not** mean it was read; no component records that.
+`confirmation` is only what the watchdog still retains for a pasted delivery:
+`pending` (awaiting the agent's next activity), `unverified` (none seen), or
+`null`. The trace lives in `core/receipts.py` and reads the existing custody
+lists by the stream_id in the frame header; it adds no state and does not change
+custody semantics.
 
 Delivery evidence has three read paths because it has three different facts:
 `dead` contains raw envelopes explicitly rejected by a recipient;
@@ -147,6 +267,23 @@ already reads only the payload fields it recognizes and drops the rest.
 contexts, reading `lib/chat_memory.py`'s `ChatMemory` directly (same "own a
 Redis client, read state directly" shape `office status`/`office peers -v`
 already use, not a round trip through an envelope).
+
+`office doc` attaches a document once and refers to it by hash, so a
+versioned checklist or spec is not re-pasted into every message (and the
+reader cannot review the wrong version). `office doc put PATH [--name NAME]`
+stores the file's bytes under their SHA-256 in tenant-scoped Redis hashes
+(`docs`, `docs.meta`, `docs.names`; `lib/doc_store.py`) and prints
+`doc:<first 12 hex>`; put that reference in a message or ticket. Identical
+bytes dedupe to the same hash and keep the first upload's metadata.
+`office doc get REF [-o PATH]` writes the bytes to stdout or `PATH`,
+`office doc info REF` shows hash, filename, MIME type, size, author and
+upload time, and `office doc ls` lists everything. `REF` is `doc:<hash>`, any
+unique hash prefix of at least 8 hex characters, or a `--name`: re-putting a
+new version with the same name moves the name to it, while every older version
+stays reachable by its hash. Names may not look like a hash prefix. The size
+cap is `send-file`'s (10 MiB). This is direct Redis state like `office status`;
+nothing crosses the switch. There is no delete or expiry yet, so stored
+documents persist until the tenant's Redis state is cleared.
 
 Operational compatibility warning: the legacy `office` CLI deployed where
 this module was developed silently loses messages submitted with `office send
@@ -273,3 +410,66 @@ unauthenticated environment variable and any process with Redis access can
 write the same keys directly, so this stops mistakes and non-lead agents, not a
 hostile local process. The same applies to the tokens hash: hiding tokens from
 `offices` prevents accidental disclosure, not reading Redis.
+
+## Board event notices (#18)
+
+Two board events now also send an ordinary `Message` envelope (written through
+the same `send()` path as any message, so it shows in the mesh log), instead of
+leaving the other party to poll `office list` or write a summary by hand:
+
+- `office add -a TARGET ...` sends the `AddTicket`, then a notice to TARGET:
+  who assigned which ticket (short id and title) and how to see/start it. The
+  notice is queued behind the `AddTicket` on the same path, so the ticket is
+  normally on the board before the notice is read. **One notice per target per
+  30 seconds** (`notice.add` key, `SET NX EX`): a bulk add of N tickets
+  announces only the first and says so, and the rest are on the board. Never
+  sent to oneself.
+- `office done` sends a notice to the ticket's `created_by` with the outcome,
+  only when that is another agent still enrolled. A self-created ticket or a
+  retired/unknown creator sends nothing and is not an error. `cancel`, `return`
+  and `hold` stay silent.
+- `--no-notify` on `add` and on `done` suppresses the notice (scripted bulk
+  work, or when the creator was already told).
+- Notices end with "Notice only, no reply needed" and nothing in `add`/`done`
+  reads the inbox, so they cannot start an acknowledgment loop; the agent guide
+  already says acknowledgments are not answered.
+- The board change is committed first. If the notice cannot be sent, `add`
+  and `done` still succeed and print a warning on stderr.
+
+The guide's "send the lead ONE line when a ticket is done" rule is separate:
+when the lead created the ticket, it now receives this notice as well as that
+line. Whether to drop the manual line is the guide owner's call, not made here.
+
+## Shell-mangled text (#16)
+
+`office` cannot see what a shell removed: inside a double-quoted argument
+`` `name` ``, `$(cmd)` and `$VAR` are expanded before `office` starts, usually
+to nothing, and the shorter text is accepted like any other. The byte count
+printed on success is the count of what *arrived*, so it cannot reveal the loss.
+What `office` can do, and now does for text given as a command-line argument
+(`send`, `broadcast`, and `add`'s `-t` and `-d`):
+
+- **Warn on the hole** the removal leaves: two or more spaces between words
+  (`the  setting`, from ``the `x` setting``) print a warning on stderr that
+  points at `--stdin` / `--file`. It never blocks the send and does not change
+  the output or exit code. It is a heuristic: it does not see a word dropped at
+  a line edge or next to punctuation, it fires on aligned columns, and two
+  spaces after `.`, `!` or `?` and leading/trailing spaces are ignored.
+- **Refuse blank text** (`""`, whitespace only): this is what a body that was
+  entirely a substitution becomes, and sending an empty message helps no one.
+  `--stdin` already refused empty input.
+- **Never check `--stdin` / `--file`** text; it is never shell-parsed, which is
+  why it is the way to send anything containing backticks, `$` or quotes.
+
+`office add` previously took its description only from `-d`. It now also
+accepts `--description-stdin` and `--description-file PATH` (exactly one of the
+three), so a ticket description with code in it no longer needs shell quoting.
+
+`office clone-to-all <repo-url> [-a AGENT,...] [--dry-run]` clones a repository
+into each selected tmux agent's workspace (`<workdir_root>/<agent>/<repo>`).
+When invoked as `root` (for example via `sudo h-mesh-office clone-to-all` or
+`docker exec -u 0`), it hands ownership of the cloned tree and any newly
+created workspace parent back to the unprivileged workspace user
+(`lib.paths.ensure_workdir_ownership`, using `os.lchown` without following
+symlinks) so agents do not hit git's `detected dubious ownership` check or
+permission errors when creating `.venv` or editing files in-repo (#28).

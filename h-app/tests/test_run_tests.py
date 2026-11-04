@@ -19,6 +19,204 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 H_APP = REPO_ROOT / "h-app"
 
 
+@pytest.mark.parametrize("passes", [True, False], ids=["success", "failure"])
+def test_runner_preserves_ambient_state_bytes_and_isolates_children(tmp_path: Path, passes: bool):
+    ambient_home = tmp_path / "ambient-home"
+    ambient_state = tmp_path / "ambient-state"
+    for directory in (ambient_home / ".h-mesh", ambient_state):
+        directory.mkdir(parents=True)
+        (directory / "tasks.jsonl").write_bytes(b"existing board bytes\x00\xff\n")
+        (directory / "window.log.jsonl").write_bytes(b"existing window bytes\x00\xfe\n")
+    custody = ambient_state / "custody.jsonl"
+    custody.write_bytes(b"existing custody bytes\n")
+    files = [*ambient_state.glob("*.jsonl"), *(ambient_home / ".h-mesh").glob("*.jsonl")]
+    before = {path: path.read_bytes() for path in files}
+    record = tmp_path / "private-state.json"
+    child_code = (
+        "from core.logging import record_task_event, log_record; "
+        "record_task_event('created', id='child', title='child fixture', agent='fixture', actor='fixture'); "
+        "log_record('fixture', 'opened', source='child')"
+    )
+    source = (
+        "import json, os, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "from core.logging import record_task_event, log_record\n"
+        "def test_target_tree_marker():\n"
+        "    record_task_event('created', id='parent', title='parent fixture', agent='fixture', actor='fixture')\n"
+        "    log_record('fixture', 'opened', source='parent')\n"
+        f"    subprocess.run([sys.executable, '-c', {child_code!r}], check=True)\n"
+        "    state = Path(os.environ['H_MESH_STATE_DIR'])\n"
+        "    assert state.name == '.h-mesh'\n"
+        "    assert 'child fixture' in (state / 'tasks.jsonl').read_text()\n"
+        "    assert 'child' in (state / 'window.log.jsonl').read_text()\n"
+        "    assert (Path.home() / '.h-mesh' / 'tasks.jsonl').resolve() == state / 'tasks.jsonl'\n"
+        "    assert 'API_TOKEN' not in os.environ\n"
+        "    assert 'VIRTUAL_ENV' not in os.environ\n"
+        f"    Path({str(record)!r}).write_text(json.dumps(dict(root=os.environ['H_MESH_TEST_ROOT'])))\n"
+        f"    assert {passes!r}\n"
+    )
+    target = _make_isolated_harness_tree(tmp_path, source)
+    core = target / "h-app" / "core"
+    core.mkdir()
+    for name in ("config.py", "logging.py"):
+        shutil.copy(H_APP / "core" / name, core / name)
+    environment = os.environ.copy()
+    environment.update({
+        "PYTHONPATH": str(target / "h-app"), "HOME": str(ambient_home),
+        "H_MESH_STATE_DIR": str(ambient_state), "TASK_RECORD": str(ambient_state / "tasks.jsonl"),
+        "H_MESH_LOG_FILE": str(ambient_state / "window.log.jsonl"),
+        "H_MESH_CUSTODY_FILE": str(custody), "H_MESH_RUN_DIR": str(ambient_state / "run"),
+        "H_MESH_WORKDIR": str(ambient_state / "workdir"),
+        "VIRTUAL_ENV": str(ambient_state / "venv"), "API_TOKEN": "fixture-secret",
+    })
+    result = subprocess.run(
+        [sys.executable, "-m", "tools.run_tests"], cwd=target, env=environment,
+        capture_output=True, text=True, timeout=20,
+    )
+    assert (result.returncode == 0) is passes, result.stdout + result.stderr
+    assert record.exists(), result.stdout + result.stderr
+    assert {path: path.read_bytes() for path in files} == before
+    assert not Path(json.loads(record.read_text())["root"]).exists()
+    assert "fixture-secret" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("name", ["AGENT_NAME", "TENANT"])
+def test_runner_refuses_office_identity_before_children(tmp_path: Path, name: str):
+    target = _make_isolated_harness_tree(
+        tmp_path, "raise AssertionError('must not collect office test')\n"
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(target / "h-app")
+    environment[name] = "fixture-office"
+    result = subprocess.run(
+        [sys.executable, "-m", "tools.run_tests"], cwd=target, env=environment,
+        capture_output=True, text=True, timeout=10,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "refusing an office identity" in output
+    assert name in output
+    assert "collected" not in output
+    assert "test state:" not in output
+
+
+@pytest.mark.parametrize("url", [None, "redis://127.0.0.1:6379/0", "redis://remote.example:16379/0"],
+                         ids=["unset", "default-port", "remote"])
+def test_pytest_guard_rejects_unsafe_redis_even_with_override(url):
+    environment = {"H_MESH_ALLOW_SHARED_REDIS": "1"}
+    if url is not None:
+        environment["REDIS_URL"] = url
+    with run_tests._state_environment(environment):
+        with pytest.raises(run_tests.UnsafeTestEnvironment, match="REDIS_URL"):
+            run_tests._require_safe_test_environment(environment)
+
+
+@pytest.mark.parametrize("name", [
+    "HOME", "H_MESH_STATE_DIR", "H_MESH_WORKDIR", "H_MESH_RUN_DIR", "H_MESH_LOG_FILE",
+    "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "TASK_RECORD", "H_MESH_CUSTODY_FILE",
+])
+def test_pytest_guard_rejects_ambient_path_overrides(tmp_path: Path, name: str):
+    environment = {"REDIS_URL": "redis://127.0.0.1:16379/0"}
+    with run_tests._state_environment(environment):
+        environment[name] = str(tmp_path / "ambient-state")
+        with pytest.raises(run_tests.UnsafeTestEnvironment, match="non-private"):
+            run_tests._require_safe_test_environment(environment)
+
+
+@pytest.mark.parametrize("root", [None, "/"], ids=["unset", "filesystem-root"])
+def test_pytest_guard_rejects_missing_or_broad_state_root(root):
+    environment = {"REDIS_URL": "redis://127.0.0.1:16379/0"}
+    with run_tests._state_environment(environment):
+        if root is None:
+            environment.pop("H_MESH_TEST_ROOT")
+        else:
+            environment["H_MESH_TEST_ROOT"] = root
+        with pytest.raises(run_tests.UnsafeTestEnvironment, match="non-private"):
+            run_tests._require_safe_test_environment(environment)
+
+
+def test_pytest_guard_rejects_state_symlink_escape(tmp_path: Path):
+    environment = {"REDIS_URL": "redis://127.0.0.1:16379/0"}
+    outside = tmp_path / "ambient-state"
+    outside.mkdir()
+    with run_tests._state_environment(environment):
+        state = Path(environment["H_MESH_STATE_DIR"])
+        (state / "run").rmdir()
+        state.rmdir()
+        state.symlink_to(outside, target_is_directory=True)
+        with pytest.raises(run_tests.UnsafeTestEnvironment, match="non-private"):
+            run_tests._require_safe_test_environment(environment)
+
+
+def _install_session_guard(target: Path, reaper_source: str) -> None:
+    tests = target / "h-app" / "tests"
+    shutil.copy(H_APP / "tests" / "conftest.py", tests / "conftest.py")
+    (tests / "_leak_manifest.py").write_text(reaper_source)
+
+
+@pytest.mark.parametrize("unsafe", ["redis-unset", "redis-default-port", "redis-remote", "ambient-state"])
+def test_direct_pytest_refuses_before_collection_or_reaping(tmp_path: Path, unsafe: str):
+    target = _make_isolated_harness_tree(
+        tmp_path, "raise AssertionError('test module must not be imported')\n"
+    )
+    _install_session_guard(target, "def reap_all_orphans(log=print):\n    raise AssertionError('reaper must not run')\n")
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(target / "h-app")
+    with run_tests._state_environment(environment):
+        if unsafe == "redis-unset":
+            environment.pop("REDIS_URL", None)
+        elif unsafe == "redis-default-port":
+            environment["REDIS_URL"] = "redis://127.0.0.1:6379/0"
+        elif unsafe == "redis-remote":
+            environment["REDIS_URL"] = "redis://remote.example:16379/0"
+        else:
+            environment["H_MESH_STATE_DIR"] = str(tmp_path / "ambient-state")
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-o", "addopts="], cwd=target, env=environment,
+            capture_output=True, text=True, timeout=10,
+        )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    expected = "non-private" if unsafe == "ambient-state" else "REDIS_URL"
+    assert expected in output
+    assert "test module must not be imported" not in output
+    assert "reaper must not run" not in output
+    assert "collected" not in output
+
+
+def test_direct_pytest_accepts_private_runner_environment(tmp_path: Path):
+    target = _make_isolated_harness_tree(
+        tmp_path, "def test_target_tree_marker():\n    assert True\n"
+    )
+    record = tmp_path / "reaper-called"
+    _install_session_guard(
+        target, "from pathlib import Path\ndef reap_all_orphans(log=print):\n"
+        f"    Path({str(record)!r}).write_text('private environment validated')\n"
+        "    return 0, 0\n",
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(target / "h-app")
+    with run_tests._state_environment(environment):
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-o", "addopts="], cwd=target, env=environment,
+            capture_output=True, text=True, timeout=10,
+        )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout
+    assert record.exists()
+
+
+def test_suite_environment_keeps_import_path_and_scrubs_office_settings(monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", str(H_APP))
+    for name in ("VIRTUAL_ENV", "VENV_PATH", "H_MESH_STATE_DIR", "H_MESH_LOG_FILE", "TASK_RECORD",
+                 "H_MESH_CUSTODY_FILE", "TMUX", "TMUX_SOCKET", "OFFICE_TOOLS", "AGENTS", "API_TOKEN"):
+        monkeypatch.setenv(name, "fixture-value")
+    environment = run_tests._suite_environment()
+    assert environment["PYTHONPATH"] == str(H_APP)
+    assert environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] == "1"
+    assert "fixture-value" not in environment.values()
+
+
 @pytest.mark.parametrize("url,endpoint", [
     ("redis://127.0.0.1:16379/0", "127.0.0.1:16379"),
     ("redis://localhost:16379/1", "localhost:16379"),

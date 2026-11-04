@@ -20,12 +20,12 @@
 #
 # Without a terminal (or with --non-interactive), every wizard setting is
 # instead read from a live env var of the same name if set (AGENTS,
-# DEFAULT_CLI, ACCOUNTS, AGENT_CLIS/AGENT_PROFILES/AGENT_PROVIDERS,
+# DEFAULT_CLI, DEFAULT_MODEL, ACCOUNTS, AGENT_CLIS/AGENT_MODELS/AGENT_PROFILES/AGENT_PROVIDERS,
 # CLAUDE_OAUTH_TOKEN_<PROFILE>, PROVIDER_LOCAL_*, TELEGRAM_*, API_TOKEN),
 # falling back to whatever's already persisted -- then persisted right back,
 # same as an interactive answer would be. See ENV_TENANT_GET below.
 #
-# AGENT_CLIS/AGENT_PROFILES/AGENT_PROVIDERS are each a comma-separated list
+# AGENT_CLIS/AGENT_MODELS/AGENT_PROFILES/AGENT_PROVIDERS are comma-separated lists
 # of agent=value pairs, e.g. AGENT_CLIS=worker1=codex,worker2=agy -- ONE '='
 # per pair, agent name on the left. A malformed entry (wrong separator, a
 # missing value) is refused with a hard error rather than silently treated
@@ -137,7 +137,11 @@ reference project's setup.sh does. Piped or scripted (not a terminal), or
 with --non-interactive, it never prompts -- flags, environment, and any
 already-persisted tenant config are all it uses.
 
-Non-interactive env vars for per-agent exceptions (AGENT_CLIS,
+DEFAULT_MODEL selects an optional vendor model; AGENT_MODELS overrides it
+per agent. Unconfigured means the CLI's own default. Local provider models
+take precedence. Vendor IDs are free text, not probed or chosen from an enum.
+
+Non-interactive env vars for per-agent exceptions (AGENT_CLIS, AGENT_MODELS,
 AGENT_PROFILES, AGENT_PROVIDERS) are each a comma-separated list of
 agent=value pairs -- e.g. AGENT_CLIS=worker1=codex,worker2=agy. A
 malformed entry (wrong separator, missing value) is refused with an
@@ -410,6 +414,7 @@ IFS=',' read -r -a AGENTS <<< "$AGENTS_CSV_EXISTING"
 [ "${#AGENTS[@]}" -eq 1 ] && [ -z "${AGENTS[0]}" ] && AGENTS=()
 
 DEF_CLI="$(ENV_TENANT_GET DEFAULT_CLI claude)"
+DEF_MODEL="$(ENV_TENANT_GET DEFAULT_MODEL "")"
 ACCOUNTS_CSV_EXISTING="$(ENV_TENANT_GET ACCOUNTS default)"
 IFS=',' read -r -a PROFILES <<< "$ACCOUNTS_CSV_EXISTING"
 DEF_PROFILE="$(ENV_TENANT_GET DEFAULT_ACCOUNT "${PROFILES[0]:-default}")"
@@ -460,10 +465,26 @@ validate_pair_map() {
 # Seed the per-agent maps from persisted exceptions before any prompting, so
 # a re-run's defaults reflect prior answers even for agents not touched this
 # time.
-for a in "${AGENTS[@]}"; do mset CLI "$a" "$DEF_CLI"; mset PROF "$a" "$DEF_PROFILE"; done
+for a in "${AGENTS[@]}"; do
+    mset CLI "$a" "$DEF_CLI"; mset PROF "$a" "$DEF_PROFILE"; mset MODEL "$a" "$DEF_MODEL"
+done
 CLI_MAP_EXISTING="$(ENV_TENANT_GET AGENT_CLIS "")"
 validate_pair_map "$CLI_MAP_EXISTING" AGENT_CLIS || exit 1
 for pair in ${CLI_MAP_EXISTING//,/ }; do mset CLI "${pair%%=*}" "${pair#*=}"; done
+validate_model_id() {
+    # IDs are free text, not a vendor enum. Delimiters/whitespace cannot be
+    # represented in the line-oriented tenant config and comma-separated map.
+    case "$1" in
+        *[[:space:],]*) echo "error: model ID must not contain whitespace or commas" >&2; return 1 ;;
+    esac
+}
+validate_model_id "$DEF_MODEL" || exit 1
+MODEL_MAP_EXISTING="$(ENV_TENANT_GET AGENT_MODELS "")"
+validate_pair_map "$MODEL_MAP_EXISTING" AGENT_MODELS || exit 1
+for pair in ${MODEL_MAP_EXISTING//,/ }; do
+    validate_model_id "${pair#*=}" || exit 1
+    mset MODEL "${pair%%=*}" "${pair#*=}"
+done
 PROFILE_MAP_EXISTING="$(ENV_TENANT_GET AGENT_PROFILES "")"
 validate_pair_map "$PROFILE_MAP_EXISTING" AGENT_PROFILES || exit 1
 for pair in ${PROFILE_MAP_EXISTING//,/ }; do mset PROF "${pair%%=*}" "${pair#*=}"; done
@@ -558,6 +579,7 @@ if [ "$INTERACTIVE" -eq 1 ]; then
         for a in "${AGENTS[@]}"; do
             [ -n "$(mget CLI "$a")" ] || mset CLI "$a" "$DEF_CLI"
             [ -n "$(mget PROF "$a")" ] || mset PROF "$a" "$DEF_PROFILE"
+            [ -n "$(mget MODEL "$a")" ] || mset MODEL "$a" "$DEF_MODEL"
         done
     elif [ "${#AGENTS[@]}" -eq 0 ]; then
         AGENTS=(architect)
@@ -623,6 +645,33 @@ if [ "$INTERACTIVE" -eq 1 ]; then
             if printf '%s\n' "${PROFILES[@]}" | grep -qx "$P"; then mset PROF "$want" "$P"
             else echo "    (no account '$P' -- keeping $(mget PROF "$want"))"; fi
         fi
+    done
+
+    model_hint() {
+        case "$1" in
+            claude) echo "  Model examples for claude: sonnet, opus (hints only)." ;;
+            codex) echo "  Model example for codex: gpt-5-codex (hint only)." ;;
+            agy) echo "  Model example for agy: gemini-2.5-pro (hint only)." ;;
+        esac
+    }
+    model_hint "$DEF_CLI"
+    OLD_DEF_MODEL="$DEF_MODEL"
+    read -rp "  Default vendor model [${DEF_MODEL:-CLI default; optional}]: " IN_MODEL
+    DEF_MODEL="${IN_MODEL:-$DEF_MODEL}"
+    validate_model_id "$DEF_MODEL" || exit 1
+    for a in "${AGENTS[@]}"; do
+        [ "$(mget MODEL "$a")" = "$OLD_DEF_MODEL" ] && mset MODEL "$a" "$DEF_MODEL"
+    done
+    read -rp "  Any agents with a different vendor model? (space-separated, blank keeps choices): " MODEL_EXC
+    for want in ${MODEL_EXC//,/ }; do
+        want="$(slug "$want")"
+        printf '%s\n' "${AGENTS[@]}" | grep -qx "$want" || { echo "  (skipping '$want' -- not an agent)"; continue; }
+        model_hint "$(mget CLI "$want")"
+        CURRENT_MODEL="$(mget MODEL "$want")"
+        read -rp "    $want -- vendor model [${CURRENT_MODEL:-CLI default; optional}]: " IN_MODEL
+        CHOSEN_MODEL="${IN_MODEL:-$CURRENT_MODEL}"
+        validate_model_id "$CHOSEN_MODEL" || exit 1
+        mset MODEL "$want" "$CHOSEN_MODEL"
     done
 
     read -rp "Point any agent at a local model provider? [y/N]: " USE_PROVIDER
@@ -742,9 +791,10 @@ fi
 # merged_daemon_env -- without this, a later "h-mesh start"/upgrade run
 # from a clean shell would silently come up without whatever only ever
 # lived in this run's exported env).
-CLI_MAP=(); PROFILE_MAP=(); PROVIDER_MAP=()
+CLI_MAP=(); MODEL_MAP=(); PROFILE_MAP=(); PROVIDER_MAP=()
 for a in "${AGENTS[@]}"; do
     [ "$(mget CLI "$a")" != "$DEF_CLI" ] && CLI_MAP+=("${a}=$(mget CLI "$a")")
+    [ "$(mget MODEL "$a")" != "$DEF_MODEL" ] && MODEL_MAP+=("${a}=$(mget MODEL "$a")")
     [ "$(mget PROF "$a")" != "$DEF_PROFILE" ] && PROFILE_MAP+=("${a}=$(mget PROF "$a")")
     [ -n "$(mget EP "$a")" ] && PROVIDER_MAP+=("${a}=$(mget EP "$a")")
 done
@@ -772,6 +822,7 @@ persist_line() {
 
 persist_line AGENTS "$(IFS=,; echo "${AGENTS[*]}")"
 persist_line DEFAULT_CLI "$DEF_CLI"
+[ -n "$DEF_MODEL" ] && persist_line DEFAULT_MODEL "$DEF_MODEL"
 persist_line ACCOUNTS "$(IFS=,; echo "${PROFILES[*]}")"
 persist_line DEFAULT_ACCOUNT "$DEF_PROFILE"
 for tv in $TOKEN_VARS; do
@@ -779,6 +830,7 @@ for tv in $TOKEN_VARS; do
     [ -n "$tval" ] && persist_line "$tv" "$tval"
 done
 [ "${#CLI_MAP[@]}"      -gt 0 ] && persist_line AGENT_CLIS "$(IFS=,; echo "${CLI_MAP[*]}")"
+[ "${#MODEL_MAP[@]}"    -gt 0 ] && persist_line AGENT_MODELS "$(IFS=,; echo "${MODEL_MAP[*]}")"
 [ "${#PROFILE_MAP[@]}"  -gt 0 ] && persist_line AGENT_PROFILES "$(IFS=,; echo "${PROFILE_MAP[*]}")"
 if [ "${#PROVIDER_MAP[@]}" -gt 0 ] && [ -n "$LOCAL_URL" ]; then
     persist_line AGENT_PROVIDERS "$(IFS=,; echo "${PROVIDER_MAP[*]}")"
@@ -806,6 +858,9 @@ printf '%s\n' "${PERSIST_LINES[@]}" | "$PYTHON" -m services.tenant_config set "$
 CLI_MAP_EXISTING="$(TENANT_ENV_GET AGENT_CLIS "")"
 PROFILE_MAP_EXISTING="$(TENANT_ENV_GET AGENT_PROFILES "")"
 PROVIDER_MAP_EXISTING="$(TENANT_ENV_GET AGENT_PROVIDERS "")"
+DEFAULT_MODEL="$DEF_MODEL"
+AGENT_MODELS="$(TENANT_ENV_GET AGENT_MODELS "")"
+export DEFAULT_MODEL AGENT_MODELS
 
 echo
 printf '  %-16s %-8s %-10s\n' AGENT CLI ACCOUNT
