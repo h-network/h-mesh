@@ -165,6 +165,25 @@ fails if a table command is in neither the prose nor the inventory, or if a
 curated name stops being explained in the prose. Guides already written for live
 agents are not rewritten; the inventory appears in new hires' guides.
 
+**Reaching another office.** After the local `send` examples the guide has a
+short inter-office section (`inter_office_guide`). Every agent gets `offices`,
+`send --office <office> -a <agent> "..."`, the exit codes (0 accepted and queued,
+1 refused with nothing sent, 3 outcome unknown, so do not blindly resend) and a
+pointer to the reply, which arrives as `[message from relay] [from
+<office>/<agent>] ...` with a hint line carrying the working answer command (see
+"Relayed inter-office messages" above). Only the lead also gets the linking
+commands (`coop-grant`, `office-add ... --token-stdin`, `coops`, `coop-revoke`,
+`office-rm`) and a warning to give a token only to the other office's lead and
+never put it in a message, file or commit. The syntax is hand-written because the
+command table carries no arguments; `tests/test_guide_inter_office.py` fails if a
+command the table marks "lead only" is missing from the lead's text or leaks into
+an ordinary agent's, if the printed `send --office` form stops parsing, or if the
+printed exit codes drift from what `send` reports. The generated command inventory (above) lists every one of these
+subcommands to every agent, the lead-only ones labelled "(lead only)";
+`tests/test_guide_command_inventory.py` pins that for `offices`, `coop-grant`,
+`coops`, `coop-revoke`, `office-add` and `office-rm`. Guides already written for
+live agents are not rewritten.
+
 The guide deliberately carries **no operator-authority text**: earlier versions
 added a per-entrance block ("routing provenance, not cryptographic proof of
 identity", "operator coordination authority cannot attach...") and an

@@ -103,3 +103,30 @@ def test_no_previously_removed_text_comes_back_through_the_inventory():
     inventory = office_command_inventory(CMD).lower()
     for gone in ("operator", "external entrance", "peers -i", "lifecycle provider", "authority"):
         assert gone not in inventory
+
+
+# The inter-office commands (#4 follow-up): the inventory must carry every one
+# for every agent, and the guide must show the `send --office` form.
+INTER_OFFICE_COMMANDS = ("offices", "coop-grant", "coops", "coop-revoke", "office-add", "office-rm")
+
+
+@pytest.mark.parametrize("lead", [
+    pytest.param(None, id="no-lead"),
+    pytest.param("architect", id="other-lead"),
+    pytest.param("worker", id="is-lead"),
+])
+def test_the_inventory_covers_every_inter_office_subcommand(lead):
+    descriptions = {names[0]: description for names, description, _ in office_cli._COMMAND_TABLE}
+    guide = _guide(lead=lead)
+    rows = _rows(guide)
+    for name in INTER_OFFICE_COMMANDS:
+        assert name in descriptions, f"{name} is no longer a command; update INTER_OFFICE_COMMANDS"
+        assert rows[name] == descriptions[name]
+    assert f"{CMD} send --office <office> -a <agent>" in guide
+
+
+def test_every_command_the_table_marks_lead_only_is_labelled_in_the_inventory():
+    rows = _rows(_guide())
+    for names, description, _ in office_cli._COMMAND_TABLE:
+        if "lead only" in description.lower():
+            assert "lead only" in rows[names[0]].lower()
