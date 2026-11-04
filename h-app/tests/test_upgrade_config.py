@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 import subprocess
@@ -41,6 +42,19 @@ def test_concurrent_upgrade_token_creation_keeps_one_identity(tmp_path, monkeypa
         tokens = list(executor.map(lambda _: ensure_api_token('proof'), range(16)))
     assert len(set(tokens)) == 1
     assert read_tenant_env('proof')['API_TOKEN'] == tokens[0]
+    # POSIX record locks share ownership inside a process: exercise the
+    # mutex above and the independent-process file lock separately.
+    code = ("import hashlib; from services.tenant_config import ensure_api_token; "
+            "print(hashlib.sha256(ensure_api_token('processproof').encode()).hexdigest())")
+    def create_in_process(_):
+        result = subprocess.run([sys.executable, '-c', code], env=dict(os.environ),
+                                text=True, capture_output=True, timeout=10, check=True)
+        return result.stdout.strip()
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        digests = list(executor.map(create_in_process, range(8)))
+    assert len(set(digests)) == 1
+    persisted = read_tenant_env('processproof')['API_TOKEN']
+    assert hashlib.sha256(persisted.encode()).hexdigest() == digests[0]
 
 
 def test_upgrade_rejects_multiline_token_without_writing_it(tmp_path, monkeypatch):
