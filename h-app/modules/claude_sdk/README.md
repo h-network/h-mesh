@@ -71,3 +71,31 @@ for the same reason (no interactive agent here to cooperate with an opt-in
 `lib/reply_correlation.py`'s `record_delivered()` only after the `query()`
 call actually returns, so an `in_reply_to` claim can't validate for a call
 that never completed.
+
+## Live per-hop progress (opt-in)
+
+A `Message` payload's `live_to` field (an agent name) streams one `Progress`
+envelope per `query()` hop -- init, each turn, and the final result -- to
+that agent as each hop happens, rather than waiting for the batched final
+reply. `live_cc_source` (bool, default `false`) additionally sends the same
+Progress envelopes to whichever agent sent the original `Message`. Neither
+field set at all is byte-for-byte today's behavior: no Progress envelopes,
+and the final `Message` reply is unaffected either way.
+
+```json
+{"text": "...", "live_to": "watcher", "live_cc_source": true}
+```
+
+Each `Progress` envelope is correlated the same way the final `Message`
+reply is (`correlation_id`/`in_reply_to` both the incoming `stream_id`), with
+this payload shape:
+
+```json
+{"event": "claude_sdk_query_started", "evidence": "init"}
+{"event": "claude_sdk_turn", "reason": "stop_reason=end_turn tools=Read"}
+{"event": "claude_sdk_query_finished", "evidence": "success", "reason": "is_error=False num_turns=2"}
+```
+
+`evidence`/`reason` are omitted (not `null`) when not applicable to that hop.
+An invalid `live_to` (not a valid agent-name segment) is dead-lettered before
+any `query()` call, the same way an invalid `context` already is.
