@@ -62,7 +62,7 @@ def post_update_env(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(upgrade, 'persist_venv_on_path', lambda *_args, **_kwargs: None)
     monkeypatch.setattr(upgrade, 'install_tmux_conf', lambda **_kwargs: None)
-    monkeypatch.setattr(upgrade, 'install_statusline', lambda *_args: None)
+    monkeypatch.setattr(upgrade, 'install_statusline', lambda *_args, **_kwargs: None)
     monkeypatch.setattr(upgrade, 'stop_daemons', lambda *_args, **_kwargs: calls.append('stop'))
     monkeypatch.setattr(upgrade, 'start_daemons', lambda **kwargs: calls.append(kwargs))
     return config, calls

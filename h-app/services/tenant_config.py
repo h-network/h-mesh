@@ -20,10 +20,13 @@ import fcntl
 import os
 import secrets
 import sys
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 
 from core.config import state_dir
+
+_TOKEN_LOCK = threading.Lock()
 
 
 def tenant_env_path(tenant: str) -> Path:
@@ -70,10 +73,12 @@ def ensure_api_token(tenant: str, supplied: str | None = None) -> str:
     """
     path = tenant_env_path(tenant)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path.with_name("env.lock"), os.O_RDWR | os.O_CREAT, 0o600)
-    with os.fdopen(fd, "r+") as lock:
+    # Record locks coordinate processes; the mutex also serializes threads
+    # within one process, where POSIX record locks share ownership.
+    with _TOKEN_LOCK, os.fdopen(os.open(path.with_name("env.lock"),
+                                       os.O_RDWR | os.O_CREAT, 0o600), "r+") as lock:
         os.fchmod(lock.fileno(), 0o600)
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        fcntl.lockf(lock, fcntl.LOCK_EX)
         values = read_tenant_env(tenant)
         token = values.get("API_TOKEN") or supplied or secrets.token_hex(32)
         if "\n" in token or "\r" in token:
