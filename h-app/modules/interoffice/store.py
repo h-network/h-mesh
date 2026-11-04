@@ -1,5 +1,6 @@
 """Redis records shared with the inter-office CLI; token values stay private."""
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -16,6 +17,77 @@ from core.registry import is_member, port_type
 _TOKEN = re.compile(r"coop\.[0-9a-f]{16}\.[A-Za-z0-9_-]{43}\Z")
 _CURSOR = re.compile(r"[0-9]{1,20}-[0-9]{1,20}\Z")
 _REPLY_ID = re.compile(r"[0-9a-f]{32}\Z")
+
+# Four times modules.api.port.MAILBOX_MAXLEN (1000, approximate count trim).
+# No time expiry: an idle API mailbox has no age limit either.
+SEEN_LEDGER_LIMIT = 4_000
+
+_ADMIT_ONCE = """
+-- interoffice bounded replay ledger and local admission v1
+if redis.call('HGET', KEYS[3], ARGV[1]) ~= ARGV[2]
+   or redis.call('HGET', KEYS[4], ARGV[1]) ~= ARGV[3] then return -1 end
+if ARGV[7] == 'remember' and redis.call('HGET', KEYS[6], ARGV[1]) ~= ARGV[9] then return -1 end
+local ranked = redis.call('TYPE', KEYS[1])['ok']
+local indexed = redis.call('TYPE', KEYS[2])['ok']
+if (ranked ~= 'none' and ranked ~= 'zset')
+   or (indexed ~= 'none' and indexed ~= 'hash') then
+    return redis.error_reply('invalid relay ledger type')
+end
+local prior = redis.call('HGET', KEYS[2], ARGV[4])
+if prior then
+    -- Repeated identities at a newer remote cursor must remain recent.
+    if ARGV[6] > prior then
+        redis.call('ZREM', KEYS[1], prior)
+        redis.call('ZADD', KEYS[1], 0, ARGV[6])
+        redis.call('HSET', KEYS[2], ARGV[4], ARGV[6])
+    end
+    return 0
+end
+if ARGV[7] == 'check' then return 2 end
+if ARGV[7] == 'enqueue' then
+    local queue = redis.call('TYPE', KEYS[5])['ok']
+    if queue ~= 'none' and queue ~= 'list' then
+        return redis.error_reply('invalid relay egress type')
+    end
+    redis.call('RPUSH', KEYS[5], ARGV[8])
+    redis.call('SET', KEYS[7], '1')
+end
+redis.call('ZADD', KEYS[1], 0, ARGV[6])
+redis.call('HSET', KEYS[2], ARGV[4], ARGV[6])
+local excess = redis.call('ZCARD', KEYS[1]) - tonumber(ARGV[5])
+if excess > 0 then
+    local oldest = redis.call('ZRANGE', KEYS[1], 0, excess - 1)
+    for _, member in ipairs(oldest) do
+        redis.call('HDEL', KEYS[2], string.sub(member, -32))
+    end
+    redis.call('ZREMRANGEBYRANK', KEYS[1], 0, excess - 1)
+end
+return 1
+"""
+
+
+class AdmissionRedis:
+    """Delegate send's policy/envelope work; guard only its single RPUSH.
+
+    The caller inspects ``admitted`` to distinguish a concurrent replay from
+    a new append. No policy or envelope implementation is duplicated here.
+    """
+    def __init__(self, store, office, stream_id, cursor):
+        self.store, self.office = store, office
+        self.stream_id, self.cursor = stream_id, cursor
+        self.admitted = None
+
+    def __getattr__(self, name):
+        return getattr(self.store.r, name)
+
+    def rpush(self, key, *values):
+        expected = prefix(self.store.pod, self.store.tenant, "relay", "egress")
+        if key != expected or len(values) != 1:
+            raise RelayStateError("unexpected relay admission write")
+        self.admitted = self.store.enqueue_once(
+            self.office, self.stream_id, self.cursor, values[0],
+        )
+        return int(self.admitted)
 
 
 class RelayStateError(RuntimeError):
@@ -141,6 +213,77 @@ class Store:
                     return True
                 except WatchError:
                     continue
+
+    def ledger_keys(self, office: Office) -> tuple[str, str]:
+        identity = json.dumps([office.name, office.url, office.participant], separators=(",", ":"))
+        digest = hashlib.sha256(identity.encode()).hexdigest()[:32]
+        return (
+            prefix(self.pod, self.tenant, resource="relay-seen.o" + digest),
+            prefix(self.pod, self.tenant, resource="relay-seen-index.o" + digest),
+        )
+
+    def ready_key(self, office: Office) -> str:
+        suffix = self.ledger_keys(office)[0].rsplit(".", 1)[1]
+        return prefix(self.pod, self.tenant, resource="relay-seen-ready." + suffix)
+
+    def backfill_cursor(self, office: Office) -> str | None:
+        with self.r.pipeline(transaction=True) as pipe:
+            ready, cursor = pipe.exists(self.ready_key(office)).hget(self.cursor_key, office.name).execute()
+        if ready or cursor is None:
+            return None
+        cursor = text(cursor)
+        cursor_order(cursor)
+        return cursor
+
+    def finish_backfill(self, office: Office, committed: str) -> bool:
+        """Only a still-current, unchanged committed cursor proves old admission."""
+        ready = self.ready_key(office)
+        with self.r.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(self.offices_key, self.tokens_key, self.cursor_key, ready)
+                    if not self.current(office, pipe=pipe) or text(pipe.hget(self.cursor_key, office.name)) != committed:
+                        pipe.unwatch()
+                        return False
+                    pipe.multi()
+                    pipe.set(ready, "1")
+                    pipe.execute()
+                    return True
+                except WatchError:
+                    continue
+
+    def remember(self, office: Office, stream_id: str, cursor: str, committed: str) -> None:
+        if cursor_order(cursor) > cursor_order(committed):
+            raise RelayStateError("backfill entry exceeds committed cursor")
+        self._admission(office, stream_id, cursor, mode="remember", committed=committed)
+
+    def _admission(self, office: Office, stream_id: str, cursor: str, raw=None,
+                   *, mode: str | None = None, committed: str = "") -> int:
+        if not isinstance(stream_id, str) or not _REPLY_ID.fullmatch(stream_id):
+            raise RelayStateError("invalid remote stream id")
+        milliseconds, sequence = cursor_order(cursor)
+        # Lexicographic members avoid IEEE-754 loss for full uint64 cursors.
+        member = f"{milliseconds:020d}-{sequence:020d}:{stream_id}"
+        with self.r.pipeline(transaction=True) as pipe:
+            record, token = pipe.hget(self.offices_key, office.name).hget(self.tokens_key, office.name).execute()
+        if parse_office(office.name, record, token, allow_plaintext=self.allow_plaintext) != office:
+            raise RelayStateError("cooperation changed during admission")
+        ranked, indexed = self.ledger_keys(office)
+        result = self.r.eval(
+            _ADMIT_ONCE, 7, ranked, indexed, self.offices_key, self.tokens_key,
+            prefix(self.pod, self.tenant, "relay", "egress"), self.cursor_key, self.ready_key(office),
+            office.name, record, token, stream_id, SEEN_LEDGER_LIMIT, member,
+            mode or ("check" if raw is None else "enqueue"), "" if raw is None else raw, committed,
+        )
+        if result == -1:
+            raise RelayStateError("cooperation or cursor changed during admission")
+        return result
+
+    def seen(self, office: Office, stream_id: str, cursor: str) -> bool:
+        return self._admission(office, stream_id, cursor) == 0
+
+    def enqueue_once(self, office: Office, stream_id: str, cursor: str, raw) -> bool:
+        return self._admission(office, stream_id, cursor, raw) == 1
 
     def reply_target(self, office: Office, reply_id: str, remote_agent: str) -> ReplyTarget | None:
         """Bind routing and trace metadata to the same validated local receipt."""
