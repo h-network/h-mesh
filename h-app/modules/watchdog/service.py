@@ -13,7 +13,7 @@ from core.keys import prefix
 from core.logging import log_record, mirror
 from core.policy import require_allowed
 from core.queues import admit_ingress
-from core.registry import is_member, members, port_type
+from core.registry import is_interoffice, is_member, members, port_type
 from modules.tmux import deliver_tmux, run_tmux
 from modules.watchdog.activity import ActivityTailer
 from modules.watchdog.presence import PresenceSampler
@@ -908,6 +908,12 @@ class Watchdog:
             raw_fields = _fields(self.r.hgetall(prefix(self.pod, self.tenant, agent, "unreplied")) or {})
             present_clients = set()
             for client, raw_value in raw_fields.items():
+                # An inter-office participant is never a client owed a reply
+                # (core.channels no longer opens these). Drop an entry written
+                # before that fix instead of nagging the lead about it forever.
+                if is_interoffice(self.r, pod=self.pod, tenant=self.tenant, agent=client):
+                    self.r.hdel(prefix(self.pod, self.tenant, agent, "unreplied"), client)
+                    continue
                 try:
                     data = json.loads(raw_value)
                     count = int(data["count"])

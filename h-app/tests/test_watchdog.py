@@ -1880,6 +1880,26 @@ class WatchdogTests(unittest.TestCase):
         envelope = parse(r.lists[_key("architect", "ingress")][-1])
         self.assertIn("telegram", envelope["payload"]["text"])
 
+    def test_unreplied_duration_drops_an_inter_office_entry_without_alerting(self):
+        # Entries written before core stopped opening them for relay/coop
+        # participants: pruned, never nagged about; a real client still alerts.
+        r = FakeRedis()
+        r.hashes[prefix(POD, TENANT, resource="interoffice-participants")]["home-architect"] = "coop"
+        _unreplied_agent(r, client="home-architect", since="2026-08-09T13:00:00Z")
+        _unreplied_agent(r, client="telegram")
+        _lead(r)
+        kicks, fake = _kicks()
+        self._set(service, "run_tmux", _quiet_windows())
+        self._set(service, "deliver_tmux", fake)
+
+        _watchdog(r).poll(now=NOW)
+
+        self.assertEqual(list(r.hashes[_key("sme-2", "unreplied")]), ["telegram"])
+        texts = [parse(raw)["payload"]["text"] for raw in r.lists[_key("architect", "ingress")]]
+        self.assertEqual(texts, [
+            "[alert from watchdog] sme-2 has 1 unanswered message from telegram, oldest 1 min old"
+        ])
+
     def test_unreplied_duration_drops_state_once_the_agent_replies(self):
         r = FakeRedis()
         _unreplied_agent(r)

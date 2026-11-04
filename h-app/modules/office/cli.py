@@ -36,7 +36,7 @@ import redis
 from core.channels import send
 from core.envelope import EnvelopeError, parse
 from core.keys import (
-    incarnation_key, prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key, validate_segment,
+    incarnation_key, interoffice_participants_key, prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key, validate_segment,
 )
 from core.logging import log_record, record_task_event
 from core.registry import is_member, members, port_type
@@ -1976,6 +1976,17 @@ def _key(name: str, pod: str, tenant: str, *args):
     return prefix(pod, tenant, resource=resources[name])
 
 
+def _mark_interoffice(r, pod: str, tenant: str, participant: str, role: str) -> None:
+    """Record a local api participant as speaking for another office.
+
+    core.channels does not treat such a sender as a client owed a reply.
+    """
+    try:
+        r.hset(interoffice_participants_key(pod, tenant), participant, role)
+    except redis.RedisError as exc:
+        raise OfficeError(f"cannot record {participant!r} as an inter-office participant: {exc}") from exc
+
+
 def _require_lead(r, *, pod: str, tenant: str, source: str, command: str) -> None:
     """Fail closed unless the caller is the tenant's lead.
 
@@ -2232,6 +2243,9 @@ def _office_add_command(argv: list[str]) -> None:
         r.hset(_key("offices", pod, tenant), name, json.dumps(record, separators=(",", ":")))
     except redis.RedisError as exc:
         raise OfficeError(f"cannot write the office address book: {exc}") from exc
+    # Mark the relay as an inter-office speaker before it can send anything, so
+    # its replies never open an "unanswered message" entry for the lead.
+    _mark_interoffice(r, pod, tenant, _RELAY_PARTICIPANT, "relay")
     if not relay_enrolled:
         send(
             r, pod=pod, tenant=tenant, source=source, destination="host",
@@ -2309,8 +2323,10 @@ def _coop_grant_command(argv: list[str]) -> None:
     if is_member(r, pod=pod, tenant=tenant, agent=participant) and \
             port_type(r, pod=pod, tenant=tenant, agent=participant) != "api":
         raise OfficeError(f"{participant!r} is an existing non-api agent; pick another participant name")
-    # Enrol first, mint second: a failure in between leaves an idle api
-    # participant, never a live token for a participant that does not exist.
+    # Mark first so the participant's first message cannot open an "unanswered"
+    # entry; then enrol first, mint second: a failure in between leaves an idle
+    # api participant, never a live token for a participant that does not exist.
+    _mark_interoffice(r, pod, tenant, participant, "coop")
     send(
         r, pod=pod, tenant=tenant, source=source, destination="host",
         payload={"agent": participant, "port_type": "api"},

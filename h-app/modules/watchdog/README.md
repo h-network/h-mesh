@@ -143,10 +143,21 @@ deliberately rather than by accident (2026-09-02):
   api-to-tmux `unreplied` it already writes. Until that lands, the alert
   still fires and lets the reader weigh the ambiguity themselves, rather
   than the watchdog guessing wrong in the direction of silence.
+- **Inter-office senders are not clients awaiting a reply.** `unreplied`
+  only tracks `api` *clients* (Telegram-style). The local `relay`
+  participant and every `coop-grant` participant are also `api` port_type,
+  but nothing could ever clear their entry (a reply to a remote agent goes
+  out with `send --office`, not to the local participant, and a coop
+  reply is optional), so they would be nagged about forever. `core.channels`
+  therefore skips them (`core.registry.is_interoffice`), and
+  `_check_unreplied_duration` prunes -- without alerting -- any such entry
+  written before that fix. Agents still cannot clear their own entries.
 - **`_check_ack_loop`'s `acks` hash has no writer yet** in h-mesh's
   `core.channels.send()` (confirmed by reading it directly) -- that family
   is dormant, not broken. Documented in its own docstring so a quiet ack-
-  loop check is not mistaken for "no ack-looping happening."
+  loop check is not mistaken for "no ack-looping happening." Because nothing
+  writes `acks`, a courtesy "acknowledged" from a remote office cannot feed
+  it either; and `acks` is a tmux-to-tmux edge, never an api sender's.
 - **`_EMIT_USAGE_LUA` preflights every key it may write, before the first
   mutation.** A Redis `EVAL` is isolated from other clients but NOT
   transactional with itself -- a runtime error partway through does not

@@ -12,9 +12,9 @@ Everything else is a module that plugs into this.
 | `envelope.py` | wire frame: `build`/`parse`/`encode`, header splicing (`stamp_source`, `advance_hop`), address resolution |
 | `keys.py` | `prefix()`, `delivery_lock_key()` and the named per-resource helpers (`receive_*_key`, `incarnation_key`, inter-office `offices_key` family) — the sole Redis key constructors, segment validation |
 | `config.py` | local state directory resolution (`H_MESH_STATE_DIR`, default `~/.h-mesh`) |
-| `channels.py` | `send()`/`receive()`, unreplied tracking, `DeadLetter`, and best-effort failure feedback to tmux senders |
+| `channels.py` | `send()`/`receive()`, unreplied tracking (api *clients* only -- inter-office participants never open an entry), `DeadLetter`, and best-effort failure feedback to tmux senders |
 | `queues.py` | `admit_ingress()` — shared atomic ingress-admission Lua op |
-| `registry.py` | read-only registry access (`members`/`member_types`/`is_member`/`port_type`) |
+| `registry.py` | read-only registry access (`members`/`member_types`/`is_member`/`port_type`) and `is_interoffice()` (is this api participant a relay/coop speaker for another office) |
 | `policy.py` | import/export tag ACL (`allows`/`require_allowed`) |
 | `dispatch.py` | generic port_type -> handler registry and dispatch with renewable per-agent delivery leases, invoked only by whatever the switch's kick actually calls -- the switch itself never imports this |
 | `logging.py` | contract-shaped JSON event logging and durable stdout mirroring, plus `configure_logging()` — the stdlib logging threshold for entry points |

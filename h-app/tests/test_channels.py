@@ -199,6 +199,27 @@ class ChannelTests(unittest.TestCase):
         raw = self.redis.lpop(prefix(POD, TENANT, "alice", "egress"))
         self.assertNotIn("in_reply_to", parse(raw))
 
+    def _send_from(self, source, text="hello from another office"):
+        send(
+            self.redis, pod=POD, tenant=TENANT, source=source,
+            destination="worker", payload={"text": text},
+        )
+        return self.redis.hashes.get(prefix(POD, TENANT, "worker", "unreplied"), {})
+
+    def test_unreplied_coop_participant_never_opens_an_entry(self):
+        self.register(**{"home-architect": "api"}, worker="tmux")
+        self.redis.hset(
+            prefix(POD, TENANT, resource="interoffice-participants"), "home-architect", "coop",
+        )
+        self.assertEqual(self._send_from("home-architect"), {})
+        # a courtesy ack from the remote office must not open one either
+        self.assertEqual(self._send_from("home-architect", "acknowledged, no reply needed"), {})
+
+    def test_unreplied_relay_never_opens_an_entry(self):
+        self.register(relay="api", worker="tmux")
+        self.redis.hset(prefix(POD, TENANT, resource="interoffice-participants"), "relay", "relay")
+        self.assertEqual(self._send_from("relay", "[from labb/worker] hi"), {})
+
     def test_unreplied_count_opens_increments_and_reply_clears(self):
         self.register(client="api", worker="tmux")
         send(
@@ -219,6 +240,33 @@ class ChannelTests(unittest.TestCase):
             destination="client", payload={"text": "reply"},
         )
         self.assertIsNone(self.redis.hget(key, "client"))
+
+    def test_unreplied_legacy_coop_token_participant_never_opens_an_entry(self):
+        # An office set up before the marker existed: only the coop-tokens record
+        # names the participant. A revoked token keeps the participant enrolled.
+        self.register(**{"home-architect": "api"}, worker="tmux")
+        tokens = prefix(POD, TENANT, resource="coop-tokens")
+        self.redis.hset(tokens, "0123456789abcdef", "not json")
+        self.redis.hset(tokens, "1123456789abcdef", json.dumps(
+            {"participant": "home-architect", "revoked": True}))
+        self.assertEqual(self._send_from("home-architect"), {})
+
+    def test_unreplied_legacy_relay_needs_an_address_book_entry(self):
+        self.register(relay="api", worker="tmux")
+        self.assertIn("relay", self._send_from("relay"))     # no office added: an ordinary api client
+        self.redis.hashes[prefix(POD, TENANT, "worker", "unreplied")].clear()
+        self.redis.hset(prefix(POD, TENANT, resource="offices"), "labb", "{}")
+        self.assertEqual(self._send_from("relay"), {})
+
+    def test_unreplied_unmarked_api_client_still_opens_one(self):
+        # Telegram-style client beside inter-office participants: unchanged.
+        self.register(telegram="api", **{"home-architect": "api"}, worker="tmux")
+        self.redis.hset(
+            prefix(POD, TENANT, resource="interoffice-participants"), "home-architect", "coop",
+        )
+        tokens = self._send_from("telegram")
+        self.assertEqual(json.loads(tokens["telegram"])["count"], 1)
+        self.assertNotIn("home-architect", self._send_from("home-architect"))
 
     def test_receive_dead_letters_opener_rejection(self):
         envelope_id = send(

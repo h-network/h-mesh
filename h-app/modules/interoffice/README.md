@@ -18,6 +18,7 @@ All Redis keys are local to `POD`/`TENANT` through `core.keys.prefix`:
 | `offices` | Hash: office name to JSON `{url, participant, added_by, added_ts}` |
 | `offices.tokens` | Hash: office name to its secret cooperation token |
 | `offices.cursor` | Hash: office name to the last committed SSE entry ID |
+| `interoffice-participants` | Hash: local api participant to `relay` or `coop`; written by `office-add` (the relay) and `coop-grant`. Marks senders that speak for another office so `core.channels` never opens an "unanswered message" entry for them (see `core/registry.py: is_interoffice`) |
 | `xsent.s<stream_id>` | Sender CLI receipt: `{sender, sender_incarnation, correlation_id, office, agent, ts}`, TTL 24 hours |
 
 Only the local lead can manage cooperation addresses and credentials through

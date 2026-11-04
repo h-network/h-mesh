@@ -19,7 +19,7 @@ from .keys import (
 )
 from .logging import emit, log_record
 from .policy import require_allowed
-from .registry import port_type
+from .registry import is_interoffice, port_type
 
 # Kinds a client can plausibly be owed a reply for. `Command`, `AddTicket` and
 # similar structured kinds are never sent by a client and would only ever
@@ -87,6 +87,8 @@ def _track_unreplied(r, *, pod: str, tenant: str, source: str, destination: str,
     client (`api` port_type,
     e.g. `telegram`) sending to a tmux agent opens or extends a count; that
     same agent sending anything back to the same client closes it outright.
+    Inter-office participants (`core.registry.is_interoffice`) are `api` too
+    but never open a count.
     Peer traffic between two tmux agents never touches this key: ticket age
     already covers that responsiveness question via the watchdog's
     doing/todo/hold family.
@@ -99,6 +101,10 @@ def _track_unreplied(r, *, pod: str, tenant: str, source: str, destination: str,
         source_type == "api"
         and destination_type == "tmux"
         and kind in _UNREPLIED_KINDS
+        # An inter-office sender (relay / coop participant) is not a client
+        # owed a reply: nothing could clear its entry and the watchdog would
+        # nag the lead forever. Checked last so ordinary traffic pays nothing.
+        and not is_interoffice(r, pod=pod, tenant=tenant, agent=source)
     ):
         key = _unreplied_key(pod, tenant, destination)
         since = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")

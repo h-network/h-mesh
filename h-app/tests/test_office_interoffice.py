@@ -490,3 +490,37 @@ def test_coops_lists_only_whitelisted_fields(monkeypatch, capsys, coop):
 def test_new_commands_are_registered_everywhere():
     for name in ("office-add", "offices", "office-rm", "coop-grant", "coop-revoke", "coops"):
         assert name in office_cli._COMMANDS and name in office_cli._DISPATCH
+
+
+# ------------------------------------------- inter-office participant marker
+
+PARTICIPANTS = prefix(POD, TENANT, resource="interoffice-participants")
+
+
+def test_office_add_marks_the_relay_whether_or_not_it_is_already_enrolled(monkeypatch):
+    _env(monkeypatch)
+    for registry in ({}, {"relay": "api"}):
+        r = Redis(registry=registry)
+        r.values[LEAD] = "architect"
+        with patch("modules.office.cli.send"):
+            run(r, ["office-add", "beta", "https://b.example", "--participant", "p",
+                    "--token-stdin"], monkeypatch, TOKEN)
+        assert r.hashes[PARTICIPANTS] == {"relay": "relay"}
+
+
+def test_coop_grant_marks_the_participant_as_inter_office(monkeypatch, coop):
+    _env(monkeypatch)
+    r = Redis()
+    r.values[LEAD] = "architect"
+    with patch("modules.office.cli.send"):
+        run(r, ["coop-grant", "alpha-office"], monkeypatch)
+    assert r.hashes[PARTICIPANTS] == {"alpha-office": "coop"}
+
+
+def test_a_refused_coop_grant_marks_nobody(monkeypatch, coop):
+    _env(monkeypatch)
+    r = Redis(registry={"scout": "tmux"})
+    r.values[LEAD] = "architect"
+    assert exit_code(r, ["coop-grant", "scout"], monkeypatch) == 1
+    assert exit_code(r, ["coop-grant", "api"], monkeypatch) == 1
+    assert not r.hashes[PARTICIPANTS]

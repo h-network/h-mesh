@@ -167,3 +167,14 @@ def coop_tokens_key(pod: str, tenant: str) -> str:
     """HASH token-id -> JSON {participant, sha256, kinds, created_ts, revoked}
     (receiving side). Only the sha256 of a secret is ever stored here."""
     return prefix(pod, tenant, resource="coop-tokens")
+
+
+def interoffice_participants_key(pod: str, tenant: str) -> str:
+    """HASH participant -> "relay" | "coop": local api participants that speak
+    for another office (the reply relay, and each coop-grant participant).
+
+    Written by ``office coop-grant`` / ``office office-add``; read by
+    ``core.registry.is_interoffice``. The registry port_type stays ``api`` --
+    this is a marker beside it, not a new port type.
+    """
+    return prefix(pod, tenant, resource="interoffice-participants")

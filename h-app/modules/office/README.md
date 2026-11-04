@@ -255,6 +255,8 @@ as a substitute.
   unless `--allow-plaintext` (or `H_MESH_ALLOW_PLAINTEXT=1`) is given, for lab
   test beds; the token then travels in the clear and `office-add` warns.
 
+**Not clients.** `coop-grant` and `office-add` also record the participant (and `relay`) in the `interoffice-participants` hash. Their inbound messages never open an `unreplied` entry, so the watchdog does not report them as "unanswered"; offices set up earlier are recognised from their coop-token records and the reserved `relay` name. The registry port_type stays `api`.
+
 **Granting (receiving side).** `office coop-grant PARTICIPANT` (lead only)
 enrols PARTICIPANT as an api participant (`StartAgent`, same mechanism as
 `hire`), mints a Message-only token with `lib.coop_tokens.grant` and prints it
