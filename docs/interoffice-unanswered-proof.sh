@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # Throwaway two-office proof for switch-agent/interoffice-no-unanswered.
-# Stages: up | pair | traffic | watch | down. Each stage holds ~/ci/suite.lock.
+# Stages: up | pair | traffic | watch | down. Run only while no suite run is in progress
+# (the original run was serialized with suite runs by holding ~/ci/suite.lock).
 # Only compose projects h-mesh-nua-a-proof / h-mesh-nua-b-proof and image
 # h-mesh-nua-proof:a16a05e are ever touched. No token value is printed.
 set -Eeuo pipefail
 umask 077
 ci="$HOME/ci"
-exec 9>"$ci/suite.lock"
-flock -w 900 9
 SHA=a16a05e7813c013d486eadc28f6f95bb372e2808
 BRANCH=switch-agent/interoffice-no-unanswered
 root="$ci/nua-proof"

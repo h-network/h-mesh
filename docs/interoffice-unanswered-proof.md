@@ -6,8 +6,8 @@ clone of pushed commit `a16a05e7813c013d486eadc28f6f95bb372e2808`
 by the real `./container/bootstrap.sh`. No `.env` was edited, no `API_TOKEN` was
 supplied, and no token value was printed (the logs were checked: no
 `coop.<id>.<secret>` string appears). The driver is
-[`interoffice-unanswered-proof.sh`](interoffice-unanswered-proof.sh); each stage
-held `~/ci/suite.lock`.
+[`interoffice-unanswered-proof.sh`](interoffice-unanswered-proof.sh); the run was
+serialized with suite runs by holding `~/ci/suite.lock` around each stage.
 
 | | office A | office B |
 |---|---|---|
