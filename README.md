@@ -199,13 +199,6 @@ callers can use `--bind-ports`/`--no-bind-ports`, `--api-port`, and
 An older office without `H_MESH_BIND_PORTS` is treated as bound for backward
 compatibility.
 
-For two offices on one host, run a command in the chosen container using
-the name pattern `h-mesh-<pod>-<tenant>-h-mesh-1`, for example:
-
-```bash
-docker exec h-mesh-mypod-home-h-mesh-1 env AGENT_NAME=architect TENANT=home h-mesh-office peers
-```
-
 For direct/manual Compose use, `compose.yaml` intentionally publishes no
 ports on its own. Add the overlay when host access is wanted:
 
@@ -279,17 +272,13 @@ persisted to the office `.env` for later recreates.
 A **non-interactive** bootstrap with neither TLS nor plaintext opt-in still
 starts the office and API. The entrypoint restricts the API (and an enabled
 session door without TLS) to **container loopback**. The published API port
-then remains closed from the host. The final bootstrap output lines and the
+then remains closed from the host. The last bootstrap output line and the
 office's `SUMMARY.md` explain how to open it: rerun bootstrap with
 `API_TLS_CERT` and `API_TLS_KEY`, or explicitly accept plaintext, for example:
 
 ```bash
 H_MESH_ALLOW_PLAINTEXT=1 ./container/bootstrap.sh --pod mypod --tenant mytenant --non-interactive
 ```
-
-The final two output lines then show the office's exact `attach.sh` path and
-the equivalent `bootstrap.sh --pod ... --tenant ... --attach` command, after
-any API enablement line. Both attach commands also appear in `SUMMARY.md`.
 
 The app-level refusal of plaintext on non-loopback binds remains in force.
 On bare hosts the API defaults to loopback; configuring a non-loopback host

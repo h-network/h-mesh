@@ -83,7 +83,7 @@ def test_bootstrap_preserves_supplied_api_token_without_printing_it(tmp_path, so
     assert "H_MESH_ALLOW_PLAINTEXT=1" in env_file.read_text()
 
 
-def test_bootstrap_noninteractive_enablement_and_attach_are_last_and_in_summary(tmp_path):
+def test_bootstrap_noninteractive_loopback_enablement_is_last_and_in_summary(tmp_path):
     log = tmp_path / "docker.log"
     _fake_docker(tmp_path, log)
     env_file = tmp_path / ".env"
@@ -91,12 +91,10 @@ def test_bootstrap_noninteractive_enablement_and_attach_are_last_and_in_summary(
                          env=_env_with_fake_docker(tmp_path), capture_output=True, text=True, timeout=10)
     assert res.returncode == 0, res.stderr
     assert "up -d" in log.read_text()
-    enablement, attach, equivalent = res.stdout.strip().splitlines()[-3:]
+    enablement = res.stdout.strip().splitlines()[-1]
     assert "published API port 18090 is closed" in enablement
     assert "API_TLS_CERT and API_TLS_KEY" in enablement
     assert "H_MESH_ALLOW_PLAINTEXT=1" in enablement
-    assert attach == f"Attach: {tmp_path / 'attach.sh'}"
-    assert equivalent == f"Or: {BOOTSTRAP} --pod testpod --tenant testtenant --attach"
     summary = (tmp_path / "SUMMARY.md").read_text()
     assert enablement in summary
     assert str(tmp_path / "attach.sh") in summary
@@ -166,8 +164,6 @@ def test_bootstrap_interactive_without_telegram_explicitly_selects_transport(tmp
     assert "TELEGRAM_BOT_TOKEN=" not in env_file.read_text()
     assert _api_token(env_file) not in output
     assert "loopback-only" not in output
-    assert output.strip().splitlines()[-2] == f"Attach: {tmp_path / 'attach.sh'}"
-    assert output.strip().splitlines()[-1] == f"Or: {BOOTSTRAP} --pod testpod --tenant testtenant --attach"
     if transport == "plaintext":
         assert "H_MESH_ALLOW_PLAINTEXT=1" in env_file.read_text()
         assert "Accept plaintext for this container?" in output

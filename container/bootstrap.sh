@@ -641,8 +641,6 @@ echo "  Status:  docker ps --filter name=$PROJECT_NAME"
 echo "  Stop:    docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE down       # keeps state"
 echo "           docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE down -v    # also drops it"
 
-# Finish with enablement and exact attach commands, after Compose output.
+# Keep the action for a closed published port last, after Compose output.
 [ -z "$API_ENABLEMENT" ] || echo "$API_ENABLEMENT"
-echo "Attach: $ATTACH_SCRIPT"
-echo "Or: $SCRIPT_DIR/bootstrap.sh --pod $POD --tenant $TENANT --attach"
 exit 0
