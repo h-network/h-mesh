@@ -2408,7 +2408,7 @@ def _offices_command(argv: list[str]) -> None:
             line = f"{name}\t{rec['url']}\tas {rec['participant']}\tadded by {rec.get('added_by', '?')}"
         except (json.JSONDecodeError, KeyError, TypeError):
             print(f"{name}\t(unreadable entry)" + ("\tlink: unreadable entry; re-add it" if args.check else ""))
-            bad += 1
+            bad += 1 if args.check else 0
             continue
         if args.check:
             try:

@@ -382,3 +382,13 @@ def test_real_app_send_names_403_and_404_causes(real_office, monkeypatch, capsys
     revoke(real_office.redis, "test", "office", real_office.token_id)
     assert exit_code(r, ["send", "--office", "beta", "-a", "alice", "x"], monkeypatch) == 1
     assert "HTTP 401" in capsys.readouterr().err
+
+
+def test_offices_check_counts_an_unreadable_entry_but_plain_offices_does_not(monkeypatch, capsys):
+    _env(monkeypatch)
+    r = Redis()
+    r.hashes[OFFICES]["broken"] = "{not json"
+    run(r, ["offices"], monkeypatch)                          # plain listing: exit 0
+    assert "broken\t(unreadable entry)" in capsys.readouterr().out
+    assert exit_code(r, ["offices", "--check"], monkeypatch) == 1
+    assert "unreadable entry; re-add it" in capsys.readouterr().out
