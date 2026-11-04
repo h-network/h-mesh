@@ -11,7 +11,7 @@ import urllib.request
 
 from core.channels import send
 from core.keys import validate_segment
-from modules.interoffice.store import Office, RelayStateError, Store, cursor_order
+from modules.interoffice.store import AdmissionRedis, Office, RelayStateError, SEEN_LEDGER_LIMIT, Store, cursor_order
 
 logger = logging.getLogger(__name__)
 READ_TIMEOUT = 5.0
@@ -24,7 +24,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def sse_events(response, stop=None):
+def sse_events(response, stop=None, on_keepalive=None):
     """Yield bounded, complete frames; comments never produce a checkpoint."""
     event, event_id, data = "message", None, []
     size = 0
@@ -44,6 +44,8 @@ def sse_events(response, stop=None):
             event, event_id, data, size = "message", None, [], 0
             continue
         if line.startswith(":"):
+            if line == ": keepalive" and not data and event_id is None and on_keepalive is not None:
+                on_keepalive()
             continue
         key, sep, value = line.partition(":")
         if value.startswith(" "):
@@ -68,7 +70,7 @@ class OfficeWorker:
         self.progress = False
         self.thread = threading.Thread(target=self.run, name=f"relay-{office.name}", daemon=True)
 
-    def _admit(self, message: dict) -> bool:
+    def _admit(self, message: dict, cursor: str) -> bool:
         """Return only after admission, or a deliberate unsupported-kind rejection."""
         if message.get("kind") != "Message":
             logger.warning("relay office=%s event=rejected reason=unsupported-kind", self.office.name)
@@ -95,13 +97,19 @@ class OfficeWorker:
             if destination is None:
                 self.stop.wait(0.25)
                 continue
+            admission = AdmissionRedis(self.store, self.office, message["stream_id"], cursor)
             local_id = self.send_fn(
-                self.store.r, pod=self.store.pod, tenant=self.store.tenant,
+                admission, pod=self.store.pod, tenant=self.store.tenant,
                 source="relay", destination=destination, kind="Message",
                 payload={"text": f"[from {self.office.name}/{agent}] {payload['text']}"},
                 correlation_id=target.correlation_id if target is not None else None,
                 module="interoffice",
             )
+            if admission.admitted is not True:
+                if admission.admitted is False:
+                    logger.info("relay office=%s event=duplicate", self.office.name)
+                    return True
+                raise RelayStateError("local admission did not append")
             logger.info(
                 "relay office=%s event=admitted destination=%s stream_id=%s",
                 self.office.name, destination, local_id,
@@ -109,9 +117,18 @@ class OfficeWorker:
             return True
         return False
 
-    def receive(self, response) -> bool:
-        """Process one connection; checkpoint ONLY after local send returned."""
-        for event, event_id, data in sse_events(response, self.stop):
+    def receive(self, response, *, backfill_cursor: str | None = None) -> bool:
+        """Commit only admitted/rejected entries; backfill never enqueues history."""
+        remaining = backfill_cursor
+        backfilled = 0
+        def finish():
+            nonlocal remaining
+            if remaining is not None:
+                if not self.store.finish_backfill(self.office, remaining):
+                    raise RelayStateError("cooperation or cursor changed during backfill")
+                remaining = None
+                logger.info("relay office=%s event=legacy-backfill-complete", self.office.name)
+        for event, event_id, data in sse_events(response, self.stop, on_keepalive=finish):
             if self.stop.is_set() or not self.store.current(self.office):
                 return False
             if event == "error":
@@ -120,7 +137,10 @@ class OfficeWorker:
                 continue
             order = cursor_order(event_id)
             prior = self.store.cursor(self.office)
-            if prior is not None and order <= cursor_order(prior):
+            historical = remaining is not None and order <= cursor_order(remaining)
+            if remaining is not None and not historical:
+                finish()
+            if not historical and prior is not None and order <= cursor_order(prior):
                 continue
             try:
                 message = json.loads(data)
@@ -128,7 +148,20 @@ class OfficeWorker:
                 raise RelayStateError("invalid SSE JSON") from None
             if not isinstance(message, dict) or message.get("cursor", event_id) != event_id:
                 raise RelayStateError("invalid SSE message")
-            if not self._admit(message):
+            if historical:
+                backfilled += 1
+                if backfilled > SEEN_LEDGER_LIMIT:
+                    raise RelayStateError("legacy mailbox exceeds replay ledger bound")
+                if message.get("kind") == "Message":
+                    self.store.remember(self.office, message.get("stream_id"), event_id, remaining)
+                if order == cursor_order(remaining):
+                    finish()
+                continue
+            if message.get("kind") == "Message" and self.store.seen(
+                self.office, message.get("stream_id"), event_id,
+            ):
+                logger.info("relay office=%s event=duplicate", self.office.name)
+            elif not self._admit(message, event_id):
                 return False
             if not self.store.checkpoint(self.office, event_id):
                 return False
@@ -143,8 +176,9 @@ class OfficeWorker:
                 if not self.store.current(self.office):
                     return
                 cursor = self.store.cursor(self.office)
+                backfill_cursor = self.store.backfill_cursor(self.office)
                 path = f"/agents/{urllib.parse.quote(self.office.participant, safe='')}/messages/stream"
-                if cursor:
+                if cursor and backfill_cursor is None:
                     path += "?after=" + urllib.parse.quote(cursor, safe="")
                 req = urllib.request.Request(
                     self.office.url + path,
@@ -154,7 +188,7 @@ class OfficeWorker:
                 with self.opener.open(req, timeout=self.read_timeout) as response:
                     if response.headers.get_content_type() != "text/event-stream":
                         raise RelayStateError("invalid stream content type")
-                    if not self.receive(response):
+                    if not self.receive(response, backfill_cursor=backfill_cursor):
                         return
             except urllib.error.HTTPError as exc:
                 # Only status is logged. Exception text/URL/headers/body are secret-bearing.

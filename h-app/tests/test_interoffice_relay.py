@@ -8,7 +8,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import pytest
 import redis
@@ -76,7 +76,7 @@ def sender_record(store, **changes):
 
 def message(cursor="10-0", **changes):
     data = {
-        "kind": "Message", "stream_id": "d" * 32, "cursor": cursor,
+        "kind": "Message", "stream_id": uuid5(NAMESPACE_URL, cursor).hex, "cursor": cursor,
         "l2": {"source": "worker", "destination": "visitor"},
         "payload": {"text": "hello from the remote office"}, "in_reply_to": REPLY_ID,
         "correlation_id": REMOTE_REPLY_CORRELATION,
@@ -337,7 +337,7 @@ def test_unenrolled_relay_does_not_create_an_unmanaged_egress_queue(store):
     assert not egress(store)
 
 
-def test_post_admission_checkpoint_failure_has_documented_at_least_once_semantics(store, monkeypatch):
+def test_post_admission_checkpoint_failure_replays_without_duplicate_admission(store, monkeypatch):
     office = add_office(store)
     sender_record(store)
     worker = OfficeWorker(store, office, mapping_wait=0)
@@ -349,9 +349,9 @@ def test_post_admission_checkpoint_failure_has_documented_at_least_once_semantic
     assert store.cursor(office) is None
     monkeypatch.setattr(store, "checkpoint", checkpoint)
     worker.receive(io.BytesIO(frame(message())))
-    assert len(egress(store)) == 2
+    assert len(egress(store)) == 1
     assert {item["correlation_id"] for item in egress(store)} == {OUTBOUND_CORRELATION}
-    assert len({item["stream_id"] for item in egress(store)}) == 2
+    assert len({item["stream_id"] for item in egress(store)}) == 1
     assert store.cursor(office) == "10-0"
 
 
