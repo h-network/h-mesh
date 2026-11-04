@@ -2,10 +2,11 @@
 
 Companion to setup.sh, not a replacement for it -- setup.sh bootstraps a
 fresh install (creates the venv, seeds the registry, starts daemons for the
-first time); this upgrades an existing one in place. It stops whatever
-daemons setup.sh already has running (services.daemons.stop_daemons, via the
-pidfiles setup.sh writes under $H_MESH_RUN_DIR), pulls and reinstalls, then
-starts fresh daemons with the current environment (services.daemons.start_daemons)
+first time); this upgrades an existing one in place. It pulls/reinstalls,
+then executes a fresh interpreter from the updated tree. That phase preserves
+or creates the private API token, resolves current configuration, stops the
+old daemons via authenticated pidfiles under $H_MESH_RUN_DIR, and starts
+the updated daemon set (services.daemons.start_daemons)
 -- so it does not double-start daemons against an already-running install,
 and a changed env var takes effect on the daemons it restarts. It also
 re-persists the venv bin dir on PATH (services.venv_path), re-installs the
@@ -42,6 +43,7 @@ from services.daemons import (
 )
 from services.tmux_conf import install_tmux_conf
 from services.venv_path import persist_venv_on_path
+from services.tenant_config import ensure_api_token
 
 
 def _run(cmd: list[str]) -> None:
@@ -59,22 +61,22 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Skip the pip reinstall step")
     parser.add_argument("--skip-pull", action="store_true",
                         help="Skip `git pull`; only reinstall and restart daemons")
+    parser.add_argument("--post-update", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    # ⚠ A self-upgrade runs the code imported before ``main`` started for this
-    # entire process. ``git pull`` and an editable reinstall only affect future
-    # Python processes. A migration, cleanup, or one-time fix added here cannot
-    # run on the first upgrade that installs it; without an explicit re-exec it
-    # begins running on the second upgrade. Do not use this function as a
-    # first-transition migration hook.
-    args = _build_parser().parse_args(argv)
+    original_args = list(sys.argv[1:] if argv is None else argv)
+    args = _build_parser().parse_args(original_args)
     config = resolve_config(args)
 
     if not config.python.exists():
         print(f"error: no venv python at {config.python} -- run setup.sh first", file=sys.stderr)
         raise SystemExit(1)
+
+    if args.post_update:
+        _post_update(config)
+        return
 
     print("=== h-mesh :: upgrade ===")
     print(f"Repo:         {REPO_ROOT}")
@@ -103,6 +105,40 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise SystemExit(1) from exc
         print()
 
+    # Pull/reinstall cannot replace modules already imported by this process.
+    # Resolve token/config/daemon inventory only in the updated interpreter.
+    # Upgraders older than this handoff need one additional fresh invocation
+    # on their first transition; the README documents that legacy sequence.
+    env = dict(os.environ)
+    h_app = str(REPO_ROOT / "h-app")
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = h_app + (os.pathsep + existing if existing else "")
+    print("Starting fresh post-update interpreter...")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execve(str(config.python),
+              [str(config.python), "-m", "services.upgrade", "--post-update", *original_args], env)
+
+
+def _post_update(config) -> None:
+    try:
+        config.env["API_TOKEN"] = ensure_api_token(config.tenant, config.env.get("API_TOKEN"))
+    except (OSError, ValueError):
+        print("error: cannot prepare private API configuration; check the tenant state directory and API_TOKEN format", file=sys.stderr)
+        raise SystemExit(1) from None
+
+    hint = None
+    if config.env.get("H_MESH_ALLOW_PLAINTEXT") != "1":
+        api_tls = bool(config.env.get("API_TLS_CERT") and config.env.get("API_TLS_KEY"))
+        session_tls = api_tls or bool(config.env.get("SESSION_TLS_CERT") and config.env.get("SESSION_TLS_KEY"))
+        if not api_tls:
+            config.env["API_BIND"] = "127.0.0.1"
+            hint = ("API is configured for loopback only. To enable non-loopback access, "
+                    "set API_TLS_CERT and API_TLS_KEY, or H_MESH_ALLOW_PLAINTEXT=1 "
+                    "to explicitly accept plaintext.")
+        if not session_tls:
+            config.env["SESSION_BIND"] = "127.0.0.1"
+
     print("Persisting venv bin on PATH (~/.bashrc, ~/.profile)...")
     persist_venv_on_path(config.python.parent.parent, log=print)
     print()
@@ -130,6 +166,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
     except DaemonError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        if hint:
+            print(hint, file=sys.stderr)
         raise SystemExit(1) from exc
 
     print()
@@ -137,6 +175,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     print()
     print("Note: already-hired agent panes keep the environment they started")
     print("with -- only panes hired after this upgrade pick up the change.")
+    if hint:
+        print(hint)
 
 
 if __name__ == "__main__":

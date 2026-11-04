@@ -332,7 +332,8 @@ scope today; see `lib/chat_memory.py`'s own module docstring.
 ## Upgrading and restarting daemons
 
 `h-mesh-upgrade` (`services.upgrade`) updates an existing install in place --
-`git pull --ff-only`, reinstall, then cleanly restart the same daemons
+`git pull --ff-only`, reinstall, then execute a fresh interpreter of the
+updated tree to prepare configuration and cleanly restart the daemons
 setup.sh started (stop via SIGTERM/SIGKILL fallback, then start fresh with
 the current environment). It won't double-start daemons against an
 already-running install: it always stops first.
@@ -340,6 +341,58 @@ already-running install: it always stops first.
 ```bash
 h-mesh-upgrade --pod mypod --tenant mytenant
 ```
+
+The fresh phase preserves an existing `API_TOKEN` even if a different one is
+ambient, or generates and persists one in the tenant's mode-`0600` config
+before starting API. It preserves the other stored settings. The reply relay
+always runs; API runs with the token; Telegram/session still require both
+Telegram settings. Without complete TLS settings or `H_MESH_ALLOW_PLAINTEXT=1`,
+API uses loopback and prints the exact settings needed for non-loopback
+access. Repeating upgrade restarts one daemon set and keeps the token and
+office state; already-hired host panes are preserved.
+
+**First transition from a pre-fix upgrader:** run the ordinary command above,
+then run this once from a fresh shell/process with the same identity and any
+explicit Redis/venv/tmux flags:
+
+```bash
+h-mesh-upgrade --pod mypod --tenant mytenant --skip-pull --skip-install
+```
+
+The first old interpreter keeps its imported daemon roster after updating
+files; the second invocation loads the new fresh-interpreter handoff and
+establishes the token/API/relay configuration. A third invocation is safe:
+the token and state stay unchanged while daemons are cleanly restarted.
+New upgraders perform the fresh handoff themselves and need only one call.
+
+**Container offices:** upgrade from the host by updating the checkout, then
+rerunning bootstrap for the **same pod and tenant**, using its existing
+generated `.env` and named volumes:
+
+```bash
+git pull --ff-only
+./container/bootstrap.sh --pod mypod --tenant mytenant --non-interactive
+```
+
+Do not hand-edit `.env` or run `down -v` during this transition. Bootstrap
+creates a missing token, preserves an established one, rebuilds/recreates
+the container, and setup starts the current API/relay daemon set. Boards,
+inboxes and registry live in the retained state volume. Container panes are
+recreated from that registry; this does not preserve running pane processes.
+On a pre-fix office without transport settings, the upgrade succeeds with
+container-loopback API and the last output line plus `SUMMARY.md` explain
+why the published port stays closed. To open it, configure existing
+in-container TLS paths through `API_TLS_CERT`/`API_TLS_KEY`, or explicitly
+accept plaintext on the bootstrap rerun:
+
+```bash
+H_MESH_ALLOW_PLAINTEXT=1 ./container/bootstrap.sh --pod mypod --tenant mytenant --non-interactive
+```
+
+The two-command legacy `h-mesh-upgrade` sequence above applies to host
+installs. Container offices use this host-side bootstrap rerun instead of
+pulling Git from inside the image. If an image was already built from the
+exact checkout SHA, `H_MESH_IMAGE=<that-tag>` with `--skip-build` reuses it.
 
 Same pod/tenant/redis-url/session/tmux-tmpdir/tmux-socket/venv flags as
 setup.sh, plus `--skip-install` and `--skip-pull` (`h-mesh-upgrade --help`

@@ -16,6 +16,9 @@ the file's format.
 """
 
 import argparse
+import fcntl
+import os
+import secrets
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -56,6 +59,28 @@ def write_tenant_env(tenant: str, values: dict[str, str]) -> None:
     path.touch(mode=0o600)
     path.chmod(0o600)
     path.write_text(content)
+
+
+def ensure_api_token(tenant: str, supplied: str | None = None) -> str:
+    """Keep an established API identity, or persist one before starting API.
+
+    Upgrade must not rotate the office's identity because a different token
+    is ambient. Serialize token creation across concurrent upgrade callers;
+    keep every other persisted tenant setting and never print the token.
+    """
+    path = tenant_env_path(tenant)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path.with_name("env.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+") as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        values = read_tenant_env(tenant)
+        token = values.get("API_TOKEN") or supplied or secrets.token_hex(32)
+        if "\n" in token or "\r" in token:
+            raise ValueError("API_TOKEN must be a single line")
+        values["API_TOKEN"] = token
+        write_tenant_env(tenant, values)
+        return token
 
 
 def main(argv: Sequence[str] | None = None) -> None:
