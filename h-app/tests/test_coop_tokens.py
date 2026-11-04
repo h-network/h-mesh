@@ -7,13 +7,23 @@ H_APP = Path(__file__).resolve().parents[1]
 if str(H_APP) not in sys.path:
     sys.path.insert(0, str(H_APP))
 
-from lib.coop_tokens import coop_tokens_key, grant, list_tokens, revoke, verify
+from lib.coop_tokens import coop_tokens_key, diagnose, grant, list_tokens, revoke, verify
 from tests.test_api import FakeRedis
 
 
 class CoopTokensTests(unittest.TestCase):
     def setUp(self):
         self.r = FakeRedis()
+
+    def test_diagnose_says_revoked_only_to_the_secret_holder(self):
+        token_id, token = grant(self.r, "p", "t", "coop-a")
+        secret = token.rsplit(".", 1)[1]
+        self.assertEqual(diagnose(self.r, "p", "t", token), "unknown_token")  # live token: verify() would pass
+        revoke(self.r, "p", "t", token_id)
+        self.assertEqual(diagnose(self.r, "p", "t", token), "revoked")
+        for bad in (f"coop.{token_id}.{'A' * 43}", f"coop.{'0' * 16}.{secret}", "coop.x.y", "", None, 7):
+            self.assertEqual(diagnose(self.r, "p", "t", bad), "unknown_token", bad)
+        self.assertEqual(diagnose(self.r, "p", "other", token), "unknown_token")
 
     def test_grant_shape_and_only_digest_is_stored(self):
         token_id, token = grant(self.r, "p", "t", "coop-a")

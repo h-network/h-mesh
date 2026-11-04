@@ -79,11 +79,36 @@ A cooperation token may do exactly this, everything else is `403`:
 |---|---|
 | `POST /agents/{agent}/envelopes` | `kind` must be `Message` (the `{"text": ...}` shorthand included); `as` is forced to the bound participant -- omitted is filled in, a different value is `403`; destination must be a concrete agent: not `all`, `host`, `api`, nor any `api`-type participant's mailbox or the lifecycle `host` port |
 | `GET /agents/{participant}/messages`, `.../messages/stream` | only the bound participant's own mailbox (`after=` and `Last-Event-ID` resume as usual); any other mailbox is `404` |
+| `GET /whoami` | what the presented token is bound to (see below) |
 
 Not reachable with a cooperation token: `/agents`, `/agents/{agent}`, board,
 activity, contexts, `/alerts`, `/restdoc`, `/docs`, `/redoc`, `/openapi.json`,
 `/health`, and any non-`Message` kind (`Command`, `StartAgent`, `StopAgent`,
 `PauseAgent`, `ResumeAgent`, `Attachment`, ...).
+
+### `GET /whoami`
+
+Lets a caller check a token (and the participant it is meant for) before the
+first send. Accepted for a cooperation token and for the office-wide
+`API_TOKEN`. `200`:
+
+```json
+{"office": "<pod>/<tenant>", "participant": "coop-a", "kinds": ["Message"], "api": 1}
+```
+
+`participant` is the participant bound to the presented token (`null` for the
+office-wide token, which is bound to none; its `kinds` is `["*"]`). `api` is the
+version of this response. A refusal is `401` with a JSON body that has the usual
+human `detail` and a top-level machine-readable `reason`:
+
+| `reason` | meaning |
+|---|---|
+| `unknown_token` | missing, malformed, unknown id or wrong secret (not distinguished) |
+| `revoked` | the secret is right but the token was revoked; only the holder of the real secret is told this |
+| `participant_not_enrolled` | the token is valid but its participant is not enrolled (any more) as an `api` participant |
+
+`reason` appears only on `/whoami`; every other route keeps a bare, reason-less
+`401`. The token is never echoed in any response.
 
 Cooperation tokens replace the HMAC `kid`/`sig` check for their principal: a
 published API does not demand a signature from them, because the token already
@@ -91,7 +116,7 @@ binds the caller to its participant. They are read from Redis on every request,
 so `revoke` takes effect on the next request, and an open SSE stream is closed
 (`event: error`, `token revoked`) within about a second of revocation. A storage
 failure while verifying fails closed (`401`). A malformed, unknown, wrong or
-revoked token is an indistinguishable `401`.
+revoked token is an indistinguishable `401` on every route except `/whoami`.
 
 Limits to know: this is policy, not storage security -- every agent of an office
 shares one Redis with no ACL, so a hostile co-resident agent could write

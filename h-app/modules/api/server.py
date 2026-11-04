@@ -17,7 +17,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from core.channels import DeadLetter, send
@@ -27,6 +27,7 @@ from core.registry import is_member, members, port_type
 from lib.chat_memory import TTL_SECONDS_MAX as CHAT_MEMORY_TTL_SECONDS
 from lib.chat_memory import ChatMemory
 from lib.coop_tokens import TOKEN_PREFIX as COOP_TOKEN_PREFIX
+from lib.coop_tokens import diagnose as diagnose_coop_token
 from lib.coop_tokens import verify as verify_coop_token
 
 DEFAULT_ENVELOPE_MAX_BYTES = 1_048_576
@@ -82,6 +83,24 @@ COOP_FORBIDDEN_DESTINATION_TYPES = frozenset({"api", "office"})
 COOP_STREAM_RECHECK_INTERVAL_S = 1.0
 _COOP_POST_RE = re.compile(r"^/agents/([^/]+)/envelopes$")
 _COOP_READ_RE = re.compile(r"^/agents/([^/]+)/messages(?:/stream)?$")
+WHOAMI_PATH = "/whoami"
+WHOAMI_API_VERSION = 1
+
+
+class ReasonedHTTPException(HTTPException):
+    """An HTTPException whose JSON body also carries a top-level ``reason``."""
+
+    def __init__(self, status_code: int, detail: str, reason: str) -> None:
+        super().__init__(status_code=status_code, detail=detail)
+        self.reason = reason
+
+
+async def _reasoned_http_exception_handler(_request: Request, exc: ReasonedHTTPException) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "reason": exc.reason},
+        headers=getattr(exc, "headers", None),
+    )
 ATTACHMENT_MAX_BYTES = 10_485_760
 ATTACHMENT_BASE64_MAX_BYTES = 4 * math.ceil(ATTACHMENT_MAX_BYTES / 3)
 ATTACHMENT_FILENAME_MAX_BYTES = 255
@@ -334,6 +353,10 @@ def _render_restdoc_html(app: FastAPI) -> str:
             "desc": "Liveness check. Returns status ok.",
             "curl": 'curl -H "Authorization: Bearer $API_TOKEN" http://localhost:8080/health',
         },
+        "/whoami": {
+            "desc": "Who this token is: office, bound participant (null for the office-wide token), allowed kinds. 401 carries a top-level reason: revoked, unknown_token or participant_not_enrolled. Also reachable with a cooperation token.",
+            "curl": 'curl -H "Authorization: Bearer $API_TOKEN" http://localhost:8080/whoami',
+        },
         "/agents": {
             "desc": "List all enrolled agents from the tenant registry.",
             "curl": 'curl -H "Authorization: Bearer $API_TOKEN" http://localhost:8080/agents',
@@ -561,7 +584,7 @@ def _render_restdoc_html(app: FastAPI) -> str:
         <br><code>Authorization: Bearer &lt;API_TOKEN&gt;</code>
       </p>
       <p style="margin-bottom:0;">
-        A <strong>cooperation token</strong> (<code>Authorization: Bearer coop.&lt;token-id&gt;.&lt;secret&gt;</code>) lets one remote office act as one enrolled api participant, and is accepted only on <code>POST /agents/{{agent}}/envelopes</code> (kind <code>Message</code>, <code>as</code> forced to its participant, never to <code>all</code>/<code>host</code>/<code>api</code>) and on its own participant's <code>/agents/&lt;participant&gt;/messages</code> and <code>/messages/stream</code>. Every other route returns 403 for it, and a revoked token fails on the next request. Use TLS; the office-wide <code>API_TOKEN</code> must never be shared with another office.
+        A <strong>cooperation token</strong> (<code>Authorization: Bearer coop.&lt;token-id&gt;.&lt;secret&gt;</code>) lets one remote office act as one enrolled api participant, and is accepted only on <code>POST /agents/{{agent}}/envelopes</code> (kind <code>Message</code>, <code>as</code> forced to its participant, never to <code>all</code>/<code>host</code>/<code>api</code>) on its own participant's <code>/agents/&lt;participant&gt;/messages</code> and <code>/messages/stream</code>, and on <code>GET /whoami</code> (a refusal there carries a top-level <code>reason</code>: <code>revoked</code>, <code>unknown_token</code> or <code>participant_not_enrolled</code>). Every other route returns 403 for it, and a revoked token fails on the next request. Use TLS; the office-wide <code>API_TOKEN</code> must never be shared with another office.
       </p>
     </div>
 
@@ -798,10 +821,13 @@ def bearer_token(request: Request) -> str:
 
 
 def _authorize_coop_route(request: Request, principal: dict[str, Any]) -> None:
-    """A cooperation token reaches exactly two things: POST envelopes (as its
-    participant) and GET its own participant's mailbox. Everything else is 403,
+    """A cooperation token reaches exactly three things: POST envelopes (as its
+    participant), GET its own participant's mailbox, and GET /whoami (what the
+    token is bound to). Everything else is 403,
     decided here before any handler runs."""
     path = request.url.path
+    if request.method == "GET" and path == WHOAMI_PATH:
+        return
     if request.method == "POST" and _COOP_POST_RE.fullmatch(path):
         return
     match = _COOP_READ_RE.fullmatch(path)
@@ -847,14 +873,23 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
         credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     ) -> None:
         request.state.coop = None
+        whoami = request.method == "GET" and request.url.path == WHOAMI_PATH
+
+        def unauthorized(reason: str) -> HTTPException:
+            # Only /whoami says why; every other route keeps an
+            # indistinguishable bare 401 (a probe learns nothing there).
+            if whoami:
+                return ReasonedHTTPException(status.HTTP_401_UNAUTHORIZED, "unauthorized", reason)
+            return HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+
         if settings.api_token is None:
             return
         if credentials is None or credentials.scheme.lower() != "bearer":
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+            raise unauthorized("unknown_token")
         if hmac.compare_digest(credentials.credentials, settings.api_token):
             return  # the office-wide token keeps full power
         if not credentials.credentials.startswith(f"{COOP_TOKEN_PREFIX}."):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+            raise unauthorized("unknown_token")
         try:
             principal = verify_coop_token(
                 client, settings.pod, settings.tenant, credentials.credentials
@@ -862,7 +897,15 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
         except Exception:
             principal = None  # storage failure fails closed
         if principal is None:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
+            reason = "unknown_token"
+            if whoami:
+                try:
+                    reason = diagnose_coop_token(
+                        client, settings.pod, settings.tenant, credentials.credentials
+                    )
+                except Exception:
+                    pass
+            raise unauthorized(reason)
         request.state.coop = principal
         _authorize_coop_route(request, principal)
 
@@ -875,6 +918,7 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
     )
     app.state.redis = client
     app.state.settings = settings
+    app.add_exception_handler(ReasonedHTTPException, _reasoned_http_exception_handler)
 
     if settings.api_published and settings.api_cors_origins:
         # Loopback-only never adds this middleware at all — the container is
@@ -909,6 +953,29 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get(WHOAMI_PATH)
+    def whoami(request: Request) -> dict[str, Any]:
+        coop = getattr(request.state, "coop", None)
+        if coop is None:
+            # The office-wide token (or an open API) is not bound to anyone.
+            participant, kinds = None, ["*"]
+        else:
+            participant, kinds = coop["participant"], list(coop["kinds"])
+            try:
+                enrolled = port_type(client, pod=settings.pod, tenant=settings.tenant, agent=participant) == "api"
+            except (KeyError, TypeError):
+                enrolled = False
+            if not enrolled:
+                raise ReasonedHTTPException(
+                    status.HTTP_401_UNAUTHORIZED, "unauthorized", "participant_not_enrolled"
+                )
+        return {
+            "office": f"{settings.pod}/{settings.tenant}",
+            "participant": participant,
+            "kinds": kinds,
+            "api": WHOAMI_API_VERSION,
+        }
 
     @app.get("/agents")
     def agents() -> dict[str, list[str]]:
