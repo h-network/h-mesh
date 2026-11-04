@@ -92,6 +92,9 @@ Options:
 Per-agent exceptions (AGENT_CLIS/AGENT_PROFILES/AGENT_PROVIDERS) and local
 model provider config (PROVIDER_LOCAL_*) are not prompted for here; add
 those directly to the office's env file. See README.md's "Bootstrap script" section for the
+TLS inputs API_TLS_CERT/API_TLS_KEY (and optional SESSION_TLS_CERT/KEY and
+H_MESH_CA_CERT) are readable HOST files, validated and staged read-only for
+the container. Requires openssl and host UID 1000 or root. See README for the
 complete non-interactive variable set, all of which apply unchanged inside
 the container.
 EOF
@@ -262,13 +265,14 @@ esac
 # of this script exactly the way setup.sh's own persisted tenant config
 # survives a re-run of the wizard.
 upsert_env_line() {
-    local key="$1" value="$2" tmp
+    local key="$1" value="$2" escaped tmp
     mkdir -p "$(dirname "$ENV_FILE")"
     (umask 077; touch "$ENV_FILE") || return 1
     chmod 0600 "$ENV_FILE" || return 1
     tmp="$(mktemp "${ENV_FILE}.XXXXXX")"
     if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
-        sed "s|^${key}=.*|${key}=${value}|" "$ENV_FILE" > "$tmp"
+        escaped="$(printf '%s' "$value" | sed 's/[\\&|]/\\&/g')"
+        sed "s|^${key}=.*|${key}=${escaped}|" "$ENV_FILE" > "$tmp"
     else
         cp "$ENV_FILE" "$tmp"
         printf '%s=%s\n' "$key" "$value" >> "$tmp"
@@ -465,24 +469,23 @@ if [ "$INTERACTIVE" -eq 1 ]; then
     fi
 fi
 
-# Compose's env_file is the durable input; persist explicitly supplied
-# transport settings too, so later recreates work from a clean shell.
-for transport_key in API_TLS_CERT API_TLS_KEY SESSION_TLS_CERT SESSION_TLS_KEY H_MESH_ALLOW_PLAINTEXT; do
-    [ -n "${!transport_key:-}" ] && upsert_env_line "$transport_key" "${!transport_key}"
-done
-TLS_CERT="$(env_file_get API_TLS_CERT)"
-TLS_KEY="$(env_file_get API_TLS_KEY)"
-PLAINTEXT="$(env_file_get H_MESH_ALLOW_PLAINTEXT)"
+# Resolve host files without persisting unvalidated paths. A rerun maps the
+# managed container paths back to its own staged copies, preserving material.
+TLS_CERT="${API_TLS_CERT:-$(env_file_get API_TLS_CERT)}"
+TLS_KEY="${API_TLS_KEY:-$(env_file_get API_TLS_KEY)}"
+SESSION_CERT="${SESSION_TLS_CERT:-$(env_file_get SESSION_TLS_CERT)}"
+SESSION_KEY="${SESSION_TLS_KEY:-$(env_file_get SESSION_TLS_KEY)}"
+CA_CERT="${H_MESH_CA_CERT:-$(env_file_get H_MESH_CA_CERT)}"
+PLAINTEXT="${H_MESH_ALLOW_PLAINTEXT:-$(env_file_get H_MESH_ALLOW_PLAINTEXT)}"
 if [ "$INTERACTIVE" -eq 1 ] && { [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; } && [ "$PLAINTEXT" != "1" ]; then
     echo
     echo "  Every office starts the API. Choose how to reach its published port."
-    echo "  TLS paths must already be reachable inside the container."
-    read -rp "  TLS certificate path (blank to explicitly accept plaintext): " TLS_CERT
+    echo "  Supply readable HOST files; bootstrap validates and mounts private copies read-only."
+    read -rp "  TLS certificate HOST path (blank to explicitly accept plaintext): " TLS_CERT
     if [ -n "$TLS_CERT" ]; then
-        read -rp "  TLS key path: " TLS_KEY
+        read -rp "  TLS key HOST path: " TLS_KEY
         [ -n "$TLS_KEY" ] || { echo "error: a TLS certificate requires its key" >&2; exit 1; }
-        upsert_env_line API_TLS_CERT "$TLS_CERT"
-        upsert_env_line API_TLS_KEY "$TLS_KEY"
+        read -rp "  Optional peer CA bundle HOST path (blank for system trust): " CA_CERT
     else
         echo "  Plaintext sends bearer tokens and messages unencrypted."
         read -rp "  Accept plaintext for this container? [y/N]: " ACCEPT_PLAINTEXT
@@ -491,12 +494,21 @@ if [ "$INTERACTIVE" -eq 1 ] && { [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; } && [
             exit 1
         fi
         PLAINTEXT=1
-        upsert_env_line H_MESH_ALLOW_PLAINTEXT 1
     fi
 fi
+source "$SCRIPT_DIR/tls.sh"
+stage_tls || exit 1
+for transport_key in API_TLS_CERT API_TLS_KEY SESSION_TLS_CERT SESSION_TLS_KEY H_MESH_CA_CERT H_MESH_ALLOW_PLAINTEXT; do
+    case "$transport_key" in
+        API_TLS_CERT) transport_value="$TLS_CERT" ;; API_TLS_KEY) transport_value="$TLS_KEY" ;;
+        SESSION_TLS_CERT) transport_value="$SESSION_CERT" ;; SESSION_TLS_KEY) transport_value="$SESSION_KEY" ;;
+        H_MESH_CA_CERT) transport_value="$CA_CERT" ;; H_MESH_ALLOW_PLAINTEXT) transport_value="$PLAINTEXT" ;;
+    esac
+    [ -z "$transport_value" ] || upsert_env_line "$transport_key" "$transport_value" || exit 1
+done
 API_ENABLEMENT=""
 if { [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; } && [ "$PLAINTEXT" != "1" ]; then
-    API_ENABLEMENT="API is loopback-only inside the container; published API port $API_PORT is closed. To open it, rerun bootstrap with API_TLS_CERT and API_TLS_KEY (in-container paths), or H_MESH_ALLOW_PLAINTEXT=1 to explicitly accept plaintext."
+    API_ENABLEMENT="API is loopback-only inside the container; published API port $API_PORT is closed. To open it, rerun bootstrap with API_TLS_CERT and API_TLS_KEY (readable HOST paths), or H_MESH_ALLOW_PLAINTEXT=1 to explicitly accept plaintext."
 fi
 
 echo
@@ -533,6 +545,7 @@ echo
 
 COMPOSE_FILES="-f $SCRIPT_DIR/compose.yaml"
 [ "$H_MESH_BIND_PORTS" -eq 1 ] && COMPOSE_FILES="$COMPOSE_FILES -f $SCRIPT_DIR/compose.ports.yaml"
+[ "$TLS_MOUNT" -eq 0 ] || COMPOSE_FILES="$COMPOSE_FILES -f $SCRIPT_DIR/compose.tls.yaml"
 
 OFFICE_DIR="$(dirname "$ENV_FILE")"
 SUMMARY_FILE="$OFFICE_DIR/SUMMARY.md"
@@ -623,12 +636,14 @@ docker compose -p $PROJECT_NAME $COMPOSE_FILES --env-file $ENV_FILE exec h-mesh 
 EOF
 chmod 0644 "$SUMMARY_FILE"
 
-COMPOSE_ARGS=(-p "$PROJECT_NAME" -f "$SCRIPT_DIR/compose.yaml" --env-file "$ENV_FILE" up -d)
-[ "$H_MESH_BIND_PORTS" -eq 1 ] && COMPOSE_ARGS=(-p "$PROJECT_NAME" -f "$SCRIPT_DIR/compose.yaml" -f "$SCRIPT_DIR/compose.ports.yaml" --env-file "$ENV_FILE" up -d)
+COMPOSE_ARGS=(-p "$PROJECT_NAME" -f "$SCRIPT_DIR/compose.yaml")
+[ "$H_MESH_BIND_PORTS" -eq 0 ] || COMPOSE_ARGS+=(-f "$SCRIPT_DIR/compose.ports.yaml")
+[ "$TLS_MOUNT" -eq 0 ] || COMPOSE_ARGS+=(-f "$SCRIPT_DIR/compose.tls.yaml")
+COMPOSE_ARGS+=(--env-file "$ENV_FILE" up -d)
 [ "$SKIP_BUILD" -eq 0 ] && COMPOSE_ARGS+=(--build)
 
 echo "Running: docker compose ${COMPOSE_ARGS[*]}"
-( cd "$REPO_ROOT" && H_MESH_TENANT_ENV_FILE="$ENV_FILE" docker compose "${COMPOSE_ARGS[@]}" ) || exit 1
+( cd "$REPO_ROOT" && H_MESH_TENANT_ENV_FILE="$ENV_FILE" H_MESH_TLS_DIR="$TLS_DIR" docker compose "${COMPOSE_ARGS[@]}" ) || exit 1
 
 echo
 echo "✓ Container started (project: $PROJECT_NAME)."

@@ -151,12 +151,14 @@ def _bootstrap_wizard(env_file, env, answers):
 
 @pytest.mark.parametrize("transport", ["plaintext", "tls"])
 def test_bootstrap_interactive_without_telegram_explicitly_selects_transport(tmp_path, transport):
+    from _tls_test_material import certificate_pair
+    cert, key = certificate_pair(tmp_path)
     log = tmp_path / "docker.log"
     _fake_docker(tmp_path, log)
     env_file = tmp_path / ".env"
     # agents, CLI, publish, API port, session port, accounts, OAuth, Telegram
     answers = ["", "", "", "", "", "", "", ""]
-    answers += ["", "y"] if transport == "plaintext" else ["/cert.pem", "/key.pem"]
+    answers += ["", "y"] if transport == "plaintext" else [str(cert), str(key), ""]
     output, code = _bootstrap_wizard(env_file, _env_with_fake_docker(tmp_path), answers)
     assert code == 0, output
     assert "Choose how to reach its published port" in output
@@ -168,8 +170,8 @@ def test_bootstrap_interactive_without_telegram_explicitly_selects_transport(tmp
         assert "H_MESH_ALLOW_PLAINTEXT=1" in env_file.read_text()
         assert "Accept plaintext for this container?" in output
     else:
-        assert "API_TLS_CERT=/cert.pem" in env_file.read_text()
-        assert "API_TLS_KEY=/key.pem" in env_file.read_text()
+        assert "API_TLS_CERT=/run/h-mesh/tls/api.crt" in env_file.read_text()
+        assert "API_TLS_KEY=/run/h-mesh/tls/api.key" in env_file.read_text()
         assert "H_MESH_ALLOW_PLAINTEXT=" not in env_file.read_text()
 
 
@@ -212,6 +214,8 @@ _SCRUBBED_BOOTSTRAP_ENV_VARS = (
     "SESSION_TLS_CERT",
     "SESSION_TLS_KEY",
     "H_MESH_ALLOW_PLAINTEXT",
+    "H_MESH_CA_CERT",
+    "H_MESH_TLS_DIR",
 )
 
 
@@ -406,6 +410,8 @@ def test_custom_port_flags_are_persisted_and_invalid_ports_fail(tmp_path):
 
 
 def test_noninteractive_summary_reports_telegram_from_env_file(tmp_path):
+    from _tls_test_material import certificate_pair
+    cert, key = certificate_pair(tmp_path)
     log = tmp_path / "docker_calls.log"
     env_file = tmp_path / "office.env"
     env_file.write_text(
@@ -434,8 +440,8 @@ def test_noninteractive_summary_reports_telegram_from_env_file(tmp_path):
         "TENANT=testtenant\n"
         "TELEGRAM_BOT_TOKEN=tg-secret-token\n"
         "TELEGRAM_CHAT_ID=424242\n"
-        "API_TLS_CERT=/etc/ssl/certs/h-mesh.pem\n"
-        "API_TLS_KEY=/etc/ssl/private/h-mesh.key\n"
+        f"API_TLS_CERT={cert}\n"
+        f"API_TLS_KEY={key}\n"
     )
     res_tls = subprocess.run(
         [
@@ -447,7 +453,7 @@ def test_noninteractive_summary_reports_telegram_from_env_file(tmp_path):
     )
     assert res_tls.returncode == 0, f"stdout: {res_tls.stdout}\nstderr: {res_tls.stderr}"
     assert "Telegram:     enabled, chat id 424242" in res_tls.stdout
-    assert "API/session:  TLS (/etc/ssl/certs/h-mesh.pem)" in res_tls.stdout
+    assert "API/session:  TLS (/run/h-mesh/tls/api.crt)" in res_tls.stdout
 
 
 def test_bootstrap_writes_office_summary_and_attach_script_without_secrets(tmp_path):

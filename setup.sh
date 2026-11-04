@@ -846,6 +846,13 @@ fi
 [ "$TELEGRAM_VOICE" = "1" ] && persist_line TELEGRAM_VOICE "1"
 persist_line API_TOKEN "$RESOLVED_API_TOKEN"
 
+# Whole-config writes must retain transport and trust settings too. Both a
+# clean-shell rerun and later daemon/agent restarts need the same CA path.
+for transport_key in API_TLS_CERT API_TLS_KEY SESSION_TLS_CERT SESSION_TLS_KEY H_MESH_CA_CERT H_MESH_ALLOW_PLAINTEXT; do
+    transport_value="$(ENV_TENANT_GET "$transport_key")"
+    [ -z "$transport_value" ] || persist_line "$transport_key" "$transport_value"
+done
+
 if [ -n "$ENV_SOURCED_KEYS" ]; then
     echo "Persisting from live environment:${ENV_SOURCED_KEYS}"
 fi

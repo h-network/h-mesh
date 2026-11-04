@@ -113,6 +113,7 @@ class Office:
     url: str = field(repr=False)
     participant: str
     token: str = field(repr=False)
+    ca_cert: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -144,7 +145,10 @@ def parse_office(name, raw, token, *, allow_plaintext: bool) -> Office:
         _ = parts.port
         if not isinstance(token, str) or not _TOKEN.fullmatch(token):
             raise ValueError
-        return Office(name, url.rstrip("/"), participant, token)
+        ca_cert = record.get("ca_cert")
+        if ca_cert is not None and (not isinstance(ca_cert, str) or not ca_cert.strip()):
+            raise ValueError
+        return Office(name, url.rstrip("/"), participant, token, ca_cert)
     except (KeyError, TypeError, ValueError, UnicodeError):
         raise RelayStateError("invalid office configuration") from None
 

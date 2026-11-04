@@ -1,0 +1,10 @@
+# bootstrap.sh stages validated host files in a private directory before up.
+services:
+  h-mesh:
+    volumes:
+      - type: bind
+        source: ${H_MESH_TLS_DIR:?Rerun container/bootstrap.sh to stage TLS material}
+        target: /run/h-mesh/tls
+        read_only: true
+        bind:
+          create_host_path: false

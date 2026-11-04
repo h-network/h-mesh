@@ -3,6 +3,7 @@
 import json
 import logging
 import random
+import ssl
 import threading
 import time
 import urllib.error
@@ -11,6 +12,7 @@ import urllib.request
 
 from core.channels import send
 from core.keys import validate_segment
+from lib.tls_context import TlsConfigError, build_context, resolve_ca_file
 from modules.interoffice.store import AdmissionRedis, Office, RelayStateError, SEEN_LEDGER_LIMIT, Store, cursor_order
 
 logger = logging.getLogger(__name__)
@@ -66,9 +68,44 @@ class OfficeWorker:
         self.store, self.office = store, office
         self.stop = stop if stop is not None else threading.Event()
         self.send_fn, self.mapping_wait, self.read_timeout = send_fn, mapping_wait, read_timeout
-        self.opener = urllib.request.build_opener(_NoRedirect())
+        self.opener = None
+        self.failure_state = None
         self.progress = False
         self.thread = threading.Thread(target=self.run, name=f"relay-{office.name}", daemon=True)
+
+    def _opener(self):
+        handlers = [_NoRedirect()]
+        if urllib.parse.urlsplit(self.office.url).scheme == "https":
+            handlers.append(urllib.request.HTTPSHandler(
+                context=build_context(resolve_ca_file(self.office.ca_cert)),
+            ))
+        return urllib.request.build_opener(*handlers)
+
+    def _failure(self, event, reason):
+        state = event, reason
+        if self.failure_state != state:
+            if event == "http-error":
+                logger.warning("relay office=%s event=http-error status=%s", self.office.name, reason)
+            else:
+                logger.warning("relay office=%s event=%s reason=%s", self.office.name, event, reason)
+            self.failure_state = state
+
+    def _connection_failure(self, exc):
+        # Never format exceptions: URLs, certificate subjects and paths are
+        # untrusted and can contain credentials. Only closed categories escape.
+        if isinstance(exc, urllib.error.URLError):
+            exc = exc.reason
+        if isinstance(exc, TlsConfigError):
+            self._failure("tls-error", "invalid-ca-file")
+        elif isinstance(exc, ssl.SSLCertVerificationError):
+            reason = {62: "hostname-mismatch", 64: "hostname-mismatch",
+                      10: "expired-certificate", 9: "certificate-not-yet-valid"}.get(
+                          getattr(exc, "verify_code", None), "untrusted-certificate")
+            self._failure("tls-error", reason)
+        elif isinstance(exc, ssl.SSLError):
+            self._failure("tls-error", "tls-handshake")
+        else:
+            self._failure("disconnected", "connection-or-stream")
 
     def _admit(self, message: dict, cursor: str) -> bool:
         """Return only after admission, or a deliberate unsupported-kind rejection."""
@@ -185,17 +222,23 @@ class OfficeWorker:
                     headers={"Authorization": "Bearer " + self.office.token, "Accept": "text/event-stream"},
                     method="GET",
                 )
-                with self.opener.open(req, timeout=self.read_timeout) as response:
+                # Rebuild from current files on reconnect, allowing repaired CA
+                # material to recover without a daemon restart or weaker trust.
+                opener = self.opener if self.opener is not None else self._opener()
+                with opener.open(req, timeout=self.read_timeout) as response:
                     if response.headers.get_content_type() != "text/event-stream":
                         raise RelayStateError("invalid stream content type")
+                    if self.failure_state is not None:
+                        logger.info("relay office=%s event=reconnected", self.office.name)
+                        self.failure_state = None
                     if not self.receive(response, backfill_cursor=backfill_cursor):
                         return
             except urllib.error.HTTPError as exc:
                 # Only status is logged. Exception text/URL/headers/body are secret-bearing.
-                logger.warning("relay office=%s event=http-error status=%d", self.office.name, exc.code)
+                self._failure("http-error", str(exc.code))
                 exc.close()
-            except Exception:
-                logger.warning("relay office=%s event=disconnected", self.office.name)
+            except Exception as exc:
+                self._connection_failure(exc)
             if self.progress:
                 backoff = 1.0
             if self.stop.wait(backoff + random.uniform(0, backoff * 0.2)):
