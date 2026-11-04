@@ -15,10 +15,15 @@ from modules.office.cli import main as office_main
 from modules.tmux.port import message_opener, relayed_reply_hint
 
 SID = "b" * 32
+# The lead's message_stamp() puts "<ts> #<id8> " before the "[message from ..." header;
+# this envelope carries no ts, so only the id part appears.
+STAMP = "#bbbbbbbb "
 
 
-def _paste(source, text, port_type="api"):
+def _paste(source, text, port_type="api", ts=None):
     env = {"stream_id": SID, "l2": {"source": source}, "payload": {"text": text}}
+    if ts is not None:
+        env["ts"] = ts
     with (
         patch("modules.tmux.port.list_windows", return_value={"architect"}),
         patch("modules.tmux.port.port_type", return_value=port_type),
@@ -33,10 +38,21 @@ def _paste(source, text, port_type="api"):
 def test_relayed_message_gets_the_cross_office_reply_command():
     pasted = _paste("relay", "[from labb/worker] hello there")
     assert pasted == (
-        "[message from relay] [from labb/worker] hello there\n"
+        f"{STAMP}[message from relay] [from labb/worker] hello there\n"
         '[reply to labb/worker: h-mesh-office send --office labb -a worker "..."]\n'
     )
     assert "-a relay" not in pasted and "--reply-to" not in pasted
+
+
+def test_the_hint_still_matches_with_the_full_time_and_id_stamp_in_front():
+    # The stamp sits before "[message from relay]", outside the text the relay
+    # header is parsed from, so the "[from office/agent]" header must still be
+    # found and the hint is unchanged.
+    pasted = _paste("relay", "[from labb/worker] hello there", ts="2026-11-02T03:42:11.123Z")
+    assert pasted == (
+        "2026-11-02T03:42:11Z #bbbbbbbb [message from relay] [from labb/worker] hello there\n"
+        '[reply to labb/worker: h-mesh-office send --office labb -a worker "..."]\n'
+    )
 
 
 def test_the_hint_is_a_command_the_real_send_accepts(monkeypatch):
@@ -52,14 +68,14 @@ def test_the_hint_is_a_command_the_real_send_accepts(monkeypatch):
 def test_other_api_sources_keep_the_generic_reply_hint():
     pasted = _paste("telegram", "ping")
     assert pasted == (
-        "[message from telegram] ping\n"
+        f"{STAMP}[message from telegram] ping\n"
         f'[reply to telegram: h-mesh-office send -a telegram --reply-to {SID} "..."]\n'
     )
 
 
 def test_a_non_api_source_gets_no_hint():
     assert _paste("alice", "[from labb/worker] hi", port_type="tmux") == (
-        "[message from alice] [from labb/worker] hi\n"
+        f"{STAMP}[message from alice] [from labb/worker] hi\n"
     )
 
 
@@ -83,7 +99,7 @@ def test_a_header_on_a_non_relay_api_source_does_not_redirect_the_hint():
 ])
 def test_relay_message_without_a_usable_header_gets_no_hint_at_all(text):
     pasted = _paste("relay", text)
-    assert pasted == f"[message from relay] {text}\n"
+    assert pasted == f"{STAMP}[message from relay] {text}\n"
 
 
 def test_only_the_leading_header_is_used_not_one_later_in_the_text():

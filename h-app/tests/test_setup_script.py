@@ -13,6 +13,7 @@ from core.keys import prefix
 from core.registry import port_type
 from modules.tmux.ops import list_windows, run_tmux
 from services.daemons import pid_alive, stop_daemons
+from _setup_test_env import ambient_setup_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SETUP_SH = REPO_ROOT / "setup.sh"
@@ -107,48 +108,45 @@ def _dep_check_env(tmpdir: str, *, h_agent_url: str) -> dict:
     # detect-missing/install/verify path in setup.sh's section 0, not
     # --skip-deps like the other tests here. redis-server, curl, and a
     # usable python3-venv are all real and already present on the test
-    # host, so section 0 never touches apt-get; only H_AGENT_INSTALL_URL
-    # is faked.
+    # host. Select individual tools, rather than inheriting directories that
+    # may also contain a real h-agent. The Redis probe uses the runner's
+    # private endpoint instead of redis-cli's implicit port 6379.
     home_dir = os.path.join(tmpdir, "home")
     os.makedirs(home_dir, exist_ok=True)
-    env = dict(os.environ)
-    env["HOME"] = home_dir
-    env["PYTHONPATH"] = str(REPO_ROOT / "h-app")
-    env["H_AGENT_INSTALL_URL"] = h_agent_url
-    env["API_BIND"] = "127.0.0.1"
-    env["API_PORT"] = "0"
-    for k in list(env.keys()):
-        if k.startswith("CLAUDE_OAUTH_TOKEN_") or k == "CLAUDE_CODE_OAUTH_TOKEN":
-            del env[k]
-
-    # Ensure h-agent is missing from PATH so setup.sh exercises its dependency
-    # detection and installer path, even if h-agent is installed on the host.
-    path_dirs = [p for p in env.get("PATH", "").split(":") if p]
-    clean_dirs = []
-    needed_symlinks = {}
-    for p in path_dirs:
-        if os.path.exists(os.path.join(p, "h-agent")):
-            for req in ("curl", "wget", "python3", "redis-server", "redis-cli", "bash", "mktemp", "sh"):
-                target = os.path.join(p, req)
-                if os.path.exists(target) and req not in needed_symlinks:
-                    needed_symlinks[req] = target
-        else:
-            clean_dirs.append(p)
-
-    if needed_symlinks:
-        helper_bin = os.path.join(tmpdir, "helper_bin")
-        os.makedirs(helper_bin, exist_ok=True)
-        for name, target in needed_symlinks.items():
-            dest = os.path.join(helper_bin, name)
-            if not os.path.exists(dest):
-                os.symlink(target, dest)
-        clean_dirs.insert(0, helper_bin)
-
-    env["PATH"] = ":".join(clean_dirs)
-    return env
+    bin_dir = Path(tmpdir) / "bin"
+    bin_dir.mkdir()
+    for command in (
+        "bash", "cat", "chmod", "curl", "dirname", "mkdir", "mktemp",
+        "redis-server", "rm", "tr",
+    ):
+        executable = shutil.which(command)
+        assert executable is not None, f"test prerequisite missing: {command}"
+        (bin_dir / command).symlink_to(executable)
+    (bin_dir / "python3").symlink_to(sys.executable)
+    redis_cli = bin_dir / "redis-cli"
+    redis_cli.write_text(
+        f"#!{sys.executable}\n"
+        "import os, redis\n"
+        "redis.Redis.from_url(os.environ['REDIS_URL']).ping()\n"
+    )
+    redis_cli.chmod(0o755)
+    return {
+        "HOME": home_dir,
+        "PATH": str(bin_dir),
+        "LANG": "C.UTF-8",
+        "PREFIX": os.path.join(home_dir, ".local"),
+        "H_MESH_STATE_DIR": os.path.join(tmpdir, "state"),
+        "TMUX_TMPDIR": os.path.join(tmpdir, "tmux"),
+        "PYTHONPATH": str(REPO_ROOT / "h-app"),
+        "H_AGENT_INSTALL_URL": h_agent_url,
+        "REDIS_URL": os.environ["REDIS_URL"],
+        # Setup now starts API for every office; isolate its listener too.
+        "API_BIND": "127.0.0.1",
+        "API_PORT": "0",
+    }
 
 
-def test_setup_fails_loudly_when_h_agent_installer_fails_twice(managed_tmpdir):
+def test_setup_fails_loudly_when_h_agent_installer_fails_twice(managed_tmpdir, ambient_setup_env):
     # The bug this replaced: setup.sh never checked curl|bash's exit status
     # at all, so a failed h-agent install was silently swallowed and the
     # script printed success anyway. Confirm the opposite now: a clear,
@@ -189,7 +187,7 @@ def test_setup_fails_loudly_when_h_agent_installer_fails_twice(managed_tmpdir):
             stop_daemons(Path(run_dir), env=env)
 
 
-def test_setup_does_not_report_equal_exit_status_when_attempts_actually_differ(managed_tmpdir):
+def test_setup_does_not_report_equal_exit_status_when_attempts_actually_differ(managed_tmpdir, ambient_setup_env):
     # The equal-exit-status line is only accurate when both attempts really
     # did exit the same way -- assert it's absent when the codes differ, so
     # the reporting can't be implemented as "always say this on the second
@@ -217,7 +215,7 @@ def test_setup_does_not_report_equal_exit_status_when_attempts_actually_differ(m
             stop_daemons(Path(run_dir), env=env)
 
 
-def test_setup_reports_only_the_observed_status_and_uncertainty_when_exit_codes_match(managed_tmpdir):
+def test_setup_reports_only_the_observed_status_and_uncertainty_when_exit_codes_match(managed_tmpdir, ambient_setup_env):
     # Reviewer's exact counterexample: h-agent's real installer exits 1 for
     # MULTIPLE distinct causes (claude/codex/agy each have their own
     # verification-failed path), so two attempts returning the same code
@@ -284,7 +282,7 @@ def test_setup_reports_only_the_observed_status_and_uncertainty_when_exit_codes_
             stop_daemons(Path(run_dir), env=env)
 
 
-def test_setup_retries_once_after_a_transient_h_agent_install_failure(managed_tmpdir):
+def test_setup_retries_once_after_a_transient_h_agent_install_failure(managed_tmpdir, ambient_setup_env):
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
     try:
         redis.Redis.from_url(redis_url).ping()
@@ -325,7 +323,7 @@ def test_setup_retries_once_after_a_transient_h_agent_install_failure(managed_tm
             pass
 
 
-def test_setup_installs_h_agent_on_first_try_when_missing(managed_tmpdir):
+def test_setup_installs_h_agent_on_first_try_when_missing(managed_tmpdir, ambient_setup_env):
     redis_url = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
     try:
         redis.Redis.from_url(redis_url).ping()

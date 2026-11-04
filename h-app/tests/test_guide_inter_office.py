@@ -54,11 +54,14 @@ def test_every_agent_gets_the_send_office_form_and_offices(agent, lead):
     pytest.param("worker", "architect", id="other-lead"),
     pytest.param("worker", None, id="no-lead"),
 ])
-def test_ordinary_agents_get_no_linking_commands(agent, lead):
+def test_ordinary_agents_get_no_linking_syntax(agent, lead):
+    # They still see the lead-only commands as labelled rows of the generated
+    # command inventory (#4); what they do not get is the linking section.
     guide = _guide(agent, lead)
     assert LEAD_HEADING not in guide
-    for name in _lead_only_commands():
-        assert name not in guide, f"{name} is lead-only but is in an ordinary agent's guide"
+    for syntax in ("coop-grant <participant>", "office-add <name> <url>", "--token-stdin",
+                   "coop-revoke <token-id>", "Give a token only to"):
+        assert syntax not in guide, f"{syntax!r} is lead-only syntax in an ordinary agent's guide"
 
 
 def test_the_lead_gets_every_lead_only_command_the_table_marks():

@@ -1,5 +1,9 @@
 """Test-suite-wide safety nets.
 
+Session startup requires private Redis plus the runner's temporary HOME,
+state, workdir, and log paths. It refuses unsafe environments before test
+collection and before the orphan reaper; autouse fixtures run too late.
+
 ⚠ Autouse, not opt-in. A test that spawns `services.tmux_reconciler`
 (directly, or indirectly via `setup.sh`/`install.sh`/`services.daemons`)
 without its own explicit `TMUX_TMPDIR`/`TMUX_SESSION`/`TMUX_SOCKET`
@@ -36,6 +40,7 @@ nothing a test needs to opt into.
 import pytest
 
 from _leak_manifest import reap_all_orphans
+from tools.run_tests import UnsafeTestEnvironment, _require_safe_test_environment
 
 
 @pytest.fixture(autouse=True)
@@ -67,6 +72,14 @@ def _scrub_ambient_telegram_and_api_env(monkeypatch):
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
+    # Session hooks run before collection and before autouse fixtures. Refuse
+    # unsafe invocations before the orphan reaper can touch shared resources.
+    import os
+
+    try:
+        _require_safe_test_environment(os.environ)
+    except UnsafeTestEnvironment as exc:
+        raise pytest.UsageError(str(exc)) from None
     reporter = session.config.pluginmanager.get_plugin("terminalreporter")
     log = reporter.write_line if reporter is not None else print
     reaped, stuck = reap_all_orphans(log=log)
