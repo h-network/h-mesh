@@ -105,6 +105,45 @@ def list_windows(session_name: str, socket: str | None = None) -> Set[str]:
     return {w for w in stdout.splitlines() if w}
 
 
+def inter_office_guide(cmd: str, is_lead: bool) -> str:
+    """The guide's section on reaching another office; the lead also gets the linking commands.
+
+    Hand-written syntax, not table-derived (the commands' arguments are not in
+    the command table). tests/test_guide_inter_office.py keeps it honest: every
+    lead-only command in the table must appear in the lead's text, and the
+    printed `send --office` form must be accepted by the real parser.
+    """
+    text = (
+        f"Another office: `{cmd} offices` lists the offices you can reach. To message\n"
+        "one of its agents:\n"
+        "\n"
+        f'    {cmd} send --office <office> -a <agent> "one quoted argument"\n'
+        "\n"
+        "Exit 0: accepted by that office (queued, not delivered). 1: refused, nothing\n"
+        "sent. 3: outcome unknown — do not blindly resend. The reply comes back as\n"
+        "`[message from relay] [from <office>/<agent>] …`, with a hint line giving the\n"
+        "command to answer it.\n"
+        "\n"
+    )
+    if is_lead:
+        text += (
+            "Linking offices is yours alone (lead-only):\n"
+            "\n"
+            f"    {cmd} coop-grant <participant>\n"
+            "                      let another office send to you as <participant>;\n"
+            "                      prints a token ONCE\n"
+            f"    {cmd} office-add <name> <url> --participant <as> --token-stdin\n"
+            "                      reach an office that granted you a token (on stdin,\n"
+            "                      never an argument)\n"
+            f"    {cmd} coops | coop-revoke <token-id> | office-rm <name>\n"
+            "\n"
+            "Give a token only to the other office's lead. Never put one in a message,\n"
+            "a file or a commit.\n"
+            "\n"
+        )
+    return text
+
+
 def generate_agents_md(
     agent_name: str,
     tenant: str = "default",
@@ -198,7 +237,7 @@ never shell-parsed. `send` prints the destination and the bytes it accepted;
 if that byte count is not what you meant to send, it did not arrive intact.
 This directory is yours; work in it.
 
-You have a task board. Nothing will notify you about it — check it yourself:
+{inter_office_guide(cmd, bool(lead and agent_name == lead))}You have a task board. Nothing will notify you about it — check it yourself:
 
     {cmd} list        titles waiting for you
     {cmd} take        take the next one, and it prints in full
