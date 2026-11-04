@@ -243,7 +243,7 @@ as a substitute.
 | `offices.tokens` | hash `name -> token`, read only by `send --office` and the relay |
 | `xsent.s<stream_id>` | the reply-routing record above |
 
-- `office office-add NAME URL [--participant P] --token-stdin [--allow-plaintext] [--no-verify]`
+- `office office-add NAME URL [--participant P] --token-stdin [--allow-plaintext] [--ca-cert PATH] [--no-verify]`
   (lead only). The token is read from stdin and there is no `--token` option,
   so it never appears in process arguments. It also enrols the local api
   participant `relay` with a `StartAgent` envelope if it is absent, and refuses
@@ -275,6 +275,24 @@ as a substitute.
 - TLS is the supported default. `http://` to a non-loopback host is refused
   unless `--allow-plaintext` (or `H_MESH_ALLOW_PLAINTEXT=1`) is given, for lab
   test beds; the token then travels in the clear and `office-add` warns.
+- **Private CA / self-signed offices.** `office-add ... --ca-cert PATH` (a PEM
+  file inside this container, checked readable and PEM-with-a-usable-cert at add
+  time, https urls only) stores `ca_cert` (the path, not a secret) in the
+  `offices` record; `offices` shows it as `CA <path>`. Precedence per request:
+  the office's `ca_cert`, else `H_MESH_CA_CERT`, else the system trust store.
+  With a CA file **only that CA is trusted**. The global default is not copied
+  into records. `office-add` on an existing name replaces the record, so repeat
+  `--ca-cert` when updating. Verification and host-name checking are never
+  turned off and there is no downgrade to http; the shared builder is
+  `lib/tls_context.py`, also used by the relay.
+- **TLS failures are "not sent".** Nothing is written before the handshake
+  completes, so a certificate that fails verification (untrusted issuer, wrong
+  host name, expired, not yet valid) or a handshake/connect failure before it
+  exits **1** with `TLS verification failed: <reason>; the message was NOT sent --
+  <fix>` (`--ca-cert PATH` / use the certificate's host name / renew the
+  certificate). `office-add` prints the same cause with `nothing saved`;
+  `offices --check` shows `link: TLS problem -- ...`. Exit **3** stays for
+  failures after the handshake, where the message may have been accepted.
 
 **Not clients.** `coop-grant` and `office-add` also record the participant (and `relay`) in the `interoffice-participants` hash. Their inbound messages never open an `unreplied` entry, so the watchdog does not report them as "unanswered"; offices set up earlier are recognised from their coop-token records and the reserved `relay` name. The registry port_type stays `api`.
 
