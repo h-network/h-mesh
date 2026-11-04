@@ -133,6 +133,9 @@ def _run_setup_with_forced_hire_exits(
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
     env["PYTHONPATH"] = str(REPO_ROOT / "h-app")
     env["POD"] = pod
+    # Setup now starts API for every office; isolate its listener too.
+    env["API_BIND"] = "127.0.0.1"
+    env["API_PORT"] = "0"
     env["TENANT"] = tenant
     env["REDIS_URL"] = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
     env["AGENTS"] = ",".join(agents)
@@ -148,13 +151,14 @@ def _run_setup_with_forced_hire_exits(
             env=env, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
         )
     finally:
-        for name in ("switch", "tmux_reconciler", "watchdog"):
-            pidfile = Path(home_dir) / ".h-mesh" / "run" / tenant / f"{name}.pid"
-            if pidfile.exists():
-                try:
-                    os.kill(int(pidfile.read_text().strip()), 9)
-                except (ValueError, OSError):
-                    pass
+        # Include the newly always-enabled API and the relay, rather
+        # than leaking any daemon omitted by a fixed name list.
+        run_dir = Path(home_dir) / ".h-mesh" / "run" / tenant
+        for pidfile in run_dir.glob("*.pid"):
+            try:
+                os.kill(int(pidfile.read_text().strip()), 9)
+            except (ValueError, OSError):
+                pass
         try:
             subprocess.run(["tmux", "-S", env["TMUX_SOCKET"], "kill-server"],
                             capture_output=True, timeout=5)

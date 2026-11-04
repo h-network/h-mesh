@@ -350,6 +350,9 @@ def test_setup_seeds_registry_and_runs_e2e_hire_and_message():
     env["PYTHONPATH"] = str(REPO_ROOT / "h-app")
     env["H_MESH_RUN_DIR"] = run_dir
     env["H_MESH_STATE_DIR"] = state_dir
+    # Setup now starts API for every office; isolate its listener too.
+    env["API_BIND"] = "127.0.0.1"
+    env["API_PORT"] = "0"
     env["H_MESH_LOG_FILE"] = os.path.join(state_dir, "window.log.jsonl")
     env["AGENT_NAME"] = "architect"
     env["POD"] = pod

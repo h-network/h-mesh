@@ -75,6 +75,9 @@ def test_upgrade_restarts_daemons_without_duplicating_and_preserves_the_tmux_ses
     env["HOME"] = home_dir
     env["PYTHONPATH"] = str(REPO_ROOT / "h-app")
     env["H_MESH_RUN_DIR"] = run_dir
+    # Setup now starts API for every office; isolate its listener too.
+    env["API_BIND"] = "127.0.0.1"
+    env["API_PORT"] = "0"
     env["AGENT_NAME"] = "architect"
     env["POD"] = pod
     env["TENANT"] = tenant
