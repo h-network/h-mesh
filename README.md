@@ -121,6 +121,9 @@ The always-on [inter-office reply relay](h-app/modules/interoffice/README.md)
 stays idle until the lead records a remote office. It then reads that office's
 reply stream with the cooperation token and admits replies locally as `relay`.
 It checkpoints after admission; a crash before checkpoint can duplicate a reply.
+For a complete step-by-step walk-through of setting up, pairing, verifying, and
+troubleshooting two offices over HTTPS or plaintext lab HTTP, see the
+[Inter-Office Communication Guide](docs/inter-office.md).
 
 ```bash
 ./setup.sh                          # interactive picker, container by default
