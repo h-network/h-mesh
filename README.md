@@ -364,6 +364,8 @@ files; the second invocation loads the new fresh-interpreter handoff and
 establishes the token/API/relay configuration. A third invocation is safe:
 the token and state stay unchanged while daemons are cleanly restarted.
 New upgraders perform the fresh handoff themselves and need only one call.
+The [migration proof](docs/upgrade-token-proof.md) records the old/second/third
+sequence and the isolated container transition with exact commands.
 
 **Container offices:** upgrade from the host by updating the checkout, then
 rerunning bootstrap for the **same pod and tenant**, using its existing
