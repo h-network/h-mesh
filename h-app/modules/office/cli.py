@@ -27,6 +27,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
+from dataclasses import dataclass
 from urllib.parse import quote, urlsplit
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2068,11 +2069,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def _server_detail(exc: urllib.error.HTTPError, token: str) -> str:
+def _server_body(exc: urllib.error.HTTPError) -> str:
     try:
-        body = exc.read(2048).decode("utf-8", "replace")
+        return exc.read(2048).decode("utf-8", "replace")
     except Exception:
-        body = ""
+        return ""
+
+
+def _server_detail(body: str, token: str) -> str:
     detail = body
     try:
         parsed = json.loads(body)
@@ -2082,6 +2086,31 @@ def _server_detail(exc: urllib.error.HTTPError, token: str) -> str:
         pass
     detail = " ".join(detail.split())[:200]
     return detail.replace(token, "***") if token else detail
+
+
+def _server_reason(body: str) -> str | None:
+    """The machine reason of a 401: top-level "reason" (the contract); a
+    reason nested in "detail" is tolerated. Anything else is None."""
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    reason = parsed.get("reason")
+    if reason is None and isinstance(parsed.get("detail"), dict):
+        reason = parsed["detail"].get("reason")
+    return reason if reason in _TOKEN_REASON_TEXT else None
+
+
+_REGRANT_HINT = "; ask its lead for a fresh coop-grant, then re-run office-add"
+_TOKEN_REASON_TEXT = {
+    "revoked": "the cooperation token was revoked by the remote office",
+    "unknown_token": "the remote office does not recognise this token "
+                     "(wrong token, or it was issued by another office)",
+    "participant_not_enrolled": "the participant this token was granted to is no longer "
+                                "enrolled at the remote office",
+}
 
 
 # connect-phase failures that prove no byte of the request reached the server.
@@ -2107,16 +2136,22 @@ def _post_to_office(url: str, token: str, agent: str, body: dict) -> dict:
             status = response.status
             raw = response.read(65536)
     except urllib.error.HTTPError as exc:
-        detail = _server_detail(exc, token)
+        exc_body = _server_body(exc)
+        detail = _server_detail(exc_body, token)
         if exc.code >= 500 or 300 <= exc.code < 400:
             raise OfficeUnknownOutcome(
                 f"remote office answered HTTP {exc.code}"
                 f"{': ' + detail if detail else ''} -- the message may have been accepted; "
                 "do not blindly retry"
             ) from None
+        reason = _server_reason(exc_body)
         hint = {
-            401: " (the cooperation token was refused: wrong, revoked or not for this office)",
-            403: " (refused by the remote office's cooperation policy)",
+            401: " -- " + _TOKEN_REASON_TEXT.get(
+                reason, "the remote office did not accept our cooperation token "
+                        "(wrong, revoked or not for this office)") + _REGRANT_HINT,
+            403: " -- the remote office's cooperation policy does not allow this token to "
+                 f"send to {agent!r}; ask its lead to widen the grant",
+            404: f" -- the remote office has no agent {agent!r} (check the name with its lead)",
         }.get(exc.code, "")
         raise OfficeError(
             f"remote office refused the message: HTTP {exc.code}"
@@ -2145,6 +2180,79 @@ def _post_to_office(url: str, token: str, agent: str, body: dict) -> dict:
             "may have been accepted; do not blindly retry"
         )
     return reply
+
+
+_OFFICE_PROBE_TIMEOUT_SECONDS = 5.0
+
+
+@dataclass(frozen=True)
+class _Link:
+    """Result of probing a remote office with a saved/proposed token.
+
+    state is one of: ok, mismatch, token_problem, unsupported, unreachable,
+    error. message is one plain line (never carries the token).
+    """
+    state: str
+    message: str
+    participant: str | None = None
+    office: str | None = None
+
+
+def _probe_office(url: str, token: str, expect_participant: str | None) -> _Link:
+    """GET {url}/whoami with the token. Never raises, never follows redirects."""
+    request = urllib.request.Request(
+        f"{url}/whoami", method="GET",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+    )
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(request, timeout=_OFFICE_PROBE_TIMEOUT_SECONDS) as response:
+            status = response.status
+            raw = response.read(65536)
+    except urllib.error.HTTPError as exc:
+        body = _server_body(exc)
+        detail = _server_detail(body, token)
+        if exc.code == 401:
+            reason = _server_reason(body)
+            text = _TOKEN_REASON_TEXT.get(
+                reason, "the remote office did not accept the cooperation token "
+                        "(wrong, revoked or not for this office)")
+            return _Link("token_problem", text + _REGRANT_HINT)
+        if exc.code in (404, 405):
+            return _Link("unsupported", (
+                f"the remote office at {url} has no /whoami (older build?), so the link "
+                "cannot be verified; upgrade it, or use --no-verify to save unchecked"))
+        if 300 <= exc.code < 400:
+            return _Link("error", (
+                f"the remote office answered HTTP {exc.code} (a redirect); redirects are never "
+                "followed because they would replay the token -- use the final url"))
+        return _Link("error", (
+            f"the remote office answered HTTP {exc.code}{': ' + detail if detail else ''}"))
+    except urllib.error.URLError as exc:
+        return _Link("unreachable", f"cannot reach the remote office at {url}: {exc.reason}")
+    except (OSError, http.client.HTTPException) as exc:
+        return _Link("unreachable", (
+            f"connection to the remote office at {url} broke ({type(exc).__name__})"))
+    try:
+        info = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        info = None
+    who = info.get("participant") if isinstance(info, dict) else None
+    if status != 200 or not isinstance(who, str) or not who:
+        return _Link("error", (
+            f"{url} did not answer /whoami like an h-mesh api door "
+            f"(HTTP {status}); is the url the api door?"))
+    remote_office = info.get("office") if isinstance(info.get("office"), str) else None
+    if info.get("api") != 1:
+        return _Link("error", (
+            f"the remote office speaks api version {info.get('api')!r}, this CLI understands 1; "
+            "upgrade whichever side is older"), who, remote_office)
+    if expect_participant is not None and who != expect_participant:
+        return _Link("mismatch", (
+            f"the remote office says this token belongs to participant {who!r}, "
+            f"but the address book has {expect_participant!r}; "
+            f"use --participant {who}"), who, remote_office)
+    return _Link("ok", "ok", who, remote_office)
 
 
 def _send_to_office(office: str, agent: str, text: str) -> None:
@@ -2209,17 +2317,24 @@ def _office_add_command(argv: list[str]) -> None:
     )
     parser.add_argument("name", help="local name for the other office")
     parser.add_argument("url", help="base url of its api door, e.g. https://office-b.example:8080")
-    parser.add_argument("--participant", required=True, metavar="NAME",
-                        help="the participant the cooperation was granted to (the 'as' value)")
+    parser.add_argument("--participant", metavar="NAME",
+                        help="the participant the cooperation was granted to (the 'as' value); "
+                             "taken from the remote office when omitted (required with --no-verify)")
     parser.add_argument("--token-stdin", action="store_true", required=True,
                         help="read the cooperation token (coop.<id>.<secret>) from stdin")
     parser.add_argument("--allow-plaintext", action="store_true",
                         help="permit http:// to a non-loopback host (lab test beds only; "
                              "the token then travels in the clear)")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="save without asking the remote office (GET /whoami) first; "
+                             "for offline use. A wrong participant or token then only "
+                             "shows on the first send")
     args = parser.parse_args(argv)
 
     name = _segment_arg(args.name, "office name")
-    participant = _segment_arg(args.participant, "participant")
+    if args.participant is None and args.no_verify:
+        raise OfficeError("--no-verify needs --participant: there is nothing to read it from")
+    participant = _segment_arg(args.participant, "participant") if args.participant else None
     if participant in _FIXED_PARTICIPANTS:
         raise OfficeError(f"participant {participant!r} is reserved")
     url, plaintext = _validated_office_url(args.url, allow_plaintext=args.allow_plaintext)
@@ -2229,13 +2344,25 @@ def _office_add_command(argv: list[str]) -> None:
 
     r, pod, tenant, source = _context()
     _require_lead(r, pod=pod, tenant=tenant, source=source, command="office-add")
-    record = {"url": url, "participant": participant, "added_by": source, "added_ts": _now()}
     # The relay daemon delivers remote replies into this office as the local
     # api participant `relay`. Enrol it if absent (same StartAgent mechanism as
     # coop-grant); refuse before any write if the name is taken by a non-api agent.
     relay_enrolled = is_member(r, pod=pod, tenant=tenant, agent=_RELAY_PARTICIPANT)
     if relay_enrolled and port_type(r, pod=pod, tenant=tenant, agent=_RELAY_PARTICIPANT) != "api":
         raise OfficeError(f"{_RELAY_PARTICIPANT!r} exists but is not an api participant; it is reserved for the relay")
+    verified_as = None
+    if not args.no_verify:
+        link = _probe_office(url, token, participant)
+        if link.state == "mismatch" and link.participant in _FIXED_PARTICIPANTS:
+            raise OfficeError(f"nothing saved: the remote office reports the reserved participant {link.participant!r}")
+        if link.state != "ok":
+            raise OfficeError(f"nothing saved: {link.message}")
+        if participant is None:
+            participant = _segment_arg(link.participant, "participant reported by the remote office")
+            if participant in _FIXED_PARTICIPANTS:
+                raise OfficeError(f"nothing saved: the remote office reports the reserved participant {participant!r}")
+        verified_as = link.office or "?"
+    record = {"url": url, "participant": participant, "added_by": source, "added_ts": _now()}
     try:
         existed = r.hexists(_key("offices", pod, tenant), name)
         # Token first: the book never names an office whose token is missing.
@@ -2256,12 +2383,16 @@ def _office_add_command(argv: list[str]) -> None:
     if plaintext:
         print(f"office: warning: {url} is plaintext http; the token travels in the clear",
               file=sys.stderr)
-    print(f"{'updated' if existed else 'added'} office {name} -> {url} (as {participant})")
+    print(f"{'updated' if existed else 'added'} office {name} -> {url} (as {participant})"
+          + (f"; verified with the remote office ({verified_as})" if verified_as else "; NOT verified"))
 
 
 def _offices_command(argv: list[str]) -> None:
     parser = _operation_parser("offices", "List the other offices in the address book (no secrets).")
-    parser.parse_args(argv)
+    parser.add_argument("--check", action="store_true",
+                        help="also ask each remote office (GET /whoami) whether the saved token "
+                             "and participant still work; exits 1 if any link is not ok")
+    args = parser.parse_args(argv)
     r, pod, tenant, _ = _context()
     try:
         raw = r.hgetall(_key("offices", pod, tenant))
@@ -2270,13 +2401,33 @@ def _offices_command(argv: list[str]) -> None:
     if not raw:
         print("no offices configured")
         return
+    bad = 0
     for name, value in sorted((_text(k), v) for k, v in raw.items()):
         try:
             rec = json.loads(_text(value))
             line = f"{name}\t{rec['url']}\tas {rec['participant']}\tadded by {rec.get('added_by', '?')}"
         except (json.JSONDecodeError, KeyError, TypeError):
-            line = f"{name}\t(unreadable entry)"
+            print(f"{name}\t(unreadable entry)" + ("\tlink: unreadable entry; re-add it" if args.check else ""))
+            bad += 1
+            continue
+        if args.check:
+            try:
+                token = _text(r.hget(_key("office_tokens", pod, tenant), name))
+            except redis.RedisError as exc:
+                raise OfficeError(f"cannot read the office token: {exc}") from exc
+            if not token:
+                link = _Link("token_problem", "no token saved; the lead must re-add it")
+            else:
+                link = _probe_office(rec["url"], token, rec["participant"])
+            if link.state != "ok":
+                bad += 1
+            label = {"ok": "ok", "mismatch": "participant mismatch",
+                     "token_problem": "token problem", "unsupported": "cannot verify",
+                     "unreachable": "unreachable", "error": "error"}[link.state]
+            line += f"\tlink: {label}" + ("" if link.state == "ok" else f" -- {link.message}")
         print(line)
+    if bad:
+        raise OfficeError(f"{bad} office link(s) not ok")
 
 
 def _office_rm_command(argv: list[str]) -> None:

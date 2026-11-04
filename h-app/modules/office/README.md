@@ -243,13 +243,34 @@ as a substitute.
 | `offices.tokens` | hash `name -> token`, read only by `send --office` and the relay |
 | `xsent.s<stream_id>` | the reply-routing record above |
 
-- `office office-add NAME URL --participant P --token-stdin [--allow-plaintext]`
+- `office office-add NAME URL [--participant P] --token-stdin [--allow-plaintext] [--no-verify]`
   (lead only). The token is read from stdin and there is no `--token` option,
   so it never appears in process arguments. It also enrols the local api
   participant `relay` with a `StartAgent` envelope if it is absent, and refuses
   if `relay` already exists as a non-api agent. It starts no process.
+  **Link check:** before saving, `office-add` calls `GET URL/whoami` with the
+  token (5 s timeout, redirects never followed). The remote answers
+  `{office, participant, kinds, api: 1}`; a 401 carries a top-level `reason`
+  (`revoked`, `unknown_token`, `participant_not_enrolled`). On any failure it
+  prints one line saying what is wrong and what to do, ends with
+  `nothing saved`, and exits 1: token revoked/unknown/participant gone (ask the
+  remote lead for a fresh `coop-grant`), participant mismatch (`the remote
+  office says this token belongs to participant 'X' ... use --participant X`),
+  unreachable, a url that is not an api door, an older remote with no
+  `/whoami`, an unknown `api` version. When `--participant` is omitted it is
+  taken from the remote's answer. `--no-verify` skips the call for offline use
+  (then `--participant` is required, and a wrong participant or token only
+  shows on the first send; the command says `NOT verified`).
 - `office offices` lists names, urls and participants. It reads only the
-  `offices` hash, so it cannot print a token.
+  `offices` hash, so it cannot print a token, and makes no network call.
+  `office offices --check` also probes every entry with its saved token and
+  appends `link: ok`, `link: participant mismatch`, `link: token problem`
+  (revoked / unknown / participant gone / no token saved), `link: cannot
+  verify` (remote has no `/whoami`) or `link: unreachable`, each with the
+  reason. It checks all entries and exits 1 if any is not ok.
+- `send --office` failures name the cause: 401 (token revoked / unknown /
+  participant gone, per the remote's `reason`), 403 (the grant does not allow
+  that destination), 404 (no such agent at the remote).
 - `office office-rm NAME` (lead only) removes the record and the token.
 - TLS is the supported default. `http://` to a non-loopback host is refused
   unless `--allow-plaintext` (or `H_MESH_ALLOW_PLAINTEXT=1`) is given, for lab

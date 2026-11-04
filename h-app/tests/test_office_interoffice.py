@@ -59,6 +59,13 @@ class Remote:
                 })
                 handler(self)
 
+            def do_GET(self):
+                remote.requests.append({
+                    "method": "GET", "path": self.path,
+                    "auth": self.headers.get("Authorization"), "body": None,
+                })
+                handler(self)
+
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
@@ -281,7 +288,7 @@ def test_office_add_is_lead_only_and_reads_the_token_from_stdin(monkeypatch, cap
     _env(monkeypatch)
     r = Redis()
     argv = ["office-add", "beta", "https://beta.example:8080/", "--participant", "alpha-office",
-            "--token-stdin"]
+            "--token-stdin", "--no-verify"]
     assert exit_code(r, argv, monkeypatch, TOKEN + "\n") == 1       # no lead at all
     assert "no lead" in capsys.readouterr().err
     r.values[LEAD] = "someone-else"
@@ -307,8 +314,8 @@ def test_office_add_does_not_reenrol_an_existing_relay(monkeypatch):
     r = Redis(registry={"relay": "api"})
     r.values[LEAD] = "architect"
     with patch("modules.office.cli.send") as send:
-        run(r, ["office-add", "beta", "https://b.example", "--participant", "p", "--token-stdin"],
-            monkeypatch, TOKEN)
+        run(r, ["office-add", "beta", "https://b.example", "--participant", "p", "--token-stdin",
+                "--no-verify"], monkeypatch, TOKEN)
     send.assert_not_called()
 
 
@@ -358,10 +365,10 @@ def test_office_add_plaintext_needs_explicit_opt_in_and_warns(monkeypatch, capsy
     r = Redis(registry={"relay": "api"})
     r.values[LEAD] = "architect"
     run(r, ["office-add", "beta", "http://10.0.0.5:8080", "--participant", "p", "--token-stdin",
-            "--allow-plaintext"], monkeypatch, TOKEN)
+            "--allow-plaintext", "--no-verify"], monkeypatch, TOKEN)
     assert "plaintext" in capsys.readouterr().err
-    run(r, ["office-add", "loop", "http://127.0.0.1:8080", "--participant", "p", "--token-stdin"],
-        monkeypatch, TOKEN)                       # loopback needs no opt-in
+    run(r, ["office-add", "loop", "http://127.0.0.1:8080", "--participant", "p", "--token-stdin",
+            "--no-verify"], monkeypatch, TOKEN)                       # loopback needs no opt-in
 
 
 def test_offices_lists_everyone_and_never_prints_a_token(monkeypatch, capsys):
@@ -504,7 +511,7 @@ def test_office_add_marks_the_relay_whether_or_not_it_is_already_enrolled(monkey
         r.values[LEAD] = "architect"
         with patch("modules.office.cli.send"):
             run(r, ["office-add", "beta", "https://b.example", "--participant", "p",
-                    "--token-stdin"], monkeypatch, TOKEN)
+                    "--token-stdin", "--no-verify"], monkeypatch, TOKEN)
         assert r.hashes[PARTICIPANTS] == {"relay": "relay"}
 
 
