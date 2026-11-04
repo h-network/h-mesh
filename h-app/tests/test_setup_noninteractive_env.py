@@ -56,6 +56,8 @@ def noninteractive_env():
     env["POD"] = pod
     env["TENANT"] = tenant
     env["REDIS_URL"] = redis_url
+    env["API_BIND"] = "127.0.0.1"
+    env["API_PORT"] = "0"
 
     # Scrub ambient tokens/telegram/api config so only what each test sets
     # explicitly is visible -- this office's own real env must not leak in.

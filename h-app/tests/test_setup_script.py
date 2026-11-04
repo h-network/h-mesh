@@ -114,6 +114,8 @@ def _dep_check_env(tmpdir: str, *, h_agent_url: str) -> dict:
     env["HOME"] = home_dir
     env["PYTHONPATH"] = str(REPO_ROOT / "h-app")
     env["H_AGENT_INSTALL_URL"] = h_agent_url
+    env["API_BIND"] = "127.0.0.1"
+    env["API_PORT"] = "0"
     for k in list(env.keys()):
         if k.startswith("CLAUDE_OAUTH_TOKEN_") or k == "CLAUDE_CODE_OAUTH_TOKEN":
             del env[k]
