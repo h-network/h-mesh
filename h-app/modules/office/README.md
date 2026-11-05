@@ -47,11 +47,27 @@ Direct sends and broadcasts cannot target it, and tmux's message-paste helper
 refuses that namespace. Its process runs once: exited output and exit status
 stay in a dead pane for inspection, with no agent restart, resume, presence,
 or stall tracking. The reconciler preserves these windows even with an empty
-agent roster. Close it explicitly, for example
-`tmux -S "$TMUX_SOCKET" kill-window -t "$TMUX_SESSION:__run__monitor"`;
+agent roster. Close it explicitly with `office run-rm monitor` (below);
 closing it does not recreate it. Reusing an existing run name fails instead
 of replacing or restarting the process. Ordinary manual typing in a run shell
 remains available through tmux. Do not rename it into an agent window.
+
+`office status` lists each run window after the agents, as
+`run:NAME  running|exited N  run window, not an agent: COMMAND`, and
+`office peers -i` adds a `run windows (non-addressable ...)` line (plain `peers`
+stays colleagues only). The state comes from Redis (`run.windows`), published by
+the tmux reconciler within one poll (about 5 s), so it works from inside an agent
+pane where the tmux isolation guard forbids asking the office's own server. A
+command that exits stays listed as `exited N` (or `exited (signal N)`) until
+removed; nothing restarts it.
+
+`office run-rm NAME [--wait SECONDS]` (lead only, advisory like `coop-grant`)
+removes a run window, running or exited. It writes the request to `run.remove`
+and waits (default 20 s) for the reconciler to kill the window and clear the
+listing; it never touches tmux itself, so it works from any pane. Exit 0 =
+removed, 1 = refused (unknown or invalid name, not the lead), 2 = requested but
+the reconciler has not confirmed (is `tmux_reconciler` running?). A raw
+`tmux kill-window -t "$TMUX_SESSION:__run__NAME"` still works but is no longer needed.
 
 Board transitions run in one isolated Lua script and preflight both Redis key
 types before mutation; `take` also checks destination emptiness before its
@@ -449,6 +465,24 @@ unauthenticated environment variable and any process with Redis access can
 write the same keys directly, so this stops mistakes and non-lead agents, not a
 hostile local process. The same applies to the tokens hash: hiding tokens from
 `offices` prevents accidental disclosure, not reading Redis.
+
+## Action audit (#27)
+
+`office audit [-a AGENT] [--since 90m|2h|1d|ISO] [--tool TOOL] [--limit N] [--json]`
+shows what agents *did*: the records h-agent's tool hooks submitted to the api
+door (`POST /agents/{agent}/audit`, see `modules/api/README.md` for the record
+format, caps and masking). Output is one line per record, oldest first,
+`recv_ts<TAB>agent<TAB>tool<TAB>exit=N<TAB>args` (`exit=-` when unknown, `…`
+after truncated args, newlines in args shown as `\n`); `--json` prints the stored
+records, one per line, including `cursor`. Without `-a` it covers every enrolled
+agent; a retired agent's kept records are read with `-a NAME`. `--since` and
+the ordering use the server's `recv_ts`, never the caller's claimed `ts`;
+`--limit` (default 50) keeps the newest N.
+
+The command reads Redis directly like the other office commands, so it needs no
+`API_TOKEN` (the HTTP read route does). That is a convenience, not an access
+boundary, and the records are not tamper-evident: with one shared OS user an
+agent can forge, skip or delete them (the plain list is in the api README).
 
 ## Board event notices (#18)
 

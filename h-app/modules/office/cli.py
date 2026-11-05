@@ -38,7 +38,8 @@ import redis
 from core.channels import send
 from core.envelope import EnvelopeError, parse
 from core.keys import (
-    incarnation_key, interoffice_participants_key, prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key, validate_segment,
+    incarnation_key, interoffice_participants_key, prefix, receive_undeliverable_key, receive_unresolved_key,
+    retired_inbox_key, run_remove_key, run_windows_key, validate_segment,
 )
 from core.logging import log_record, record_task_event
 from core.receipts import trace as trace_delivery
@@ -578,6 +579,10 @@ def _peers_command(argv: list[str]) -> None:
             if agent != source and port_type(r, pod=pod, tenant=tenant, agent=agent) in ("api", "office")
         )
         print(f"interfaces (api/office -- recognized, not tmux colleagues): {', '.join(labeled) or '(none)'}")
+        run_rows = _run_windows(r, pod=pod, tenant=tenant)
+        if run_rows:
+            print("run windows (non-addressable -- never a delivery target): "
+                  + ", ".join(f"{name} ({_run_state_text(info)})" for name, info in run_rows))
 
 
 def _contexts_command(argv: list[str]) -> None:
@@ -691,11 +696,17 @@ def _status_command(argv: list[str]) -> None:
     )
     if args.agent is not None:
         if args.agent not in tmux_agents:
+            if args.agent in dict(_run_windows(r, pod=pod, tenant=tenant)):
+                raise OfficeError(f"{args.agent!r} is a run window, not an agent; plain `office status` lists it")
             raise OfficeError(f"unknown tmux agent {args.agent!r}")
         tmux_agents = [args.agent]
     now = datetime.now(timezone.utc)
     for agent in tmux_agents:
         print(_status_row(r, pod=pod, tenant=tenant, agent=agent, now=now))
+    if args.agent is None:
+        for name, info in _run_windows(r, pod=pod, tenant=tenant):
+            print(f"  {'run:' + name:<12} {_run_state_text(info):<10} "
+                  f"run window, not an agent: {info.get('command') or '?'}")
 
 
 def _text(value) -> str:
@@ -708,7 +719,8 @@ def _run_command(argv: list[str]) -> None:
     parser = _operation_parser(
         "run", "Open a non-addressable process window; not an agent. "
         "Use: office run NAME [--cwd PATH] [-- COMMAND ...]. "
-        "Default: bash -il. Exited commands stay visible and are never restarted.",
+        "Default: bash -il. Exited commands stay visible and are never restarted. "
+        "Remove with: office run-rm NAME.",
     )
     parser.add_argument("name", help="window label (lowercase office-name syntax)")
     parser.add_argument("--cwd", type=Path, help="working directory (default: current directory)")
@@ -729,6 +741,74 @@ def _run_command(argv: list[str]) -> None:
     except (OSError, RuntimeError, ValueError) as exc:
         raise OfficeError(str(exc)) from exc
     print(f"opened non-addressable window {window} in {session}")
+
+
+def _run_windows(r, *, pod: str, tenant: str) -> list[tuple[str, dict]]:
+    """The `office run` windows the tmux reconciler last published, sorted by name.
+
+    Read from Redis, not tmux: from inside an agent pane the tmux isolation guard
+    forbids asking the office's own server. A missing or unreadable key is "none".
+    """
+    try:
+        raw = r.hgetall(run_windows_key(pod, tenant)) or {}
+    except redis.RedisError:
+        return []
+    rows = []
+    for name, value in raw.items():
+        try:
+            info = json.loads(_text(value))
+        except ValueError:
+            info = {}
+        rows.append((_text(name), info if isinstance(info, dict) else {}))
+    return sorted(rows)
+
+
+def _run_state_text(info: dict) -> str:
+    if info.get("state") != "exited":
+        return "running"
+    if info.get("signal"):
+        return f"exited (signal {info['signal']})"
+    if isinstance(info.get("exit_status"), int):
+        return f"exited {info['exit_status']}"
+    return "exited"
+
+
+def _run_rm_command(argv: list[str]) -> None:
+    parser = _operation_parser(
+        "run-rm", "Remove an `office run` window (running or exited). Lead only. "
+        "The tmux reconciler performs the removal; this never touches tmux itself.",
+    )
+    parser.add_argument("name", help="the run window's NAME as shown by `office status`")
+    parser.add_argument("--wait", type=float, default=20.0, metavar="SECONDS",
+                        help="how long to wait for the reconciler to confirm (default 20; 0 = do not wait)")
+    args = parser.parse_args(argv)
+    try:
+        name = validate_segment(args.name)
+    except KeyError:
+        raise OfficeError(f"invalid run window name {args.name!r}") from None
+    r, pod, tenant, source = _context()
+    _require_lead(r, pod=pod, tenant=tenant, source=source, command="run-rm")
+    if name not in dict(_run_windows(r, pod=pod, tenant=tenant)):
+        raise OfficeError(
+            f"unknown run window {name!r} (see `office status`; a window opened in the last few "
+            "seconds is listed after the reconciler's next pass)"
+        )
+    try:
+        r.sadd(run_remove_key(pod, tenant), name)
+    except redis.RedisError as exc:
+        raise OfficeError(f"cannot request the removal: {exc}") from exc
+    log_record("office", "run_window_remove_requested", source=source, destination=name)
+    deadline = time.monotonic() + max(args.wait, 0.0)
+    while True:
+        if name not in dict(_run_windows(r, pod=pod, tenant=tenant)) and not r.sismember(run_remove_key(pod, tenant), name):
+            print(f"removed run window {name}")
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+    print(f"office: removal of run window {name!r} requested but not yet confirmed "
+          "(is the tmux reconciler running?)", file=sys.stderr)
+    raise SystemExit(2)
 
 
 def _fields(raw: dict) -> dict[str, str]:
@@ -3171,6 +3251,56 @@ def _coops_command(argv: list[str]) -> None:
 
 
 
+def _audit_command(argv: list[str]) -> None:
+    """Read the action audit (#27): what agents DID, newest last.
+
+    ⚠ Reads Redis directly like the other office commands, so it is a
+    convenience, NOT an access boundary: with one shared OS user any agent can
+    read (or forge, or delete) these records. See modules/office/README.md.
+    """
+    parser = _operation_parser("audit", "Show the action audit: commands and tool calls agents ran.")
+    parser.add_argument("-a", "--agent", metavar="AGENT",
+                        help="only this agent (also works for a retired agent whose records are kept)")
+    parser.add_argument("--since", metavar="WHEN", help="90m, 2h, 1d or an ISO-8601 time (by receive time)")
+    parser.add_argument("--tool", metavar="TOOL", help="only this tool (e.g. Bash)")
+    parser.add_argument("--limit", type=int, default=50, metavar="N",
+                        help="show at most the newest N records (default 50)")
+    parser.add_argument("--json", action="store_true", help="one JSON record per line")
+    args = parser.parse_args(argv)
+    if args.limit < 1:
+        parser.error("--limit must be >= 1")
+    audit = importlib.import_module("lib.audit")
+    r, pod, tenant, _ = _context()
+    try:
+        moment = audit.parse_since(args.since) if args.since else None
+        if args.agent:
+            validate_segment(args.agent)
+    except (audit.AuditError, KeyError) as exc:
+        raise OfficeError(str(exc) if isinstance(exc, audit.AuditError) else f"invalid agent name {args.agent!r}") from exc
+    agents = [args.agent] if args.agent else sorted(_text(a) for a in members(r, pod=pod, tenant=tenant))
+    rows = []
+    for name in agents:
+        rows.extend(audit.read_since(r, pod, tenant, name, moment))
+    if args.tool:
+        rows = [row for row in rows if row.get("tool") == args.tool]
+    rows.sort(key=lambda row: (str(row.get("recv_ts", "")), str(row.get("cursor", ""))))
+    rows = rows[-args.limit:]
+    if not rows:
+        print("no audit records")
+        return
+    for row in rows:
+        if args.json:
+            print(json.dumps(row, separators=(",", ":")))
+            continue
+        exit_code = row.get("exit")
+        shown = "-" if exit_code is None else str(exit_code)
+        # One physical line per record: args may hold newlines.
+        text = str(row.get("args", "")).replace("\\", "\\\\").replace("\n", "\\n")
+        more = "\u2026" if row.get("args_truncated") else ""
+        print(f"{row.get('recv_ts', '?')}\t{row.get('agent', '?')}\t{row.get('tool', '?')}\t"
+              f"exit={shown}\t{text}{more}")
+
+
 # ---------------------------------------------------------------------------
 # Dispatch: one table, not three hand-synced places.
 #
@@ -3197,6 +3327,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("status",), "show agent presence and open work", _status_command),
     (("hire",), "enrol a new agent", lambda argv: _lifecycle_command("hire", argv)),
     (("run",), "open a non-addressable shell or command window", _run_command),
+    (("run-rm",), "remove a run window (restricted to the lead)", _run_rm_command),
     (("let-go",), "retire an agent", lambda argv: _lifecycle_command("letGo", argv)),
     (("pause",), "pause an agent's CLI", lambda argv: _lifecycle_command("pause", argv)),
     (("resume",), "resume an agent's CLI and inbox", lambda argv: _lifecycle_command("resume", argv)),
@@ -3225,6 +3356,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("coop-grant",), "grant another office a cooperation token (lead only)", _coop_grant_command),
     (("coop-revoke",), "revoke a cooperation token (lead only)", _coop_revoke_command),
     (("coops",), "list granted cooperation tokens", _coops_command),
+    (("audit",), "show the action audit: commands and tool calls agents ran", _audit_command),
 )
 
 _COMMANDS: tuple[str, ...] = tuple(name for names, _, _ in _COMMAND_TABLE for name in names)

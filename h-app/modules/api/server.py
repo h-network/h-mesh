@@ -19,6 +19,7 @@ from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from starlette.concurrency import run_in_threadpool
 
 from core.channels import DeadLetter, send
 from core.envelope import EnvelopeError, resolve_destination
@@ -26,6 +27,7 @@ from core.keys import ingress_stalled_key, prefix
 from core.registry import is_member, members, port_type
 from lib.chat_memory import TTL_SECONDS_MAX as CHAT_MEMORY_TTL_SECONDS
 from lib.chat_memory import ChatMemory
+from lib import audit as audit_store
 from lib.coop_tokens import TOKEN_PREFIX as COOP_TOKEN_PREFIX
 from lib.coop_tokens import diagnose as diagnose_coop_token
 from lib.coop_tokens import verify as verify_coop_token
@@ -356,6 +358,10 @@ def _render_restdoc_html(app: FastAPI) -> str:
         "/whoami": {
             "desc": "Who this token is: office, bound participant (null for the office-wide token), allowed kinds. 401 carries a top-level reason: revoked, unknown_token or participant_not_enrolled. Also reachable with a cooperation token.",
             "curl": 'curl -H "Authorization: Bearer $API_TOKEN" http://localhost:8080/whoami',
+        },
+        "/agents/{agent}/audit": {
+            "desc": "Action audit (#27). POST stores one JSON record of what the agent did (secrets masked server-side, 8 KiB cap, 202 {id}); GET reads them (`?after=<cursor>`, `limit`). Not tamper-evident: see the README.",
+            "curl": 'curl -X POST -H "Authorization: Bearer $API_TOKEN" -d \'{"tool":"Bash","args":"ls","exit":0}\' http://localhost:8080/agents/sme-2/audit',
         },
         "/agents": {
             "desc": "List all enrolled agents from the tenant registry.",
@@ -1197,6 +1203,54 @@ def create_app(*, settings: ApiSettings | None = None, redis_client: Any = None)
             "activity": activity,
             "next_cursor": next_cursor,
         }
+
+    def _audit_agent(agent: str) -> None:
+        try:
+            prefix(settings.pod, settings.tenant, agent)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="invalid agent") from exc
+        if not is_member(client, pod=settings.pod, tenant=settings.tenant, agent=agent):
+            raise HTTPException(status_code=404, detail="unknown agent")
+
+    @app.post("/agents/{agent}/audit", status_code=status.HTTP_202_ACCEPTED)
+    async def post_audit(agent: str, request: Request) -> dict[str, str]:
+        """Action audit (#27): store one masked record of what `agent` did."""
+        _audit_agent(agent)
+        declared = request.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > audit_store.MAX_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="audit record too large")
+        chunks, size = [], 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > audit_store.MAX_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="audit record too large")
+            chunks.append(chunk)
+        try:
+            body = json.loads(b"".join(chunks))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=422, detail="body must be a JSON object") from exc
+        try:
+            cursor = await run_in_threadpool(
+                audit_store.append, client, settings.pod, settings.tenant, agent, body
+            )
+        except audit_store.AuditError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except redis.exceptions.RedisError as exc:
+            raise HTTPException(status_code=503, detail="audit store unavailable") from exc
+        return {"id": cursor}
+
+    @app.get("/agents/{agent}/audit")
+    def get_audit(
+        agent: str,
+        after: str | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ) -> dict[str, Any]:
+        _audit_agent(agent)
+        try:
+            records = audit_store.read(client, settings.pod, settings.tenant, agent, after=after, limit=limit)
+        except redis.exceptions.RedisError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"agent": agent, "audit": records, "next_cursor": records[-1]["cursor"] if records else after}
 
     @app.get("/agents/{agent}/activity/stream", include_in_schema=False)
     async def stream_activity(
