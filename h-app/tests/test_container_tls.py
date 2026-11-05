@@ -7,12 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from _tls_test_material import certificate_pair
+from _tls_test_material import certificate_pair, tls_host_uid
 from test_container_bootstrap import BOOTSTRAP, _env_with_fake_docker, _fake_docker
 
 
 @pytest.fixture
-def tls_bootstrap(tmp_path):
+def tls_bootstrap(tmp_path, tls_host_uid):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log = tmp_path / "docker.log"
@@ -35,7 +35,7 @@ def tls_bootstrap(tmp_path):
     return run, env_file, cert, key, log, bin_dir
 
 
-def test_tls_stages_private_copies_and_readonly_compose_mount(tls_bootstrap):
+def test_tls_stages_private_copies_and_readonly_compose_mount(tls_bootstrap, tls_host_uid):
     run, env_file, cert, key, log, _ = tls_bootstrap
     result = run()
     assert result.returncode == 0, result.stderr
@@ -45,7 +45,7 @@ def test_tls_stages_private_copies_and_readonly_compose_mount(tls_bootstrap):
     assert (staged / "ca.crt").read_bytes() == cert.read_bytes()
     assert stat.S_IMODE(staged.stat().st_mode) == 0o700
     assert stat.S_IMODE((staged / "api.key").stat().st_mode) == 0o600
-    assert (staged / "api.key").stat().st_uid == 1000
+    assert (staged / "api.key").stat().st_uid == tls_host_uid
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
     values = dict(line.split("=", 1) for line in env_file.read_text().splitlines())
     assert values["API_TLS_CERT"] == "/run/h-mesh/tls/api.crt"
@@ -112,15 +112,41 @@ def test_tls_bad_material_never_reaches_compose_up(tls_bootstrap, tmp_path, faul
     assert "private material must never be printed" not in result.stdout + result.stderr
 
 
-def test_tls_unsupported_uid_fails_before_up(tls_bootstrap):
+def test_tls_unsupported_uid_fails_before_up(tls_bootstrap, tls_host_uid):
     run, _, _, _, log, bin_dir = tls_bootstrap
     fake_id = bin_dir / "id"
-    fake_id.write_text("#!/bin/sh\nprintf '2001\\n'\n")
+    unsupported_uid = 2001 if tls_host_uid != 2001 else 2002
+    fake_id.write_text(f"#!/bin/sh\nprintf '{unsupported_uid}\\n'\n")
     fake_id.chmod(0o755)
     result = run()
     assert result.returncode != 0
     assert "permission: host UID must be 1000 or root" in result.stderr
     assert "up -d" not in log.read_text()
+
+
+def test_tls_production_uid_policy_allows_only_root_and_1000(tmp_path):
+    # A symlink stops accepted UIDs before staging or chown. Rejected UIDs
+    # must fail earlier, at the real script's UID check, on every runner UID.
+    (tmp_path / "tls").symlink_to(tmp_path, target_is_directory=True)
+    fake_id = tmp_path / "id"
+    env = dict(os.environ, PATH=f"{tmp_path}:{os.environ['PATH']}")
+    real_script = Path(__file__).resolve().parents[2] / "container" / "tls.sh"
+    for uid in (0, 1000, 1001, 2001):
+        fake_id.write_text(f"#!/bin/sh\nprintf '{uid}\\n'\n")
+        fake_id.chmod(0o755)
+        result = subprocess.run([
+            "bash", "-c",
+            'source "$1"; ENV_FILE="$2"; TLS_CERT=fixture; '
+            'TLS_KEY= SESSION_CERT= SESSION_KEY= CA_CERT=; stage_tls',
+            "tls-policy", str(real_script), str(tmp_path / ".env"),
+        ], env=env, capture_output=True, text=True, timeout=10)
+        assert result.returncode != 0
+        if uid in (0, 1000):
+            assert "staging directory must be a real directory" in result.stderr
+            assert "permission: host UID" not in result.stderr
+        else:
+            assert "permission: host UID must be 1000 or root" in result.stderr
+            assert "staging directory" not in result.stderr
 
 
 @pytest.mark.parametrize("mode", ["session", "ca-only"])

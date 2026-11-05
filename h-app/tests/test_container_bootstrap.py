@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from _tls_test_material import tls_host_uid
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = REPO_ROOT / "container" / "bootstrap.sh"
 ENTRYPOINT = REPO_ROOT / "container" / "entrypoint.sh"
@@ -150,7 +152,7 @@ def _bootstrap_wizard(env_file, env, answers):
 
 
 @pytest.mark.parametrize("transport", ["plaintext", "tls"])
-def test_bootstrap_interactive_without_telegram_explicitly_selects_transport(tmp_path, transport):
+def test_bootstrap_interactive_without_telegram_explicitly_selects_transport(tmp_path, transport, tls_host_uid):
     from _tls_test_material import certificate_pair
     cert, key = certificate_pair(tmp_path)
     log = tmp_path / "docker.log"
@@ -409,7 +411,7 @@ def test_custom_port_flags_are_persisted_and_invalid_ports_fail(tmp_path):
     assert "1 to 65535" in res.stderr
 
 
-def test_noninteractive_summary_reports_telegram_from_env_file(tmp_path):
+def test_noninteractive_summary_reports_telegram_from_env_file(tmp_path, tls_host_uid):
     from _tls_test_material import certificate_pair
     cert, key = certificate_pair(tmp_path)
     log = tmp_path / "docker_calls.log"

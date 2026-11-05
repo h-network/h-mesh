@@ -15,6 +15,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from _tls_test_material import tls_host_uid
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BOOTSTRAP = REPO_ROOT / "container" / "bootstrap.sh"
 
@@ -176,7 +178,7 @@ def test_enabling_telegram_forces_a_plaintext_or_tls_decision(tmp_path):
     assert "unencrypted" in output
 
 
-def test_telegram_with_a_real_cert_path_persists_cert_and_key_not_plaintext(tmp_path):
+def test_telegram_with_a_real_cert_path_persists_cert_and_key_not_plaintext(tmp_path, tls_host_uid):
     from _tls_test_material import certificate_pair
     cert, key = certificate_pair(tmp_path)
     _fake_docker(tmp_path)

@@ -309,6 +309,14 @@ deliberately supplies synthetic ambient configuration and an existing h-agent
 to these tests, so isolation is exercised even in a clean runner shell. This
 does not change setup's documented environment-over-persisted-config behavior.
 
+TLS bootstrap fixtures generate a private copy of the real bootstrap and TLS
+helper, replacing only the helper's single allowed non-root UID with the test
+runner's UID. The fixture asserts that the replacement matches exactly once;
+filesystem ownership, private modes, PEM validation, and staged-copy checks
+remain real. This lets UID 1001 CI runners exercise staging without privileges.
+A separate test executes the unchanged production helper and pins its policy:
+only root and UID 1000 may stage TLS material.
+
 ## There is no enforced merge gate, and that is deliberate
 
 Nothing in the repository prevents a change from reaching `main` without
