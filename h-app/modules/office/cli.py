@@ -3171,6 +3171,56 @@ def _coops_command(argv: list[str]) -> None:
 
 
 
+def _audit_command(argv: list[str]) -> None:
+    """Read the action audit (#27): what agents DID, newest last.
+
+    ⚠ Reads Redis directly like the other office commands, so it is a
+    convenience, NOT an access boundary: with one shared OS user any agent can
+    read (or forge, or delete) these records. See modules/office/README.md.
+    """
+    parser = _operation_parser("audit", "Show the action audit: commands and tool calls agents ran.")
+    parser.add_argument("-a", "--agent", metavar="AGENT",
+                        help="only this agent (also works for a retired agent whose records are kept)")
+    parser.add_argument("--since", metavar="WHEN", help="90m, 2h, 1d or an ISO-8601 time (by receive time)")
+    parser.add_argument("--tool", metavar="TOOL", help="only this tool (e.g. Bash)")
+    parser.add_argument("--limit", type=int, default=50, metavar="N",
+                        help="show at most the newest N records (default 50)")
+    parser.add_argument("--json", action="store_true", help="one JSON record per line")
+    args = parser.parse_args(argv)
+    if args.limit < 1:
+        parser.error("--limit must be >= 1")
+    audit = importlib.import_module("lib.audit")
+    r, pod, tenant, _ = _context()
+    try:
+        moment = audit.parse_since(args.since) if args.since else None
+        if args.agent:
+            validate_segment(args.agent)
+    except (audit.AuditError, KeyError) as exc:
+        raise OfficeError(str(exc) if isinstance(exc, audit.AuditError) else f"invalid agent name {args.agent!r}") from exc
+    agents = [args.agent] if args.agent else sorted(_text(a) for a in members(r, pod=pod, tenant=tenant))
+    rows = []
+    for name in agents:
+        rows.extend(audit.read_since(r, pod, tenant, name, moment))
+    if args.tool:
+        rows = [row for row in rows if row.get("tool") == args.tool]
+    rows.sort(key=lambda row: (str(row.get("recv_ts", "")), str(row.get("cursor", ""))))
+    rows = rows[-args.limit:]
+    if not rows:
+        print("no audit records")
+        return
+    for row in rows:
+        if args.json:
+            print(json.dumps(row, separators=(",", ":")))
+            continue
+        exit_code = row.get("exit")
+        shown = "-" if exit_code is None else str(exit_code)
+        # One physical line per record: args may hold newlines.
+        text = str(row.get("args", "")).replace("\\", "\\\\").replace("\n", "\\n")
+        more = "\u2026" if row.get("args_truncated") else ""
+        print(f"{row.get('recv_ts', '?')}\t{row.get('agent', '?')}\t{row.get('tool', '?')}\t"
+              f"exit={shown}\t{text}{more}")
+
+
 # ---------------------------------------------------------------------------
 # Dispatch: one table, not three hand-synced places.
 #
@@ -3225,6 +3275,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("coop-grant",), "grant another office a cooperation token (lead only)", _coop_grant_command),
     (("coop-revoke",), "revoke a cooperation token (lead only)", _coop_revoke_command),
     (("coops",), "list granted cooperation tokens", _coops_command),
+    (("audit",), "show the action audit: commands and tool calls agents ran", _audit_command),
 )
 
 _COMMANDS: tuple[str, ...] = tuple(name for names, _, _ in _COMMAND_TABLE for name in names)

@@ -125,6 +125,78 @@ offices (the default the API enforces for non-loopback binds); plaintext is
 only for a lab test bed via the existing `H_MESH_ALLOW_PLAINTEXT=1` opt-in.
 Message-only means no attachments across offices in this version.
 
+## Action audit (#27)
+
+A bounded record of what an agent *did* (shell and tool commands), as opposed to
+the switch's log of what it *said*. h-agent's per-CLI tool hooks submit the
+records; this door stores and serves them. Design: `docs/design/action-audit.md`.
+
+| route | |
+|---|---|
+| `POST /agents/{agent}/audit` | store one record; `202 {"id": "<cursor>"}`. `agent` must be enrolled (else `404`); a body over **8 KiB** is `413`; an invalid record is `422` with the reason |
+| `GET /agents/{agent}/audit?after=<cursor>&limit=N` | records oldest first, `{"agent", "audit": [...], "next_cursor"}`; `limit` 1-1000 (default 100), same cursor convention as `/activity` |
+
+Both need the office `API_TOKEN` (reads included). A cooperation token is `403`
+on both. When the API runs with no `API_TOKEN` at all, like every other route it
+is open.
+
+**Record** (JSON object, unknown fields are `422`):
+
+| field | rule |
+|---|---|
+| `tool` | required; tool name (`Bash`, `Edit`, ...), 1-64 chars of letters, digits and `. _ : @ -` |
+| `args` | the command or tool input: a string, or JSON (stored as canonical JSON text). **Masked here**, truncated to 2048 bytes, `args_truncated` says so |
+| `exit`, `out_bytes` | integer result code (or `null`) and size of the output. The output itself is never stored |
+| `ts` | the caller's ISO-8601 time. Asserted, not proven |
+| `cli`, `session`, `call_id` | free labels (same character rule); `call_id` pairs a `pre` and a `post` record |
+| `phase` | `pre` or `post` (a `pre` with no `post` shows a command that never returned) |
+| `v` | optional, must be `1` |
+
+The server adds `agent` (from the URL), `recv_ts` (this process's clock, the one
+to trust), `args_sha256` (SHA-256 of the *masked, untruncated* args), and
+`prev_hash: null`: reserved for a later version that chains records, never
+settable by a caller. A stored record is a `record` field in the Redis stream
+`pod:<p>:tenant:<t>:agent:<name>:audit`, capped at **5000 entries per agent**
+(approximate `MAXLEN`); the key is not removed when the agent is retired.
+`H_MESH_AUDIT_FILE=/path/audit.jsonl` additionally appends every accepted record
+(plus its `id`) as one JSON line; unset means off, a write failure never fails
+the request, and rotating or deleting the file is the operator's job.
+
+**Secret masking happens on the server, on every record,** whatever h-agent
+already did (h-agent should mask too). The full text is masked *before* it is
+digested or truncated, so a secret cannot survive by being cut in half and the
+digest cannot be used to guess one. Masked: `Authorization`/`Bearer`/`Basic`
+values, `--token`/`--password`/`--secret`/`--api-key`-style flag values,
+`NAME=value` where NAME contains `token`, `secret`, `password`, `key` or
+`credential`, JSON `"password": "..."`-style members, `X-...-Key/Token` headers,
+`user:password@` in URLs, cooperation tokens (`coop.<id>.<secret>`), PEM blocks
+(also cut-off ones), and common key shapes (`sk-`, `ghp_`, `github_pat_`,
+`xox?-`, `AKIA...`, JWTs). It is **best-effort pattern masking**: a secret passed
+as a bare positional argument has no shape to recognise and is stored as sent.
+
+### What the action audit cannot guarantee
+
+All agents run as one OS user with the same Redis and the same `API_TOKEN`.
+Therefore, plainly:
+
+- An agent can **forge** a record for any agent (it has the token and Redis).
+  `agent` and `session` are asserted, not proven.
+- An agent can **skip** auditing: unset/edit its CLI hook config, run commands
+  outside the hooked tool, or use a CLI without hooks.
+- An agent can **delete or rewrite** the stream and the mirror file.
+- Capture covers hooked CLI tool calls only; operator terminal work is covered
+  only if h-agent also wraps that shell.
+- `ts` is client-supplied; only `recv_ts` is the server's.
+
+So this is an accountability and diagnostics log for honest mistakes and
+reconstruction, **not tamper-evident evidence**. Real guarantees need the
+deferred separation: a writer under a different OS user (unix socket, append-only
+file owned by it), then a per-agent hash chain so deletion is detectable. Out of
+scope now; the record format (`v`, `call_id`) leaves room for `prev_hash`.
+
+Reading is not an access boundary either: `office audit` reads Redis directly
+and any agent can; the API route additionally needs `API_TOKEN`.
+
 ## SSE idle keepalive
 
 `/agents/{agent}/activity/stream` and `/alerts/stream` (both routed through

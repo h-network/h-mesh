@@ -450,6 +450,24 @@ write the same keys directly, so this stops mistakes and non-lead agents, not a
 hostile local process. The same applies to the tokens hash: hiding tokens from
 `offices` prevents accidental disclosure, not reading Redis.
 
+## Action audit (#27)
+
+`office audit [-a AGENT] [--since 90m|2h|1d|ISO] [--tool TOOL] [--limit N] [--json]`
+shows what agents *did*: the records h-agent's tool hooks submitted to the api
+door (`POST /agents/{agent}/audit`, see `modules/api/README.md` for the record
+format, caps and masking). Output is one line per record, oldest first,
+`recv_ts<TAB>agent<TAB>tool<TAB>exit=N<TAB>args` (`exit=-` when unknown, `…`
+after truncated args, newlines in args shown as `\n`); `--json` prints the stored
+records, one per line, including `cursor`. Without `-a` it covers every enrolled
+agent; a retired agent's kept records are read with `-a NAME`. `--since` and
+the ordering use the server's `recv_ts`, never the caller's claimed `ts`;
+`--limit` (default 50) keeps the newest N.
+
+The command reads Redis directly like the other office commands, so it needs no
+`API_TOKEN` (the HTTP read route does). That is a convenience, not an access
+boundary, and the records are not tamper-evident: with one shared OS user an
+agent can forge, skip or delete them (the plain list is in the api README).
+
 ## Board event notices (#18)
 
 Two board events now also send an ordinary `Message` envelope (written through
