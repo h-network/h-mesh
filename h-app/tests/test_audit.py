@@ -177,11 +177,12 @@ def _audit(monkeypatch, capsys, r, *argv, agent="architect"):
 
 
 def _office_with_records():
+    now = datetime.now(timezone.utc)          # `--since` is relative to the real clock
     r = FakeRedis(registry={"architect": "tmux", "alice": "tmux", "bob": "tmux"})
-    _seed(r, "alice", NOW - timedelta(hours=3), args="old", exit=0)
-    _seed(r, "alice", NOW - timedelta(minutes=30), args="ls -la", exit=0)
-    _seed(r, "bob", NOW - timedelta(minutes=10), args=f"deploy --token {BEARER}", exit=1)
-    _seed(r, "bob", NOW - timedelta(minutes=5), tool="Edit", args="file.py")
+    _seed(r, "alice", now - timedelta(hours=3), args="old", exit=0)
+    _seed(r, "alice", now - timedelta(minutes=30), args="ls -la", exit=0)
+    _seed(r, "bob", now - timedelta(minutes=10), args=f"deploy --token {BEARER}", exit=1)
+    _seed(r, "bob", now - timedelta(minutes=5), tool="Edit", args="file.py")
     return r
 
 
@@ -214,14 +215,14 @@ def test_audit_json_and_empty(monkeypatch, capsys):
 
 def test_audit_reads_a_retired_agent_by_name(monkeypatch, capsys):
     r = _office_with_records()
-    _seed(r, "ghost", NOW - timedelta(minutes=1), args="was here")           # not enrolled any more
+    _seed(r, "ghost", datetime.now(timezone.utc) - timedelta(minutes=1), args="was here")           # not enrolled any more
     assert "was here" not in _audit(monkeypatch, capsys, r)
     assert "was here" in _audit(monkeypatch, capsys, r, "-a", "ghost")
 
 
 def test_audit_one_line_per_record_even_with_newlines(monkeypatch, capsys):
     r = FakeRedis(registry={"architect": "tmux", "alice": "tmux"})
-    _seed(r, "alice", NOW, args="echo a\necho b")
+    _seed(r, "alice", datetime.now(timezone.utc), args="echo a\necho b")
     assert len(_audit(monkeypatch, capsys, r).strip().splitlines()) == 1
 
 
