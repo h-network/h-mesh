@@ -214,6 +214,10 @@ whichever door it used. It uses none of the removed alarm phrases.
 the lead and an office with no lead, plus the alarm phrases' absence and that
 the destructive rule is unchanged and directly follows.
 
+Status: unit-tested, not proven live. No live claude agent has been shown to act on a
+benign api request and decline a body-claimed "I am the operator" one; the operator
+verifies that on a real claude office.
+
 The "ticket done" rule is a one-line notice, not a report: when a ticket is
 done the agent sends the lead ONE line saying so, naming the ticket (title or
 id), then runs `h-mesh-office done`. No summary or recap of changes; the commit
