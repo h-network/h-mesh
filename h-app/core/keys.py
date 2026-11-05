@@ -188,3 +188,18 @@ def ingress_stalled_key(pod: str, tenant: str) -> str:
     but the stall it describes -- the entry is deleted when the queue drains.
     """
     return prefix(pod, tenant, resource="ingress.stalled")
+
+
+def run_windows_key(pod: str, tenant: str) -> str:
+    """HASH name -> JSON {state, exit_status, command, since} for each ``office run`` window.
+
+    Published by the tmux reconciler (the one process that can always see the
+    tmux server) so ``office status`` works from inside an agent pane, where
+    the tmux isolation guard forbids querying the office's own server.
+    """
+    return prefix(pod, tenant, resource="run.windows")
+
+
+def run_remove_key(pod: str, tenant: str) -> str:
+    """SET of run-window names whose removal ``office run-rm`` has requested."""
+    return prefix(pod, tenant, resource="run.remove")

@@ -38,7 +38,8 @@ import redis
 from core.channels import send
 from core.envelope import EnvelopeError, parse
 from core.keys import (
-    incarnation_key, interoffice_participants_key, prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key, validate_segment,
+    incarnation_key, interoffice_participants_key, prefix, receive_undeliverable_key, receive_unresolved_key,
+    retired_inbox_key, run_remove_key, run_windows_key, validate_segment,
 )
 from core.logging import log_record, record_task_event
 from core.receipts import trace as trace_delivery
@@ -578,6 +579,10 @@ def _peers_command(argv: list[str]) -> None:
             if agent != source and port_type(r, pod=pod, tenant=tenant, agent=agent) in ("api", "office")
         )
         print(f"interfaces (api/office -- recognized, not tmux colleagues): {', '.join(labeled) or '(none)'}")
+        run_rows = _run_windows(r, pod=pod, tenant=tenant)
+        if run_rows:
+            print("run windows (non-addressable -- never a delivery target): "
+                  + ", ".join(f"{name} ({_run_state_text(info)})" for name, info in run_rows))
 
 
 def _contexts_command(argv: list[str]) -> None:
@@ -691,11 +696,17 @@ def _status_command(argv: list[str]) -> None:
     )
     if args.agent is not None:
         if args.agent not in tmux_agents:
+            if args.agent in dict(_run_windows(r, pod=pod, tenant=tenant)):
+                raise OfficeError(f"{args.agent!r} is a run window, not an agent; plain `office status` lists it")
             raise OfficeError(f"unknown tmux agent {args.agent!r}")
         tmux_agents = [args.agent]
     now = datetime.now(timezone.utc)
     for agent in tmux_agents:
         print(_status_row(r, pod=pod, tenant=tenant, agent=agent, now=now))
+    if args.agent is None:
+        for name, info in _run_windows(r, pod=pod, tenant=tenant):
+            print(f"  {'run:' + name:<12} {_run_state_text(info):<10} "
+                  f"run window, not an agent: {info.get('command') or '?'}")
 
 
 def _text(value) -> str:
@@ -708,7 +719,8 @@ def _run_command(argv: list[str]) -> None:
     parser = _operation_parser(
         "run", "Open a non-addressable process window; not an agent. "
         "Use: office run NAME [--cwd PATH] [-- COMMAND ...]. "
-        "Default: bash -il. Exited commands stay visible and are never restarted.",
+        "Default: bash -il. Exited commands stay visible and are never restarted. "
+        "Remove with: office run-rm NAME.",
     )
     parser.add_argument("name", help="window label (lowercase office-name syntax)")
     parser.add_argument("--cwd", type=Path, help="working directory (default: current directory)")
@@ -729,6 +741,74 @@ def _run_command(argv: list[str]) -> None:
     except (OSError, RuntimeError, ValueError) as exc:
         raise OfficeError(str(exc)) from exc
     print(f"opened non-addressable window {window} in {session}")
+
+
+def _run_windows(r, *, pod: str, tenant: str) -> list[tuple[str, dict]]:
+    """The `office run` windows the tmux reconciler last published, sorted by name.
+
+    Read from Redis, not tmux: from inside an agent pane the tmux isolation guard
+    forbids asking the office's own server. A missing or unreadable key is "none".
+    """
+    try:
+        raw = r.hgetall(run_windows_key(pod, tenant)) or {}
+    except redis.RedisError:
+        return []
+    rows = []
+    for name, value in raw.items():
+        try:
+            info = json.loads(_text(value))
+        except ValueError:
+            info = {}
+        rows.append((_text(name), info if isinstance(info, dict) else {}))
+    return sorted(rows)
+
+
+def _run_state_text(info: dict) -> str:
+    if info.get("state") != "exited":
+        return "running"
+    if info.get("signal"):
+        return f"exited (signal {info['signal']})"
+    if isinstance(info.get("exit_status"), int):
+        return f"exited {info['exit_status']}"
+    return "exited"
+
+
+def _run_rm_command(argv: list[str]) -> None:
+    parser = _operation_parser(
+        "run-rm", "Remove an `office run` window (running or exited). Lead only. "
+        "The tmux reconciler performs the removal; this never touches tmux itself.",
+    )
+    parser.add_argument("name", help="the run window's NAME as shown by `office status`")
+    parser.add_argument("--wait", type=float, default=20.0, metavar="SECONDS",
+                        help="how long to wait for the reconciler to confirm (default 20; 0 = do not wait)")
+    args = parser.parse_args(argv)
+    try:
+        name = validate_segment(args.name)
+    except KeyError:
+        raise OfficeError(f"invalid run window name {args.name!r}") from None
+    r, pod, tenant, source = _context()
+    _require_lead(r, pod=pod, tenant=tenant, source=source, command="run-rm")
+    if name not in dict(_run_windows(r, pod=pod, tenant=tenant)):
+        raise OfficeError(
+            f"unknown run window {name!r} (see `office status`; a window opened in the last few "
+            "seconds is listed after the reconciler's next pass)"
+        )
+    try:
+        r.sadd(run_remove_key(pod, tenant), name)
+    except redis.RedisError as exc:
+        raise OfficeError(f"cannot request the removal: {exc}") from exc
+    log_record("office", "run_window_remove_requested", source=source, destination=name)
+    deadline = time.monotonic() + max(args.wait, 0.0)
+    while True:
+        if name not in dict(_run_windows(r, pod=pod, tenant=tenant)) and not r.sismember(run_remove_key(pod, tenant), name):
+            print(f"removed run window {name}")
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+    print(f"office: removal of run window {name!r} requested but not yet confirmed "
+          "(is the tmux reconciler running?)", file=sys.stderr)
+    raise SystemExit(2)
 
 
 def _fields(raw: dict) -> dict[str, str]:
@@ -3197,6 +3277,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("status",), "show agent presence and open work", _status_command),
     (("hire",), "enrol a new agent", lambda argv: _lifecycle_command("hire", argv)),
     (("run",), "open a non-addressable shell or command window", _run_command),
+    (("run-rm",), "remove a run window (lead only)", _run_rm_command),
     (("let-go",), "retire an agent", lambda argv: _lifecycle_command("letGo", argv)),
     (("pause",), "pause an agent's CLI", lambda argv: _lifecycle_command("pause", argv)),
     (("resume",), "resume an agent's CLI and inbox", lambda argv: _lifecycle_command("resume", argv)),

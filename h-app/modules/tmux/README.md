@@ -11,6 +11,7 @@ same as every module owning its own daemon logic.
 |---|---|
 | `ops.py` | passive tmux mechanics: `run_tmux`, `create_window`, `kill_window`, `submit_text`, session-history detection, CLI trust/guide seeding, single-guide decision (`claude_reads_agents_md`, `migrate_agent_guide`) |
 | `port.py` | `deliver_tmux` entrypoint and terminal delivery handlers (`message_opener`, `command_opener`, `attachment_opener`), delivery-verification marking |
+| `run_windows.py` | observe and remove `office run` windows: `snapshot` (state of every `__run__*` window), `publish` (mirror it to Redis `run.windows`), `process_removals` (honour `run.remove`) |
 | `reconciler.py` | `TmuxReconciler` -- the daemon logic: compares desired tmux membership against real windows, creates/removes them |
 
 ⚠ `require_isolated_tmux()` and `run_tmux()` in `ops.py` enforce strict isolation:
@@ -35,6 +36,16 @@ underscores are invalid in participant addresses, and `submit_text` also
 rejects this namespace before issuing a tmux command. The reconciler excludes
 these windows from stale-window cleanup and agent restart tracking, including
 when the registry has no tmux agents.
+
+At the end of each pass the reconciler also calls `run_windows.process_removals`
+and `run_windows.publish` (inside a try/except, so a fault there never stops
+agent reconciliation). It is the one process that can always ask tmux: an agent
+pane may not, because of the isolation guard. `publish` mirrors every run window
+to the tenant hash `run.windows` (`name -> {state: running|exited, exit_status,
+signal, command, since}`), writing only on a change, and `process_removals`
+kills the windows named in the set `run.remove` **by tmux window id**, never by
+name (tmux resolves `-t session:a` by prefix, so removing `a` must not be able to
+take `ab`). Both go through `ops.run_tmux`; `ops.py` is unchanged.
 
 A new window initially holds a private placeholder process while
 `remain-on-exit` and rename protection are set. Only then is the requested
