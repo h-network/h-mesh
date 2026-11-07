@@ -665,7 +665,7 @@ def _render_restdoc_html(app: FastAPI) -> str:
       Live terminal streaming and driving takes place over a dedicated WebSocket service on port 8081 at <code>ws://&lt;host&gt;:8081/session</code>.
     </p>
     <ul>
-      <li><strong>Authentication:</strong> Checked once on connection via <code>Authorization: Bearer &lt;API_TOKEN&gt;</code> header.</li>
+      <li><strong>Authentication:</strong> Checked once on connection, with the office-wide <code>API_TOKEN</code> only (a cooperation token is not accepted here): either the <code>Authorization: Bearer &lt;API_TOKEN&gt;</code> header, or, for clients that cannot set headers (browsers), a <code>?token=&lt;API_TOKEN&gt;</code> query parameter. Prefer the header, since URLs end up in logs and history. A failed check closes the socket with code <code>4401</code>.</li>
       <li><strong>Terminal Geometry:</strong> Fixed at <strong>120×32</strong> layout. Clients may NOT resize windows.</li>
     </ul>
 
