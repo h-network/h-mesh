@@ -3037,13 +3037,72 @@ def _resolve_office_host(host: str, port: int) -> list[str]:
     return sorted({info[4][0] for info in infos})
 
 
-def _url_by_name(name: str, port: int, *, https: bool) -> str:
-    """http(s)://NAME:PORT for an office reachable by name on a shared network.
+def _parse_route_table(text: str) -> list:
+    """Directly attached IPv4 networks from /proc/net/route text."""
+    networks = []
+    for line in text.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 8:
+            continue
+        try:
+            destination = int(fields[1], 16)
+            gateway = int(fields[2], 16)
+            flags = int(fields[3], 16)
+            mask = int(fields[7], 16)
+            if destination == 0 or gateway != 0 or not flags & 1:
+                continue            # default route, a routed (gatewayed) net, or down
+            networks.append(ipaddress.IPv4Network(
+                (ipaddress.IPv4Address(destination.to_bytes(4, "little")),
+                 ipaddress.IPv4Address(mask.to_bytes(4, "little"))), strict=False))
+        except (ValueError, OverflowError):
+            continue
+    return networks
+
+
+def _parse_if_inet6(text: str) -> list:
+    """Directly attached IPv6 networks from /proc/net/if_inet6 text."""
+    networks = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or len(fields[0]) != 32:
+            continue
+        try:
+            address = ipaddress.IPv6Address(bytes.fromhex(fields[0]))
+            networks.append(ipaddress.IPv6Network((address, int(fields[2], 16)), strict=False))
+        except ValueError:
+            continue
+    return networks
+
+
+def _local_subnets() -> list:
+    """Subnets of this container's own network interfaces (plus loopback).
+
+    A by-name office whose address lies in one of these is on a directly
+    attached (docker) network; anything else, even a private LAN address, is
+    reached over a routed path. A seam for tests.
+    """
+    networks = [ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("::1/128")]
+    for path, parse in (("/proc/net/route", _parse_route_table),
+                        ("/proc/net/if_inet6", _parse_if_inet6)):
+        try:
+            networks.extend(parse(Path(path).read_text()))
+        except OSError:
+            pass
+    return networks
+
+
+def _url_by_name(name: str, port: int, *, https: bool, allow_plaintext: bool = False) -> str:
+    """The url of an office reachable by name on a shared network.
 
     Only a plain DNS label is accepted (no dots, slashes, colons, '@', so the
     lookup cannot be pointed at an arbitrary host or smuggle a URL part), and
     every address it resolves to must be private/loopback: a by-name office is
     one on the same host or network, never a public address.
+
+    Plaintext is a separate gate: http without --allow-plaintext is accepted
+    only if every address lies inside a subnet of one of this container's own
+    interfaces (a directly attached docker network). A private address outside
+    them (e.g. a LAN host reached through a search domain) needs the flag.
     """
     if not _DNS_LABEL_RE.fullmatch(name) or name.isdigit():
         raise OfficeError(
@@ -3061,18 +3120,33 @@ def _url_by_name(name: str, port: int, *, https: bool) -> str:
         ) from None
     if not addresses:
         raise OfficeError(f"office name {name!r} resolved to no address. Nothing saved")
+    parsed = []
     for address in addresses:
         try:
-            private = ipaddress.ip_address(address.split("%", 1)[0]).is_private
+            ip = ipaddress.ip_address(address.split("%", 1)[0])
+            private = ip.is_private
         except ValueError:
-            private = False
+            raise OfficeError(f"office name {name!r} resolved to an unreadable address {address!r}. Nothing saved") from None
         if not private:
             raise OfficeError(
                 f"office name {name!r} resolves to {address}, which is not a private address; "
                 "by-name lookup is only for offices on a shared private network. "
                 "Nothing saved; pass its url explicitly if that is really the office"
             )
-    return f"{'https' if https else 'http'}://{name}:{port}"
+        parsed.append(ip)
+    scheme = "https" if https else "http"
+    if not https and not allow_plaintext:
+        subnets = _local_subnets()
+        foreign = [str(ip) for ip in parsed
+                   if not any(ip.version == net.version and ip in net for net in subnets)]
+        if foreign:
+            raise OfficeError(
+                f"office name {name!r} resolves to {foreign[0]}, a private address outside every "
+                "network this container is attached to; plaintext http to it would cross a LAN "
+                "or a routed path. Use https (--ca-cert PATH), or pass --allow-plaintext for a "
+                "lab test bed. Nothing saved"
+            )
+    return f"{scheme}://{name}:{port}"
 
 
 def _office_add_command(argv: list[str]) -> None:
@@ -3121,10 +3195,13 @@ def _office_add_command(argv: list[str]) -> None:
         port = _DEFAULT_BY_NAME_PORT if args.port is None else args.port
         if not 1 <= port <= 65535:
             raise OfficeError(f"invalid --port {port}: must be 1-65535")
-        # Names that cannot be a DNS label are refused before any lookup.
-        by_name = _url_by_name(args.name, port, https=args.ca_cert is not None)
-        # Private-address check above is the gate for plaintext on a shared
-        # network; the existing warning still prints.
+        # Names that cannot be a DNS label are refused before any lookup. An
+        # address on a directly attached network may use plaintext without the
+        # flag; any other private address needs it. The warning still prints.
+        by_name = _url_by_name(
+            args.name, port, https=args.ca_cert is not None,
+            allow_plaintext=args.allow_plaintext or os.environ.get("H_MESH_ALLOW_PLAINTEXT") == "1",
+        )
         url, plaintext = _validated_office_url(by_name, allow_plaintext=True)
     else:
         url, plaintext = _validated_office_url(args.url, allow_plaintext=args.allow_plaintext)

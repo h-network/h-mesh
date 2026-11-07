@@ -18,6 +18,7 @@ from test_office_interoffice import (  # noqa: F401 -- fixtures + helpers
 )
 from test_office_tls import _issue, _make_ca
 
+_REAL_LOCAL_SUBNETS = office_cli._local_subnets          # before the autouse patch
 WHO = {"office": "peer-office", "participant": "alpha-office", "kinds": ["Message"], "api": 1}
 STREAM_ID = "0123456789abcdef0123456789abcdef"
 
@@ -53,6 +54,18 @@ class Dns:
                 return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (self.table[host], port or 0))]
             return real(host, port, *args, **kwargs)
         monkeypatch.setattr(socket, "getaddrinfo", fake)
+
+
+IN_SUBNET = "172.20.0.5"          # inside the fake attached network below
+FOREIGN_PRIVATE = "10.9.9.9"      # private, but not on any attached network
+
+
+@pytest.fixture(autouse=True)
+def _attached_networks(monkeypatch):
+    import ipaddress
+    monkeypatch.setattr(office_cli, "_local_subnets", lambda: [
+        ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("172.20.0.0/16")])
+    monkeypatch.delenv("H_MESH_ALLOW_PLAINTEXT", raising=False)
 
 
 def lead_redis():
@@ -98,7 +111,7 @@ def test_add_by_name_derives_the_url_probes_whoami_and_saves(monkeypatch, capsys
 
 def test_default_port_is_the_container_api_port(monkeypatch, remote):
     _env(monkeypatch)
-    Dns(monkeypatch, {"peer-b": "172.20.0.5"})
+    Dns(monkeypatch, {"peer-b": IN_SUBNET})
     r = lead_redis()
     add_ok(r, monkeypatch, "peer-b", "--participant", "alpha-office", "--no-verify")
     assert json.loads(r.hashes[OFFICES]["peer-b"])["url"] == "http://peer-b:8080"
@@ -249,3 +262,105 @@ def test_offices_check_and_send_explain_a_name_that_stopped_resolving(monkeypatc
     assert exit_code(r, ["send", "--office", "peer-b", "-a", "scout", "x"], monkeypatch) == 1
     err = capsys.readouterr().err
     assert "cannot reach the remote office at http://peer-b:8080" in err and "SUMMARY.md" in err
+
+
+# ------------------------------------------------- plaintext gate (phase 1 -> 2)
+
+def test_in_subnet_address_needs_no_plaintext_flag_but_warns(monkeypatch, capsys):
+    _env(monkeypatch)
+    Dns(monkeypatch, {"peer-b": IN_SUBNET})
+    r = lead_redis()
+    add_ok(r, monkeypatch, "peer-b", "--participant", "alpha-office", "--no-verify")
+    assert json.loads(r.hashes[OFFICES]["peer-b"])["url"] == "http://peer-b:8080"
+    assert "plaintext http" in capsys.readouterr().err
+
+
+def test_private_but_foreign_address_requires_the_flag(monkeypatch, capsys):
+    _env(monkeypatch)
+    Dns(monkeypatch, {"peer-b": FOREIGN_PRIVATE})
+    r = lead_redis()
+    assert add(r, monkeypatch, "peer-b", "--participant", "alpha-office", "--no-verify") == 1
+    err = capsys.readouterr().err
+    assert FOREIGN_PRIVATE in err and "outside every network this container is attached to" in err
+    assert "--allow-plaintext" in err and "Nothing saved" in err
+    assert not r.hashes[OFFICES] and not r.hashes[OFFICE_TOKENS]
+    add_ok(r, monkeypatch, "peer-b", "--participant", "alpha-office", "--no-verify", "--allow-plaintext")
+    assert json.loads(r.hashes[OFFICES]["peer-b"])["url"] == "http://peer-b:8080"
+    assert "plaintext http" in capsys.readouterr().err               # warning kept
+
+
+def test_the_environment_opt_in_also_covers_a_foreign_private_address(monkeypatch, capsys):
+    _env(monkeypatch)
+    monkeypatch.setenv("H_MESH_ALLOW_PLAINTEXT", "1")
+    Dns(monkeypatch, {"peer-b": FOREIGN_PRIVATE})
+    r = lead_redis()
+    add_ok(r, monkeypatch, "peer-b", "--participant", "alpha-office", "--no-verify")
+    assert "peer-b" in r.hashes[OFFICES]
+
+
+def test_one_foreign_address_among_attached_ones_still_needs_the_flag(monkeypatch, capsys):
+    _env(monkeypatch)
+    real = socket.getaddrinfo
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, port, *a, **k: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", (IN_SUBNET, port)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", (FOREIGN_PRIVATE, port)),
+    ] if host == "peer-b" else real(host, port, *a, **k))
+    r = lead_redis()
+    assert add(r, monkeypatch, "peer-b", "--participant", "alpha-office", "--no-verify") == 1
+    assert FOREIGN_PRIVATE in capsys.readouterr().err
+
+
+def test_https_by_name_to_a_foreign_private_address_needs_no_plaintext_flag(
+        tmp_path_factory, monkeypatch, capsys):
+    _env(monkeypatch)
+    ca = _make_ca(tmp_path_factory.mktemp("foreign") / "ca", "foreign-ca")
+    Dns(monkeypatch, {"peer-b": FOREIGN_PRIVATE})
+    r = lead_redis()
+    add_ok(r, monkeypatch, "peer-b", "--participant", "alpha-office", "--no-verify",
+           "--ca-cert", str(ca / "ca.pem"))
+    assert json.loads(r.hashes[OFFICES]["peer-b"])["url"] == "https://peer-b:8080"
+    assert "plaintext" not in capsys.readouterr().err
+
+
+def test_a_public_address_is_refused_even_with_the_flag(monkeypatch, capsys):
+    _env(monkeypatch)
+    Dns(monkeypatch, {"peer-b": "8.8.8.8"})
+    r = lead_redis()
+    assert add(r, monkeypatch, "peer-b", "--participant", "alpha-office", "--no-verify",
+               "--allow-plaintext") == 1
+    assert "not a private address" in capsys.readouterr().err
+    assert not r.hashes[OFFICES]
+
+
+def test_resolution_still_happens_under_no_verify(monkeypatch):
+    _env(monkeypatch)
+    dns = Dns(monkeypatch, {})
+    r = lead_redis()
+    assert add(r, monkeypatch, "ghost-office", "--participant", "alpha-office", "--no-verify") == 1
+    assert "ghost-office" in dns.lookups and not r.hashes[OFFICES]
+
+
+ROUTE_TABLE = (
+    "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+    "eth0\t00000000\t010014AC\t0003\t0\t0\t0\t00000000\t0\t0\t0\n"
+    "eth0\t000014AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n"
+    "eth1\t0000A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n"
+    "eth2\t0000090A\t0100090A\t0003\t0\t0\t0\t0000FFFF\t0\t0\t0\n"
+    "eth3\t0000070A\t00000000\t0000\t0\t0\t0\t0000FFFF\t0\t0\t0\n"
+)
+
+
+def test_route_table_parser_keeps_only_directly_attached_up_networks():
+    nets = [str(n) for n in office_cli._parse_route_table(ROUTE_TABLE)]
+    assert nets == ["172.20.0.0/16", "192.168.0.0/24"]      # not the default, not gatewayed, not down
+
+
+def test_if_inet6_parser_reads_prefixes():
+    text = ("fe800000000000000042acfffe140002 03 40 20 80 eth0\n"
+            "fd00000000000000000000000000000a 03 40 00 80 eth0\n")
+    assert [str(n) for n in office_cli._parse_if_inet6(text)] == ["fe80::/64", "fd00::/64"]
+
+
+def test_local_subnets_always_include_loopback():
+    nets = {str(n) for n in _REAL_LOCAL_SUBNETS()}
+    assert {"127.0.0.0/8", "::1/128"} <= nets

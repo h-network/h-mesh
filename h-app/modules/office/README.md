@@ -425,9 +425,14 @@ as a substitute.
   no dots, slashes, colons or `@`, not all digits), the lookup happens before
   anything is written (also with `--no-verify`), and **every** address it
   returns must be private/loopback, so a by-name lookup can never point the
-  token at a public host. Because the peer is on a private network, plain
-  `http://` needs no `--allow-plaintext` here, but the plaintext warning is
-  still printed. If the name does not resolve the error says to check that both
+  token at a public host. **Plaintext gate:** plain `http://` skips
+  `--allow-plaintext` only when every resolved address lies inside a subnet of
+  one of this container's own network interfaces (read from
+  `/proc/net/route` and `/proc/net/if_inet6`; loopback counts), i.e. a
+  directly attached docker network. A private address outside those subnets
+  (for instance a LAN host reached through a search domain) still resolves but
+  needs `--allow-plaintext` (or `H_MESH_ALLOW_PLAINTEXT=1`); `https://` via
+  `--ca-cert` needs neither. The plaintext warning is always printed. If the name does not resolve the error says to check that both
   offices share a network and that `NAME` is the peer's network alias (its
   `SUMMARY.md`), and nothing is saved. An explicit `URL` behaves exactly as
   before and never triggers a lookup. Afterwards `offices --check` and
