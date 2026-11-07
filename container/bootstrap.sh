@@ -242,13 +242,27 @@ fi
 # `KEY=value` grep, not sourcing the file: the env file may carry secrets
 # (tokens), and sourcing an operator-edited file would execute it as shell.
 env_file_get() {
-    local key="$1"
+    local key="$1" line found=""
     [ -f "$ENV_FILE" ] || return 0
-    sed -n "s/^${key}=//p" "$ENV_FILE" | tail -n1
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "${key}="*) found="${line#*=}" ;;
+        esac
+    done < "$ENV_FILE"
+    [ -z "$found" ] || printf '%s\n' "$found"
 }
 
 EXISTING_OFFICE_NETWORK="$(env_file_get H_MESH_OFFICE_NETWORK)"
 EXISTING_BIND_PORTS="$(env_file_get H_MESH_BIND_PORTS)"
+EXISTING_TG_TOKEN="$(env_file_get TELEGRAM_BOT_TOKEN)"
+EXISTING_TG_CHAT="$(env_file_get TELEGRAM_CHAT_ID)"
+EXISTING_TG_VOICE="$(env_file_get TELEGRAM_VOICE)"
+TLS_CERT="${API_TLS_CERT:-$(env_file_get API_TLS_CERT)}"
+TLS_KEY="${API_TLS_KEY:-$(env_file_get API_TLS_KEY)}"
+SESSION_CERT="${SESSION_TLS_CERT:-$(env_file_get SESSION_TLS_CERT)}"
+SESSION_KEY="${SESSION_TLS_KEY:-$(env_file_get SESSION_TLS_KEY)}"
+CA_CERT="${H_MESH_CA_CERT:-$(env_file_get H_MESH_CA_CERT)}"
+PLAINTEXT="${H_MESH_ALLOW_PLAINTEXT:-$(env_file_get H_MESH_ALLOW_PLAINTEXT)}"
 [ -z "$AGENTS" ] && AGENTS="$(env_file_get AGENTS)"
 [ -z "$DEFAULT_CLI" ] && DEFAULT_CLI="$(env_file_get DEFAULT_CLI)"
 [ -z "$API_PORT" ] && API_PORT="$(env_file_get API_PORT)"
@@ -300,26 +314,6 @@ remove_env_line() {
     grep -v "^${key}=" "$ENV_FILE" > "$tmp" || true
     mv "$tmp" "$ENV_FILE"
 }
-
-upsert_env_line POD "$POD"
-upsert_env_line TENANT "$TENANT"
-upsert_env_line AGENTS "$AGENTS"
-upsert_env_line DEFAULT_CLI "$DEFAULT_CLI"
-
-# Bootstrap runs before the container has a tenant config. Persist the API
-# identity here, so Compose and every later recreate inherit the same one.
-# Existing office values win over ambient credentials from another office.
-RESOLVED_API_TOKEN="$(env_file_get API_TOKEN)"
-if [ -z "$RESOLVED_API_TOKEN" ]; then
-    RESOLVED_API_TOKEN="${API_TOKEN:-}"
-    if [ -z "$RESOLVED_API_TOKEN" ]; then
-        RESOLVED_API_TOKEN="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" || exit 1
-        [[ "$RESOLVED_API_TOKEN" =~ ^[0-9a-f]{64}$ ]] || {
-            echo "error: could not generate API_TOKEN" >&2; exit 1;
-        }
-    fi
-    upsert_env_line API_TOKEN "$RESOLVED_API_TOKEN" || exit 1
-fi
 
 check_bool() {
     local val="$1" def="$2"
@@ -422,6 +416,7 @@ if [ "$INTERACTIVE" -eq 1 ] && [ "$OFFICE_NETWORK_EXPLICIT" -eq 0 ]; then
             OFFICE_NETWORK_MODE="create_or_join"
             ;;
         3|join|JOIN)
+            echo "  Existing h-mesh office networks (label ${OFFICE_NETWORK_LABEL})"
             LABELLED_NETS=()
             while IFS= read -r _ln; do
                 [ -n "$_ln" ] && LABELLED_NETS+=("$_ln")
@@ -430,7 +425,6 @@ if [ "$INTERACTIVE" -eq 1 ] && [ "$OFFICE_NETWORK_EXPLICIT" -eq 0 ]; then
                 echo "error: no existing h-mesh office networks found (label ${OFFICE_NETWORK_LABEL}); choose 2 to create one or pass --office-network <name>" >&2
                 exit 1
             fi
-            echo "  Existing h-mesh office networks (label ${OFFICE_NETWORK_LABEL})"
             for _idx in "${!LABELLED_NETS[@]}"; do
                 echo "    $((_idx + 1))) ${LABELLED_NETS[$_idx]}"
             done
@@ -459,12 +453,7 @@ H_MESH_OFFICE_ALIAS=""
 if [ -n "$H_MESH_OFFICE_NETWORK" ]; then
     H_MESH_OFFICE_ALIAS="${POD}-${TENANT}"
     validate_dns_label "$H_MESH_OFFICE_ALIAS" "office network alias" || exit 1
-    ensure_office_network "$H_MESH_OFFICE_NETWORK" "$OFFICE_NETWORK_MODE" || exit 1
-    upsert_env_line H_MESH_OFFICE_NETWORK "$H_MESH_OFFICE_NETWORK" || exit 1
-    upsert_env_line H_MESH_OFFICE_ALIAS "$H_MESH_OFFICE_ALIAS" || exit 1
-else
-    remove_env_line H_MESH_OFFICE_NETWORK
-    remove_env_line H_MESH_OFFICE_ALIAS
+    validate_office_network_name "$H_MESH_OFFICE_NETWORK" || exit 1
 fi
 
 warn_port_collision() {
@@ -497,7 +486,11 @@ if [ "$BIND_PORTS_EXPLICIT" -eq 0 ]; then
         H_MESH_BIND_PORTS="${EXISTING_BIND_PORTS:-1}"
     fi
 fi
-H_MESH_BIND_PORTS="$(normalize_bind_ports "$H_MESH_BIND_PORTS")" || exit 1
+case "$H_MESH_BIND_PORTS" in
+    1|[Yy]|[Yy][Ee][Ss]) H_MESH_BIND_PORTS=1 ;;
+    0|[Nn]|[Nn][Oo]) H_MESH_BIND_PORTS=0 ;;
+    *) echo "error: H_MESH_BIND_PORTS must be 1 or 0 (got: $H_MESH_BIND_PORTS)" >&2; exit 1 ;;
+esac
 if [ "$INTERACTIVE" -eq 1 ]; then
     if [ "$H_MESH_BIND_PORTS" -eq 0 ]; then
         read -rp "Publish the API/session ports to the host? [y/N]: " _in
@@ -521,22 +514,22 @@ if [ "$INTERACTIVE" -eq 1 ]; then
 fi
 validate_port "$API_PORT" "API port" || exit 1
 validate_port "$SESSION_PORT" "session port" || exit 1
-if [ "$H_MESH_BIND_PORTS" -eq 1 ]; then
-    warn_port_collision "$API_PORT" "API"
-    warn_port_collision "$SESSION_PORT" "session"
-fi
-upsert_env_line H_MESH_BIND_PORTS "$H_MESH_BIND_PORTS"
-upsert_env_line API_PORT "$API_PORT"
-upsert_env_line SESSION_PORT "$SESSION_PORT"
 
 # Match setup.sh's account-name/token flow: account names live in ACCOUNTS,
 # and each token is stored under CLAUDE_OAUTH_TOKEN_<SLUG>. Read env values
 # indirectly rather than sourcing the office file, which may contain
 # operator-edited content and secrets.
-slug() { echo "$1" | tr '[:upper:]' '[:lower:]' | tr ' ' '-'; }
-token_var() { printf 'CLAUDE_OAUTH_TOKEN_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
+slug() {
+    local s="${1,,}"
+    printf '%s' "${s// /-}"
+}
+token_var() {
+    local s="${1^^}"
+    printf 'CLAUDE_OAUTH_TOKEN_%s' "${s//-/_}"
+}
 IFS=',' read -r -a PROFILES <<< "$ACCOUNTS"
 TOKEN_VARS=()
+TOKEN_VALS=()
 
 resolve_token() {
     local profile="$1" var existing live entered
@@ -555,12 +548,13 @@ resolve_token() {
         entered="$existing"
     fi
     TOKEN_VARS+=("$var")
-    [ -n "$entered" ] && upsert_env_line "$var" "$entered"
+    TOKEN_VALS+=("$entered")
 }
 
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
 TELEGRAM_VOICE=""
+WANT_TELEGRAM_PERSIST=0
 if [ "$INTERACTIVE" -eq 1 ]; then
     read -rp "Use more than one account? [y/N]: " USE_PROFILES
     if check_bool "$USE_PROFILES" "n"; then
@@ -568,7 +562,7 @@ if [ "$INTERACTIVE" -eq 1 ]; then
         NP="${NP:-${#PROFILES[@]}}"
         [[ "$NP" =~ ^[1-9][0-9]*$ ]] || { echo "  error: expected a positive number" >&2; exit 2; }
         NEW_PROFILES=()
-        for i in $(seq 1 "$NP"); do
+        for ((i = 1; i <= NP; i++)); do
             if [ "$i" -eq 1 ]; then pdef="default"; else pdef="${PROFILES[$((i-1))]:-account-$i}"; fi
             read -rp "  Account #$i name [$pdef]: " P
             P="$(slug "${P:-$pdef}")"
@@ -595,12 +589,8 @@ if ! printf '%s\n' "${PROFILES[@]}" | grep -qx "$DEFAULT_ACCOUNT"; then
     echo "error: default account '$DEFAULT_ACCOUNT' is not listed in ACCOUNTS ($ACCOUNTS)" >&2
     exit 1
 fi
-upsert_env_line ACCOUNTS "$ACCOUNTS"
-upsert_env_line DEFAULT_ACCOUNT "$DEFAULT_ACCOUNT"
 
 if [ "$INTERACTIVE" -eq 1 ]; then
-    EXISTING_TG_TOKEN="$(env_file_get TELEGRAM_BOT_TOKEN)"
-    EXISTING_TG_CHAT="$(env_file_get TELEGRAM_CHAT_ID)"
     read -rp "Run the Telegram bot? [y/N]: " WANT_TELEGRAM
     if check_bool "$WANT_TELEGRAM" "n"; then
         if [ -n "$EXISTING_TG_TOKEN" ]; then
@@ -612,7 +602,6 @@ if [ "$INTERACTIVE" -eq 1 ]; then
         read -rp "  Telegram Chat ID (required)${EXISTING_TG_CHAT:+ [$EXISTING_TG_CHAT]}: " IN_TG_CHAT
         TELEGRAM_CHAT_ID="${IN_TG_CHAT:-$EXISTING_TG_CHAT}"
         if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-            EXISTING_TG_VOICE="$(env_file_get TELEGRAM_VOICE)"
             if [ "$EXISTING_TG_VOICE" = "1" ]; then
                 read -rp "  Enable spoken voice replies? [Y/n]: " WANT_VOICE
                 check_bool "$WANT_VOICE" "y" && TELEGRAM_VOICE=1 || TELEGRAM_VOICE=0
@@ -620,10 +609,7 @@ if [ "$INTERACTIVE" -eq 1 ]; then
                 read -rp "  Enable spoken voice replies? [y/N]: " WANT_VOICE
                 check_bool "$WANT_VOICE" "n" && TELEGRAM_VOICE=1 || TELEGRAM_VOICE=0
             fi
-            upsert_env_line TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN"
-            upsert_env_line TELEGRAM_CHAT_ID "$TELEGRAM_CHAT_ID"
-            upsert_env_line TELEGRAM_VOICE "$TELEGRAM_VOICE"
-
+            WANT_TELEGRAM_PERSIST=1
         else
             echo "  ⚠ Both a Telegram Bot Token and Chat ID are required -- Telegram bot not enabled." >&2
             TELEGRAM_BOT_TOKEN=""
@@ -634,12 +620,6 @@ fi
 
 # Resolve host files without persisting unvalidated paths. A rerun maps the
 # managed container paths back to its own staged copies, preserving material.
-TLS_CERT="${API_TLS_CERT:-$(env_file_get API_TLS_CERT)}"
-TLS_KEY="${API_TLS_KEY:-$(env_file_get API_TLS_KEY)}"
-SESSION_CERT="${SESSION_TLS_CERT:-$(env_file_get SESSION_TLS_CERT)}"
-SESSION_KEY="${SESSION_TLS_KEY:-$(env_file_get SESSION_TLS_KEY)}"
-CA_CERT="${H_MESH_CA_CERT:-$(env_file_get H_MESH_CA_CERT)}"
-PLAINTEXT="${H_MESH_ALLOW_PLAINTEXT:-$(env_file_get H_MESH_ALLOW_PLAINTEXT)}"
 if [ "$INTERACTIVE" -eq 1 ] && { [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; } && [ "$PLAINTEXT" != "1" ]; then
     echo
     echo "  Every office starts the API. Choose how to reach its published port."
@@ -658,6 +638,54 @@ if [ "$INTERACTIVE" -eq 1 ] && { [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; } && [
         fi
         PLAINTEXT=1
     fi
+fi
+
+# Bootstrap runs before the container has a tenant config. Persist the API
+# identity here, so Compose and every later recreate inherit the same one.
+# Existing office values win over ambient credentials from another office.
+RESOLVED_API_TOKEN="$(env_file_get API_TOKEN)"
+if [ -z "$RESOLVED_API_TOKEN" ]; then
+    RESOLVED_API_TOKEN="${API_TOKEN:-}"
+    if [ -z "$RESOLVED_API_TOKEN" ]; then
+        RESOLVED_API_TOKEN="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" || exit 1
+        [[ "$RESOLVED_API_TOKEN" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "error: could not generate API_TOKEN" >&2; exit 1;
+        }
+    fi
+fi
+
+if [ -n "$H_MESH_OFFICE_NETWORK" ]; then
+    ensure_office_network "$H_MESH_OFFICE_NETWORK" "$OFFICE_NETWORK_MODE" || exit 1
+fi
+
+upsert_env_line POD "$POD" || exit 1
+upsert_env_line TENANT "$TENANT" || exit 1
+upsert_env_line AGENTS "$AGENTS" || exit 1
+upsert_env_line DEFAULT_CLI "$DEFAULT_CLI" || exit 1
+upsert_env_line API_TOKEN "$RESOLVED_API_TOKEN" || exit 1
+if [ -n "$H_MESH_OFFICE_NETWORK" ]; then
+    upsert_env_line H_MESH_OFFICE_NETWORK "$H_MESH_OFFICE_NETWORK" || exit 1
+    upsert_env_line H_MESH_OFFICE_ALIAS "$H_MESH_OFFICE_ALIAS" || exit 1
+else
+    remove_env_line H_MESH_OFFICE_NETWORK
+    remove_env_line H_MESH_OFFICE_ALIAS
+fi
+if [ "$H_MESH_BIND_PORTS" -eq 1 ]; then
+    warn_port_collision "$API_PORT" "API"
+    warn_port_collision "$SESSION_PORT" "session"
+fi
+upsert_env_line H_MESH_BIND_PORTS "$H_MESH_BIND_PORTS" || exit 1
+upsert_env_line API_PORT "$API_PORT" || exit 1
+upsert_env_line SESSION_PORT "$SESSION_PORT" || exit 1
+for _t_idx in "${!TOKEN_VARS[@]}"; do
+    [ -z "${TOKEN_VALS[$_t_idx]}" ] || upsert_env_line "${TOKEN_VARS[$_t_idx]}" "${TOKEN_VALS[$_t_idx]}" || exit 1
+done
+upsert_env_line ACCOUNTS "$ACCOUNTS" || exit 1
+upsert_env_line DEFAULT_ACCOUNT "$DEFAULT_ACCOUNT" || exit 1
+if [ "$WANT_TELEGRAM_PERSIST" -eq 1 ]; then
+    upsert_env_line TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN" || exit 1
+    upsert_env_line TELEGRAM_CHAT_ID "$TELEGRAM_CHAT_ID" || exit 1
+    upsert_env_line TELEGRAM_VOICE "$TELEGRAM_VOICE" || exit 1
 fi
 source "$SCRIPT_DIR/tls.sh"
 stage_tls || exit 1
