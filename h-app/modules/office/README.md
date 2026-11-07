@@ -59,7 +59,10 @@ stays colleagues only). The state comes from Redis (`run.windows`), published by
 the tmux reconciler within one poll (about 5 s), so it works from inside an agent
 pane where the tmux isolation guard forbids asking the office's own server. A
 command that exits stays listed as `exited N` (or `exited (signal N)`) until
-removed; nothing restarts it.
+removed; nothing restarts it. tmux fills in a dead pane's status only when it reaps
+the child, which can lag, so a window that is dead but has no status or signal yet
+reads `exited (status pending)` rather than a bare `exited`; the code appears on
+its own once tmux reaps (the reconciler republishes on any status change).
 
 `office run-rm NAME [--wait SECONDS]` (lead only, advisory like `coop-grant`)
 removes a run window, running or exited. It writes the request to `run.remove`

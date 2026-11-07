@@ -13,7 +13,7 @@ from core.channels import DeadLetter
 from core.keys import prefix, run_remove_key, run_windows_key
 from modules.office import cli
 from modules.tmux import ops, port
-from test_office_run import _dead, _eventually, run_office  # noqa: F401  (fixture)
+from test_office_run import _dead, _eventually, _wait_dead_status, run_office  # noqa: F401  (fixture)
 
 SLEEP = ["/bin/sleep", "86400"]
 
@@ -36,6 +36,7 @@ def _published(ctx):
 def _open_exited(ctx, name="once", status=7):
     cli.main(["run", name, "--", sys.executable, "-c", f"import sys; sys.exit({status})"])
     _eventually(lambda: _dead(ctx, f"__run__{name}"))
+    _wait_dead_status(ctx, f"__run__{name}")   # tmux records the status only when it reaps the child
 
 
 def test_reconciler_publishes_running_and_exited_run_windows(office):
@@ -57,6 +58,7 @@ def test_publishing_again_keeps_since_and_a_state_change_moves_it(office):
     office["reconciler"].reconcile_once(office["r"])
     assert _published(office)["job"] == first
     _eventually(lambda: _dead(office, "__run__job"))
+    _wait_dead_status(office, "__run__job")
     office["reconciler"].reconcile_once(office["r"])
     after = _published(office)["job"]
     assert after["state"] == "exited" and after["exit_status"] == 0
@@ -88,6 +90,32 @@ def test_status_and_peers_list_run_windows_with_their_state(office, capsys):
     assert "monitor (running)" in out and "once (exited 7)" in out
     cli.main(["peers"])
     assert "monitor" not in capsys.readouterr().out      # plain peers stays colleagues only
+
+
+def test_a_dead_window_without_a_recorded_status_reads_pending_then_the_code(office, capsys):
+    key = run_windows_key(office["pod"], office["tenant"])
+    pending = {"state": "exited", "exit_status": None, "signal": None, "command": "sh", "since": "t"}
+    office["r"].hset(key, "late", json.dumps(pending))
+    cli.main(["status"])
+    assert "exited (status pending)" in capsys.readouterr().out
+    cli.main(["peers", "-i"])
+    assert "late (exited (status pending))" in capsys.readouterr().out
+    office["r"].hset(key, "late", json.dumps({**pending, "exit_status": 7}))
+    cli.main(["status"])
+    out = capsys.readouterr().out
+    assert "exited 7" in out and "pending" not in out
+
+
+def test_publish_rewrites_a_pending_exit_once_the_status_is_known(office, monkeypatch):
+    from modules.tmux import run_windows
+    info = {"window_id": "@9", "command": "sh", "state": "exited", "exit_status": None, "signal": None}
+    kw = dict(pod=office["pod"], tenant=office["tenant"], session=office["tenant"], socket=office["socket"])
+    monkeypatch.setattr(run_windows, "snapshot", lambda *a, **k: {"late": dict(info)})
+    run_windows.publish(office["r"], **kw)
+    assert _published(office)["late"]["exit_status"] is None
+    monkeypatch.setattr(run_windows, "snapshot", lambda *a, **k: {"late": {**info, "exit_status": 3}})
+    run_windows.publish(office["r"], **kw)
+    assert _published(office)["late"]["exit_status"] == 3
 
 
 def test_status_without_run_windows_prints_no_run_line(office, capsys):

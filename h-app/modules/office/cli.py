@@ -770,7 +770,9 @@ def _run_state_text(info: dict) -> str:
         return f"exited (signal {info['signal']})"
     if isinstance(info.get("exit_status"), int):
         return f"exited {info['exit_status']}"
-    return "exited"
+    # tmux records a dead pane's status only when it reaps the child, which can lag
+    # (tmux 3.5a); the reconciler republishes the moment the code appears.
+    return "exited (status pending)"
 
 
 def _run_rm_command(argv: list[str]) -> None:

@@ -45,7 +45,10 @@ to the tenant hash `run.windows` (`name -> {state: running|exited, exit_status,
 signal, command, since}`), writing only on a change, and `process_removals`
 kills the windows named in the set `run.remove` **by tmux window id**, never by
 name (tmux resolves `-t session:a` by prefix, so removing `a` must not be able to
-take `ab`). Both go through `ops.run_tmux`; `ops.py` is unchanged.
+take `ab`). A dead pane can briefly (tmux 3.5a: sometimes for a long while) have
+no `pane_dead_status`; `publish` stores `exit_status: null` and rewrites as soon
+as the status appears, and the CLI shows `exited (status pending)` meanwhile. The
+reconciler does not nudge tmux to reap. Both go through `ops.run_tmux`; `ops.py` is unchanged.
 
 A new window initially holds a private placeholder process while
 `remain-on-exit` and rename protection are set. Only then is the requested
