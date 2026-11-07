@@ -211,7 +211,8 @@ Sending `/menu` (registered with Telegram, so it's in the client's `/` picker
 too) shows a **sticky keyboard** — `ReplyKeyboardMarkup`, pinned at the bottom
 of the chat across messages, rather than an inline keyboard attached to one
 message that scrolls away. Its buttons are the top-level office options
-— built against `CONTRACTS.md`/`API.md`/`control/openers.py`, not `office`'s
+— built against the predecessor project's `CONTRACTS.md`/`API.md`/`control/openers.py`
+(not part of this repository; the current API is `modules/api/README.md`), not `office`'s
 own (narrower) argparse surface, per office-sme:
 
 - **📋 Overview** — presence and open ticket (`doing[0]`) for every
@@ -297,11 +298,13 @@ own (narrower) argparse surface, per office-sme:
   reached the source egress queue, while downstream lifecycle custody is what
   proves the agent exists. The admitted result carries a **📋 Copy name**
   button for the requested agent name.
-  ⚠ **No profile picker**: `office profiles` reads Redis directly and has no
+  ⚠ **No profile picker**: the predecessor's `office profiles` command (it does not
+  exist in h-mesh, which has no `profiles` command; `hire --profile` is passed
+  through unchecked client-side) read Redis directly and had no
   REST equivalent, so this client cannot list valid accounts ahead of time. A
   bad profile name still comes back as a clear `422` — and the api's error
-  conveniently lists the valid ones (`control/openers.py`'s
-  `available_profiles` check).
+  conveniently lists the valid ones (the predecessor's `control/openers.py`
+  `available_profiles` check, predecessor project, not part of this repository).
 - **📢 Broadcast** — type a message, sent to every agent (`POST
   /agents/all/envelopes`).
 - **🔊 Voice: ON / 🔇 Voice: OFF** — toggle spoken text-to-speech voice replies
@@ -538,7 +541,7 @@ from).
 
 ⚠ **Only three alert kinds ever reach either surface: `blocked`, `stalled`,
 `credential`.** These are exactly what `GET /alerts`/`GET /alerts/stream`
-document (API.md's Watchdog Alerts Feed). The two newer, lead-only alerts —
+document (the predecessor's API.md Watchdog Alerts Feed; see `modules/api/README.md` for the current API). The two newer, lead-only alerts —
 `doing_duration` and `todo_duration` (the "unpicked ticket" one) — are pasted
 directly into the *lead's* tmux pane as an ordinary `Message` envelope
 (`modules.watchdog.service`'s `_notify_lead`, confirmed against `_check_doing_duration`/
@@ -687,7 +690,7 @@ Sending a photo used to be silently dropped — `_dispatch_update` only ever
 looked at `message.text`, and a photo update carries `message.photo`/
 `message.caption` instead, so it fell through with no reply and no record
 anywhere. It now downloads the photo and sends a real `Attachment`-kind
-envelope (`docs/CONTRACTS.md`) — file bytes on the bus, `content_base64`,
+envelope (`docs/CONTRACTS.md`, predecessor project, not part of this repository) — file bytes on the bus, `content_base64`,
 not a path shared out of band. An earlier version of this feature (before
 the Attachment kind existed) saved the file under the agent's own workdir
 and sent a plain `Message` naming the path; that's gone now that there's a
@@ -874,7 +877,7 @@ limitation `PANE_WATCH_CHROME_OVERRIDES`, §2d, exists for).
 
 ## 3. Documentation Gaps in `docs/API.md`
 
-Built strictly against [`docs/API.md`](../../docs/API.md). The following gaps and ambiguities were encountered:
+Built strictly against the predecessor project's `docs/API.md` (predecessor project, not part of this repository); the current API is documented in [`modules/api/README.md`](../../modules/api/README.md). The following gaps and ambiguities were encountered in that document:
 
 1. **Delivery verification was conflated with presence**:
    Older API behavior exposed a retained unverified-delivery marker as a
@@ -901,7 +904,7 @@ Built strictly against [`docs/API.md`](../../docs/API.md). The following gaps an
    `doing_duration` and `todo_duration` ("unpicked ticket") are delivered as a direct `Message` to the lead's tmux pane (`_notify_lead`), not written to the alerts stream `_alert` writes to. API.md's Watchdog Alerts Feed section reads as if it covers "alerts produced by `modules.watchdog`" generally; it does not mention this split, and nothing in the REST/SSE surface exposes those two kinds at all.
 
 8. **The account/profile registry has no REST endpoint**:
-   `available_profiles` (`bus/accounts.py`) — what `office profiles` reads and what `StartAgent`'s `profile` field is validated against (`control/openers.py`) — is direct-Redis only. A REST client can `StartAgent` with a `profile` and get a clear `422` naming the valid accounts if it guesses wrong, but cannot list them ahead of time to offer a picker. `office usage` is the same shape (direct Redis, no REST equivalent).
+   `available_profiles` (predecessor `bus/accounts.py`) — what the predecessor's `office profiles` read and what `StartAgent`'s `profile` field was validated against (predecessor `control/openers.py`; (predecessor project, not part of this repository)) — is direct-Redis only. A REST client can `StartAgent` with a `profile` and get a clear `422` naming the valid accounts if it guesses wrong, but cannot list them ahead of time to offer a picker. `office usage` is the same shape (direct Redis, no REST equivalent).
 
 ## TLS
 

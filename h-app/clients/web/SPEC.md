@@ -3,7 +3,7 @@
 > The web UI for running an office. Judge it as a product someone pays for, not
 > as a demo. this file is the bar. The build spec it was written against has been
 > retired. ⚠ **`clients/` is no longer closed to development** — `TODO.md:19` and
-> `SPRINTS.md:299-304` record the reversal (2026-08-29, by the operator): clients are
+> `SPRINTS.md:299-304` (predecessor project, not part of this repository) record the reversal (2026-08-29, by the operator): clients are
 > in active use as the primary user interface and ordinary in-scope work.
 
 ⚠ **Status: Parts I–V have all shipped.** Every numbered requirement below —
@@ -17,7 +17,7 @@ agent page (§24–26) — is built and present in `clients/web/ui/*.js`,
 work order because that is what it originally was, written across several
 rounds as each prior round shipped; the imperative "build X"/"must" language
 below is preserved as the record of what was asked for and why, corrected in
-place rather than silently rewritten (`docs/TEST-SIGNOFF.md`'s rule for a
+place rather than silently rewritten (`docs/TEST-SIGNOFF.md`, predecessor project, not part of this repository: its rule for a
 living document). Two specific claims this left behind are corrected below,
 at §13 and §27, where they had gone furthest from stating the truth.
 

@@ -1,5 +1,7 @@
 # Upgrade token and daemon migration proof
 
+> Historical record: counts, commits and offices are as of 2026-11-04; see docs/inter-office.md for current behaviour.
+
 The runtime under test is `setup-agent/upgrade-token-daemons` at
 `28be8419064e8c4e0fe2df08238d56193d1cc5a6`, built on release candidate
 `bc001977508fb00caab17f2eb9540657be63bdc2`. The legacy runtime is develop

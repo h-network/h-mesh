@@ -1,5 +1,7 @@
 # Live Inter-Office Messaging Proof on `laba` ↔ `labb` (`2026-11-03`)
 
+> Historical record: counts, commits and offices are as of 2026-11-03; see docs/inter-office.md for current behaviour.
+
 This document records the fresh, live end-to-end verification and negative-case proof of inter-office messaging between the two containerized offices `laba` (`172.16.0.201:18080`) and `labb` (`172.16.0.201:18082`) on the `h-lab` testbed VM (`172.16.0.201`), executed on `2026-11-03T22:19Z–22:30Z`.
 
 No token or secret values appear in this document; only `token-id`, `participant`, `sha256` digests, and metadata are shown.

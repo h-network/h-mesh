@@ -1,5 +1,7 @@
 # `office run` windows: status, `exited` state and `run-rm`, fresh-install proof
 
+> Historical record: counts, commits and offices are as of 2026-11-05; see docs/inter-office.md for current behaviour.
+
 Run on the isolated h-lab VM on 2026-11-05 (03:54Z-03:57Z) from a fresh clone of
 pushed commit `c0834993d19ba3ee33c483272a25e90087e0b7bf`
 (`switch-agent/office-run`), on a throwaway office created by the real
