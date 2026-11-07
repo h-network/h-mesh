@@ -3051,9 +3051,10 @@ def _parse_route_table(text: str) -> list:
             mask = int(fields[7], 16)
             if destination == 0 or gateway != 0 or not flags & 1:
                 continue            # default route, a routed (gatewayed) net, or down
-            networks.append(ipaddress.IPv4Network(
-                (ipaddress.IPv4Address(destination.to_bytes(4, "little")),
-                 ipaddress.IPv4Address(mask.to_bytes(4, "little"))), strict=False))
+            # /proc/net/route prints the 32-bit values byte-reversed (little endian)
+            network = int.from_bytes(destination.to_bytes(4, "little"), "big")
+            prefix = bin(int.from_bytes(mask.to_bytes(4, "little"), "big")).count("1")
+            networks.append(ipaddress.IPv4Network((network, prefix), strict=False))
         except (ValueError, OverflowError):
             continue
     return networks
