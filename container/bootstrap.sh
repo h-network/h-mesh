@@ -47,7 +47,12 @@ POD="${POD:-}"
 TENANT="${TENANT:-}"
 AGENTS="${AGENTS:-}"
 DEFAULT_CLI="${DEFAULT_CLI:-}"
+H_MESH_OFFICE_NETWORK="${H_MESH_OFFICE_NETWORK:-${OFFICE_NETWORK:-}}"
+OFFICE_NETWORK_EXPLICIT=0
+[ -n "$H_MESH_OFFICE_NETWORK" ] && OFFICE_NETWORK_EXPLICIT=1
 H_MESH_BIND_PORTS="${H_MESH_BIND_PORTS:-}"
+BIND_PORTS_EXPLICIT=0
+[ -n "$H_MESH_BIND_PORTS" ] && BIND_PORTS_EXPLICIT=1
 API_PORT="${API_PORT:-}"
 SESSION_PORT="${SESSION_PORT:-}"
 ACCOUNTS="${ACCOUNTS:-}"
@@ -59,11 +64,12 @@ Usage: ./setup.sh --container [options]
        ./container/bootstrap.sh [options]
 
 Collects what an office's env file needs (POD, TENANT, AGENTS,
-DEFAULT_CLI, Claude account names and OAuth tokens, host port publishing,
-optional Telegram bot config, and a
+DEFAULT_CLI, optional shared h-mesh office network, host port publishing,
+Claude account names and OAuth tokens, optional Telegram bot config, and a
 TLS-or-plaintext decision),
-writes it to offices/<pod>/<tenant>/.env (alongside a regenerated
-SUMMARY.md and executable attach.sh containing no secrets), then runs
+writes it to offices/<pod>/<tenant>/.env (alongside an optional
+compose.network.yaml, a regenerated SUMMARY.md, and an executable attach.sh
+containing no secrets), then runs
 'docker compose -p h-mesh-<pod>-<tenant> up --build' -- setup.sh's own
 non-interactive path runs inside the container from there (see
 container/entrypoint.sh).
@@ -73,10 +79,13 @@ Options:
   --tenant <name>         Tenant name (default: \$TENANT, or existing office's value, or "default")
   --agents <a,b,c>        Comma-separated agent names (default: \$AGENTS, or existing value, or "architect")
   --cli <claude|codex|agy> Default CLI (default: \$DEFAULT_CLI, or existing value, or "claude")
-  --bind-ports           Publish API/session ports to the host (the default)
-  --no-bind-ports        Do not publish API/session ports to the host
-  --api-port <port>      API host port (default: \$API_PORT, existing value, or 8080)
-  --session-port <port>  Session host port (default: \$SESSION_PORT, existing value, or 8081)
+  --office-network <name> Create or join a labelled h-mesh office network (io.h-mesh.office-network=1)
+                          with container DNS alias <pod>-<tenant> (default: \$H_MESH_OFFICE_NETWORK or existing value)
+  --no-office-network     Detach from / do not join an office network
+  --bind-ports            Publish API/session ports to the host (default when no office network is selected)
+  --no-bind-ports         Do not publish API/session ports to the host (default when an office network is selected)
+  --api-port <port>       API host port (default: \$API_PORT, existing value, or 8080)
+  --session-port <port>   Session host port (default: \$SESSION_PORT, existing value, or 8081)
   --env-file <path>       Use this exact env file instead of offices/<pod>/<tenant>/.env
                           (advanced/testing use -- also disables the project-name isolation
                           this script otherwise guarantees; pass --project-name too if you use it)
@@ -108,8 +117,10 @@ while [ $# -gt 0 ]; do
         --tenant) TENANT="$2"; shift 2 ;;
         --agents) AGENTS="$2"; shift 2 ;;
         --cli) DEFAULT_CLI="$2"; shift 2 ;;
-        --bind-ports) H_MESH_BIND_PORTS=1; shift ;;
-        --no-bind-ports) H_MESH_BIND_PORTS=0; shift ;;
+        --office-network) H_MESH_OFFICE_NETWORK="${2:-none}"; OFFICE_NETWORK_EXPLICIT=1; shift 2 ;;
+        --no-office-network) H_MESH_OFFICE_NETWORK="none"; OFFICE_NETWORK_EXPLICIT=1; shift ;;
+        --bind-ports) H_MESH_BIND_PORTS=1; BIND_PORTS_EXPLICIT=1; shift ;;
+        --no-bind-ports) H_MESH_BIND_PORTS=0; BIND_PORTS_EXPLICIT=1; shift ;;
         --api-port) API_PORT="$2"; shift 2 ;;
         --session-port) SESSION_PORT="$2"; shift 2 ;;
         --env-file) ENV_FILE_OVERRIDE="$2"; shift 2 ;;
@@ -231,17 +242,31 @@ fi
 # `KEY=value` grep, not sourcing the file: the env file may carry secrets
 # (tokens), and sourcing an operator-edited file would execute it as shell.
 env_file_get() {
-    local key="$1"
+    local key="$1" line found=""
     [ -f "$ENV_FILE" ] || return 0
-    sed -n "s/^${key}=//p" "$ENV_FILE" | tail -n1
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "${key}="*) found="${line#*=}" ;;
+        esac
+    done < "$ENV_FILE"
+    [ -z "$found" ] || printf '%s\n' "$found"
 }
 
+EXISTING_OFFICE_NETWORK="$(env_file_get H_MESH_OFFICE_NETWORK)"
+EXISTING_BIND_PORTS="$(env_file_get H_MESH_BIND_PORTS)"
+EXISTING_TG_TOKEN="$(env_file_get TELEGRAM_BOT_TOKEN)"
+EXISTING_TG_CHAT="$(env_file_get TELEGRAM_CHAT_ID)"
+EXISTING_TG_VOICE="$(env_file_get TELEGRAM_VOICE)"
+TLS_CERT="${API_TLS_CERT:-$(env_file_get API_TLS_CERT)}"
+TLS_KEY="${API_TLS_KEY:-$(env_file_get API_TLS_KEY)}"
+SESSION_CERT="${SESSION_TLS_CERT:-$(env_file_get SESSION_TLS_CERT)}"
+SESSION_KEY="${SESSION_TLS_KEY:-$(env_file_get SESSION_TLS_KEY)}"
+CA_CERT="${H_MESH_CA_CERT:-$(env_file_get H_MESH_CA_CERT)}"
+PLAINTEXT="${H_MESH_ALLOW_PLAINTEXT:-$(env_file_get H_MESH_ALLOW_PLAINTEXT)}"
 [ -z "$AGENTS" ] && AGENTS="$(env_file_get AGENTS)"
 [ -z "$DEFAULT_CLI" ] && DEFAULT_CLI="$(env_file_get DEFAULT_CLI)"
-[ -z "$H_MESH_BIND_PORTS" ] && H_MESH_BIND_PORTS="$(env_file_get H_MESH_BIND_PORTS)"
 [ -z "$API_PORT" ] && API_PORT="$(env_file_get API_PORT)"
 [ -z "$SESSION_PORT" ] && SESSION_PORT="$(env_file_get SESSION_PORT)"
-H_MESH_BIND_PORTS="${H_MESH_BIND_PORTS:-1}"
 API_PORT="${API_PORT:-8080}"
 SESSION_PORT="${SESSION_PORT:-8081}"
 [ -z "$ACCOUNTS" ] && ACCOUNTS="$(env_file_get ACCOUNTS)"
@@ -280,10 +305,20 @@ upsert_env_line() {
     mv "$tmp" "$ENV_FILE"
 }
 
-upsert_env_line POD "$POD"
-upsert_env_line TENANT "$TENANT"
-upsert_env_line AGENTS "$AGENTS"
-upsert_env_line DEFAULT_CLI "$DEFAULT_CLI"
+remove_env_line() {
+    local key="$1" tmp
+    [ -f "$ENV_FILE" ] || return 0
+    grep -q "^${key}=" "$ENV_FILE" 2>/dev/null || return 0
+    tmp="$(mktemp "${ENV_FILE}.XXXXXX")" || return 1
+    chmod 0600 "$tmp" || return 1
+    grep -v "^${key}=" "$ENV_FILE" > "$tmp" || true
+    mv "$tmp" "$ENV_FILE"
+}
+
+upsert_env_line POD "$POD" || exit 1
+upsert_env_line TENANT "$TENANT" || exit 1
+upsert_env_line AGENTS "$AGENTS" || exit 1
+upsert_env_line DEFAULT_CLI "$DEFAULT_CLI" || exit 1
 
 # Bootstrap runs before the container has a tenant config. Persist the API
 # identity here, so Compose and every later recreate inherit the same one.
@@ -326,6 +361,121 @@ validate_port() {
     fi
 }
 
+OFFICE_NETWORK_LABEL="io.h-mesh.office-network=1"
+
+validate_dns_label() {
+    local value="$1" label="$2"
+    if [ "${#value}" -lt 1 ] || [ "${#value}" -gt 63 ] || [[ ! "$value" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "error: $label '$value' is not a legal DNS label (must be 1-63 lowercase alphanumeric/hyphen chars, start and end with a letter or digit, and not be all digits)" >&2
+        return 1
+    fi
+    return 0
+}
+
+validate_office_network_name() {
+    local value="$1"
+    if [ "${#value}" -lt 1 ] || [ "${#value}" -gt 63 ] || [[ ! "$value" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || [[ "$value" =~ ^[0-9]+$ ]]; then
+        echo "error: office network name '$value' must be 1-63 lowercase alphanumeric/hyphen chars, starting and ending with a letter or digit" >&2
+        return 1
+    fi
+    return 0
+}
+
+list_labelled_office_networks() {
+    docker network ls --filter "label=${OFFICE_NETWORK_LABEL}" --format '{{.Name}}' 2>/dev/null
+}
+
+ensure_office_network() {
+    local net="$1" mode="${2:-create_or_join}" inspect_out rc
+    validate_office_network_name "$net" || return 1
+    inspect_out="$(docker network inspect --format '{{index .Labels "io.h-mesh.office-network"}}' "$net" 2>/dev/null)"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        if [ "$inspect_out" != "1" ]; then
+            echo "error: docker network '$net' exists without label ${OFFICE_NETWORK_LABEL}; refusing to join a network bootstrap did not create" >&2
+            return 1
+        fi
+        return 0
+    fi
+    if [ "$mode" = "join_only" ]; then
+        echo "error: office network '$net' does not exist with label ${OFFICE_NETWORK_LABEL}" >&2
+        return 1
+    fi
+    case "$net" in
+        bridge|host|default|null)
+            echo "error: docker network '$net' is a built-in network without label ${OFFICE_NETWORK_LABEL}; refusing to join a network bootstrap did not create" >&2
+            return 1 ;;
+    esac
+    docker network create --label "$OFFICE_NETWORK_LABEL" "$net" >/dev/null || {
+        echo "error: failed to create office network '$net'" >&2
+        return 1
+    }
+    return 0
+}
+
+OFFICE_NETWORK_MODE="create_or_join"
+if [ "$INTERACTIVE" -eq 1 ] && [ "$OFFICE_NETWORK_EXPLICIT" -eq 0 ]; then
+    echo "  Office network options (1) none, (2) create a new office network, (3) join an existing office network."
+    if [ -n "$EXISTING_OFFICE_NETWORK" ]; then
+        read -rp "Office network choice (1/2/3, blank keeps '$EXISTING_OFFICE_NETWORK'): " _net_choice
+    else
+        read -rp "Office network choice (1/2/3) [1]: " _net_choice
+    fi
+    case "$_net_choice" in
+        "")
+            H_MESH_OFFICE_NETWORK="$EXISTING_OFFICE_NETWORK"
+            OFFICE_NETWORK_MODE="create_or_join"
+            ;;
+        1|none|NONE)
+            H_MESH_OFFICE_NETWORK=""
+            ;;
+        2|create|CREATE)
+            _def_net="${EXISTING_OFFICE_NETWORK:-h-mesh-net}"
+            read -rp "  New office network name [$_def_net]: " _net_name
+            H_MESH_OFFICE_NETWORK="${_net_name:-$_def_net}"
+            OFFICE_NETWORK_MODE="create_or_join"
+            ;;
+        3|join|JOIN)
+            echo "  Existing h-mesh office networks (label ${OFFICE_NETWORK_LABEL})"
+            LABELLED_NETS=()
+            while IFS= read -r _ln; do
+                [ -n "$_ln" ] && LABELLED_NETS+=("$_ln")
+            done < <(list_labelled_office_networks)
+            if [ "${#LABELLED_NETS[@]}" -eq 0 ]; then
+                echo "error: no existing h-mesh office networks found (label ${OFFICE_NETWORK_LABEL}); choose 2 to create one or pass --office-network <name>" >&2
+                exit 1
+            fi
+            for _idx in "${!LABELLED_NETS[@]}"; do
+                echo "    $((_idx + 1))) ${LABELLED_NETS[$_idx]}"
+            done
+            read -rp "  Join office network (number or name) [${LABELLED_NETS[0]}]: " _join_in
+            _join_in="${_join_in:-${LABELLED_NETS[0]}}"
+            if [[ "$_join_in" =~ ^[0-9]+$ ]] && [ "$_join_in" -ge 1 ] && [ "$_join_in" -le "${#LABELLED_NETS[@]}" ]; then
+                H_MESH_OFFICE_NETWORK="${LABELLED_NETS[$((_join_in - 1))]}"
+            else
+                H_MESH_OFFICE_NETWORK="$_join_in"
+            fi
+            OFFICE_NETWORK_MODE="join_only"
+            ;;
+        *)
+            echo "error: invalid office network choice '$_net_choice' (expected 1, 2, or 3)" >&2
+            exit 1
+            ;;
+    esac
+else
+    [ "$OFFICE_NETWORK_EXPLICIT" -eq 1 ] || H_MESH_OFFICE_NETWORK="$EXISTING_OFFICE_NETWORK"
+    case "$H_MESH_OFFICE_NETWORK" in
+        none|NONE) H_MESH_OFFICE_NETWORK="" ;;
+    esac
+fi
+
+H_MESH_OFFICE_ALIAS=""
+if [ -n "$H_MESH_OFFICE_NETWORK" ]; then
+    H_MESH_OFFICE_ALIAS="${POD}-${TENANT}"
+    validate_dns_label "$H_MESH_OFFICE_ALIAS" "office network alias" || exit 1
+    validate_office_network_name "$H_MESH_OFFICE_NETWORK" || exit 1
+fi
+
 warn_port_collision() {
     local port="$1" label="$2" candidate claimed_key claimed_port
     while IFS= read -r candidate; do
@@ -345,35 +495,61 @@ warn_port_collision() {
     fi
 }
 
-H_MESH_BIND_PORTS="$(normalize_bind_ports "$H_MESH_BIND_PORTS")" || exit 1
-if [ "$INTERACTIVE" -eq 1 ]; then
-    read -rp "Publish the API/session ports to the host? [Y/n]: " _in
-    if check_bool "$_in" "y"; then
-        H_MESH_BIND_PORTS=1
-        read -rp "API host port [$API_PORT]: " _in; API_PORT="${_in:-$API_PORT}"
-        read -rp "Session host port [$SESSION_PORT]: " _in; SESSION_PORT="${_in:-$SESSION_PORT}"
+if [ "$BIND_PORTS_EXPLICIT" -eq 0 ]; then
+    if [ -n "$H_MESH_OFFICE_NETWORK" ]; then
+        if [ -n "$EXISTING_OFFICE_NETWORK" ] && [ -n "$EXISTING_BIND_PORTS" ]; then
+            H_MESH_BIND_PORTS="$EXISTING_BIND_PORTS"
+        else
+            H_MESH_BIND_PORTS=0
+        fi
     else
-        H_MESH_BIND_PORTS=0
+        H_MESH_BIND_PORTS="${EXISTING_BIND_PORTS:-1}"
+    fi
+fi
+case "$H_MESH_BIND_PORTS" in
+    1|[Yy]|[Yy][Ee][Ss]) H_MESH_BIND_PORTS=1 ;;
+    0|[Nn]|[Nn][Oo]) H_MESH_BIND_PORTS=0 ;;
+    *) echo "error: H_MESH_BIND_PORTS must be 1 or 0 (got: $H_MESH_BIND_PORTS)" >&2; exit 1 ;;
+esac
+if [ "$INTERACTIVE" -eq 1 ]; then
+    if [ "$H_MESH_BIND_PORTS" -eq 0 ]; then
+        read -rp "Publish the API/session ports to the host? [y/N]: " _in
+        if check_bool "$_in" "n"; then
+            H_MESH_BIND_PORTS=1
+            read -rp "API host port [$API_PORT]: " _in; API_PORT="${_in:-$API_PORT}"
+            read -rp "Session host port [$SESSION_PORT]: " _in; SESSION_PORT="${_in:-$SESSION_PORT}"
+        else
+            H_MESH_BIND_PORTS=0
+        fi
+    else
+        read -rp "Publish the API/session ports to the host? [Y/n]: " _in
+        if check_bool "$_in" "y"; then
+            H_MESH_BIND_PORTS=1
+            read -rp "API host port [$API_PORT]: " _in; API_PORT="${_in:-$API_PORT}"
+            read -rp "Session host port [$SESSION_PORT]: " _in; SESSION_PORT="${_in:-$SESSION_PORT}"
+        else
+            H_MESH_BIND_PORTS=0
+        fi
     fi
 fi
 validate_port "$API_PORT" "API port" || exit 1
 validate_port "$SESSION_PORT" "session port" || exit 1
-if [ "$H_MESH_BIND_PORTS" -eq 1 ]; then
-    warn_port_collision "$API_PORT" "API"
-    warn_port_collision "$SESSION_PORT" "session"
-fi
-upsert_env_line H_MESH_BIND_PORTS "$H_MESH_BIND_PORTS"
-upsert_env_line API_PORT "$API_PORT"
-upsert_env_line SESSION_PORT "$SESSION_PORT"
 
 # Match setup.sh's account-name/token flow: account names live in ACCOUNTS,
 # and each token is stored under CLAUDE_OAUTH_TOKEN_<SLUG>. Read env values
 # indirectly rather than sourcing the office file, which may contain
 # operator-edited content and secrets.
-slug() { echo "$1" | tr '[:upper:]' '[:lower:]' | tr ' ' '-'; }
-token_var() { printf 'CLAUDE_OAUTH_TOKEN_%s' "$(printf '%s' "$1" | tr 'a-z-' 'A-Z_')"; }
+slug() {
+    local s="${1,,}"
+    printf '%s' "${s// /-}"
+}
+token_var() {
+    local s="${1^^}"
+    printf 'CLAUDE_OAUTH_TOKEN_%s' "${s//-/_}"
+}
 IFS=',' read -r -a PROFILES <<< "$ACCOUNTS"
 TOKEN_VARS=()
+TOKEN_VALS=()
 
 resolve_token() {
     local profile="$1" var existing live entered
@@ -392,12 +568,13 @@ resolve_token() {
         entered="$existing"
     fi
     TOKEN_VARS+=("$var")
-    [ -n "$entered" ] && upsert_env_line "$var" "$entered"
+    TOKEN_VALS+=("$entered")
 }
 
 TELEGRAM_BOT_TOKEN=""
 TELEGRAM_CHAT_ID=""
 TELEGRAM_VOICE=""
+WANT_TELEGRAM_PERSIST=0
 if [ "$INTERACTIVE" -eq 1 ]; then
     read -rp "Use more than one account? [y/N]: " USE_PROFILES
     if check_bool "$USE_PROFILES" "n"; then
@@ -405,7 +582,7 @@ if [ "$INTERACTIVE" -eq 1 ]; then
         NP="${NP:-${#PROFILES[@]}}"
         [[ "$NP" =~ ^[1-9][0-9]*$ ]] || { echo "  error: expected a positive number" >&2; exit 2; }
         NEW_PROFILES=()
-        for i in $(seq 1 "$NP"); do
+        for ((i = 1; i <= NP; i++)); do
             if [ "$i" -eq 1 ]; then pdef="default"; else pdef="${PROFILES[$((i-1))]:-account-$i}"; fi
             read -rp "  Account #$i name [$pdef]: " P
             P="$(slug "${P:-$pdef}")"
@@ -432,12 +609,8 @@ if ! printf '%s\n' "${PROFILES[@]}" | grep -qx "$DEFAULT_ACCOUNT"; then
     echo "error: default account '$DEFAULT_ACCOUNT' is not listed in ACCOUNTS ($ACCOUNTS)" >&2
     exit 1
 fi
-upsert_env_line ACCOUNTS "$ACCOUNTS"
-upsert_env_line DEFAULT_ACCOUNT "$DEFAULT_ACCOUNT"
 
 if [ "$INTERACTIVE" -eq 1 ]; then
-    EXISTING_TG_TOKEN="$(env_file_get TELEGRAM_BOT_TOKEN)"
-    EXISTING_TG_CHAT="$(env_file_get TELEGRAM_CHAT_ID)"
     read -rp "Run the Telegram bot? [y/N]: " WANT_TELEGRAM
     if check_bool "$WANT_TELEGRAM" "n"; then
         if [ -n "$EXISTING_TG_TOKEN" ]; then
@@ -449,7 +622,6 @@ if [ "$INTERACTIVE" -eq 1 ]; then
         read -rp "  Telegram Chat ID (required)${EXISTING_TG_CHAT:+ [$EXISTING_TG_CHAT]}: " IN_TG_CHAT
         TELEGRAM_CHAT_ID="${IN_TG_CHAT:-$EXISTING_TG_CHAT}"
         if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-            EXISTING_TG_VOICE="$(env_file_get TELEGRAM_VOICE)"
             if [ "$EXISTING_TG_VOICE" = "1" ]; then
                 read -rp "  Enable spoken voice replies? [Y/n]: " WANT_VOICE
                 check_bool "$WANT_VOICE" "y" && TELEGRAM_VOICE=1 || TELEGRAM_VOICE=0
@@ -457,10 +629,7 @@ if [ "$INTERACTIVE" -eq 1 ]; then
                 read -rp "  Enable spoken voice replies? [y/N]: " WANT_VOICE
                 check_bool "$WANT_VOICE" "n" && TELEGRAM_VOICE=1 || TELEGRAM_VOICE=0
             fi
-            upsert_env_line TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN"
-            upsert_env_line TELEGRAM_CHAT_ID "$TELEGRAM_CHAT_ID"
-            upsert_env_line TELEGRAM_VOICE "$TELEGRAM_VOICE"
-
+            WANT_TELEGRAM_PERSIST=1
         else
             echo "  ⚠ Both a Telegram Bot Token and Chat ID are required -- Telegram bot not enabled." >&2
             TELEGRAM_BOT_TOKEN=""
@@ -471,12 +640,6 @@ fi
 
 # Resolve host files without persisting unvalidated paths. A rerun maps the
 # managed container paths back to its own staged copies, preserving material.
-TLS_CERT="${API_TLS_CERT:-$(env_file_get API_TLS_CERT)}"
-TLS_KEY="${API_TLS_KEY:-$(env_file_get API_TLS_KEY)}"
-SESSION_CERT="${SESSION_TLS_CERT:-$(env_file_get SESSION_TLS_CERT)}"
-SESSION_KEY="${SESSION_TLS_KEY:-$(env_file_get SESSION_TLS_KEY)}"
-CA_CERT="${H_MESH_CA_CERT:-$(env_file_get H_MESH_CA_CERT)}"
-PLAINTEXT="${H_MESH_ALLOW_PLAINTEXT:-$(env_file_get H_MESH_ALLOW_PLAINTEXT)}"
 if [ "$INTERACTIVE" -eq 1 ] && { [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; } && [ "$PLAINTEXT" != "1" ]; then
     echo
     echo "  Every office starts the API. Choose how to reach its published port."
@@ -495,6 +658,32 @@ if [ "$INTERACTIVE" -eq 1 ] && { [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; } && [
         fi
         PLAINTEXT=1
     fi
+fi
+
+if [ -n "$H_MESH_OFFICE_NETWORK" ]; then
+    ensure_office_network "$H_MESH_OFFICE_NETWORK" "$OFFICE_NETWORK_MODE" || exit 1
+    upsert_env_line H_MESH_OFFICE_NETWORK "$H_MESH_OFFICE_NETWORK" || exit 1
+    upsert_env_line H_MESH_OFFICE_ALIAS "$H_MESH_OFFICE_ALIAS" || exit 1
+else
+    remove_env_line H_MESH_OFFICE_NETWORK
+    remove_env_line H_MESH_OFFICE_ALIAS
+fi
+if [ "$H_MESH_BIND_PORTS" -eq 1 ]; then
+    warn_port_collision "$API_PORT" "API"
+    warn_port_collision "$SESSION_PORT" "session"
+fi
+upsert_env_line H_MESH_BIND_PORTS "$H_MESH_BIND_PORTS" || exit 1
+upsert_env_line API_PORT "$API_PORT" || exit 1
+upsert_env_line SESSION_PORT "$SESSION_PORT" || exit 1
+for _t_idx in "${!TOKEN_VARS[@]}"; do
+    [ -z "${TOKEN_VALS[$_t_idx]}" ] || upsert_env_line "${TOKEN_VARS[$_t_idx]}" "${TOKEN_VALS[$_t_idx]}" || exit 1
+done
+upsert_env_line ACCOUNTS "$ACCOUNTS" || exit 1
+upsert_env_line DEFAULT_ACCOUNT "$DEFAULT_ACCOUNT" || exit 1
+if [ "$WANT_TELEGRAM_PERSIST" -eq 1 ]; then
+    upsert_env_line TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN" || exit 1
+    upsert_env_line TELEGRAM_CHAT_ID "$TELEGRAM_CHAT_ID" || exit 1
+    upsert_env_line TELEGRAM_VOICE "$TELEGRAM_VOICE" || exit 1
 fi
 source "$SCRIPT_DIR/tls.sh"
 stage_tls || exit 1
@@ -516,6 +705,11 @@ echo "  Pod:          $POD"
 echo "  Tenant:       $TENANT"
 echo "  Agents:       $AGENTS"
 echo "  Default CLI:  $DEFAULT_CLI"
+if [ -n "$H_MESH_OFFICE_NETWORK" ]; then
+    echo "  Office net:   $H_MESH_OFFICE_NETWORK (alias: $H_MESH_OFFICE_ALIAS)"
+else
+    echo "  Office net:   none"
+fi
 if [ "$H_MESH_BIND_PORTS" -eq 1 ]; then
     echo "  Host ports:   API $API_PORT, session $SESSION_PORT"
 else
@@ -543,14 +737,49 @@ echo "  Env file:     $ENV_FILE"
 echo "  Project name: $PROJECT_NAME"
 echo
 
-COMPOSE_FILES="-f $SCRIPT_DIR/compose.yaml"
-[ "$H_MESH_BIND_PORTS" -eq 1 ] && COMPOSE_FILES="$COMPOSE_FILES -f $SCRIPT_DIR/compose.ports.yaml"
-[ "$TLS_MOUNT" -eq 0 ] || COMPOSE_FILES="$COMPOSE_FILES -f $SCRIPT_DIR/compose.tls.yaml"
-
 OFFICE_DIR="$(dirname "$ENV_FILE")"
 SUMMARY_FILE="$OFFICE_DIR/SUMMARY.md"
 ATTACH_SCRIPT="$OFFICE_DIR/attach.sh"
+NETWORK_COMPOSE_FILE="$OFFICE_DIR/compose.network.yaml"
 mkdir -p "$OFFICE_DIR"
+
+if [ -n "$H_MESH_OFFICE_NETWORK" ]; then
+    cat > "$NETWORK_COMPOSE_FILE" <<EOF
+# Generated by container/bootstrap.sh for pod=$POD tenant=$TENANT.
+# Attaches the office container to the shared h-mesh office network
+# ($H_MESH_OFFICE_NETWORK) with the stable DNS alias $H_MESH_OFFICE_ALIAS.
+services:
+  h-mesh:
+    networks:
+      office:
+        aliases:
+          - $H_MESH_OFFICE_ALIAS
+
+networks:
+  office:
+    external: true
+    name: $H_MESH_OFFICE_NETWORK
+EOF
+    chmod 0644 "$NETWORK_COMPOSE_FILE"
+else
+    rm -f "$NETWORK_COMPOSE_FILE"
+fi
+
+COMPOSE_FILES="-f $SCRIPT_DIR/compose.yaml"
+[ "$H_MESH_BIND_PORTS" -eq 1 ] && COMPOSE_FILES="$COMPOSE_FILES -f $SCRIPT_DIR/compose.ports.yaml"
+[ "$TLS_MOUNT" -eq 0 ] || COMPOSE_FILES="$COMPOSE_FILES -f $SCRIPT_DIR/compose.tls.yaml"
+[ -z "$H_MESH_OFFICE_NETWORK" ] || COMPOSE_FILES="$COMPOSE_FILES -f $NETWORK_COMPOSE_FILE"
+
+if [ -n "$H_MESH_OFFICE_NETWORK" ]; then
+    if [ -n "$TLS_CERT" ] && [ -n "$TLS_KEY" ]; then
+        SUMMARY_NET_SCHEME="https"
+    else
+        SUMMARY_NET_SCHEME="http"
+    fi
+    SUMMARY_OFFICE_NETWORK="$H_MESH_OFFICE_NETWORK (alias: $H_MESH_OFFICE_ALIAS; peer URL: ${SUMMARY_NET_SCHEME}://${H_MESH_OFFICE_ALIAS}:8080)"
+else
+    SUMMARY_OFFICE_NETWORK="none"
+fi
 
 if [ "$H_MESH_BIND_PORTS" -eq 1 ]; then
     SUMMARY_PORTS="API $API_PORT, session $SESSION_PORT"
@@ -593,6 +822,7 @@ cat > "$SUMMARY_FILE" <<EOF
 - **Agents:** $AGENTS
 - **Default CLI:** $DEFAULT_CLI
 - **Accounts:** $ACCOUNTS (default: $DEFAULT_ACCOUNT; OAuth tokens: $CONFIGURED_TOKENS/${#PROFILES[@]} configured)
+- **Office network:** $SUMMARY_OFFICE_NETWORK
 - **Published ports:** $SUMMARY_PORTS
 - **Telegram:** $SUMMARY_TELEGRAM
 - **API/session transport:** $SUMMARY_TLS
@@ -639,6 +869,7 @@ chmod 0644 "$SUMMARY_FILE"
 COMPOSE_ARGS=(-p "$PROJECT_NAME" -f "$SCRIPT_DIR/compose.yaml")
 [ "$H_MESH_BIND_PORTS" -eq 0 ] || COMPOSE_ARGS+=(-f "$SCRIPT_DIR/compose.ports.yaml")
 [ "$TLS_MOUNT" -eq 0 ] || COMPOSE_ARGS+=(-f "$SCRIPT_DIR/compose.tls.yaml")
+[ -z "$H_MESH_OFFICE_NETWORK" ] || COMPOSE_ARGS+=(-f "$NETWORK_COMPOSE_FILE")
 COMPOSE_ARGS+=(--env-file "$ENV_FILE" up -d)
 [ "$SKIP_BUILD" -eq 0 ] && COMPOSE_ARGS+=(--build)
 

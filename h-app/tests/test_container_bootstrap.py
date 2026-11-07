@@ -158,8 +158,8 @@ def test_bootstrap_interactive_without_telegram_explicitly_selects_transport(tmp
     log = tmp_path / "docker.log"
     _fake_docker(tmp_path, log)
     env_file = tmp_path / ".env"
-    # agents, CLI, publish, API port, session port, accounts, OAuth, Telegram
-    answers = ["", "", "", "", "", "", "", ""]
+    # agents, CLI, office network, publish, API port, session port, accounts, OAuth, Telegram
+    answers = ["", "", "", "", "", "", "", "", ""]
     answers += ["", "y"] if transport == "plaintext" else [str(cert), str(key), ""]
     output, code = _bootstrap_wizard(env_file, _env_with_fake_docker(tmp_path), answers)
     assert code == 0, output
@@ -181,7 +181,7 @@ def test_bootstrap_interactive_declining_plaintext_requires_tls(tmp_path):
     log = tmp_path / "docker.log"
     _fake_docker(tmp_path, log)
     env_file = tmp_path / ".env"
-    output, code = _bootstrap_wizard(env_file, _env_with_fake_docker(tmp_path), [""] * 10)
+    output, code = _bootstrap_wizard(env_file, _env_with_fake_docker(tmp_path), [""] * 11)
     assert code != 0
     assert "choose TLS or explicitly accept plaintext" in output
     assert "up -d" not in log.read_text()
@@ -204,6 +204,9 @@ _SCRUBBED_BOOTSTRAP_ENV_VARS = (
     "TENANT",
     "AGENTS",
     "DEFAULT_CLI",
+    "H_MESH_OFFICE_NETWORK",
+    "H_MESH_OFFICE_ALIAS",
+    "OFFICE_NETWORK",
     "H_MESH_BIND_PORTS",
     "API_PORT",
     "SESSION_PORT",
@@ -238,6 +241,8 @@ def test_help_documents_attach():
     )
     assert res.returncode == 0, res.stderr
     assert "--attach" in res.stdout
+    assert "--office-network" in res.stdout
+    assert "--no-office-network" in res.stdout
     assert "--bind-ports" in res.stdout
     assert "--no-bind-ports" in res.stdout
     assert "--api-port" in res.stdout
@@ -713,6 +718,311 @@ def test_entrypoint_preflight_applies_when_api_token_is_set_without_telegram(tmp
     summary_text = (env_file.parent / "SUMMARY.md").read_text()
     assert "**API/session transport:** plaintext (H_MESH_ALLOW_PLAINTEXT=1)" in summary_text
     assert "standalone-api-secret" not in summary_text
+
+
+def _fake_docker_with_networks(bin_dir: Path, log_path: Path, initial_networks: dict[str, str] | None = None) -> Path:
+    db_path = bin_dir / "networks.db"
+    lines = [f"{name}={label}" for name, label in (initial_networks or {"bridge": ""}).items()]
+    db_path.write_text("\n".join(lines) + ("\n" if lines else ""))
+    docker = bin_dir / "docker"
+    docker.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "$@" >> "{log_path}"\n'
+        f'DB="{db_path}"\n'
+        'if [ "$1" = "network" ]; then\n'
+        '    sub="$2"\n'
+        '    shift 2\n'
+        '    case "$sub" in\n'
+        '        ls)\n'
+        '            want_label=0\n'
+        '            for arg in "$@"; do\n'
+        '                [ "$arg" = "label=io.h-mesh.office-network=1" ] && want_label=1\n'
+        '            done\n'
+        '            while IFS="=" read -r name val; do\n'
+        '                [ -z "$name" ] && continue\n'
+        '                if [ "$want_label" -eq 1 ]; then\n'
+        '                    [ "$val" = "1" ] && echo "$name"\n'
+        '                else\n'
+        '                    echo "$name"\n'
+        '                fi\n'
+        '            done < "$DB"\n'
+        '            exit 0\n'
+        '            ;;\n'
+        '        inspect)\n'
+        '            target="${!#}"\n'
+        '            if grep -q "^${target}=" "$DB" 2>/dev/null; then\n'
+        '                sed -n "s/^${target}=//p" "$DB" | tail -n1\n'
+        '                exit 0\n'
+        '            fi\n'
+        '            echo "Error: No such network: $target" >&2\n'
+        '            exit 1\n'
+        '            ;;\n'
+        '        create)\n'
+        '            label_val=""\n'
+        '            prev=""\n'
+        '            for arg in "$@"; do\n'
+        '                if [ "$prev" = "--label" ] && [ "$arg" = "io.h-mesh.office-network=1" ]; then\n'
+        '                    label_val="1"\n'
+        '                fi\n'
+        '                prev="$arg"\n'
+        '            done\n'
+        '            target="${!#}"\n'
+        '            printf "%s=%s\\n" "$target" "$label_val" >> "$DB"\n'
+        '            echo "$target"\n'
+        '            exit 0\n'
+        '            ;;\n'
+        '    esac\n'
+        'fi\n'
+        'exit 0\n'
+    )
+    docker.chmod(0o755)
+    return db_path
+
+
+def test_office_network_noninteractive_creates_labelled_network_writes_override_and_defaults_no_ports(tmp_path):
+    log = tmp_path / "docker_calls.log"
+    db_path = _fake_docker_with_networks(tmp_path, log)
+    office_dir = tmp_path / "offices" / "netpod" / "nettenant"
+    office_dir.mkdir(parents=True)
+    env_file = office_dir / ".env"
+
+    res = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP),
+            "--pod", "netpod", "--tenant", "nettenant",
+            "--office-network", "hmesh-shared",
+            "--env-file", str(env_file), "--skip-build", "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env={**_env_with_fake_docker(tmp_path), "H_MESH_ALLOW_PLAINTEXT": "1"},
+        stdin=subprocess.DEVNULL,
+    )
+    assert res.returncode == 0, f"stdout: {res.stdout}\nstderr: {res.stderr}"
+
+    calls = log.read_text()
+    assert "network create --label io.h-mesh.office-network=1 hmesh-shared" in calls
+    assert "hmesh-shared=1" in db_path.read_text()
+
+    env_text = env_file.read_text()
+    assert "H_MESH_OFFICE_NETWORK=hmesh-shared" in env_text
+    assert "H_MESH_OFFICE_ALIAS=netpod-nettenant" in env_text
+    assert "H_MESH_BIND_PORTS=0" in env_text
+
+    override_file = office_dir / "compose.network.yaml"
+    assert override_file.is_file()
+    override_text = override_file.read_text()
+    assert "external: true" in override_text
+    assert "name: hmesh-shared" in override_text
+    assert "- netpod-nettenant" in override_text
+
+    up_call = log.read_text().splitlines()[-1]
+    assert f"-f {override_file}" in up_call
+    assert "compose.ports.yaml" not in up_call
+
+    summary_text = (office_dir / "SUMMARY.md").read_text()
+    attach_text = (office_dir / "attach.sh").read_text()
+    assert "**Office network:** hmesh-shared (alias: netpod-nettenant; peer URL: http://netpod-nettenant:8080)" in summary_text
+    assert "**Published ports:** not published" in summary_text
+    assert f"-f {override_file}" in summary_text
+    assert f"-f {override_file}" in attach_text
+    assert _api_token(env_file) not in summary_text
+    assert _api_token(env_file) not in attach_text
+
+    # Explicit --bind-ports is still respected when an office network is chosen via env.
+    office2_dir = tmp_path / "offices" / "netpod2" / "nettenant"
+    office2_dir.mkdir(parents=True)
+    env_file2 = office2_dir / ".env"
+    env2 = {**_env_with_fake_docker(tmp_path), "H_MESH_OFFICE_NETWORK": "hmesh-shared", "H_MESH_ALLOW_PLAINTEXT": "1"}
+    res2 = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP),
+            "--pod", "netpod2", "--tenant", "nettenant",
+            "--bind-ports", "--api-port", "18190", "--session-port", "18191",
+            "--env-file", str(env_file2), "--skip-build", "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env=env2, stdin=subprocess.DEVNULL,
+    )
+    assert res2.returncode == 0, f"stdout: {res2.stdout}\nstderr: {res2.stderr}"
+    assert "H_MESH_BIND_PORTS=1" in env_file2.read_text()
+    up_call2 = log.read_text().splitlines()[-1]
+    assert "compose.ports.yaml" in up_call2
+    assert f"-f {office2_dir / 'compose.network.yaml'}" in up_call2
+
+
+def test_office_network_idempotent_rerun_and_explicit_detach(tmp_path):
+    log = tmp_path / "docker_calls.log"
+    _fake_docker_with_networks(tmp_path, log)
+    office_dir = tmp_path / "offices" / "testpod" / "testtenant"
+    office_dir.mkdir(parents=True)
+    env_file = office_dir / ".env"
+    override_file = office_dir / "compose.network.yaml"
+    base_env = {**_env_with_fake_docker(tmp_path), "H_MESH_ALLOW_PLAINTEXT": "1"}
+
+    first = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP),
+            "--pod", "testpod", "--tenant", "testtenant",
+            "--office-network", "hmesh-idem",
+            "--env-file", str(env_file), "--skip-build", "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env=base_env, stdin=subprocess.DEVNULL,
+    )
+    assert first.returncode == 0, first.stderr
+    assert override_file.is_file()
+    assert log.read_text().count("network create --label io.h-mesh.office-network=1 hmesh-idem") == 1
+
+    # Rerun without --office-network must NOT recreate the network and must NOT detach the office.
+    second = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP),
+            "--pod", "testpod", "--tenant", "testtenant",
+            "--env-file", str(env_file), "--skip-build", "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env=base_env, stdin=subprocess.DEVNULL,
+    )
+    assert second.returncode == 0, second.stderr
+    assert log.read_text().count("network create --label io.h-mesh.office-network=1 hmesh-idem") == 1
+    assert "H_MESH_OFFICE_NETWORK=hmesh-idem" in env_file.read_text()
+    assert "H_MESH_OFFICE_ALIAS=testpod-testtenant" in env_file.read_text()
+    assert "H_MESH_BIND_PORTS=0" in env_file.read_text()
+    assert override_file.is_file()
+    assert f"-f {override_file}" in log.read_text().splitlines()[-1]
+
+    # Interactive rerun with all blank answers also keeps the existing office network.
+    out_interactive, code_interactive = _bootstrap_wizard(
+        env_file, base_env, ["", "", "", "", "", "", ""]
+    )
+    assert code_interactive == 0, out_interactive
+    assert "H_MESH_OFFICE_NETWORK=hmesh-idem" in env_file.read_text()
+    assert override_file.is_file()
+
+    # Explicit --no-office-network detaches and removes compose.network.yaml.
+    third = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP),
+            "--pod", "testpod", "--tenant", "testtenant",
+            "--no-office-network",
+            "--env-file", str(env_file), "--skip-build", "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env=base_env, stdin=subprocess.DEVNULL,
+    )
+    assert third.returncode == 0, third.stderr
+    assert "H_MESH_OFFICE_NETWORK=" not in env_file.read_text()
+    assert "H_MESH_OFFICE_ALIAS=" not in env_file.read_text()
+    assert not override_file.exists()
+    assert "**Office network:** none" in (office_dir / "SUMMARY.md").read_text()
+
+
+def test_office_network_refuses_unlabelled_existing_network(tmp_path):
+    log = tmp_path / "docker_calls.log"
+    _fake_docker_with_networks(tmp_path, log, initial_networks={"bridge": "", "unlabelled-net": ""})
+    office_dir = tmp_path / "offices" / "testpod" / "testtenant"
+    office_dir.mkdir(parents=True)
+    env_file = office_dir / ".env"
+
+    for bad_net in ("unlabelled-net", "bridge"):
+        log.write_text("")
+        res = subprocess.run(
+            [
+                "bash", str(BOOTSTRAP),
+                "--pod", "testpod", "--tenant", "testtenant",
+                "--office-network", bad_net,
+                "--env-file", str(env_file), "--skip-build", "--non-interactive",
+            ],
+            capture_output=True, text=True, timeout=10,
+            env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+        )
+        assert res.returncode != 0
+        assert "io.h-mesh.office-network=1" in res.stderr
+        assert "refusing to join a network bootstrap did not create" in res.stderr
+        assert "up -d" not in log.read_text()
+        assert not (office_dir / "compose.network.yaml").exists()
+
+
+def test_office_network_interactive_picker_filters_by_label_and_creates_or_joins(tmp_path):
+    log = tmp_path / "docker_calls.log"
+    _fake_docker_with_networks(
+        tmp_path, log,
+        initial_networks={
+            "bridge": "",
+            "foreign-unlabelled": "",
+            "hmesh-alpha": "1",
+            "hmesh-beta": "1",
+        },
+    )
+    office_dir = tmp_path / "offices" / "testpod" / "testtenant"
+    office_dir.mkdir(parents=True)
+    env_file = office_dir / ".env"
+
+    # Choice 3 (join existing) -> pick #2 (hmesh-beta) -> publish ports default no ("") -> accounts/OAuth/Telegram -> plaintext ("", "y")
+    answers_join = ["", "", "3", "2", "", "", "", "", "", "y"]
+    output, code = _bootstrap_wizard(env_file, _env_with_fake_docker(tmp_path), answers_join)
+    assert code == 0, output
+    assert "1) hmesh-alpha" in output
+    assert "2) hmesh-beta" in output
+    assert "bridge" not in output
+    assert "foreign-unlabelled" not in output
+    assert "H_MESH_OFFICE_NETWORK=hmesh-beta" in env_file.read_text()
+    assert "H_MESH_BIND_PORTS=0" in env_file.read_text()
+    assert "name: hmesh-beta" in (office_dir / "compose.network.yaml").read_text()
+
+    # Choice 2 (create new) -> name "hmesh-created" -> publish ports default no ("") -> accounts/OAuth/Telegram
+    office2_dir = tmp_path / "offices" / "testpod2" / "testtenant"
+    office2_dir.mkdir(parents=True)
+    env_file2 = office2_dir / ".env"
+    env2 = {**_env_with_fake_docker(tmp_path), "H_MESH_ALLOW_PLAINTEXT": "1"}
+    answers_create = ["", "", "2", "hmesh-created", "", "", "", ""]
+    output2, code2 = _bootstrap_wizard(env_file2, env2, answers_create)
+    assert code2 == 0, output2
+    assert "network create --label io.h-mesh.office-network=1 hmesh-created" in log.read_text()
+    assert "H_MESH_OFFICE_NETWORK=hmesh-created" in env_file2.read_text()
+    assert "H_MESH_BIND_PORTS=0" in env_file2.read_text()
+
+
+def test_office_network_validates_alias_is_legal_dns_label(tmp_path):
+    log = tmp_path / "docker_calls.log"
+    _fake_docker_with_networks(tmp_path, log)
+    env_file = tmp_path / ".env"
+
+    # Both pod (40 chars) and tenant (30 chars) are valid identity segments individually,
+    # but <pod>-<tenant> is 71 chars (> 63 RFC 1123 DNS label limit).
+    long_pod = "p" * 40
+    long_tenant = "t" * 30
+    res_long = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP),
+            "--pod", long_pod, "--tenant", long_tenant,
+            "--office-network", "hmesh-shared",
+            "--env-file", str(env_file), "--skip-build", "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+    )
+    assert res_long.returncode != 0
+    assert "not a legal DNS label" in res_long.stderr
+    assert "network create" not in log.read_text()
+    assert "up -d" not in log.read_text()
+
+    # A trailing hyphen in tenant also makes <pod>-<tenant> an illegal DNS label.
+    res_hyphen = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP),
+            "--pod", "testpod", "--tenant", "bad-",
+            "--office-network", "hmesh-shared",
+            "--env-file", str(env_file), "--skip-build", "--non-interactive",
+        ],
+        capture_output=True, text=True, timeout=10,
+        env=_env_with_fake_docker(tmp_path), stdin=subprocess.DEVNULL,
+    )
+    assert res_hyphen.returncode != 0
+    assert "not a legal DNS label" in res_hyphen.stderr
+    assert "network create" not in log.read_text()
+    assert "up -d" not in log.read_text()
+
 
 
 

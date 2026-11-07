@@ -159,7 +159,42 @@ H_MESH_ALLOW_PLAINTEXT=1 AGENTS=architect,worker \
 
 > **Why a non-interactive office without TLS or `H_MESH_ALLOW_PLAINTEXT=1` is unreachable from outside:** If neither `API_TLS_CERT`/`API_TLS_KEY` nor `H_MESH_ALLOW_PLAINTEXT=1` is provided during a `--non-interactive` bootstrap, the container still boots, but the entrypoint binds `services.api` to container loopback (`127.0.0.1:8080`). The published host port remains closed until you rerun `bootstrap.sh` with TLS paths or `H_MESH_ALLOW_PLAINTEXT=1`.
 
-### 3.3 Attaching to Your Offices
+### 3.3 Option C: Same-Host Shared Office Network (No Published Host Ports Needed)
+
+When two or more offices run in Docker on the **same host**, they can communicate over a labelled `h-mesh` Docker network (`io.h-mesh.office-network=1`) without publishing any API or session ports on the host:
+
+- **Interactive setup:** Run `./container/bootstrap.sh`. At `Office network choice (1/2/3) [1]:`, choose `2` (`create a new office network`) on the first office (for example, `h-mesh-net`) and `3` (`join an existing office network`) on the second office. The picker lists only Docker networks carrying the label `io.h-mesh.office-network=1` (never `bridge` or unrelated networks). When an office network is chosen, `Publish the API/session ports to the host? [y/N]:` defaults to **no**.
+- **Non-interactive setup:** Pass `--office-network <name>` (or export `H_MESH_OFFICE_NETWORK=<name>`):
+
+```bash
+# Office A (netalpha/default on shared office network h-mesh-net, no host ports published)
+H_MESH_ALLOW_PLAINTEXT=1 AGENTS=architect,worker \
+  ./container/bootstrap.sh --pod netalpha --tenant default --office-network h-mesh-net --non-interactive
+
+# Office B (netbeta/default joining h-mesh-net, reusing the built image, no host ports published)
+H_MESH_ALLOW_PLAINTEXT=1 AGENTS=architect,worker \
+  ./container/bootstrap.sh --pod netbeta --tenant default --office-network h-mesh-net --skip-build --non-interactive
+```
+
+What `bootstrap.sh` configures for an office network:
+
+- Creates the Docker network with `--label io.h-mesh.office-network=1` if missing, or verifies that an existing network of that name carries `io.h-mesh.office-network=1` (refusing any unlabelled network).
+- Attaches the container with the stable DNS alias `<pod>-<tenant>` (validated as a legal RFC 1123 DNS label) via `offices/<pod>/<tenant>/compose.network.yaml` and records `H_MESH_OFFICE_NETWORK` and `H_MESH_OFFICE_ALIAS` in `.env` and `SUMMARY.md`.
+- Defaults `H_MESH_BIND_PORTS=0` so nothing is published on the host IP (pass `--bind-ports` if you also want host ports published).
+- Rerunning `./container/bootstrap.sh --pod <pod> --tenant <tenant>` is idempotent and keeps the office attached to its office network unless `--no-office-network` is passed.
+
+When pairing two offices on the same office network with `h-mesh-office office-add`, use the remote office's container DNS alias and internal API port `8080` (`http://<pod>-<tenant>:8080` with `--allow-plaintext`, or `https://<pod>-<tenant>:8080` with TLS):
+
+```bash
+# On netalpha (as architect), register netbeta via its office-network alias:
+printf '%s\n' 'coop.<id>.<secret>' | \
+  h-mesh-office office-add netbeta http://netbeta-default:8080 \
+    --participant netalpha-peer \
+    --allow-plaintext \
+    --token-stdin
+```
+
+### 3.4 Attaching to Your Offices
 
 Each bootstrapped office writes an executable `attach.sh` and a `SUMMARY.md` (with zero secret values) under `offices/<pod>/<tenant>/`:
 
