@@ -57,6 +57,14 @@ API_PORT="${API_PORT:-}"
 SESSION_PORT="${SESSION_PORT:-}"
 ACCOUNTS="${ACCOUNTS:-}"
 DEFAULT_ACCOUNT="${DEFAULT_ACCOUNT:-}"
+PROVIDER_LOCAL_URL="${PROVIDER_LOCAL_URL:-}"
+PROVIDER_LOCAL_MODEL="${PROVIDER_LOCAL_MODEL:-}"
+PROVIDER_LOCAL_TOKEN="${PROVIDER_LOCAL_TOKEN:-}"
+AGENT_PROVIDERS="${AGENT_PROVIDERS:-}"
+PROVIDER_AGENTS_ARG=""
+PROVIDER_EXPLICIT=0
+[ -n "$PROVIDER_LOCAL_URL" ] || [ -n "$PROVIDER_LOCAL_MODEL" ] || [ -n "$AGENT_PROVIDERS" ] && PROVIDER_EXPLICIT=1
+NO_PROVIDER=0
 
 usage() {
     cat <<EOF
@@ -65,8 +73,9 @@ Usage: ./setup.sh --container [options]
 
 Collects what an office's env file needs (POD, TENANT, AGENTS,
 DEFAULT_CLI, optional shared h-mesh office network, host port publishing,
-Claude account names and OAuth tokens, optional Telegram bot config, and a
-TLS-or-plaintext decision),
+Claude account names and OAuth tokens, optional local model provider config,
+optional Telegram bot config, and a TLS-or-plaintext decision when the API
+is reachable via an office network or published host port),
 writes it to offices/<pod>/<tenant>/.env (alongside an optional
 compose.network.yaml, a regenerated SUMMARY.md, and an executable attach.sh
 containing no secrets), then runs
@@ -86,6 +95,10 @@ Options:
   --no-bind-ports         Do not publish API/session ports to the host (default when an office network is selected)
   --api-port <port>       API host port (default: \$API_PORT, existing value, or 8080)
   --session-port <port>   Session host port (default: \$SESSION_PORT, existing value, or 8081)
+  --provider-url <url>    Local OpenAI-compatible provider base URL (sets PROVIDER_LOCAL_URL)
+  --provider-model <id>   Local model name (sets PROVIDER_LOCAL_MODEL)
+  --provider-agents <a,b> Agents using the local provider, or 'all' (sets AGENT_PROVIDERS; default: all agents)
+  --no-provider           Remove local model provider configuration from the office env file
   --env-file <path>       Use this exact env file instead of offices/<pod>/<tenant>/.env
                           (advanced/testing use -- also disables the project-name isolation
                           this script otherwise guarantees; pass --project-name too if you use it)
@@ -98,9 +111,10 @@ Options:
                           if you only meant to skip a rebuild, not the up itself.
   -h, --help              Show this help message
 
-Per-agent exceptions (AGENT_CLIS/AGENT_PROFILES/AGENT_PROVIDERS) and local
-model provider config (PROVIDER_LOCAL_*) are not prompted for here; add
-those directly to the office's env file. See README.md's "Bootstrap script" section for the
+Per-agent CLI/account exceptions (AGENT_CLIS/AGENT_PROFILES) are not
+prompted for here; add those directly to the office's env file. Optional
+local provider token can be supplied interactively or via PROVIDER_LOCAL_TOKEN.
+See README.md's "Bootstrap script" section for the
 TLS inputs API_TLS_CERT/API_TLS_KEY (and optional SESSION_TLS_CERT/KEY and
 H_MESH_CA_CERT) are readable HOST files, validated and staged read-only for
 the container. Requires openssl and host UID 1000 or root. See README for the
@@ -123,6 +137,10 @@ while [ $# -gt 0 ]; do
         --no-bind-ports) H_MESH_BIND_PORTS=0; BIND_PORTS_EXPLICIT=1; shift ;;
         --api-port) API_PORT="$2"; shift 2 ;;
         --session-port) SESSION_PORT="$2"; shift 2 ;;
+        --provider-url) PROVIDER_LOCAL_URL="$2"; PROVIDER_EXPLICIT=1; shift 2 ;;
+        --provider-model) PROVIDER_LOCAL_MODEL="$2"; PROVIDER_EXPLICIT=1; shift 2 ;;
+        --provider-agents) PROVIDER_AGENTS_ARG="$2"; PROVIDER_EXPLICIT=1; shift 2 ;;
+        --no-provider) NO_PROVIDER=1; PROVIDER_EXPLICIT=1; shift ;;
         --env-file) ENV_FILE_OVERRIDE="$2"; shift 2 ;;
         --project-name) PROJECT_NAME_OVERRIDE="$2"; shift 2 ;;
         --skip-build) SKIP_BUILD=1; shift ;;
@@ -254,6 +272,10 @@ env_file_get() {
 
 EXISTING_OFFICE_NETWORK="$(env_file_get H_MESH_OFFICE_NETWORK)"
 EXISTING_BIND_PORTS="$(env_file_get H_MESH_BIND_PORTS)"
+EXISTING_PROVIDER_URL="$(env_file_get PROVIDER_LOCAL_URL)"
+EXISTING_PROVIDER_MODEL="$(env_file_get PROVIDER_LOCAL_MODEL)"
+EXISTING_PROVIDER_TOKEN="$(env_file_get PROVIDER_LOCAL_TOKEN)"
+EXISTING_AGENT_PROVIDERS="$(env_file_get AGENT_PROVIDERS)"
 EXISTING_TG_TOKEN="$(env_file_get TELEGRAM_BOT_TOKEN)"
 EXISTING_TG_CHAT="$(env_file_get TELEGRAM_CHAT_ID)"
 EXISTING_TG_VOICE="$(env_file_get TELEGRAM_VOICE)"
@@ -415,7 +437,7 @@ ensure_office_network() {
 
 OFFICE_NETWORK_MODE="create_or_join"
 if [ "$INTERACTIVE" -eq 1 ] && [ "$OFFICE_NETWORK_EXPLICIT" -eq 0 ]; then
-    echo "  Office network options (1) none, (2) create a new office network, (3) join an existing office network."
+    echo "Office network options (1) none, (2) create a new office network, (3) join an existing office network."
     if [ -n "$EXISTING_OFFICE_NETWORK" ]; then
         read -rp "Office network choice (1/2/3, blank keeps '$EXISTING_OFFICE_NETWORK'): " _net_choice
     else
@@ -610,6 +632,126 @@ if ! printf '%s\n' "${PROFILES[@]}" | grep -qx "$DEFAULT_ACCOUNT"; then
     exit 1
 fi
 
+provider_agents_from_map() {
+    local map="$1" fallback="$2" pair agent out=()
+    if [ -n "$map" ]; then
+        for pair in ${map//,/ }; do
+            agent="${pair%%=*}"
+            [ -n "$agent" ] && out+=("$agent")
+        done
+    fi
+    if [ "${#out[@]}" -gt 0 ]; then
+        (IFS=,; echo "${out[*]}")
+    else
+        echo "$fallback"
+    fi
+}
+
+build_agent_providers_map() {
+    local raw="$1" roster_csv="$2" item agent prov
+    local -a roster=() pairs=() seen=()
+    IFS=',' read -r -a roster <<< "$roster_csv"
+    if [ "$raw" = "all" ] || [ "$raw" = "ALL" ]; then
+        raw="$roster_csv"
+    fi
+    for item in ${raw//,/ }; do
+        [ -n "$item" ] || continue
+        if [[ "$item" == *=* ]]; then
+            agent="$(slug "${item%%=*}")"
+            prov="$(slug "${item#*=}")"
+        else
+            agent="$(slug "$item")"
+            prov="local"
+        fi
+        if [ -z "$agent" ] || [ -z "$prov" ]; then
+            echo "error: invalid AGENT_PROVIDERS entry '$item'" >&2
+            return 1
+        fi
+        if ! printf '%s\n' "${roster[@]}" | grep -qx "$agent"; then
+            echo "error: local provider agent '$agent' is not listed in AGENTS ($roster_csv)" >&2
+            return 1
+        fi
+        if ! printf '%s\n' "${seen[@]}" | grep -qx "$agent"; then
+            seen+=("$agent")
+            pairs+=("${agent}=${prov}")
+        fi
+    done
+    if [ "${#pairs[@]}" -eq 0 ]; then
+        echo "error: at least one agent must be selected for the local model provider" >&2
+        return 1
+    fi
+    (IFS=,; echo "${pairs[*]}")
+}
+
+WANT_PROVIDER_PERSIST=0
+if [ "$NO_PROVIDER" -eq 1 ]; then
+    PROVIDER_LOCAL_URL=""
+    PROVIDER_LOCAL_MODEL=""
+    PROVIDER_LOCAL_TOKEN=""
+    AGENT_PROVIDERS=""
+elif [ "$INTERACTIVE" -eq 1 ] && [ "$PROVIDER_EXPLICIT" -eq 0 ]; then
+    read -rp "Point any agent at a local model provider? [y/N]: " USE_PROVIDER
+    if check_bool "$USE_PROVIDER" "n"; then
+        _def_url="${PROVIDER_LOCAL_URL:-$EXISTING_PROVIDER_URL}"
+        read -rp "  Local provider base URL, e.g. http://10.0.0.5:8000 (no trailing /v1)${_def_url:+ [$_def_url]}: " _in_url
+        PROVIDER_LOCAL_URL="${_in_url:-$_def_url}"
+        PROVIDER_LOCAL_URL="${PROVIDER_LOCAL_URL%/}"
+        PROVIDER_LOCAL_URL="${PROVIDER_LOCAL_URL%/v1}"
+        _def_model="${PROVIDER_LOCAL_MODEL:-$EXISTING_PROVIDER_MODEL}"
+        read -rp "  Local model name${_def_model:+ [$_def_model]}: " _in_model
+        PROVIDER_LOCAL_MODEL="${_in_model:-$_def_model}"
+        _def_prov_agents="$(provider_agents_from_map "${AGENT_PROVIDERS:-$EXISTING_AGENT_PROVIDERS}" "$AGENTS")"
+        read -rp "  Which agents use it? (comma- or space-separated, or 'all') [$_def_prov_agents]: " _in_agents
+        _in_agents="${_in_agents:-$_def_prov_agents}"
+        if [ -n "${PROVIDER_LOCAL_TOKEN:-$EXISTING_PROVIDER_TOKEN}" ]; then
+            read -rsp "  Optional API token for local provider [keep existing]: " _in_tok; echo
+            PROVIDER_LOCAL_TOKEN="${_in_tok:-${PROVIDER_LOCAL_TOKEN:-$EXISTING_PROVIDER_TOKEN}}"
+        else
+            read -rsp "  Optional API token for local provider (blank for none): " _in_tok; echo
+            PROVIDER_LOCAL_TOKEN="$_in_tok"
+        fi
+        if [ -n "$PROVIDER_LOCAL_URL" ] && [ -n "$PROVIDER_LOCAL_MODEL" ]; then
+            AGENT_PROVIDERS="$(build_agent_providers_map "$_in_agents" "$AGENTS")" || exit 1
+            WANT_PROVIDER_PERSIST=1
+        else
+            echo "  ⚠ Both a local provider URL and model name are required -- local model provider not enabled." >&2
+            PROVIDER_LOCAL_URL=""
+            PROVIDER_LOCAL_MODEL=""
+            PROVIDER_LOCAL_TOKEN=""
+            AGENT_PROVIDERS=""
+        fi
+    else
+        PROVIDER_LOCAL_URL="${PROVIDER_LOCAL_URL:-$EXISTING_PROVIDER_URL}"
+        PROVIDER_LOCAL_MODEL="${PROVIDER_LOCAL_MODEL:-$EXISTING_PROVIDER_MODEL}"
+        PROVIDER_LOCAL_TOKEN="${PROVIDER_LOCAL_TOKEN:-$EXISTING_PROVIDER_TOKEN}"
+        AGENT_PROVIDERS="${AGENT_PROVIDERS:-$EXISTING_AGENT_PROVIDERS}"
+    fi
+else
+    PROVIDER_LOCAL_URL="${PROVIDER_LOCAL_URL:-$EXISTING_PROVIDER_URL}"
+    PROVIDER_LOCAL_URL="${PROVIDER_LOCAL_URL%/}"
+    PROVIDER_LOCAL_URL="${PROVIDER_LOCAL_URL%/v1}"
+    PROVIDER_LOCAL_MODEL="${PROVIDER_LOCAL_MODEL:-$EXISTING_PROVIDER_MODEL}"
+    PROVIDER_LOCAL_TOKEN="${PROVIDER_LOCAL_TOKEN:-$EXISTING_PROVIDER_TOKEN}"
+    if [ -n "$PROVIDER_AGENTS_ARG" ]; then
+        AGENT_PROVIDERS="$(build_agent_providers_map "$PROVIDER_AGENTS_ARG" "$AGENTS")" || exit 1
+    elif [ -n "$AGENT_PROVIDERS" ]; then
+        AGENT_PROVIDERS="$(build_agent_providers_map "$AGENT_PROVIDERS" "$AGENTS")" || exit 1
+    elif [ -n "$EXISTING_AGENT_PROVIDERS" ]; then
+        AGENT_PROVIDERS="$EXISTING_AGENT_PROVIDERS"
+    elif [ -n "$PROVIDER_LOCAL_URL" ] && [ -n "$PROVIDER_LOCAL_MODEL" ]; then
+        AGENT_PROVIDERS="$(build_agent_providers_map "$AGENTS" "$AGENTS")" || exit 1
+    fi
+    if [ "$PROVIDER_EXPLICIT" -eq 1 ]; then
+        if [ -z "$PROVIDER_LOCAL_URL" ] || [ -z "$PROVIDER_LOCAL_MODEL" ]; then
+            echo "error: local model provider requires both --provider-url (PROVIDER_LOCAL_URL) and --provider-model (PROVIDER_LOCAL_MODEL)" >&2
+            exit 1
+        fi
+        WANT_PROVIDER_PERSIST=1
+    elif [ -n "$PROVIDER_LOCAL_URL" ] && [ -n "$PROVIDER_LOCAL_MODEL" ] && [ -n "$AGENT_PROVIDERS" ]; then
+        WANT_PROVIDER_PERSIST=1
+    fi
+fi
+
 if [ "$INTERACTIVE" -eq 1 ]; then
     read -rp "Run the Telegram bot? [y/N]: " WANT_TELEGRAM
     if check_bool "$WANT_TELEGRAM" "n"; then
@@ -640,18 +782,25 @@ fi
 
 # Resolve host files without persisting unvalidated paths. A rerun maps the
 # managed container paths back to its own staged copies, preserving material.
-if [ "$INTERACTIVE" -eq 1 ] && { [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; } && [ "$PLAINTEXT" != "1" ]; then
+# When neither an office network nor a published host port is active, nothing
+# outside the container can reach the API, so skip the TLS/plaintext question
+# and keep loopback-only inside the container.
+if [ "$INTERACTIVE" -eq 1 ] && { [ "$H_MESH_BIND_PORTS" -eq 1 ] || [ -n "$H_MESH_OFFICE_NETWORK" ]; } && { [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; } && [ "$PLAINTEXT" != "1" ]; then
     echo
-    echo "  Every office starts the API. Choose how to reach its published port."
-    echo "  Supply readable HOST files; bootstrap validates and mounts private copies read-only."
-    read -rp "  TLS certificate HOST path (blank to explicitly accept plaintext): " TLS_CERT
+    if [ "$H_MESH_BIND_PORTS" -eq 1 ]; then
+        echo "Every office starts the API. Choose how to reach its published port."
+    else
+        echo "Every office starts the API. Peers on office network '$H_MESH_OFFICE_NETWORK' reach its API on port 8080 (http://$H_MESH_OFFICE_ALIAS:8080 or https://$H_MESH_OFFICE_ALIAS:8080)."
+    fi
+    echo "Supply readable HOST files; bootstrap validates and mounts private copies read-only."
+    read -rp "TLS certificate HOST path (blank to explicitly accept plaintext): " TLS_CERT
     if [ -n "$TLS_CERT" ]; then
         read -rp "  TLS key HOST path: " TLS_KEY
         [ -n "$TLS_KEY" ] || { echo "error: a TLS certificate requires its key" >&2; exit 1; }
         read -rp "  Optional peer CA bundle HOST path (blank for system trust): " CA_CERT
     else
-        echo "  Plaintext sends bearer tokens and messages unencrypted."
-        read -rp "  Accept plaintext for this container? [y/N]: " ACCEPT_PLAINTEXT
+        echo "Plaintext sends bearer tokens and messages unencrypted."
+        read -rp "Accept plaintext for this container? [y/N]: " ACCEPT_PLAINTEXT
         if ! check_bool "$ACCEPT_PLAINTEXT" n; then
             echo "error: choose TLS or explicitly accept plaintext to finish the guided install" >&2
             exit 1
@@ -680,6 +829,17 @@ for _t_idx in "${!TOKEN_VARS[@]}"; do
 done
 upsert_env_line ACCOUNTS "$ACCOUNTS" || exit 1
 upsert_env_line DEFAULT_ACCOUNT "$DEFAULT_ACCOUNT" || exit 1
+if [ "$NO_PROVIDER" -eq 1 ]; then
+    remove_env_line PROVIDER_LOCAL_URL
+    remove_env_line PROVIDER_LOCAL_MODEL
+    remove_env_line PROVIDER_LOCAL_TOKEN
+    remove_env_line AGENT_PROVIDERS
+elif [ "$WANT_PROVIDER_PERSIST" -eq 1 ]; then
+    upsert_env_line PROVIDER_LOCAL_URL "$PROVIDER_LOCAL_URL" || exit 1
+    upsert_env_line PROVIDER_LOCAL_MODEL "$PROVIDER_LOCAL_MODEL" || exit 1
+    upsert_env_line AGENT_PROVIDERS "$AGENT_PROVIDERS" || exit 1
+    [ -z "$PROVIDER_LOCAL_TOKEN" ] || upsert_env_line PROVIDER_LOCAL_TOKEN "$PROVIDER_LOCAL_TOKEN" || exit 1
+fi
 if [ "$WANT_TELEGRAM_PERSIST" -eq 1 ]; then
     upsert_env_line TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN" || exit 1
     upsert_env_line TELEGRAM_CHAT_ID "$TELEGRAM_CHAT_ID" || exit 1
@@ -697,7 +857,13 @@ for transport_key in API_TLS_CERT API_TLS_KEY SESSION_TLS_CERT SESSION_TLS_KEY H
 done
 API_ENABLEMENT=""
 if { [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; } && [ "$PLAINTEXT" != "1" ]; then
-    API_ENABLEMENT="API is loopback-only inside the container; published API port $API_PORT is closed. To open it, rerun bootstrap with API_TLS_CERT and API_TLS_KEY (readable HOST paths), or H_MESH_ALLOW_PLAINTEXT=1 to explicitly accept plaintext."
+    if [ "$H_MESH_BIND_PORTS" -eq 1 ]; then
+        API_ENABLEMENT="API is loopback-only inside the container; published API port $API_PORT is closed. To open it, rerun bootstrap with API_TLS_CERT and API_TLS_KEY (readable HOST paths), or H_MESH_ALLOW_PLAINTEXT=1 to explicitly accept plaintext."
+    elif [ -n "$H_MESH_OFFICE_NETWORK" ]; then
+        API_ENABLEMENT="API is loopback-only inside the container; peer URL http://$H_MESH_OFFICE_ALIAS:8080 on office network '$H_MESH_OFFICE_NETWORK' is closed. To open it, rerun bootstrap with API_TLS_CERT and API_TLS_KEY (readable HOST paths), or H_MESH_ALLOW_PLAINTEXT=1 to explicitly accept plaintext."
+    else
+        API_ENABLEMENT="API is loopback-only inside the container (127.0.0.1:8080); no office network is joined and no host ports are published, so nothing outside the container can reach the API."
+    fi
 fi
 
 echo
@@ -720,6 +886,17 @@ echo "  Default acct: $DEFAULT_ACCOUNT"
 CONFIGURED_TOKENS=0
 for token_name in "${TOKEN_VARS[@]}"; do [ -n "$(env_file_get "$token_name")" ] && CONFIGURED_TOKENS=$((CONFIGURED_TOKENS + 1)); done
 echo "  OAuth tokens: $CONFIGURED_TOKENS/${#PROFILES[@]} configured"
+SUMMARY_PROV_URL="$(env_file_get PROVIDER_LOCAL_URL)"
+SUMMARY_PROV_MODEL="$(env_file_get PROVIDER_LOCAL_MODEL)"
+SUMMARY_PROV_TOKEN="$(env_file_get PROVIDER_LOCAL_TOKEN)"
+SUMMARY_AGENT_PROVIDERS="$(env_file_get AGENT_PROVIDERS)"
+if [ -n "$SUMMARY_PROV_URL" ] && [ -n "$SUMMARY_PROV_MODEL" ]; then
+    SUMMARY_PROV_TOK_STATE="$([ -n "$SUMMARY_PROV_TOKEN" ] && echo "configured" || echo "not set")"
+    SUMMARY_LOCAL_PROVIDER="$SUMMARY_PROV_MODEL @ $SUMMARY_PROV_URL (agents: ${SUMMARY_AGENT_PROVIDERS:-none}; token: $SUMMARY_PROV_TOK_STATE)"
+else
+    SUMMARY_LOCAL_PROVIDER="not configured"
+fi
+echo "  Local model:  $SUMMARY_LOCAL_PROVIDER"
 SUMMARY_TG_TOKEN="$(env_file_get TELEGRAM_BOT_TOKEN)"
 SUMMARY_TG_CHAT="$(env_file_get TELEGRAM_CHAT_ID)"
 SUMMARY_API_TOKEN="$(env_file_get API_TOKEN)"
@@ -797,6 +974,8 @@ if { [ -n "$SUMMARY_TG_TOKEN" ] && [ -n "$SUMMARY_TG_CHAT" ]; } || [ -n "$SUMMAR
         SUMMARY_TLS="TLS ($(env_file_get API_TLS_CERT))"
     elif [ "$PLAINTEXT" = "1" ]; then
         SUMMARY_TLS="plaintext (H_MESH_ALLOW_PLAINTEXT=1)"
+    elif [ "$H_MESH_BIND_PORTS" -eq 0 ] && [ -z "$H_MESH_OFFICE_NETWORK" ]; then
+        SUMMARY_TLS="loopback-only inside the container (no office network or published host port)"
     else
         SUMMARY_TLS="loopback-only inside the container"
     fi
@@ -822,6 +1001,7 @@ cat > "$SUMMARY_FILE" <<EOF
 - **Agents:** $AGENTS
 - **Default CLI:** $DEFAULT_CLI
 - **Accounts:** $ACCOUNTS (default: $DEFAULT_ACCOUNT; OAuth tokens: $CONFIGURED_TOKENS/${#PROFILES[@]} configured)
+- **Local model provider:** $SUMMARY_LOCAL_PROVIDER
 - **Office network:** $SUMMARY_OFFICE_NETWORK
 - **Published ports:** $SUMMARY_PORTS
 - **Telegram:** $SUMMARY_TELEGRAM

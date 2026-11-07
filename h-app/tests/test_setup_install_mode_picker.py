@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PICKER = "[container/host] (container): "
+PICKER = "(container/host) [container]: "
 
 
 @pytest.fixture
@@ -66,15 +66,26 @@ def _run_at_tty(setup, env, args, *, answer=None, until):
         os.close(master)
 
 
-@pytest.mark.parametrize("answer", ["", "h", "Host"])
+@pytest.mark.parametrize("answer", ["", "c", "Container", "h", "Host"])
 def test_setup_tty_picker_answer_routing(picker_setup, answer):
     setup, env = picker_setup
-    selected = "container-selected" if not answer else "Pod name ["
+    is_container = answer.lower() in ("", "c", "container")
+    selected = "container-selected" if is_container else "Pod name ["
     output = _run_at_tty(
         setup, env, ["--skip-deps"], answer=answer, until=selected,
     )
     assert PICKER in output
-    assert ("container-selected" in output) == (not answer)
+    assert ("container-selected" in output) == is_container
+
+
+def test_setup_tty_picker_rejects_invalid_answer_and_reasks(picker_setup):
+    setup, env = picker_setup
+    output = _run_at_tty(
+        setup, env, ["--skip-deps"], answer="invalid\nhost", until="Pod name [",
+    )
+    assert "error: expected 'container' or 'host' (got: 'invalid')" in output
+    assert output.count(PICKER) >= 2
+    assert "container-selected" not in output
 
 
 @pytest.mark.parametrize("non_interactive", [False, True])

@@ -73,11 +73,12 @@ def _env(bin_dir: Path) -> dict:
     env.pop("ACCOUNTS", None)
     env.pop("DEFAULT_ACCOUNT", None)
     for key in list(env):
-        if (key.startswith(("CLAUDE_OAUTH_TOKEN_", "TELEGRAM_"))
+        if (key.startswith(("CLAUDE_OAUTH_TOKEN_", "TELEGRAM_", "PROVIDER_"))
                 or key in ("CLAUDE_CODE_OAUTH_TOKEN", "API_TOKEN", "API_TLS_CERT",
                            "API_TLS_KEY", "H_MESH_ALLOW_PLAINTEXT", "H_MESH_CA_CERT",
                            "SESSION_TLS_CERT", "SESSION_TLS_KEY", "H_MESH_TLS_DIR",
-                           "H_MESH_OFFICE_NETWORK", "H_MESH_OFFICE_ALIAS", "OFFICE_NETWORK")):
+                           "H_MESH_OFFICE_NETWORK", "H_MESH_OFFICE_ALIAS", "OFFICE_NETWORK",
+                           "AGENT_PROVIDERS")):
             del env[key]
     return env
 
@@ -87,8 +88,8 @@ def _env_file_text(path: Path) -> str:
 
 
 def _with_defaults(answers: list[str]) -> list[str]:
-    """Accept default office network, default port publishing, and the default single account."""
-    return [*answers[:2], "", "", "", "", "", *answers[2:]]
+    """Accept default office network, default port publishing, default single account, and no local provider."""
+    return [*answers[:2], "", "", "", "", "", answers[2], "", *answers[3:]]
 
 
 def test_banner_prints_at_a_real_terminal(tmp_path):
@@ -289,8 +290,8 @@ def test_port_prompt_accepts_custom_ports(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        # agents, cli, office net=none, bind=yes, api, session, single account, oauth, telegram=no
-        answers=["", "", "", "y", "18080", "18081", "", "", "n", "", "y"],
+        # agents, cli, office net=none, bind=yes, api, session, single account, oauth, local provider=no, telegram=no
+        answers=["", "", "", "y", "18080", "18081", "", "", "", "n", "", "y"],
     )
     assert code == 0, output
     text = _env_file_text(env_file)
@@ -305,12 +306,14 @@ def test_port_prompt_can_disable_host_publishing(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        # agents, cli, office net=none, bind=no (no port prompts), single account, oauth, telegram=no
-        answers=["", "", "", "n", "", "", "n", "", "y"],
+        # agents, cli, office net=none, bind=no (no port prompts), single account, oauth, local provider=no, telegram=no (no TLS prompt when unreachable)
+        answers=["", "", "", "n", "", "", "", "n"],
     )
     assert code == 0, output
     assert "H_MESH_BIND_PORTS=0" in _env_file_text(env_file)
     assert "Host ports:   not published" in output
+    assert "TLS certificate HOST path" not in output
+    assert "no office network or published host port" in (tmp_path / "SUMMARY.md").read_text()
 
 
 def test_multiple_accounts_and_oauth_tokens_are_persisted(tmp_path):
@@ -319,8 +322,8 @@ def test_multiple_accounts_and_oauth_tokens_are_persisted(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        # agents, cli, office net=none, bind=yes, api, session, multi=yes, count, account names/tokens, default, telegram=no
-        answers=["", "", "", "", "", "", "y", "2", "", "tok-default", "backup", "tok-backup", "backup", "n", "", "y"],
+        # agents, cli, office net=none, bind=yes, api, session, multi=yes, count, account names/tokens, default, local provider=no, telegram=no
+        answers=["", "", "", "", "", "", "y", "2", "", "tok-default", "backup", "tok-backup", "backup", "", "n", "", "y"],
     )
     assert code == 0, output
     text = _env_file_text(env_file)
@@ -342,8 +345,8 @@ def test_multiple_account_rerun_keeps_existing_names_and_tokens(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        # agents, cli, office net=none, bind=yes, api, session, multi=yes, keep count/names/tokens/default, telegram=no
-        answers=["", "", "", "", "", "", "y", "", "", "", "", "", "", "n", "", "y"],
+        # agents, cli, office net=none, bind=yes, api, session, multi=yes, keep count/names/tokens/default, local provider=no, telegram=no
+        answers=["", "", "", "", "", "", "y", "", "", "", "", "", "", "", "n", "", "y"],
     )
     assert code == 0, output
     text = _env_file_text(env_file)
@@ -351,3 +354,77 @@ def test_multiple_account_rerun_keeps_existing_names_and_tokens(tmp_path):
     assert "CLAUDE_OAUTH_TOKEN_DEFAULT=one" in text
     assert "CLAUDE_OAUTH_TOKEN_BACKUP=two" in text
     assert output.count("[keep existing]") == 2
+
+
+def test_local_provider_interactive_and_noninteractive_and_rerun(tmp_path):
+    _fake_docker(tmp_path)
+    env_file = tmp_path / "office.env"
+    # Interactive: agents=architect,worker, cli=claude, office net=none, bind=no, single account, oauth=blank,
+    # local provider=yes, url=http://10.0.0.5:8000/v1/, model=nemotron-30b, agents="", token="secret-prov-tok", telegram=no
+    output, code = _run_wizard(
+        ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
+        env=_env(tmp_path),
+        answers=[
+            "architect,worker", "", "", "n", "", "",
+            "y", "http://10.0.0.5:8000/v1/", "nemotron-30b", "", "secret-prov-tok",
+            "n",
+        ],
+    )
+    assert code == 0, output
+    text = _env_file_text(env_file)
+    assert "PROVIDER_LOCAL_URL=http://10.0.0.5:8000" in text
+    assert "PROVIDER_LOCAL_MODEL=nemotron-30b" in text
+    assert "AGENT_PROVIDERS=architect=local,worker=local" in text
+    assert "PROVIDER_LOCAL_TOKEN=secret-prov-tok" in text
+    assert "secret-prov-tok" not in output
+    assert "token: configured" in output
+    summary = (tmp_path / "SUMMARY.md").read_text()
+    assert "nemotron-30b @ http://10.0.0.5:8000 (agents: architect=local,worker=local; token: configured)" in summary
+    assert "secret-prov-tok" not in summary
+
+    # Rerun opting into local provider keeps existing URL, model, agents, and token on blank answers.
+    output_rerun, code_rerun = _run_wizard(
+        ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
+        env=_env(tmp_path),
+        answers=["", "", "", "", "", "", "y", "", "", "", "", "n"],
+    )
+    assert code_rerun == 0, output_rerun
+    assert "Optional API token for local provider [keep existing]:" in output_rerun
+    assert "PROVIDER_LOCAL_TOKEN=secret-prov-tok" in _env_file_text(env_file)
+    assert "secret-prov-tok" not in output_rerun
+
+    # Non-interactive --no-provider clears the provider settings.
+    proc_clear = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP),
+            "--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file),
+            "--no-provider", "--non-interactive",
+        ],
+        env=_env(tmp_path), capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+    )
+    assert proc_clear.returncode == 0, proc_clear.stderr
+    cleared = _env_file_text(env_file)
+    assert "PROVIDER_LOCAL_URL=" not in cleared
+    assert "PROVIDER_LOCAL_MODEL=" not in cleared
+    assert "PROVIDER_LOCAL_TOKEN=" not in cleared
+    assert "AGENT_PROVIDERS=" not in cleared
+
+    # Non-interactive --provider-url / --provider-model / --provider-agents writes them before compose up.
+    proc_set = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP),
+            "--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file),
+            "--agents", "architect,worker",
+            "--provider-url", "http://172.16.0.11:8000/v1",
+            "--provider-model", "nemotron-3.5",
+            "--provider-agents", "worker",
+            "--non-interactive",
+        ],
+        env=_env(tmp_path), capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+    )
+    assert proc_set.returncode == 0, proc_set.stderr
+    set_text = _env_file_text(env_file)
+    assert "PROVIDER_LOCAL_URL=http://172.16.0.11:8000" in set_text
+    assert "PROVIDER_LOCAL_MODEL=nemotron-3.5" in set_text
+    assert "AGENT_PROVIDERS=worker=local" in set_text
+    assert "token: not set" in proc_set.stdout

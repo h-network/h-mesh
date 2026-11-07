@@ -158,8 +158,8 @@ def test_bootstrap_interactive_without_telegram_explicitly_selects_transport(tmp
     log = tmp_path / "docker.log"
     _fake_docker(tmp_path, log)
     env_file = tmp_path / ".env"
-    # agents, CLI, office network, publish, API port, session port, accounts, OAuth, Telegram
-    answers = ["", "", "", "", "", "", "", "", ""]
+    # agents, CLI, office network, publish, API port, session port, accounts, OAuth, local provider, Telegram
+    answers = ["", "", "", "", "", "", "", "", "", ""]
     answers += ["", "y"] if transport == "plaintext" else [str(cert), str(key), ""]
     output, code = _bootstrap_wizard(env_file, _env_with_fake_docker(tmp_path), answers)
     assert code == 0, output
@@ -181,7 +181,7 @@ def test_bootstrap_interactive_declining_plaintext_requires_tls(tmp_path):
     log = tmp_path / "docker.log"
     _fake_docker(tmp_path, log)
     env_file = tmp_path / ".env"
-    output, code = _bootstrap_wizard(env_file, _env_with_fake_docker(tmp_path), [""] * 11)
+    output, code = _bootstrap_wizard(env_file, _env_with_fake_docker(tmp_path), [""] * 12)
     assert code != 0
     assert "choose TLS or explicitly accept plaintext" in output
     assert "up -d" not in log.read_text()
@@ -212,6 +212,7 @@ _SCRUBBED_BOOTSTRAP_ENV_VARS = (
     "SESSION_PORT",
     "ACCOUNTS",
     "DEFAULT_ACCOUNT",
+    "AGENT_PROVIDERS",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "API_TOKEN",
     "API_TLS_CERT",
@@ -230,7 +231,7 @@ def _env_with_fake_docker(bin_dir: Path) -> dict:
     for key in _SCRUBBED_BOOTSTRAP_ENV_VARS:
         env.pop(key, None)
     for key in list(env):
-        if key.startswith(("CLAUDE_OAUTH_TOKEN_", "TELEGRAM_")):
+        if key.startswith(("CLAUDE_OAUTH_TOKEN_", "TELEGRAM_", "PROVIDER_")):
             del env[key]
     return env
 
@@ -893,7 +894,7 @@ def test_office_network_idempotent_rerun_and_explicit_detach(tmp_path):
 
     # Interactive rerun with all blank answers also keeps the existing office network.
     out_interactive, code_interactive = _bootstrap_wizard(
-        env_file, base_env, ["", "", "", "", "", "", ""]
+        env_file, base_env, ["", "", "", "", "", "", "", ""]
     )
     assert code_interactive == 0, out_interactive
     assert "H_MESH_OFFICE_NETWORK=hmesh-idem" in env_file.read_text()
@@ -958,24 +959,26 @@ def test_office_network_interactive_picker_filters_by_label_and_creates_or_joins
     office_dir.mkdir(parents=True)
     env_file = office_dir / ".env"
 
-    # Choice 3 (join existing) -> pick #2 (hmesh-beta) -> publish ports default no ("") -> accounts/OAuth/Telegram -> plaintext ("", "y")
-    answers_join = ["", "", "3", "2", "", "", "", "", "", "y"]
+    # Choice 3 (join existing) -> pick #2 (hmesh-beta) -> publish ports default no ("") -> accounts/OAuth/local provider/Telegram -> plaintext ("", "y")
+    answers_join = ["", "", "3", "2", "", "", "", "", "", "", "y"]
     output, code = _bootstrap_wizard(env_file, _env_with_fake_docker(tmp_path), answers_join)
     assert code == 0, output
     assert "1) hmesh-alpha" in output
     assert "2) hmesh-beta" in output
     assert "bridge" not in output
     assert "foreign-unlabelled" not in output
+    assert "Peers on office network 'hmesh-beta' reach its API on port 8080" in output
+    assert "Choose how to reach its published port" not in output
     assert "H_MESH_OFFICE_NETWORK=hmesh-beta" in env_file.read_text()
     assert "H_MESH_BIND_PORTS=0" in env_file.read_text()
     assert "name: hmesh-beta" in (office_dir / "compose.network.yaml").read_text()
 
-    # Choice 2 (create new) -> name "hmesh-created" -> publish ports default no ("") -> accounts/OAuth/Telegram
+    # Choice 2 (create new) -> name "hmesh-created" -> publish ports default no ("") -> accounts/OAuth/local provider/Telegram
     office2_dir = tmp_path / "offices" / "testpod2" / "testtenant"
     office2_dir.mkdir(parents=True)
     env_file2 = office2_dir / ".env"
     env2 = {**_env_with_fake_docker(tmp_path), "H_MESH_ALLOW_PLAINTEXT": "1"}
-    answers_create = ["", "", "2", "hmesh-created", "", "", "", ""]
+    answers_create = ["", "", "2", "hmesh-created", "", "", "", "", ""]
     output2, code2 = _bootstrap_wizard(env_file2, env2, answers_create)
     assert code2 == 0, output2
     assert "network create --label io.h-mesh.office-network=1 hmesh-created" in log.read_text()
