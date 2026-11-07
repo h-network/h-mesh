@@ -315,6 +315,26 @@ remove_env_line() {
     mv "$tmp" "$ENV_FILE"
 }
 
+upsert_env_line POD "$POD" || exit 1
+upsert_env_line TENANT "$TENANT" || exit 1
+upsert_env_line AGENTS "$AGENTS" || exit 1
+upsert_env_line DEFAULT_CLI "$DEFAULT_CLI" || exit 1
+
+# Bootstrap runs before the container has a tenant config. Persist the API
+# identity here, so Compose and every later recreate inherit the same one.
+# Existing office values win over ambient credentials from another office.
+RESOLVED_API_TOKEN="$(env_file_get API_TOKEN)"
+if [ -z "$RESOLVED_API_TOKEN" ]; then
+    RESOLVED_API_TOKEN="${API_TOKEN:-}"
+    if [ -z "$RESOLVED_API_TOKEN" ]; then
+        RESOLVED_API_TOKEN="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" || exit 1
+        [[ "$RESOLVED_API_TOKEN" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "error: could not generate API_TOKEN" >&2; exit 1;
+        }
+    fi
+    upsert_env_line API_TOKEN "$RESOLVED_API_TOKEN" || exit 1
+fi
+
 check_bool() {
     local val="$1" def="$2"
     val="${val:-$def}"
@@ -640,30 +660,8 @@ if [ "$INTERACTIVE" -eq 1 ] && { [ -z "$TLS_CERT" ] || [ -z "$TLS_KEY" ]; } && [
     fi
 fi
 
-# Bootstrap runs before the container has a tenant config. Persist the API
-# identity here, so Compose and every later recreate inherit the same one.
-# Existing office values win over ambient credentials from another office.
-RESOLVED_API_TOKEN="$(env_file_get API_TOKEN)"
-if [ -z "$RESOLVED_API_TOKEN" ]; then
-    RESOLVED_API_TOKEN="${API_TOKEN:-}"
-    if [ -z "$RESOLVED_API_TOKEN" ]; then
-        RESOLVED_API_TOKEN="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" || exit 1
-        [[ "$RESOLVED_API_TOKEN" =~ ^[0-9a-f]{64}$ ]] || {
-            echo "error: could not generate API_TOKEN" >&2; exit 1;
-        }
-    fi
-fi
-
 if [ -n "$H_MESH_OFFICE_NETWORK" ]; then
     ensure_office_network "$H_MESH_OFFICE_NETWORK" "$OFFICE_NETWORK_MODE" || exit 1
-fi
-
-upsert_env_line POD "$POD" || exit 1
-upsert_env_line TENANT "$TENANT" || exit 1
-upsert_env_line AGENTS "$AGENTS" || exit 1
-upsert_env_line DEFAULT_CLI "$DEFAULT_CLI" || exit 1
-upsert_env_line API_TOKEN "$RESOLVED_API_TOKEN" || exit 1
-if [ -n "$H_MESH_OFFICE_NETWORK" ]; then
     upsert_env_line H_MESH_OFFICE_NETWORK "$H_MESH_OFFICE_NETWORK" || exit 1
     upsert_env_line H_MESH_OFFICE_ALIAS "$H_MESH_OFFICE_ALIAS" || exit 1
 else

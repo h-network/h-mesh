@@ -52,7 +52,7 @@ def _run_wizard(args: list[str], env: dict, answers: list[str], timeout: float =
             if not chunk:
                 break
             output += chunk
-            if output.rstrip().endswith(b":") and answer_idx < len(answers):
+            if chunk.rstrip().endswith(b":") and answer_idx < len(answers):
                 os.write(master, (answers[answer_idx] + "\n").encode())
                 answer_idx += 1
 
