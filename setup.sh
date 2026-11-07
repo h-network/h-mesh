@@ -69,11 +69,16 @@ if [ -z "$INSTALL_MODE" ]; then
         [ "$_arg" = "--non-interactive" ] && _noninteractive=1
     done
     if [ "$_noninteractive" -eq 0 ] && [ -t 0 ]; then
-        read -rp "Run in a Docker container, or install on this host? [container/host] (container): " _mode_answer
-        case "$_mode_answer" in
-            [Hh]*) INSTALL_MODE="host" ;;
-            *) INSTALL_MODE="container" ;;
-        esac
+        while [ -z "$INSTALL_MODE" ]; do
+            if ! read -rp "Run in a Docker container, or install on this host? (container/host) [container]: " _mode_answer; then
+                exit 1
+            fi
+            case "${_mode_answer,,}" in
+                ""|c|container) INSTALL_MODE="container" ;;
+                h|host) INSTALL_MODE="host" ;;
+                *) echo "error: expected 'container' or 'host' (got: '$_mode_answer')" >&2 ;;
+            esac
+        done
     else
         INSTALL_MODE="host"
     fi
@@ -537,6 +542,7 @@ EP_NAME="$(ENV_TENANT_GET PROVIDER_NAME local)"
 PROVIDER_KEY_PREFIX="$(provider_key_prefix "$EP_NAME")"
 LOCAL_URL="$(ENV_TENANT_GET "${PROVIDER_KEY_PREFIX}_URL" "")"
 LOCAL_MODEL="$(ENV_TENANT_GET "${PROVIDER_KEY_PREFIX}_MODEL" "")"
+LOCAL_TOKEN="$(ENV_TENANT_GET "${PROVIDER_KEY_PREFIX}_TOKEN" "local")"
 LOCAL_KIND="$(ENV_TENANT_GET "${PROVIDER_KEY_PREFIX}_KIND" vllm)"
 
 TELEGRAM_BOT_TOKEN="$(ENV_TENANT_GET TELEGRAM_BOT_TOKEN "")"
@@ -838,7 +844,7 @@ if [ "${#PROVIDER_MAP[@]}" -gt 0 ] && [ -n "$LOCAL_URL" ]; then
     PROVIDER_KEY_PREFIX="$(provider_key_prefix "$EP_NAME")"
     persist_line "${PROVIDER_KEY_PREFIX}_URL" "$LOCAL_URL"
     persist_line "${PROVIDER_KEY_PREFIX}_MODEL" "$LOCAL_MODEL"
-    persist_line "${PROVIDER_KEY_PREFIX}_TOKEN" "local"
+    persist_line "${PROVIDER_KEY_PREFIX}_TOKEN" "$LOCAL_TOKEN"
     persist_line "${PROVIDER_KEY_PREFIX}_KIND" "$LOCAL_KIND"
 fi
 [ -n "$TELEGRAM_BOT_TOKEN" ] && persist_line TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN"
