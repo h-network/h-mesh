@@ -203,19 +203,54 @@ which you want before anything else, with container as the default -- see
 "Bootstrap script" above. Selecting container or passing `--container`
 hands off entirely to `container/bootstrap.sh`, a smaller wizard (same
 banner as the host wizard) that collects `POD`/`TENANT`/`AGENTS`/
-`DEFAULT_CLI`, whether to publish the API/session ports (and which host
+`DEFAULT_CLI`, an optional shared `h-mesh` office network choice (`1` none,
+`2` create a new office network, or `3` join an existing office network),
+whether to publish the API/session ports (and which host
 ports to use), one or more Claude account names, and each account's OAuth
 token (blank to log in
 interactively later -- see "Finding and attaching..." below for how a
 container operator can actually do that), and optional Telegram bot config,
-writes them to `offices/<pod>/<tenant>/.env` (alongside a regenerated
-`SUMMARY.md` and executable `attach.sh`, neither of which contains secret
+writes them to `offices/<pod>/<tenant>/.env` (alongside an optional
+`compose.network.yaml`, a regenerated
+`SUMMARY.md`, and an executable `attach.sh`, none of which contain secret
 values), and runs `docker compose up
 --build`. The interactive wizard always requires a TLS-or-plaintext choice
 for the API, including when Telegram is declined. A certificate path requires
 its key; plaintext requires an explicit yes, so completing the guided install
 with published ports leaves the API reachable. Run `./container/bootstrap.sh
 --help` for its full flag/env surface.
+
+**Shared office network (same-host inter-office without publishing host ports).**
+`container/bootstrap.sh` can attach offices on the same Docker host to a
+labelled `h-mesh` Docker network (`io.h-mesh.office-network=1`):
+- **Interactive picker:** Offers `(1) none` (default on a fresh office),
+  `(2) create a new office network`, or `(3) join an existing office network`.
+  The picker lists **only** Docker networks carrying the label
+  `io.h-mesh.office-network=1` (filtered by label, never by name, so `bridge`
+  or unrelated Docker networks are never shown or joined).
+- **Non-interactive flag/env:** `--office-network <name>` (or
+  `H_MESH_OFFICE_NETWORK=<name>`) creates `<name>` with label
+  `io.h-mesh.office-network=1` if missing, or joins it if it already carries
+  that label. If a network named `<name>` already exists without
+  `io.h-mesh.office-network=1`, `bootstrap.sh` refuses before starting Compose.
+- **Stable DNS alias (`<pod>-<tenant>`):** The container joins the office
+  network with the alias `<pod>-<tenant>` (validated as a legal RFC 1123 DNS
+  label), so sibling offices on the same office network reach its API at
+  `http://<pod>-<tenant>:8080` (or `https://<pod>-<tenant>:8080`) without
+  publishing any ports on the host.
+- **Host port publishing default:** When an office network is chosen, host port
+  publishing defaults to **no** (`H_MESH_BIND_PORTS=0`); pass `--bind-ports`
+  (or answer `y` interactively) to also publish host ports.
+- **Persistence and idempotent reruns:** `bootstrap.sh` records
+  `H_MESH_OFFICE_NETWORK` and `H_MESH_OFFICE_ALIAS` in
+  `offices/<pod>/<tenant>/.env` and `SUMMARY.md`, and writes
+  `offices/<pod>/<tenant>/compose.network.yaml` next to `.env` (included in
+  `SUMMARY.md` and `attach.sh` Compose commands so the network attachment
+  survives container recreates and manual `docker compose up`). Rerunning
+  `./container/bootstrap.sh --pod <pod> --tenant <tenant>` is idempotent and
+  keeps the office on its configured network unless `--no-office-network` (or
+  interactive choice `1`) is explicitly given. Existing offices without
+  `H_MESH_OFFICE_NETWORK` keep working unchanged.
 
 **One office, one directory, one explicit Compose project.** Docker
 Compose's own project-name default is the *containing folder's* name

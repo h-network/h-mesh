@@ -76,7 +76,8 @@ def _env(bin_dir: Path) -> dict:
         if (key.startswith(("CLAUDE_OAUTH_TOKEN_", "TELEGRAM_"))
                 or key in ("CLAUDE_CODE_OAUTH_TOKEN", "API_TOKEN", "API_TLS_CERT",
                            "API_TLS_KEY", "H_MESH_ALLOW_PLAINTEXT", "H_MESH_CA_CERT",
-                           "SESSION_TLS_CERT", "SESSION_TLS_KEY", "H_MESH_TLS_DIR")):
+                           "SESSION_TLS_CERT", "SESSION_TLS_KEY", "H_MESH_TLS_DIR",
+                           "H_MESH_OFFICE_NETWORK", "H_MESH_OFFICE_ALIAS", "OFFICE_NETWORK")):
             del env[key]
     return env
 
@@ -86,8 +87,8 @@ def _env_file_text(path: Path) -> str:
 
 
 def _with_defaults(answers: list[str]) -> list[str]:
-    """Accept default port publishing and the default single account."""
-    return [*answers[:2], "", "", "", "", *answers[2:]]
+    """Accept default office network, default port publishing, and the default single account."""
+    return [*answers[:2], "", "", "", "", "", *answers[2:]]
 
 
 def test_banner_prints_at_a_real_terminal(tmp_path):
@@ -288,8 +289,8 @@ def test_port_prompt_accepts_custom_ports(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        # agents, cli, bind=yes, api, session, single account, oauth, telegram=no
-        answers=["", "", "y", "18080", "18081", "", "", "n", "", "y"],
+        # agents, cli, office net=none, bind=yes, api, session, single account, oauth, telegram=no
+        answers=["", "", "", "y", "18080", "18081", "", "", "n", "", "y"],
     )
     assert code == 0, output
     text = _env_file_text(env_file)
@@ -304,8 +305,8 @@ def test_port_prompt_can_disable_host_publishing(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        # agents, cli, bind=no (no port prompts), single account, oauth, telegram=no
-        answers=["", "", "n", "", "", "n", "", "y"],
+        # agents, cli, office net=none, bind=no (no port prompts), single account, oauth, telegram=no
+        answers=["", "", "", "n", "", "", "n", "", "y"],
     )
     assert code == 0, output
     assert "H_MESH_BIND_PORTS=0" in _env_file_text(env_file)
@@ -318,8 +319,8 @@ def test_multiple_accounts_and_oauth_tokens_are_persisted(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        # agents, cli, multi=yes, count, account names/tokens, default, telegram=no
-        answers=["", "", "", "", "", "y", "2", "", "tok-default", "backup", "tok-backup", "backup", "n", "", "y"],
+        # agents, cli, office net=none, bind=yes, api, session, multi=yes, count, account names/tokens, default, telegram=no
+        answers=["", "", "", "", "", "", "y", "2", "", "tok-default", "backup", "tok-backup", "backup", "n", "", "y"],
     )
     assert code == 0, output
     text = _env_file_text(env_file)
@@ -341,8 +342,8 @@ def test_multiple_account_rerun_keeps_existing_names_and_tokens(tmp_path):
     output, code = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        # agents, cli, multi=yes, keep count/names/tokens/default, telegram=no
-        answers=["", "", "", "", "", "y", "", "", "", "", "", "", "n", "", "y"],
+        # agents, cli, office net=none, bind=yes, api, session, multi=yes, keep count/names/tokens/default, telegram=no
+        answers=["", "", "", "", "", "", "y", "", "", "", "", "", "n", "", "y"],
     )
     assert code == 0, output
     text = _env_file_text(env_file)
