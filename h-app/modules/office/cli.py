@@ -2811,6 +2811,13 @@ _TOKEN_REASON_TEXT = {
 _NOT_SENT_ERRORS = (ConnectionRefusedError, socket.gaierror)
 
 
+def _name_hint(reason) -> str:
+    if isinstance(reason, socket.gaierror):
+        return (" -- the host name does not resolve from this container: is the peer on the "
+                "same shared office network, and is its alias right (see its SUMMARY.md)?")
+    return ""
+
+
 def _post_to_office(url: str, token: str, agent: str, body: dict, ca_cert: str | None = None) -> dict:
     """POST one envelope; return the parsed 202 body.
 
@@ -2853,7 +2860,9 @@ def _post_to_office(url: str, token: str, agent: str, body: dict, ca_cert: str |
         ) from None
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, _NOT_SENT_ERRORS):
-            raise OfficeError(f"cannot reach the remote office at {url}: {exc.reason}") from None
+            raise OfficeError(
+                f"cannot reach the remote office at {url}: {exc.reason}{_name_hint(exc.reason)}"
+            ) from None
         if url.lower().startswith("https://") and not tls["tls"]:
             # Nothing is written before the handshake completes, so this is
             # provably NOT sent -- verification and handshake failures included.
@@ -2936,7 +2945,8 @@ def _probe_office(url: str, token: str, expect_participant: str | None,
                 and not isinstance(exc.reason, _NOT_SENT_ERRORS):
             what, fix = _tls_failure(exc.reason, url, ca_cert)
             return _Link("tls", f"{what} -- {fix}")
-        return _Link("unreachable", f"cannot reach the remote office at {url}: {exc.reason}")
+        return _Link("unreachable",
+                     f"cannot reach the remote office at {url}: {exc.reason}{_name_hint(exc.reason)}")
     except (OSError, http.client.HTTPException) as exc:
         return _Link("unreachable", (
             f"connection to the remote office at {url} broke ({type(exc).__name__})"))
@@ -3017,6 +3027,54 @@ def _send_to_office(office: str, agent: str, text: str) -> None:
     print(f"sent to {office}/{agent}: {len(text.encode('utf-8'))} bytes ({stream_id})")
 
 
+_DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_DEFAULT_BY_NAME_PORT = 8080          # the api port INSIDE every office container
+
+
+def _resolve_office_host(host: str, port: int) -> list[str]:
+    """Addresses the container's resolver gives `host` (a seam for tests)."""
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    return sorted({info[4][0] for info in infos})
+
+
+def _url_by_name(name: str, port: int, *, https: bool) -> str:
+    """http(s)://NAME:PORT for an office reachable by name on a shared network.
+
+    Only a plain DNS label is accepted (no dots, slashes, colons, '@', so the
+    lookup cannot be pointed at an arbitrary host or smuggle a URL part), and
+    every address it resolves to must be private/loopback: a by-name office is
+    one on the same host or network, never a public address.
+    """
+    if not _DNS_LABEL_RE.fullmatch(name) or name.isdigit():
+        raise OfficeError(
+            f"cannot look up {name!r} by name: only a plain DNS label is accepted "
+            "(lowercase letters, digits and hyphens; no dots, slashes, colons or '@'). "
+            "Pass the url explicitly for anything else"
+        )
+    try:
+        addresses = _resolve_office_host(name, port)
+    except (OSError, UnicodeError) as exc:
+        raise OfficeError(
+            f"cannot resolve office name {name!r}: {exc}. Check that this office and {name!r} "
+            "are on the same shared office network, and that the name is the peer's network "
+            "alias (see its SUMMARY.md). Nothing saved; to reach it another way give its url"
+        ) from None
+    if not addresses:
+        raise OfficeError(f"office name {name!r} resolved to no address. Nothing saved")
+    for address in addresses:
+        try:
+            private = ipaddress.ip_address(address.split("%", 1)[0]).is_private
+        except ValueError:
+            private = False
+        if not private:
+            raise OfficeError(
+                f"office name {name!r} resolves to {address}, which is not a private address; "
+                "by-name lookup is only for offices on a shared private network. "
+                "Nothing saved; pass its url explicitly if that is really the office"
+            )
+    return f"{'https' if https else 'http'}://{name}:{port}"
+
+
 def _office_add_command(argv: list[str]) -> None:
     parser = _operation_parser(
         "office-add",
@@ -3024,7 +3082,14 @@ def _office_add_command(argv: list[str]) -> None:
         "The cooperation token is read from stdin and never accepted as an argument.",
     )
     parser.add_argument("name", help="local name for the other office")
-    parser.add_argument("url", help="base url of its api door, e.g. https://office-b.example:8080")
+    parser.add_argument("url", nargs="?",
+                        help="base url of its api door, e.g. https://office-b.example:8080. "
+                             "Omit it for an office on a shared office network: NAME is then "
+                             "looked up by name and the url is http://NAME:8080 "
+                             "(https with --ca-cert)")
+    parser.add_argument("--port", type=int, metavar="PORT",
+                        help="api port for a by-name office (default 8080, the port inside "
+                             "the container); not valid with a url")
     parser.add_argument("--participant", metavar="NAME",
                         help="the participant the cooperation was granted to (the 'as' value); "
                              "taken from the remote office when omitted (required with --no-verify)")
@@ -3050,7 +3115,19 @@ def _office_add_command(argv: list[str]) -> None:
     participant = _segment_arg(args.participant, "participant") if args.participant else None
     if participant in _FIXED_PARTICIPANTS:
         raise OfficeError(f"participant {participant!r} is reserved")
-    url, plaintext = _validated_office_url(args.url, allow_plaintext=args.allow_plaintext)
+    if args.url is not None and args.port is not None:
+        raise OfficeError("--port only applies when the url is omitted; put the port in the url")
+    if args.url is None:
+        port = _DEFAULT_BY_NAME_PORT if args.port is None else args.port
+        if not 1 <= port <= 65535:
+            raise OfficeError(f"invalid --port {port}: must be 1-65535")
+        # Names that cannot be a DNS label are refused before any lookup.
+        by_name = _url_by_name(args.name, port, https=args.ca_cert is not None)
+        # Private-address check above is the gate for plaintext on a shared
+        # network; the existing warning still prints.
+        url, plaintext = _validated_office_url(by_name, allow_plaintext=True)
+    else:
+        url, plaintext = _validated_office_url(args.url, allow_plaintext=args.allow_plaintext)
     ca_cert = None
     if args.ca_cert is not None:
         if not url.startswith("https://"):

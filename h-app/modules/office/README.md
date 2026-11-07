@@ -396,7 +396,7 @@ as a substitute.
 | `offices.tokens` | hash `name -> token`, read only by `send --office` and the relay |
 | `xsent.s<stream_id>` | the reply-routing record above |
 
-- `office office-add NAME URL [--participant P] --token-stdin [--allow-plaintext] [--ca-cert PATH] [--no-verify]`
+- `office office-add NAME [URL] [--port PORT] [--participant P] --token-stdin [--allow-plaintext] [--ca-cert PATH] [--no-verify]`
   (lead only). The token is read from stdin and there is no `--token` option,
   so it never appears in process arguments. It also enrols the local api
   participant `relay` with a `StartAgent` envelope if it is absent, and refuses
@@ -414,6 +414,25 @@ as a substitute.
   taken from the remote's answer. `--no-verify` skips the call for offline use
   (then `--participant` is required, and a wrong participant or token only
   shows on the first send; the command says `NOT verified`).
+- **By name (shared office network).** Omit `URL` and `NAME` is looked up with
+  the container's own name resolution: the url becomes `http://NAME:8080`
+  (8080 is the api port inside every office container; `--port` overrides it,
+  and is refused together with a url), or `https://NAME:8080` when `--ca-cert`
+  is given (the certificate must then be valid for `NAME`). The rest is the
+  ordinary `office-add`: `GET /whoami` with the token, a participant mismatch
+  or bad token saves nothing, `--participant` is read from the answer. Safety
+  rules: `NAME` must be a plain DNS label (lowercase letters, digits, hyphens;
+  no dots, slashes, colons or `@`, not all digits), the lookup happens before
+  anything is written (also with `--no-verify`), and **every** address it
+  returns must be private/loopback, so a by-name lookup can never point the
+  token at a public host. Because the peer is on a private network, plain
+  `http://` needs no `--allow-plaintext` here, but the plaintext warning is
+  still printed. If the name does not resolve the error says to check that both
+  offices share a network and that `NAME` is the peer's network alias (its
+  `SUMMARY.md`), and nothing is saved. An explicit `URL` behaves exactly as
+  before and never triggers a lookup. Afterwards `offices --check` and
+  `send --office NAME` treat the entry like any other; a name that stops
+  resolving is reported with the same hint.
 - `office offices` lists names, urls and participants. It reads only the
   `offices` hash, so it cannot print a token, and makes no network call.
   `office offices --check` also probes every entry with its saved token and

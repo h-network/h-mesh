@@ -22,6 +22,8 @@ Each `h-mesh` office is an isolated pod/tenant with its own Redis bus, switch, a
 
 > **Transport security default:** HTTPS (`https://`) with certificate and hostname verification is the default for inter-office communication. Plaintext `http://` to a non-loopback host is refused unless both the receiving office has opted into plaintext (`H_MESH_ALLOW_PLAINTEXT=1` or the interactive plaintext prompt) and the sending office passes `--allow-plaintext` to `office-add`.
 
+> **Offices on one shared network (by name):** when both offices are attached to the same Docker network, run `h-mesh-office office-add <name> --token-stdin` with **no url**. `<name>` is looked up as a host name from inside the container (it must be the peer's network alias, see its `SUMMARY.md`), the address becomes `http://<name>:8080` (`--port` changes the port; `https://` with `--ca-cert`), and `/whoami` verifies the token and participant exactly as for a url. Only a plain DNS label is accepted (no dots, slashes, colons or `@`) and every resolved address must be private, so no token can be sent to a public host this way; `--allow-plaintext` is not needed on such a private link, and the plaintext warning is still shown. If the name does not resolve, check that both offices share the network and that the alias is right; nothing is saved.
+
 ---
 
 ## 2. Prerequisites
