@@ -52,7 +52,7 @@ def _run_wizard(args: list[str], env: dict, answers: list[str], timeout: float =
             if not chunk:
                 break
             output += chunk
-            if chunk.rstrip().endswith(b":") and answer_idx < len(answers):
+            if output.rstrip().endswith(b":") and answer_idx < len(answers):
                 os.write(master, (answers[answer_idx] + "\n").encode())
                 answer_idx += 1
 
@@ -343,7 +343,7 @@ def test_multiple_account_rerun_keeps_existing_names_and_tokens(tmp_path):
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
         # agents, cli, office net=none, bind=yes, api, session, multi=yes, keep count/names/tokens/default, telegram=no
-        answers=["", "", "", "", "", "", "y", "", "", "", "", "", "n", "", "y"],
+        answers=["", "", "", "", "", "", "y", "", "", "", "", "", "", "n", "", "y"],
     )
     assert code == 0, output
     text = _env_file_text(env_file)

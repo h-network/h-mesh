@@ -137,7 +137,7 @@ def _bootstrap_wizard(env_file, env, answers):
                 if not chunk:
                     break
                 output += chunk
-                if chunk.rstrip().endswith(b":") and index < len(answers):
+                if output.rstrip().endswith(b":") and index < len(answers):
                     os.write(master, (answers[index] + "\n").encode())
                     index += 1
             elif proc.poll() is not None:
