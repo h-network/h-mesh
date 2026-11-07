@@ -1,6 +1,6 @@
 # Action audit (#27): h-mesh side
 
-Status: approved; first slice implemented on `api-agent/action-audit`. Base: `origin/develop` 1757b16.
+Status: approved; first slice implemented (`lib/audit.py`, `POST/GET /agents/{agent}/audit`, `office audit`; merged to `develop`). Written against `origin/develop` 1757b16.
 
 **Problem.** The switch logs every envelope hop; nothing records what an agent
 *did* (shell/tool commands). Capture belongs to h-agent (per-CLI tool hooks,

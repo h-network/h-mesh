@@ -238,6 +238,9 @@ labelled `h-mesh` Docker network (`io.h-mesh.office-network=1`):
   label), so sibling offices on the same office network reach its API at
   `http://<pod>-<tenant>:8080` (or `https://<pod>-<tenant>:8080`) without
   publishing any ports on the host.
+- **Pairing by name:** on a shared office network the lead registers the peer
+  with `h-mesh-office office-add <pod>-<tenant> --token-stdin` and no url; see
+  [Inter-Office Communication Guide](docs/inter-office.md).
 - **Host port publishing default:** When an office network is chosen, host port
   publishing defaults to **no** (`H_MESH_BIND_PORTS=0`); pass `--bind-ports`
   (or answer `y` interactively) to also publish host ports.
@@ -263,7 +266,7 @@ always resolves an office to `offices/<pod>/<tenant>/.env` and always passes
 are isolated by construction. `offices/` is gitignored -- it holds live
 credentials (`CLAUDE_OAUTH_TOKEN_<PROFILE>`, `API_TOKEN`, etc.), the same as
 `container/.env` (kept as a single-office convenience default) always was.
-Port publishing defaults to yes, with `API_PORT=8080` and
+Without an office network, port publishing defaults to yes, with `API_PORT=8080` and
 `SESSION_PORT=8081`, preserving the previous single-office behavior. The
 wizard warns if a selected port appears in a sibling office's `.env` or is
 already listening locally; choose distinct ports for multiple offices, or
@@ -558,10 +561,10 @@ python -m tools.run_tests
 ```
 
 The configured test path covers the entire `h-app` source tree, including
-tests colocated under `clients/web`. The runner asserts a minimum collection
-count before executing pytest, so under-collection fails loudly while normal
-test additions require no maintenance. If tests are intentionally removed,
-update `EXPECTED_MINIMUM_TEST_COUNT` in the runner.
+tests colocated under `clients/web`. The runner checks collection against the
+reviewed node list `h-app/tools/test_nodeids.txt` and reports every `added` or
+`missing` node, so adding, removing or renaming a test means updating that file
+in the same change (see [`docs/ci.md`](docs/ci.md)).
 Passing an explicit path such as `pytest tests/` overrides configured discovery
 and intentionally runs only the selected subtree; do not use a narrowed path
 as evidence that the complete suite passes.
@@ -582,6 +585,8 @@ provides these process entry points:
 - `h-mesh-tmux-reconciler` — the tmux registry reconciler daemon
 - `h-mesh-watchdog` — the delivery and presence watchdog daemon
 - `h-mesh-tmux-port AGENT` — direct tmux delivery-port invocation
+- `h-mesh` — the unified command dispatcher (`h-mesh start`, `h-mesh upgrade`, ...)
+- `h-mesh-claude-sdk-port AGENT` — direct claude_sdk delivery-port invocation
 - `h-mesh-office` — the operator CLI
 - `h-mesh-clone-to-all` — the standalone clone-to-all compatibility command
 - `h-mesh-upgrade` — pull, reinstall, and cleanly restart the daemons setup.sh started

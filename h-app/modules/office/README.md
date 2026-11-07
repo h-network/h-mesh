@@ -12,9 +12,9 @@ settled `lib.agentlifecycle` API. Same domain, both sides, one module.
 | `pricing.py` | model token pricing and cost calculation, used only by `usage` |
 | `port.py` | the receiving half -- one-envelope lifecycle dispatch plus its runnable kick entrypoint |
 
-Not runnable via any packaging yet -- h-mesh has no console-scripts story for
-any module, so `office` is reached the same way tests reach it: put `h-app/`
-on `sys.path` and call `modules.office.cli.main`.
+The installed commands are `h-mesh-office` (this CLI, `modules.office.cli:main`)
+and `h-mesh COMMAND` (`dispatcher.py`, which also routes the service entry
+points); `h-mesh-clone-to-all` is the standalone `clone-to-all`.
 
 `profiles` is not a command yet: it needs an `available_profiles()`
 (configured-accounts) read that has no h-mesh equivalent anywhere in `core`
@@ -150,7 +150,8 @@ one JSON line `{"agent", "state", "ticket"}` per match, so a `rel:<id>` or a
 quoted id resolves without guessing `-a`. Plain `office show ID [-a AGENT]` is
 unchanged, as are tickets already stored and the `-r/--related` option (related
 ids are still stored unvalidated). The id is already the first column of
-`office list` and what `add` prints; there is no notification on `add`.
+`office list` and what `add` prints. `add` also sends the assignee a notice
+(see "Board event notices (#18)" below; `--no-notify` suppresses it).
 
 `office add --authority TEXT` sets the ticket's authoritative directive once, at
 creation: what the creator is instructing or approving, up to 2000 characters.
@@ -348,9 +349,9 @@ total, so the total understates real spend whenever an agy agent is running.
 Collecting agy usage would need a new data source in the watchdog; no
 collection code exists in `office`.
 
-## Inter-office (proof of concept)
+## Inter-office
 
-One office can send a message to an agent in another office. The CLI itself
+The user guide is [`docs/inter-office.md`](../../../docs/inter-office.md). One office can send a message to an agent in another office. The CLI itself
 POSTs to the other office's api door; a separate relay daemon handles replies
 only (it is not part of this module). Message kind only, no attachments.
 
@@ -395,7 +396,7 @@ as a substitute.
 
 | resource | holds |
 |---|---|
-| `offices` | hash `name -> {url, participant, added_by, added_ts}`, no secrets |
+| `offices` | hash `name -> {url, participant, added_by, added_ts[, ca_cert]}`, no secrets |
 | `offices.tokens` | hash `name -> token`, read only by `send --office` and the relay |
 | `xsent.s<stream_id>` | the reply-routing record above |
 
