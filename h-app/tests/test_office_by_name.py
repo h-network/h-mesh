@@ -122,7 +122,7 @@ def test_by_name_office_works_with_offices_check_and_send(monkeypatch, capsys, r
 
 def test_ca_cert_by_name_uses_https_and_verifies_the_name(tmp_path_factory, monkeypatch, capsys, remote):
     _env(monkeypatch)
-    ca = _make_ca(tmp_path_factory.mktemp("byname-ca"), "byname-ca")
+    ca = _make_ca(tmp_path_factory.mktemp("byname") / "ca", "byname-ca")
     cert, key = _issue(ca, "peer", "DNS:peer-b")
     rem = remote(serve(None), tls=(cert, key))
     Dns(monkeypatch, {"peer-b": "127.0.0.1"})
