@@ -238,7 +238,19 @@ def test_the_dockerfile_no_longer_copies_a_root_tmux_conf_and_still_ships_assets
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="needs tmux")
 def test_the_real_binding_flips_mouse_on_a_private_socket(tmp_path):
-    """Press Ctrl+b m on a real attached client; mouse goes on -> off -> on."""
+    """Press Ctrl+b m on a real attached client; mouse goes on -> off -> on.
+
+    Two races, both measured on the test VM (tmux 3.4, 40-300 runs each), are waited
+    out by what tmux reports, not by sleeping:
+
+    * A key written right after the client attaches is dropped (a first press lost in
+      8-11 of 40 runs). So the client is first proven live with a throwaway key bound
+      only here (Ctrl+q sets `@ready`), resent until it lands.
+    * A second press written with no gap after the state flips is lost in 1-3 of 100
+      runs; any gap of 50 ms or more, and a bind without the `display` message, lost
+      none. So the second press waits until tmux has logged the first press's own
+      "mouse off" message. A human cannot press twice within that window.
+    """
     sock = str(tmp_path / "s")
     env = dict(os.environ, HOME=str(tmp_path), TERM="xterm-256color")
     env.pop("TMUX", None)
@@ -249,28 +261,37 @@ def test_the_real_binding_flips_mouse_on_a_private_socket(tmp_path):
     def mouse():
         return tmux("show", "-gv", "mouse").stdout.strip()
 
-    def wait_for(want):
+    def wait_until(predicate, what):
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            if mouse() == want:
+            if predicate():
                 return
-            time.sleep(0.05)
-        assert mouse() == want
+            time.sleep(0.02)
+        assert predicate(), what
 
     assert tmux("-f", str(SHIPPED_TMUX_CONF), "new-session", "-d", "-s", "t", "/bin/sleep", "60").returncode == 0
     master, slave = pty.openpty()
     client = subprocess.Popen(["tmux", "-S", sock, "attach", "-t", "t"], stdin=slave, stdout=slave,
                               stderr=slave, env=env)
     try:
-        deadline = time.monotonic() + 5
-        while not tmux("list-clients").stdout.strip() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        assert tmux("list-clients").stdout.strip(), "client did not attach"
+        wait_until(lambda: tmux("list-clients").stdout.strip(), "client did not attach")
+        name = tmux("list-clients", "-F", "#{client_name}").stdout.split()[0]
+
+        assert tmux("bind-key", "-n", "C-q", "set", "-g", "@ready", "1").returncode == 0
+
+        def live():
+            os.write(master, b"\x11")
+            return tmux("show", "-gv", "@ready").stdout.strip() == "1"
+
+        wait_until(live, "the attached client never delivered a key")
         assert mouse() == "on"
+
         os.write(master, b"\x02m")
-        wait_for("off")
+        wait_until(lambda: mouse() == "off", "first Ctrl+b m did not turn mouse off")
+        wait_until(lambda: "mouse off" in tmux("show-messages", "-t", name).stdout,
+                   "tmux never logged the 'mouse off' message")
         os.write(master, b"\x02m")
-        wait_for("on")
+        wait_until(lambda: mouse() == "on", "second Ctrl+b m did not turn mouse back on")
     finally:
         client.kill()
         client.wait(timeout=5)
