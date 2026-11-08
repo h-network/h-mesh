@@ -179,6 +179,25 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(request(self.app, "GET", "/health")[0], 401)
         self.assertEqual(request(self.app, "GET", "/health", token="secret"), (200, {"status": "ok"}))
 
+    def test_restdoc_session_auth_text_matches_the_session_service(self):
+        """The /restdoc session section once said header-only; the service also takes ?token=."""
+        from modules.session.app import _authorized
+
+        class Socket:
+            def __init__(self, headers=None, query=b""):
+                self.headers = headers or {}
+                self.query_params = None
+                self.scope = {"query_string": query}
+
+        self.assertTrue(_authorized(Socket({"authorization": "Bearer tok"}), "tok"))
+        self.assertTrue(_authorized(Socket(query=b"token=tok"), "tok"))
+        self.assertFalse(_authorized(Socket(query=b"token=nope"), "tok"))
+        self.assertFalse(_authorized(Socket(), "tok"))
+        html = server_module._render_restdoc_html(self.app)
+        self.assertIn("Authorization: Bearer &lt;API_TOKEN&gt;", html)
+        self.assertIn("?token=&lt;API_TOKEN&gt;", html)
+        self.assertIn("4401", html)
+
     def test_external_route_contract(self):
         routes = {(method, route.path) for route in self.app.routes for method in getattr(route, "methods", set())}
         expected = {

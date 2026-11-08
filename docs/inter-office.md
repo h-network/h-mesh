@@ -20,7 +20,7 @@ Each `h-mesh` office is an isolated pod/tenant with its own Redis bus, switch, a
    ```
    Neither incoming cooperation messages nor relayed replies open client "unanswered message" watchdog timers.
 
-> **Transport security default:** HTTPS (`https://`) with certificate and hostname verification is the default for inter-office communication. Plaintext `http://` to a non-loopback host is refused unless both the receiving office has opted into plaintext (`H_MESH_ALLOW_PLAINTEXT=1` or the interactive plaintext prompt) and the sending office passes `--allow-plaintext` to `office-add`.
+> **Transport security default:** HTTPS (`https://`) with certificate and hostname verification is the default for inter-office communication. Plaintext `http://` to a non-loopback host is refused unless both the receiving office has opted into plaintext (`H_MESH_ALLOW_PLAINTEXT=1` or the interactive plaintext prompt) and the sending office passes `--allow-plaintext` to `office-add` (the one exception is an office reached by name on a directly attached network, below: the sending side then needs no flag, the receiving office still needs the opt-in).
 
 > **Offices on one shared network (by name):** when both offices are attached to the same Docker network, run `h-mesh-office office-add <name> --token-stdin` with **no url**. `<name>` is looked up as a host name from inside the container (it must be the peer's network alias, see its `SUMMARY.md`), the address becomes `http://<name>:8080` (`--port` changes the port; `https://` with `--ca-cert`), and `/whoami` verifies the token and participant exactly as for a url. Only a plain DNS label is accepted (no dots, slashes, colons or `@`) and every resolved address must be private, so no token can be sent to a public host this way; `--allow-plaintext` is not needed only when the address lies inside a subnet of one of the container's own network interfaces (a directly attached Docker network; loopback counts). A private address outside those subnets, such as a LAN host reached through a search domain, still resolves but requires `--allow-plaintext`; the plaintext warning is always shown. The receiving office still needs `H_MESH_ALLOW_PLAINTEXT=1`. If the name does not resolve, check that both offices share the network and that the alias is right; nothing is saved.
 
@@ -49,6 +49,8 @@ cd h-mesh
 ## 3. Fresh Office Setup (`container/bootstrap.sh`)
 
 You can run multiple offices on the same host as long as each office has a distinct `POD`/`TENANT` pair and distinct published host ports (`API_PORT` and `SESSION_PORT`). `container/bootstrap.sh` isolates every office under `offices/<pod>/<tenant>/` and runs Compose under the project name `h-mesh-<pod>-<tenant>`.
+
+`./setup.sh --container <flags>` is the front door and hands every flag to `container/bootstrap.sh` unchanged; this guide writes `./container/bootstrap.sh` directly.
 
 Below are the two supported transport setups for a pair of fresh offices: **Section 3.1 (HTTPS with a private CA, recommended)** and **Section 3.2 (Plaintext HTTP for an isolated lab testbed)**.
 
@@ -96,7 +98,7 @@ openssl x509 -req -in /tmp/h-mesh-certs/officey.csr \
 Run `./container/bootstrap.sh` interactively (or `./setup.sh --container`) and supply the **host** file paths when prompted for the TLS certificate, TLS key, and optional peer CA bundle:
 
 ```text
-  TLS certificate HOST path (blank to explicitly accept plaintext): /tmp/h-mesh-certs/officex.crt
+TLS certificate HOST path (blank for plaintext; you will be asked to confirm): /tmp/h-mesh-certs/officex.crt
   TLS key HOST path: /tmp/h-mesh-certs/officex.key
   Optional peer CA bundle HOST path (blank for system trust): /tmp/h-mesh-certs/ca.crt
 ```
@@ -144,7 +146,7 @@ HTTP 401
 
 For an isolated lab testbed without TLS certificates:
 
-- **Interactively:** Run `./container/bootstrap.sh`, leave `TLS certificate HOST path (blank to explicitly accept plaintext):` blank, and answer `y` at `Accept plaintext for this container? [y/N]:`.
+- **Interactively:** Run `./container/bootstrap.sh`, leave `TLS certificate HOST path (blank for plaintext; you will be asked to confirm):` blank, and answer `y` at `Accept plaintext for this container? [y/N]:`.
 - **Non-interactively:** Export `H_MESH_ALLOW_PLAINTEXT=1`:
 
 ```bash
@@ -183,7 +185,15 @@ What `bootstrap.sh` configures for an office network:
 - Defaults `H_MESH_BIND_PORTS=0` so nothing is published on the host IP (pass `--bind-ports` if you also want host ports published).
 - Rerunning `./container/bootstrap.sh --pod <pod> --tenant <tenant>` is idempotent and keeps the office attached to its office network unless `--no-office-network` is passed.
 
-When pairing two offices on the same office network with `h-mesh-office office-add`, use the remote office's container DNS alias and internal API port `8080` (`http://<pod>-<tenant>:8080` with `--allow-plaintext`, or `https://<pod>-<tenant>:8080` with TLS):
+When pairing two offices on the same office network with `h-mesh-office office-add`, the simplest form omits the url (see "Offices on one shared network" in section 1): `NAME` is the remote office's container DNS alias `<pod>-<tenant>` and the address is `http://<pod>-<tenant>:8080`:
+
+```bash
+# On netalpha (as architect), register netbeta by its alias; no url, no --allow-plaintext on a directly attached network:
+printf '%s\n' 'coop.<id>.<secret>' | \
+  h-mesh-office office-add netbeta-default --token-stdin
+```
+
+The address book entry is named after the alias (`netbeta-default`) here. To pick another local name, or to use an explicit url, give the remote office's container DNS alias and internal API port `8080` (`http://<pod>-<tenant>:8080` with `--allow-plaintext`, or `https://<pod>-<tenant>:8080` with TLS):
 
 ```bash
 # On netalpha (as architect), register netbeta via its office-network alias:
@@ -501,7 +511,7 @@ no offices configured
 | Symptom / Detail | Cause | Fix |
 |---|---|---|
 | `remote office refused the message: HTTP 403: 'as' must be the participant this token is bound to -- the remote office's cooperation policy does not allow this token to send to '...'` | The stored participant name in the address book does not match the token's bound participant (for example, if `--no-verify` was used with the wrong `--participant`), or a raw HTTP caller spoofed `"as"`. | Run `h-mesh-office offices --check` to see the expected participant name, then re-run `h-mesh-office office-add` with the matching `--participant`. |
-| `HTTP 403: envelope kind not permitted for a cooperation token` | A raw HTTP caller attempted to send a non-`Message` kind (`Command`, `StartAgent`, `StopAgent`, `Pause`, `Resume`). | Cooperation tokens only permit `Message` envelopes. Lifecycle commands cannot cross office boundaries. |
+| `HTTP 403: envelope kind not permitted for a cooperation token` | A raw HTTP caller attempted to send a non-`Message` kind (`Command`, `StartAgent`, `StopAgent`, `PauseAgent`, `ResumeAgent`). | Cooperation tokens only permit `Message` envelopes. Lifecycle commands cannot cross office boundaries. |
 | `HTTP 403: destination not permitted for a cooperation token` (or CLI error `cannot send to 'host': not an agent` / `invalid agent name 'all'`) | Attempting to send to reserved participants (`all`, `host`, `api`). | Address a specific enrolled agent in the remote office (for example, `-a architect` or `-a worker`). |
 | `HTTP 403: not permitted for a cooperation token` | A cooperation token was used against internal tenant endpoints (`/agents`, `/board`, `/alerts`, `/agents/<name>/activity`). | Cooperation tokens are restricted to `GET /whoami`, `POST /agents/<target>/envelopes`, and `GET /agents/<bound-participant>/messages[/stream]`. |
 

@@ -1,5 +1,7 @@
 # Final Release Gate A Verification (`rc-next-3` @ `86dcddf`)
 
+> Historical record: counts, commits and offices are as of 2026-11-04; see docs/inter-office.md for current behaviour.
+
 This document records the live fresh-install Release Gate A verification (plaintext AND HTTPS/TLS with private CA) on `h-lab@172.16.0.201` against [`docs/inter-office.md`](inter-office.md) on candidate commit `86dcddffc0664efdc9612d8f9f28fe5099f66686` (`origin/architect/rc-next-3`, certified `1904/1904`).
 
 ---

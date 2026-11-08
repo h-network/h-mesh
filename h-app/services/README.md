@@ -55,3 +55,5 @@ itself at import from the same variable.
 | `telegram_bot.py` | `clients.telegram.bot.TelegramBot` polling client |
 | `web_console.py` | `clients.web.server.WebConsoleServer` HTTP/WS proxy server |
 | `interoffice_relay.py` | Always-on idle supervisor for recorded offices' reply SSE streams; see `modules/interoffice/README.md`. |
+| `session.py` | `modules.session.app` WebSocket daemon (tmux control-mode session door) |
+| `watchdog.py` | `modules.watchdog.service` delivery and presence watchdog daemon |

@@ -1,5 +1,7 @@
 # Inter-office senders do not open "unanswered message" entries: live proof
 
+> Historical record: counts, commits and offices are as of 2026-11-04; see docs/inter-office.md for current behaviour.
+
 Verified on the isolated h-lab VM on 2026-11-04 (15:06Z-15:18Z), from a fresh
 clone of pushed commit `a16a05e7813c013d486eadc28f6f95bb372e2808`
 (`switch-agent/interoffice-no-unanswered`), using two throwaway offices created

@@ -209,15 +209,20 @@ whether to publish the API/session ports (and which host
 ports to use), one or more Claude account names, and each account's OAuth
 token (blank to log in
 interactively later -- see "Finding and attaching..." below for how a
-container operator can actually do that), and optional Telegram bot config,
+container operator can actually do that), an optional local OpenAI-compatible
+model provider (`PROVIDER_LOCAL_URL`, `PROVIDER_LOCAL_MODEL`, which agents use
+it via `AGENT_PROVIDERS`, and optional `PROVIDER_LOCAL_TOKEN`), and optional
+Telegram bot config,
 writes them to `offices/<pod>/<tenant>/.env` (alongside an optional
 `compose.network.yaml`, a regenerated
 `SUMMARY.md`, and an executable `attach.sh`, none of which contain secret
 values), and runs `docker compose up
---build`. The interactive wizard always requires a TLS-or-plaintext choice
-for the API, including when Telegram is declined. A certificate path requires
-its key; plaintext requires an explicit yes, so completing the guided install
-with published ports leaves the API reachable. Run `./container/bootstrap.sh
+--build`. Whenever the API is reachable outside the container (via published
+host ports or a shared office network), the interactive wizard requires a
+TLS-or-plaintext choice for the API, including when Telegram is declined. When
+no office network is joined and no host ports are published, nothing outside
+the container can reach the API, so the wizard skips the TLS/plaintext prompt
+and keeps the API loopback-only inside the container. Run `./container/bootstrap.sh
 --help` for its full flag/env surface.
 
 **Shared office network (same-host inter-office without publishing host ports).**
@@ -227,7 +232,9 @@ labelled `h-mesh` Docker network (`io.h-mesh.office-network=1`):
   `(2) create a new office network`, or `(3) join an existing office network`.
   The picker lists **only** Docker networks carrying the label
   `io.h-mesh.office-network=1` (filtered by label, never by name, so `bridge`
-  or unrelated Docker networks are never shown or joined).
+  or unrelated Docker networks are never shown or joined; when joining, it
+  defaults to the only labelled network when there is just one, and has no
+  default when multiple exist).
 - **Non-interactive flag/env:** `--office-network <name>` (or
   `H_MESH_OFFICE_NETWORK=<name>`) creates `<name>` with label
   `io.h-mesh.office-network=1` if missing, or joins it if it already carries
@@ -238,6 +245,9 @@ labelled `h-mesh` Docker network (`io.h-mesh.office-network=1`):
   label), so sibling offices on the same office network reach its API at
   `http://<pod>-<tenant>:8080` (or `https://<pod>-<tenant>:8080`) without
   publishing any ports on the host.
+- **Pairing by name:** on a shared office network the lead registers the peer
+  with `h-mesh-office office-add <pod>-<tenant> --token-stdin` and no url; see
+  [Inter-Office Communication Guide](docs/inter-office.md).
 - **Host port publishing default:** When an office network is chosen, host port
   publishing defaults to **no** (`H_MESH_BIND_PORTS=0`); pass `--bind-ports`
   (or answer `y` interactively) to also publish host ports.
@@ -263,7 +273,7 @@ always resolves an office to `offices/<pod>/<tenant>/.env` and always passes
 are isolated by construction. `offices/` is gitignored -- it holds live
 credentials (`CLAUDE_OAUTH_TOKEN_<PROFILE>`, `API_TOKEN`, etc.), the same as
 `container/.env` (kept as a single-office convenience default) always was.
-Port publishing defaults to yes, with `API_PORT=8080` and
+Without an office network, port publishing defaults to yes, with `API_PORT=8080` and
 `SESSION_PORT=8081`, preserving the previous single-office behavior. The
 wizard warns if a selected port appears in a sibling office's `.env` or is
 already listening locally; choose distinct ports for multiple offices, or
@@ -307,13 +317,18 @@ Every non-interactive env var from "Bootstrap script" above (`AGENTS`,
 `API_TOKEN`, `H_MESH_BIND_PORTS`, `API_PORT`, and `SESSION_PORT`) applies
 unchanged. `bootstrap.sh`'s interactive wizard prompts
 for the account count and names, each account's corresponding
-`CLAUDE_OAUTH_TOKEN_<PROFILE>`, and for
+`CLAUDE_OAUTH_TOKEN_<PROFILE>`, optional local model provider settings
+(`PROVIDER_LOCAL_URL`, `PROVIDER_LOCAL_MODEL`, `AGENT_PROVIDERS`, and optional
+`PROVIDER_LOCAL_TOKEN` -- on a rerun when a provider is already configured,
+`A local model provider is already configured (<url>, <model>). Keep it? [Y/n]:`
+keeps it on `Y`/blank and removes it on `n`, the same effect as `--no-provider`;
+or non-interactively via `--provider-url`,
+`--provider-model`, `--provider-agents`, `--no-provider`), and for
 `TELEGRAM_*` directly, mirroring the host wizard -- these were previously,
 incorrectly, treated as file-only "advanced" options; a working office
 always needs some credential, and the choice to enable Telegram is one the
-host wizard already offered. Per-agent account assignment and other
-exceptions (`AGENT_CLIS`/`AGENT_PROFILES`/`AGENT_PROVIDERS`) and local model
-provider config (`PROVIDER_LOCAL_*`) remain file-only. `API_TOKEN` is never
+host wizard already offered. Per-agent CLI/account assignment and other
+exceptions (`AGENT_CLIS`/`AGENT_PROFILES`) remain file-only. `API_TOKEN` is never
 prompted anywhere. Both host setup and container bootstrap generate 32 random
 bytes (64 hex characters) when no token is configured, including without
 Telegram. Container bootstrap persists it in `offices/<pod>/<tenant>/.env`
@@ -558,10 +573,10 @@ python -m tools.run_tests
 ```
 
 The configured test path covers the entire `h-app` source tree, including
-tests colocated under `clients/web`. The runner asserts a minimum collection
-count before executing pytest, so under-collection fails loudly while normal
-test additions require no maintenance. If tests are intentionally removed,
-update `EXPECTED_MINIMUM_TEST_COUNT` in the runner.
+tests colocated under `clients/web`. The runner checks collection against the
+reviewed node list `h-app/tools/test_nodeids.txt` and reports every `added` or
+`missing` node, so adding, removing or renaming a test means updating that file
+in the same change (see [`docs/ci.md`](docs/ci.md)).
 Passing an explicit path such as `pytest tests/` overrides configured discovery
 and intentionally runs only the selected subtree; do not use a narrowed path
 as evidence that the complete suite passes.
@@ -582,6 +597,8 @@ provides these process entry points:
 - `h-mesh-tmux-reconciler` — the tmux registry reconciler daemon
 - `h-mesh-watchdog` — the delivery and presence watchdog daemon
 - `h-mesh-tmux-port AGENT` — direct tmux delivery-port invocation
+- `h-mesh` — the unified command dispatcher (`h-mesh start`, `h-mesh upgrade`, ...)
+- `h-mesh-claude-sdk-port AGENT` — direct claude_sdk delivery-port invocation
 - `h-mesh-office` — the operator CLI
 - `h-mesh-clone-to-all` — the standalone clone-to-all compatibility command
 - `h-mesh-upgrade` — pull, reinstall, and cleanly restart the daemons setup.sh started

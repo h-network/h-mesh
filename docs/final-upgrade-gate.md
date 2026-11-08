@@ -1,5 +1,7 @@
 # Final upgrade gate: rc-next-3
 
+> Historical record: counts, commits and offices are as of 2026-11-04; see docs/inter-office.md for current behaviour.
+
 Runtime candidate: `86dcddffc0664efdc9612d8f9f28fe5099f66686`
 (`origin/architect/rc-next-3`). This branch adds evidence only; no runtime,
 test, manifest or deployment configuration changes.

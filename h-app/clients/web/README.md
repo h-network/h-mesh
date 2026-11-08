@@ -234,7 +234,7 @@ reachable from a Mini App session just by existing.
 **Auth is Telegram's own scheme, reused rather than duplicated.** The Mini
 App SDK hands the page `Telegram.WebApp.initData`, which Telegram itself
 signs with `HMAC-SHA256("WebAppData", bot_token)` — the same
-HMAC-over-canonical-payload shape `docs/API.md`'s per-client `kid`/`sig`
+HMAC-over-canonical-payload shape the predecessor project's `docs/API.md` per-client `kid`/`sig`
 signatures already use elsewhere in this project, so this reuses the
 primitive rather than inventing a second one. The login page
 (`_serve_login_page` in `server.py`) detects a Telegram WebView and POSTs
@@ -349,7 +349,7 @@ certificate is never presented to it. Its own client is plaintext-only: the
 WebSocket proxy opens a bare socket and the REST proxy verifies with the default
 context. **Against TLS doors, terminals fail even with a valid certificate.**
 Run the doors published on loopback with TLS terminated in front, or see
-`docs/TODO.md`.
+`docs/TODO.md` (predecessor project, not part of this repository).
 
 ## Checking it
 
