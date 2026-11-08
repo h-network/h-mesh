@@ -232,7 +232,9 @@ labelled `h-mesh` Docker network (`io.h-mesh.office-network=1`):
   `(2) create a new office network`, or `(3) join an existing office network`.
   The picker lists **only** Docker networks carrying the label
   `io.h-mesh.office-network=1` (filtered by label, never by name, so `bridge`
-  or unrelated Docker networks are never shown or joined).
+  or unrelated Docker networks are never shown or joined; when joining, it
+  defaults to the only labelled network when there is just one, and has no
+  default when multiple exist).
 - **Non-interactive flag/env:** `--office-network <name>` (or
   `H_MESH_OFFICE_NETWORK=<name>`) creates `<name>` with label
   `io.h-mesh.office-network=1` if missing, or joins it if it already carries
@@ -317,7 +319,10 @@ unchanged. `bootstrap.sh`'s interactive wizard prompts
 for the account count and names, each account's corresponding
 `CLAUDE_OAUTH_TOKEN_<PROFILE>`, optional local model provider settings
 (`PROVIDER_LOCAL_URL`, `PROVIDER_LOCAL_MODEL`, `AGENT_PROVIDERS`, and optional
-`PROVIDER_LOCAL_TOKEN` -- or non-interactively via `--provider-url`,
+`PROVIDER_LOCAL_TOKEN` -- on a rerun when a provider is already configured,
+`A local model provider is already configured (<url>, <model>). Keep it? [Y/n]:`
+keeps it on `Y`/blank and removes it on `n`, the same effect as `--no-provider`;
+or non-interactively via `--provider-url`,
 `--provider-model`, `--provider-agents`, `--no-provider`), and for
 `TELEGRAM_*` directly, mirroring the host wizard -- these were previously,
 incorrectly, treated as file-only "advanced" options; a working office

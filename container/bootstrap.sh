@@ -470,8 +470,16 @@ if [ "$INTERACTIVE" -eq 1 ] && [ "$OFFICE_NETWORK_EXPLICIT" -eq 0 ]; then
             for _idx in "${!LABELLED_NETS[@]}"; do
                 echo "    $((_idx + 1))) ${LABELLED_NETS[$_idx]}"
             done
-            read -rp "  Join office network (number or name) [${LABELLED_NETS[0]}]: " _join_in
-            _join_in="${_join_in:-${LABELLED_NETS[0]}}"
+            if [ "${#LABELLED_NETS[@]}" -eq 1 ]; then
+                read -rp "  Join office network (number or name) [${LABELLED_NETS[0]}]: " _join_in
+                _join_in="${_join_in:-${LABELLED_NETS[0]}}"
+            else
+                read -rp "  Join office network (number or name): " _join_in
+                if [ -z "$_join_in" ]; then
+                    echo "error: specify which office network to join (number or name)" >&2
+                    exit 1
+                fi
+            fi
             if [[ "$_join_in" =~ ^[0-9]+$ ]] && [ "$_join_in" -ge 1 ] && [ "$_join_in" -le "${#LABELLED_NETS[@]}" ]; then
                 H_MESH_OFFICE_NETWORK="${LABELLED_NETS[$((_join_in - 1))]}"
             else
@@ -690,41 +698,66 @@ if [ "$NO_PROVIDER" -eq 1 ]; then
     PROVIDER_LOCAL_TOKEN=""
     AGENT_PROVIDERS=""
 elif [ "$INTERACTIVE" -eq 1 ] && [ "$PROVIDER_EXPLICIT" -eq 0 ]; then
-    read -rp "Point any agent at a local model provider? [y/N]: " USE_PROVIDER
-    if check_bool "$USE_PROVIDER" "n"; then
-        _def_url="${PROVIDER_LOCAL_URL:-$EXISTING_PROVIDER_URL}"
-        read -rp "  Local provider base URL, e.g. http://10.0.0.5:8000 (no trailing /v1)${_def_url:+ [$_def_url]}: " _in_url
-        PROVIDER_LOCAL_URL="${_in_url:-$_def_url}"
-        PROVIDER_LOCAL_URL="${PROVIDER_LOCAL_URL%/}"
-        PROVIDER_LOCAL_URL="${PROVIDER_LOCAL_URL%/v1}"
-        _def_model="${PROVIDER_LOCAL_MODEL:-$EXISTING_PROVIDER_MODEL}"
-        read -rp "  Local model name${_def_model:+ [$_def_model]}: " _in_model
-        PROVIDER_LOCAL_MODEL="${_in_model:-$_def_model}"
-        _def_prov_agents="$(provider_agents_from_map "${AGENT_PROVIDERS:-$EXISTING_AGENT_PROVIDERS}" "$AGENTS")"
-        read -rp "  Which agents use it? (comma- or space-separated, or 'all') [$_def_prov_agents]: " _in_agents
-        _in_agents="${_in_agents:-$_def_prov_agents}"
-        if [ -n "${PROVIDER_LOCAL_TOKEN:-$EXISTING_PROVIDER_TOKEN}" ]; then
-            read -rsp "  Optional API token for local provider [keep existing]: " _in_tok; echo
-            PROVIDER_LOCAL_TOKEN="${_in_tok:-${PROVIDER_LOCAL_TOKEN:-$EXISTING_PROVIDER_TOKEN}}"
-        else
-            read -rsp "  Optional API token for local provider (blank for none): " _in_tok; echo
-            PROVIDER_LOCAL_TOKEN="$_in_tok"
-        fi
-        if [ -n "$PROVIDER_LOCAL_URL" ] && [ -n "$PROVIDER_LOCAL_MODEL" ]; then
-            AGENT_PROVIDERS="$(build_agent_providers_map "$_in_agents" "$AGENTS")" || exit 1
+    _existing_url="${PROVIDER_LOCAL_URL:-$EXISTING_PROVIDER_URL}"
+    _existing_model="${PROVIDER_LOCAL_MODEL:-$EXISTING_PROVIDER_MODEL}"
+    if [ -n "$_existing_url" ] && [ -n "$_existing_model" ]; then
+        read -rp "A local model provider is already configured ($_existing_url, $_existing_model). Keep it? [Y/n]: " KEEP_PROVIDER
+        if check_bool "$KEEP_PROVIDER" "y"; then
+            PROVIDER_LOCAL_URL="${_existing_url%/}"
+            PROVIDER_LOCAL_URL="${PROVIDER_LOCAL_URL%/v1}"
+            PROVIDER_LOCAL_MODEL="$_existing_model"
+            PROVIDER_LOCAL_TOKEN="${PROVIDER_LOCAL_TOKEN:-$EXISTING_PROVIDER_TOKEN}"
+            if [ -n "${AGENT_PROVIDERS:-$EXISTING_AGENT_PROVIDERS}" ]; then
+                AGENT_PROVIDERS="${AGENT_PROVIDERS:-$EXISTING_AGENT_PROVIDERS}"
+            else
+                AGENT_PROVIDERS="$(build_agent_providers_map "$AGENTS" "$AGENTS")" || exit 1
+            fi
             WANT_PROVIDER_PERSIST=1
         else
-            echo "  ⚠ Both a local provider URL and model name are required -- local model provider not enabled." >&2
+            NO_PROVIDER=1
             PROVIDER_LOCAL_URL=""
             PROVIDER_LOCAL_MODEL=""
             PROVIDER_LOCAL_TOKEN=""
             AGENT_PROVIDERS=""
         fi
     else
-        PROVIDER_LOCAL_URL="${PROVIDER_LOCAL_URL:-$EXISTING_PROVIDER_URL}"
-        PROVIDER_LOCAL_MODEL="${PROVIDER_LOCAL_MODEL:-$EXISTING_PROVIDER_MODEL}"
-        PROVIDER_LOCAL_TOKEN="${PROVIDER_LOCAL_TOKEN:-$EXISTING_PROVIDER_TOKEN}"
-        AGENT_PROVIDERS="${AGENT_PROVIDERS:-$EXISTING_AGENT_PROVIDERS}"
+        read -rp "Point any agent at a local model provider? [y/N]: " USE_PROVIDER
+        if check_bool "$USE_PROVIDER" "n"; then
+            _def_url="${PROVIDER_LOCAL_URL:-$EXISTING_PROVIDER_URL}"
+            read -rp "  Local provider base URL, e.g. http://10.0.0.5:8000 (no trailing /v1)${_def_url:+ [$_def_url]}: " _in_url
+            PROVIDER_LOCAL_URL="${_in_url:-$_def_url}"
+            PROVIDER_LOCAL_URL="${PROVIDER_LOCAL_URL%/}"
+            PROVIDER_LOCAL_URL="${PROVIDER_LOCAL_URL%/v1}"
+            _def_model="${PROVIDER_LOCAL_MODEL:-$EXISTING_PROVIDER_MODEL}"
+            read -rp "  Local model name${_def_model:+ [$_def_model]}: " _in_model
+            PROVIDER_LOCAL_MODEL="${_in_model:-$_def_model}"
+            _def_prov_agents="$(provider_agents_from_map "${AGENT_PROVIDERS:-$EXISTING_AGENT_PROVIDERS}" "$AGENTS")"
+            read -rp "  Which agents use it? (comma- or space-separated, or 'all') [$_def_prov_agents]: " _in_agents
+            _in_agents="${_in_agents:-$_def_prov_agents}"
+            if [ -n "${PROVIDER_LOCAL_TOKEN:-$EXISTING_PROVIDER_TOKEN}" ]; then
+                read -rsp "  Optional API token for local provider [keep existing]: " _in_tok; echo
+                PROVIDER_LOCAL_TOKEN="${_in_tok:-${PROVIDER_LOCAL_TOKEN:-$EXISTING_PROVIDER_TOKEN}}"
+            else
+                read -rsp "  Optional API token for local provider (blank for none): " _in_tok; echo
+                PROVIDER_LOCAL_TOKEN="$_in_tok"
+            fi
+            if [ -n "$PROVIDER_LOCAL_URL" ] && [ -n "$PROVIDER_LOCAL_MODEL" ]; then
+                AGENT_PROVIDERS="$(build_agent_providers_map "$_in_agents" "$AGENTS")" || exit 1
+                WANT_PROVIDER_PERSIST=1
+            else
+                echo "  ⚠ Both a local provider URL and model name are required -- local model provider not enabled." >&2
+                PROVIDER_LOCAL_URL=""
+                PROVIDER_LOCAL_MODEL=""
+                PROVIDER_LOCAL_TOKEN=""
+                AGENT_PROVIDERS=""
+            fi
+        else
+            NO_PROVIDER=1
+            PROVIDER_LOCAL_URL=""
+            PROVIDER_LOCAL_MODEL=""
+            PROVIDER_LOCAL_TOKEN=""
+            AGENT_PROVIDERS=""
+        fi
     fi
 else
     PROVIDER_LOCAL_URL="${PROVIDER_LOCAL_URL:-$EXISTING_PROVIDER_URL}"
@@ -793,7 +826,7 @@ if [ "$INTERACTIVE" -eq 1 ] && { [ "$H_MESH_BIND_PORTS" -eq 1 ] || [ -n "$H_MESH
         echo "Every office starts the API. Peers on office network '$H_MESH_OFFICE_NETWORK' reach its API on port 8080 (http://$H_MESH_OFFICE_ALIAS:8080 or https://$H_MESH_OFFICE_ALIAS:8080)."
     fi
     echo "Supply readable HOST files; bootstrap validates and mounts private copies read-only."
-    read -rp "TLS certificate HOST path (blank to explicitly accept plaintext): " TLS_CERT
+    read -rp "TLS certificate HOST path (blank for plaintext; you will be asked to confirm): " TLS_CERT
     if [ -n "$TLS_CERT" ]; then
         read -rp "  TLS key HOST path: " TLS_KEY
         [ -n "$TLS_KEY" ] || { echo "error: a TLS certificate requires its key" >&2; exit 1; }

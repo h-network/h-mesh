@@ -177,6 +177,7 @@ def test_enabling_telegram_forces_a_plaintext_or_tls_decision(tmp_path):
     )
     assert code == 0, output
     assert "H_MESH_ALLOW_PLAINTEXT=1" in _env_file_text(env_file)
+    assert "TLS certificate HOST path (blank for plaintext; you will be asked to confirm):" in output
     assert "unencrypted" in output
 
 
@@ -371,6 +372,7 @@ def test_local_provider_interactive_and_noninteractive_and_rerun(tmp_path):
         ],
     )
     assert code == 0, output
+    assert "Point any agent at a local model provider? [y/N]:" in output
     text = _env_file_text(env_file)
     assert "PROVIDER_LOCAL_URL=http://10.0.0.5:8000" in text
     assert "PROVIDER_LOCAL_MODEL=nemotron-30b" in text
@@ -382,32 +384,34 @@ def test_local_provider_interactive_and_noninteractive_and_rerun(tmp_path):
     assert "nemotron-30b @ http://10.0.0.5:8000 (agents: architect=local,worker=local; token: configured)" in summary
     assert "secret-prov-tok" not in summary
 
-    # Rerun opting into local provider keeps existing URL, model, agents, and token on blank answers.
+    # Rerun when a provider is already configured asks "Keep it? [Y/n]:"; blank keeps existing settings.
     output_rerun, code_rerun = _run_wizard(
         ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
         env=_env(tmp_path),
-        answers=["", "", "", "", "", "", "y", "", "", "", "", "n"],
+        answers=["", "", "", "", "", "", "", "n"],
     )
     assert code_rerun == 0, output_rerun
-    assert "Optional API token for local provider [keep existing]:" in output_rerun
-    assert "PROVIDER_LOCAL_TOKEN=secret-prov-tok" in _env_file_text(env_file)
+    assert "A local model provider is already configured (http://10.0.0.5:8000, nemotron-30b). Keep it? [Y/n]:" in output_rerun
+    rerun_text = _env_file_text(env_file)
+    assert "PROVIDER_LOCAL_URL=http://10.0.0.5:8000" in rerun_text
+    assert "PROVIDER_LOCAL_MODEL=nemotron-30b" in rerun_text
+    assert "AGENT_PROVIDERS=architect=local,worker=local" in rerun_text
+    assert "PROVIDER_LOCAL_TOKEN=secret-prov-tok" in rerun_text
     assert "secret-prov-tok" not in output_rerun
 
-    # Non-interactive --no-provider clears the provider settings.
-    proc_clear = subprocess.run(
-        [
-            "bash", str(BOOTSTRAP),
-            "--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file),
-            "--no-provider", "--non-interactive",
-        ],
-        env=_env(tmp_path), capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+    # Answering 'n' to "Keep it? [Y/n]:" on rerun removes the provider (same effect as --no-provider).
+    output_remove, code_remove = _run_wizard(
+        ["--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file)],
+        env=_env(tmp_path),
+        answers=["", "", "", "", "", "", "n", "n"],
     )
-    assert proc_clear.returncode == 0, proc_clear.stderr
-    cleared = _env_file_text(env_file)
-    assert "PROVIDER_LOCAL_URL=" not in cleared
-    assert "PROVIDER_LOCAL_MODEL=" not in cleared
-    assert "PROVIDER_LOCAL_TOKEN=" not in cleared
-    assert "AGENT_PROVIDERS=" not in cleared
+    assert code_remove == 0, output_remove
+    assert "A local model provider is already configured (http://10.0.0.5:8000, nemotron-30b). Keep it? [Y/n]:" in output_remove
+    removed_text = _env_file_text(env_file)
+    assert "PROVIDER_LOCAL_URL=" not in removed_text
+    assert "PROVIDER_LOCAL_MODEL=" not in removed_text
+    assert "PROVIDER_LOCAL_TOKEN=" not in removed_text
+    assert "AGENT_PROVIDERS=" not in removed_text
 
     # Non-interactive --provider-url / --provider-model / --provider-agents writes them before compose up.
     proc_set = subprocess.run(
@@ -428,3 +432,19 @@ def test_local_provider_interactive_and_noninteractive_and_rerun(tmp_path):
     assert "PROVIDER_LOCAL_MODEL=nemotron-3.5" in set_text
     assert "AGENT_PROVIDERS=worker=local" in set_text
     assert "token: not set" in proc_set.stdout
+
+    # Non-interactive --no-provider also clears the provider settings.
+    proc_clear = subprocess.run(
+        [
+            "bash", str(BOOTSTRAP),
+            "--pod", "testpod", "--tenant", "testtenant", "--env-file", str(env_file),
+            "--no-provider", "--non-interactive",
+        ],
+        env=_env(tmp_path), capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+    )
+    assert proc_clear.returncode == 0, proc_clear.stderr
+    cleared = _env_file_text(env_file)
+    assert "PROVIDER_LOCAL_URL=" not in cleared
+    assert "PROVIDER_LOCAL_MODEL=" not in cleared
+    assert "PROVIDER_LOCAL_TOKEN=" not in cleared
+    assert "AGENT_PROVIDERS=" not in cleared

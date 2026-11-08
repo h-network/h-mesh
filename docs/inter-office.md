@@ -98,7 +98,7 @@ openssl x509 -req -in /tmp/h-mesh-certs/officey.csr \
 Run `./container/bootstrap.sh` interactively (or `./setup.sh --container`) and supply the **host** file paths when prompted for the TLS certificate, TLS key, and optional peer CA bundle:
 
 ```text
-  TLS certificate HOST path (blank to explicitly accept plaintext): /tmp/h-mesh-certs/officex.crt
+TLS certificate HOST path (blank for plaintext; you will be asked to confirm): /tmp/h-mesh-certs/officex.crt
   TLS key HOST path: /tmp/h-mesh-certs/officex.key
   Optional peer CA bundle HOST path (blank for system trust): /tmp/h-mesh-certs/ca.crt
 ```
@@ -146,7 +146,7 @@ HTTP 401
 
 For an isolated lab testbed without TLS certificates:
 
-- **Interactively:** Run `./container/bootstrap.sh`, leave `TLS certificate HOST path (blank to explicitly accept plaintext):` blank, and answer `y` at `Accept plaintext for this container? [y/N]:`.
+- **Interactively:** Run `./container/bootstrap.sh`, leave `TLS certificate HOST path (blank for plaintext; you will be asked to confirm):` blank, and answer `y` at `Accept plaintext for this container? [y/N]:`.
 - **Non-interactively:** Export `H_MESH_ALLOW_PLAINTEXT=1`:
 
 ```bash

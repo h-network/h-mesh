@@ -965,6 +965,8 @@ def test_office_network_interactive_picker_filters_by_label_and_creates_or_joins
     assert code == 0, output
     assert "1) hmesh-alpha" in output
     assert "2) hmesh-beta" in output
+    assert "Join office network (number or name):" in output
+    assert "Join office network (number or name) [" not in output
     assert "bridge" not in output
     assert "foreign-unlabelled" not in output
     assert "Peers on office network 'hmesh-beta' reach its API on port 8080" in output
@@ -972,6 +974,25 @@ def test_office_network_interactive_picker_filters_by_label_and_creates_or_joins
     assert "H_MESH_OFFICE_NETWORK=hmesh-beta" in env_file.read_text()
     assert "H_MESH_BIND_PORTS=0" in env_file.read_text()
     assert "name: hmesh-beta" in (office_dir / "compose.network.yaml").read_text()
+
+    # When exactly one labelled network exists, joining defaults to that network.
+    single_bin = tmp_path / "single_bin"
+    single_bin.mkdir()
+    _fake_docker_with_networks(
+        single_bin, log,
+        initial_networks={"bridge": "", "hmesh-only": "1"},
+    )
+    office_single_dir = tmp_path / "offices" / "singlepod" / "testtenant"
+    office_single_dir.mkdir(parents=True)
+    env_single = office_single_dir / ".env"
+    single_env = _env_with_fake_docker(tmp_path)
+    single_env["PATH"] = f"{single_bin}:{single_env['PATH']}"
+    single_env["H_MESH_ALLOW_PLAINTEXT"] = "1"
+    answers_join_single = ["", "", "3", "", "", "", "", "", ""]
+    output_single, code_single = _bootstrap_wizard(env_single, single_env, answers_join_single)
+    assert code_single == 0, output_single
+    assert "Join office network (number or name) [hmesh-only]:" in output_single
+    assert "H_MESH_OFFICE_NETWORK=hmesh-only" in env_single.read_text()
 
     # Choice 2 (create new) -> name "hmesh-created" -> publish ports default no ("") -> accounts/OAuth/local provider/Telegram
     office2_dir = tmp_path / "offices" / "testpod2" / "testtenant"
@@ -1025,6 +1046,30 @@ def test_office_network_validates_alias_is_legal_dns_label(tmp_path):
     assert "not a legal DNS label" in res_hyphen.stderr
     assert "network create" not in log.read_text()
     assert "up -d" not in log.read_text()
+
+
+def test_dockerfile_copied_runtime_scripts_are_world_readable_and_executable(tmp_path):
+    dockerfile = (REPO_ROOT / "container" / "Dockerfile").read_text()
+    assert "chmod +x" not in dockerfile, (
+        "bare 'chmod +x' on a 0600 file from a umask 077 checkout produces 0711 "
+        "(no read bit for non-owner ubuntu, causing exit 126 Permission denied)"
+    )
+    assert "COPY --chmod=0755 container/entrypoint.sh /usr/local/bin/entrypoint.sh" in dockerfile
+    assert "RUN chmod 0755 /usr/local/bin/entrypoint.sh" in dockerfile
+    assert "chmod 0755 /app/setup.sh" in dockerfile
+
+    # Simulate a umask 077 checkout where runtime scripts start at mode 0600,
+    # then apply the Dockerfile's chmod 0755 and verify a+rx (0o555) bits are set.
+    for rel in ("container/entrypoint.sh", "setup.sh"):
+        src = REPO_ROOT / rel
+        assert src.is_file()
+        staged = tmp_path / src.name
+        staged.write_bytes(src.read_bytes())
+        staged.chmod(0o600)
+        subprocess.run(["chmod", "0755", str(staged)], check=True)
+        mode = staged.stat().st_mode & 0o777
+        assert (mode & 0o555) == 0o555, f"{rel} after chmod 0755 is {oct(mode)}, not a+rx"
+
 
 
 
