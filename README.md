@@ -93,7 +93,11 @@ also:
   shell/pane, not just the one running setup.sh)
 - installs h-mesh's default `~/.tmux.conf` (mouse mode, status bar, pane
   borders -- the same UX the container base image otherwise bakes in, for a
-  bare host that has none; never overwrites an existing `~/.tmux.conf`)
+  bare host that has none; never overwrites an existing `~/.tmux.conf`). It is
+  a symlink to `assets/tmux.conf`; an install from before that file moved out of
+  the repo root has a dangling link to the old path, which setup.sh and
+  `h-mesh upgrade` re-point (and nothing else). Keys: see
+  [the tmux module README](h-app/modules/tmux/README.md#default-tmuxconf-keys)
 - installs a context-usage statusline (a progress bar showing how full the
   model's context window is) for the default account's claude config;
   profiled accounts get it too, at hire time, since that account's config
@@ -520,7 +524,7 @@ setup.sh, plus `--skip-install` and `--skip-pull` (`h-mesh-upgrade --help`
 for the full list). Pod and tenant must be valid non-empty h-mesh names; an
 invalid value is rejected before the upgrade stops or starts anything. It
 also re-persists the venv bin dir on `PATH`,
-re-installs the default `tmux.conf`, and re-installs the default account's
+re-installs the default `assets/tmux.conf` link (repairing the old root-path link), and re-installs the default account's
 statusline, so running it repairs an install that predates any of those
 fixes.
 

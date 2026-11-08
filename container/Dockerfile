@@ -61,7 +61,7 @@ ENV HOME=/home/ubuntu \
     VIRTUAL_ENV=/opt/h-mesh \
     PATH="/opt/h-mesh/bin:/home/ubuntu/.local/bin:${PATH}"
 
-COPY --chown=ubuntu:ubuntu pyproject.toml README.md LICENSE setup.sh tmux.conf ./
+COPY --chown=ubuntu:ubuntu pyproject.toml README.md LICENSE setup.sh ./
 COPY --chown=ubuntu:ubuntu assets/ ./assets/
 COPY --chown=ubuntu:ubuntu h-app/ ./h-app/
 

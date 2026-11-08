@@ -101,6 +101,38 @@ The #20 stamp is written before `[message from relay]`, outside the text the
 header is parsed from, so a stamped relayed message still gets its hint
 (`test_the_hint_still_matches_with_the_full_time_and_id_stamp_in_front`).
 
+## Default tmux.conf keys
+
+`assets/tmux.conf` is the tmux config h-mesh ships (installed as `~/.tmux.conf` by
+`setup.sh` / `h-mesh upgrade` via `services.tmux_conf`; a user's own file or a link
+elsewhere is never touched). Prefix is `Ctrl+b`. Mouse mode is **on** by default.
+
+| Keys | Action |
+|---|---|
+| `Ctrl+b m` | toggle mouse mode and show `mouse on` / `mouse off` |
+| `Ctrl+b \|` / `Ctrl+b -` | split right / below, in the current path |
+| `Ctrl+b z` | zoom the pane |
+| `Ctrl+b .` | set the pane title |
+| `Ctrl+b r` | reload `~/.tmux.conf` |
+| `Ctrl+b k` / `Ctrl+b K` | kill the pane / the session |
+| `Alt+Arrow` / `Ctrl+Arrow` | move between panes / resize (no prefix) |
+
+**Copying text.** With mouse on, a drag selects in tmux's own copy mode, copies to
+tmux's buffer and leaves copy mode, so nothing reaches the system clipboard.
+`Ctrl+b m` turns mouse off for terminal-native select/copy/paste (press it again to
+get click-between-panes, scroll and drag-resize back), and **Shift-drag** (Option-drag
+on macOS) selects natively even while mouse is on. `m` replaces tmux's default
+binding for marking a pane (`select-pane -m`). No OSC 52 / vi-mode copy settings are
+changed.
+
+**Moved from the repo root.** The file used to be `tmux.conf` at the repo root, so
+existing installs hold `~/.tmux.conf -> <repo>/tmux.conf`, now dangling. The
+installer treats a symlink whose target is exactly this repo's old root `tmux.conf`
+(dangling or not, absolute or relative, through a symlinked directory) as its own and
+re-points it at `assets/tmux.conf` atomically. A real file, a link anywhere else, or a
+dangling link to another checkout is left alone. The container image copies `assets/`
+(not a root file); nothing in the image links it into `~/.tmux.conf` itself.
+
 ## Agent guide
 
 `write_agent_guide` (called by `create_window` on every hire/reconcile, and by

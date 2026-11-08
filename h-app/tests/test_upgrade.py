@@ -194,7 +194,7 @@ def test_upgrade_restarts_daemons_without_duplicating_and_preserves_the_tmux_ses
         # Upgrade also (re-)installs the default tmux.conf.
         tmux_conf_path = os.path.join(home_dir, ".tmux.conf")
         assert os.path.islink(tmux_conf_path)
-        assert os.path.realpath(tmux_conf_path) == os.path.realpath(str(REPO_ROOT / "tmux.conf"))
+        assert os.path.realpath(tmux_conf_path) == os.path.realpath(str(REPO_ROOT / "assets" / "tmux.conf"))
 
         # The tmux server/session itself was never touched -- worker1's pane
         # survives the upgrade (the documented limit: it keeps its original
