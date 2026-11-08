@@ -10,7 +10,7 @@ Everything else is a module that plugs into this.
 | file | what it holds |
 |---|---|
 | `envelope.py` | wire frame: `build`/`parse`/`encode`, header splicing (`stamp_source`, `advance_hop`), address resolution |
-| `keys.py` | `prefix()`, `delivery_lock_key()` and the named per-resource helpers (`receive_*_key`, `incarnation_key`, inter-office `offices_key` family) — the sole Redis key constructors, segment validation |
+| `keys.py` | `prefix()`, `delivery_lock_key()` and the named per-resource helpers (`receive_*_key`, `incarnation_key`, inter-office `offices_key` family, `run_windows_key`/`run_remove_key`) — the sole Redis key constructors, segment validation |
 | `config.py` | local state directory resolution (`H_MESH_STATE_DIR`, default `~/.h-mesh`) |
 | `channels.py` | `send()`/`receive()`, unreplied tracking (api *clients* only -- inter-office participants never open an entry), `DeadLetter`, and best-effort failure feedback to tmux senders |
 | `queues.py` | `admit_ingress()` — shared atomic ingress-admission Lua op |

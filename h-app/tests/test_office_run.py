@@ -68,6 +68,39 @@ def _dead(ctx, window):
     return code == 0 and output == "1"
 
 
+NUDGES = []  # one entry per time a test needed the reap nudge below (read by probes)
+
+
+def _dead_status(ctx, window):
+    """The exit status tmux reports for a dead pane, or None while it is not yet set.
+
+    ⚠ `pane_dead` can read 1 before `pane_dead_status` is filled in: tmux closes the
+    pane's pty first and records the child's wait status only when it reaps the child.
+    Reading the status the instant `_dead` is true therefore races and yields ''.
+    """
+    code, output, _ = ops.run_tmux("display-message", "-p", "-t", f"{ctx['tenant']}:{window}",
+                                    "#{pane_dead_status}", socket=ctx["socket"])
+    return output if code == 0 and output != "" else None
+
+
+def _wait_dead_status(ctx, window):
+    """Poll (bounded) until tmux has recorded the pane's exit status.
+
+    Measured on the test VM (tmux 3.5a): in roughly 1 run in 10 the finished child stays
+    a zombie of the tmux server (`ps` shows `<defunct>`) for as long as we watch -- over
+    30 s -- with `pane_dead=1` and no status, because the server never ran its
+    waitpid for that SIGCHLD. The next child the server spawns and sees exit makes it
+    reap everything, so after the first bounded poll we run one throwaway `run-shell`
+    to provoke that, then poll again. The status assertion itself is unchanged.
+    """
+    try:
+        _eventually(lambda: _dead_status(ctx, window) is not None)
+    except AssertionError:
+        NUDGES.append(window)
+        ops.run_tmux("run-shell", "true", socket=ctx["socket"])
+        _eventually(lambda: _dead_status(ctx, window) is not None)
+
+
 def test_run_cli_default_shell_without_redis_or_enrollment(monkeypatch, capsys):
     calls = []
     monkeypatch.setenv("TMUX_SESSION", "office")
@@ -187,6 +220,7 @@ def test_run_exits_once_retains_output_and_is_not_restarted(run_office, status):
     cli.main(["run", "once", "--", sys.executable, "-c", script, str(marker), str(status)])
     window = "__run__once"
     _eventually(lambda: _dead(ctx, window))
+    _wait_dead_status(ctx, window)
     for _ in range(3):
         ctx["reconciler"].reconcile_once(ctx["r"])
     assert marker.read_text() == "x"
@@ -194,8 +228,7 @@ def test_run_exits_once_retains_output_and_is_not_restarted(run_office, status):
     assert window not in ctx["reconciler"]._failure_counts
     assert window not in ctx["reconciler"]._spawned_agents
     assert window not in ctx["reconciler"]._known_windows
-    assert ops.run_tmux("display-message", "-p", "-t", f"{ctx['tenant']}:{window}",
-                         "#{pane_dead_status}", socket=ctx["socket"])[1] == str(status)
+    assert _dead_status(ctx, window) == str(status)
     # Reconciliation can resize an unattached window and move output out of
     # the visible screen. Retention includes scrollback, not just the viewport.
     assert "one-shot-output" in ops.run_tmux("capture-pane", "-p", "-J", "-S", "-", "-t", f"{ctx['tenant']}:{window}",

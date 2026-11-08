@@ -52,8 +52,8 @@ RUN useradd --create-home --shell /bin/bash ubuntu \
     && mkdir -p /app /opt/h-mesh /workdir /home/ubuntu/.h-mesh \
     && chown -R ubuntu:ubuntu /app /opt/h-mesh /workdir /home/ubuntu
 
-COPY container/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY --chmod=0755 container/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
 WORKDIR /app
 USER ubuntu
@@ -61,11 +61,13 @@ ENV HOME=/home/ubuntu \
     VIRTUAL_ENV=/opt/h-mesh \
     PATH="/opt/h-mesh/bin:/home/ubuntu/.local/bin:${PATH}"
 
-COPY --chown=ubuntu:ubuntu pyproject.toml README.md LICENSE setup.sh tmux.conf ./
+COPY --chown=ubuntu:ubuntu pyproject.toml README.md LICENSE setup.sh ./
 COPY --chown=ubuntu:ubuntu assets/ ./assets/
 COPY --chown=ubuntu:ubuntu h-app/ ./h-app/
 
-RUN python3 -m venv "$VIRTUAL_ENV" \
+RUN chmod -R u+rwX,go+rX /app \
+    && chmod 0755 /app/setup.sh \
+    && python3 -m venv "$VIRTUAL_ENV" \
     && "$VIRTUAL_ENV/bin/pip" install --no-cache-dir --upgrade pip \
     && "$VIRTUAL_ENV/bin/pip" install --no-cache-dir -e .
 

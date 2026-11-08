@@ -29,6 +29,12 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: Install Redis for isolated test instances
+        run: |
+          # Leave port 6379 to the Redis service container used by smoke tests.
+          sudo systemctl mask redis-server.service
+          sudo apt-get update
+          sudo apt-get install -y redis-server
       - name: Reject unreviewed legacy-name references
         run: python h-app/tools/legacy_names.py
       - name: Install h-mesh

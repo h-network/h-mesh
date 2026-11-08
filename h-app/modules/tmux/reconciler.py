@@ -11,6 +11,7 @@ from core.logging import log_record
 from core.registry import members, port_type
 from lib.paths import get_agent_workdir, get_workdir_root
 from . import ops as tmux_ops
+from . import run_windows
 from .ops import write_agent_guide, window_env
 
 
@@ -501,6 +502,27 @@ class TmuxReconciler:
                     existing_windows.remove(window)
 
         self._known_windows = {w for w in existing_windows if not tmux_ops.is_run_window(w)}
+
+        self._sync_run_windows(r)
+
+    def _sync_run_windows(self, r: redis.Redis) -> None:
+        """Publish `office run` window state and honour `office run-rm` requests.
+
+        Never raises into the reconcile loop: run windows are outside the
+        roster, so a fault here must not stop agent windows being reconciled.
+        """
+        try:
+            run_windows.process_removals(
+                r, pod=self.pod, tenant=self.tenant, session=self.session_name, socket=self.socket,
+            )
+            run_windows.publish(
+                r, pod=self.pod, tenant=self.tenant, session=self.session_name, socket=self.socket,
+            )
+        except Exception as exc:
+            try:
+                log_record("tmux_reconciler", "error", reason=f"run window sync failed: {exc}")
+            except Exception:
+                pass
 
     def run_forever(self) -> None:
         r = redis.Redis.from_url(self.redis_url)

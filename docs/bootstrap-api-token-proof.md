@@ -1,5 +1,7 @@
 # Fresh API-token bootstrap proof
 
+> Historical record: counts, commits and offices are as of 2026-11-04; see docs/inter-office.md for current behaviour.
+
 Verified on the isolated h-lab VM on 2026-11-04 from pushed commit
 `91afbe654bd3766cc5c45d5de488002be0a2b462`, using two fresh pods. The
 checkout was `/home/h-lab/ci/setup-api-token.p9CkxD/repo`; both offices and

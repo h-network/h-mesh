@@ -481,7 +481,7 @@ def test_setup_seeds_registry_and_runs_e2e_hire_and_message(managed_tmpdir):
         # setup.sh also installs the default tmux.conf.
         tmux_conf_path = os.path.join(home_dir, ".tmux.conf")
         assert os.path.islink(tmux_conf_path)
-        assert os.path.realpath(tmux_conf_path) == os.path.realpath(str(REPO_ROOT / "tmux.conf"))
+        assert os.path.realpath(tmux_conf_path) == os.path.realpath(str(REPO_ROOT / "assets" / "tmux.conf"))
 
         # Read daemon PIDs from run_dir
         with open(os.path.join(run_dir, "switch.pid")) as f:

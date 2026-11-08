@@ -171,6 +171,11 @@ Install the `redis-server` executable before running the suite (for example,
 start, the runner exits non-zero before pytest rather than falling back to
 localhost port 6379. No office startup or shutdown command is needed.
 
+GitHub CI installs this executable on the runner and masks the packaged
+`redis-server.service` before installation to prevent automatic service startup.
+The complete suite uses its own ephemeral Redis; the separate `redis:7` service
+container on port 6379 remains available to the workflow's subsequent smoke tests.
+
 An explicit `REDIS_URL` must be a `redis://` or `rediss://` TCP URL. The runner
 uses the Redis client's URL parsing rules, including percent-decoded hosts
 and query-string defaults. It refuses port 6379 and non-loopback hosts by
@@ -303,6 +308,14 @@ tmux socket, working directory, and logs belong to the test. A shared fixture
 deliberately supplies synthetic ambient configuration and an existing h-agent
 to these tests, so isolation is exercised even in a clean runner shell. This
 does not change setup's documented environment-over-persisted-config behavior.
+
+TLS bootstrap fixtures generate a private copy of the real bootstrap and TLS
+helper, replacing only the helper's single allowed non-root UID with the test
+runner's UID. The fixture asserts that the replacement matches exactly once;
+filesystem ownership, private modes, PEM validation, and staged-copy checks
+remain real. This lets UID 1001 CI runners exercise staging without privileges.
+A separate test executes the unchanged production helper and pins its policy:
+only root and UID 1000 may stage TLS material.
 
 ## There is no enforced merge gate, and that is deliberate
 

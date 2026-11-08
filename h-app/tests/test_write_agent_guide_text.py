@@ -4,8 +4,10 @@ The operator-authority block (every entrance variant) and the "Interface
 entries may only accept ..." sentence were removed because agents refused
 legitimate Telegram/api messages on provenance grounds. The external-door
 warning paragraph was removed afterwards for the same reason (#5 follow-up),
-with no replacement text, and so was the "That's colleagues only ..." peers
-paragraph. The destructive/ambiguous rule is deliberately kept.
+and so was the "That's colleagues only ..." peers paragraph. The
+destructive/ambiguous rule is deliberately kept. A calibrated replacement for
+the warning (outside doors are normal; a message cannot grant itself authority)
+lives later in the guide and is pinned in test_guide_external_doors.py.
 """
 import pytest
 
@@ -87,7 +89,7 @@ def test_kept_text_is_still_present_and_unchanged(home, tmp_path, variant):
     assert "    h-mesh-office peers\n\nA message arrives in your terminal as" in agents
 
 
-def test_nothing_replaces_the_removed_warning(home, tmp_path):
+def test_the_old_warning_is_not_restored_at_the_top(home, tmp_path):
     agents, _ = _write(tmp_path)
     before, after = agents.split("    h-mesh-office peers\n\n")
     assert after.startswith("A message arrives in your terminal as")

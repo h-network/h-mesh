@@ -8,6 +8,14 @@
   --term-btn-bg: var(--surface-raised, #182235);
   --term-btn-hover: var(--accent-soft, #142d50);
   --term-btn-text: var(--text-primary, #eef4fb);
+  /* Mode colours (read-only = info, interactive = warning), shared by the typing
+     banner and the mode badges. These were referenced but never defined. */
+  --term-readonly-bg: var(--info-soft, #133149);
+  --term-readonly-border: var(--info, #72b7eb);
+  --term-readonly-fg: var(--info, #72b7eb);
+  --term-interactive-bg: var(--warning-soft, #392b0e);
+  --term-interactive-border: var(--warning, #f4bd57);
+  --term-interactive-fg: var(--warning, #f4bd57);
 }
 
 .terminal-panel {
@@ -35,15 +43,6 @@
 .term-tab-bar {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
-  background: var(--surface-panel);
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-md);
-  border: var(--panel-border);
-  overflow-x: auto;
-  box-shadow: var(--shadow-sm);
-}
-=======
   gap: var(--space-2);
   background: var(--surface-panel);
   padding: var(--space-2) var(--space-3);
@@ -80,23 +79,15 @@
   border-color: var(--accent);
   box-shadow: var(--shadow-sm);
 }
-}
 
 .term-tab-close {
   background: transparent;
   border: none;
   color: inherit;
-<<<<<<< HEAD
-  font-size: 0.8rem;
-  padding: 2px 4px;
-  cursor: pointer;
-  border-radius: 50%;
-=======
   font-size: var(--text-xs);
   padding: var(--space-1);
   cursor: pointer;
   border-radius: var(--radius-pill);
->>>>>>> 51d32b6 (Build 33 Part IV: apply design tokens, tabular numerals, and semantic color scale to terminal workspace)
   opacity: 0.7;
 }
 
@@ -109,56 +100,14 @@
   margin-left: auto;
   display: flex;
   align-items: center;
-<<<<<<< HEAD
-  gap: 6px;
-}
-
-/* Prominent Typing Control Banner (SPEC §16 Rule 3) */
-=======
   gap: var(--space-2);
 }
 
 /* Prominent Typing Control Banner (SPEC §16 Rule 3 & §19 Semantic Colors) */
->>>>>>> 51d32b6 (Build 33 Part IV: apply design tokens, tabular numerals, and semantic color scale to terminal workspace)
 .typing-banner {
   display: flex;
   align-items: center;
   justify-content: space-between;
-<<<<<<< HEAD
-  padding: 8px 16px;
-  border-radius: 6px;
-  font-size: 0.85rem;
-  font-weight: 600;
-  transition: all 0.2s ease;
-}
-
-.typing-banner.readonly {
-  background: var(--term-readonly-bg);
-  border: 1px solid var(--term-readonly-border);
-  color: var(--term-readonly-fg);
-}
-
-.typing-banner.interactive {
-  background: var(--term-interactive-bg);
-  border: 1px solid var(--term-interactive-border);
-  color: var(--term-interactive-fg);
-}
-
-.typing-toggle-btn {
-  font-size: 0.85rem;
-  font-weight: 700;
-  padding: 6px 14px;
-  border-radius: 6px;
-  cursor: pointer;
-  border: 1px solid currentColor;
-  background: rgba(255, 255, 255, 0.1);
-  color: inherit;
-  transition: background 0.15s ease;
-}
-
-.typing-toggle-btn:hover {
-  background: rgba(255, 255, 255, 0.25);
-=======
   padding: var(--space-2) var(--space-4);
   border-radius: var(--radius-md);
   font-size: var(--text-sm);
@@ -194,7 +143,6 @@
 
 .typing-toggle-btn:hover {
   background: rgba(255, 255, 255, 0.2);
->>>>>>> 51d32b6 (Build 33 Part IV: apply design tokens, tabular numerals, and semantic color scale to terminal workspace)
 }
 
 .terminal-bar {

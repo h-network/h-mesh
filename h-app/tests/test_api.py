@@ -91,7 +91,12 @@ class FakeRedis:
         return entry_id
 
     def xrange(self, key, min="-", max="+", count=None):
-        return self.streams.get(key, [])[:count]
+        entries = self.streams.get(key, [])
+        if isinstance(min, str) and min.startswith("("):
+            # exclusive lower bound, honoured only for this fake's own "<n>-0" ids
+            floor = int(min[1:].split("-")[0])
+            entries = [entry for entry in entries if int(str(entry[0]).split("-")[0]) > floor]
+        return entries[:count]
 
     def eval(self, script, numkeys, *args):
         keys = args[:numkeys]
@@ -124,10 +129,10 @@ class FakePipeline:
         return [self.redis.lrange(*call) for call in self.calls]
 
 
-def request(app, method, path, *, token=None, body=None):
+def request(app, method, path, *, token=None, body=None, raw=None):
     sent = []
     received = False
-    encoded = json.dumps(body).encode() if body is not None else b""
+    encoded = raw if raw is not None else (json.dumps(body).encode() if body is not None else b"")
     headers = [(b"content-type", b"application/json")]
     if token is not None:
         headers.append((b"authorization", f"Bearer {token}".encode()))
@@ -148,9 +153,9 @@ def request(app, method, path, *, token=None, body=None):
         "http_version": "1.1",
         "method": method,
         "scheme": "http",
-        "path": path,
-        "raw_path": path.encode(),
-        "query_string": b"",
+        "path": path.partition("?")[0],
+        "raw_path": path.partition("?")[0].encode(),
+        "query_string": path.partition("?")[2].encode(),
         "headers": headers,
         "client": ("127.0.0.1", 1234),
         "server": ("127.0.0.1", 8080),
@@ -173,6 +178,25 @@ class ApiTests(unittest.TestCase):
     def test_auth_and_health(self):
         self.assertEqual(request(self.app, "GET", "/health")[0], 401)
         self.assertEqual(request(self.app, "GET", "/health", token="secret"), (200, {"status": "ok"}))
+
+    def test_restdoc_session_auth_text_matches_the_session_service(self):
+        """The /restdoc session section once said header-only; the service also takes ?token=."""
+        from modules.session.app import _authorized
+
+        class Socket:
+            def __init__(self, headers=None, query=b""):
+                self.headers = headers or {}
+                self.query_params = None
+                self.scope = {"query_string": query}
+
+        self.assertTrue(_authorized(Socket({"authorization": "Bearer tok"}), "tok"))
+        self.assertTrue(_authorized(Socket(query=b"token=tok"), "tok"))
+        self.assertFalse(_authorized(Socket(query=b"token=nope"), "tok"))
+        self.assertFalse(_authorized(Socket(), "tok"))
+        html = server_module._render_restdoc_html(self.app)
+        self.assertIn("Authorization: Bearer &lt;API_TOKEN&gt;", html)
+        self.assertIn("?token=&lt;API_TOKEN&gt;", html)
+        self.assertIn("4401", html)
 
     def test_external_route_contract(self):
         routes = {(method, route.path) for route in self.app.routes for method in getattr(route, "methods", set())}
@@ -1091,6 +1115,100 @@ class CoopTokenApiTests(unittest.TestCase):
         self.assertEqual(revoked, [True])
         body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
         self.assertIn(b"token revoked", body)
+
+
+class AuditApiTests(unittest.TestCase):
+    """#27 action audit routes: POST stores a masked record, GET reads it back."""
+
+    BEARER = "s3cr3tBearerValue99"
+    COOP = "coop.0123456789abcdef." + "Zq3_-" * 8 + "abc"
+    PEM = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgk\nzzzPEMBODYzzz\n-----END PRIVATE KEY-----"
+
+    def setUp(self):
+        self.redis = FakeRedis()
+        self.redis.registry.update({"coop-a": "api"})
+        self.app = create_app(
+            settings=ApiSettings(pod="test", tenant="office", api_token="secret"),
+            redis_client=self.redis,
+        )
+
+    def post(self, agent, body=None, token="secret", raw=None):
+        return request(self.app, "POST", f"/agents/{agent}/audit", token=token, body=body, raw=raw)
+
+    def get(self, path, token="secret"):
+        return request(self.app, "GET", path, token=token)
+
+    def test_post_stores_a_record_and_returns_its_cursor(self):
+        status, body = self.post("alice", {"tool": "Bash", "args": "ls", "exit": 0, "cli": "claude", "session": "s1"})
+        self.assertEqual((status, body), (202, {"id": "1-0"}))
+        status, body = self.get("/agents/alice/audit")
+        self.assertEqual(status, 200)
+        (row,) = body["audit"]
+        self.assertEqual((row["agent"], row["tool"], row["args"], row["exit"]), ("alice", "Bash", "ls", 0))
+        self.assertEqual(body["next_cursor"], row["cursor"])
+
+    def test_bearer_coop_token_and_pem_are_stored_masked(self):
+        args = (
+            f'curl -H "Authorization: Bearer {self.BEARER}" -H "X-Coop: {self.COOP}" '
+            f"--data '{self.PEM}' https://other.example"
+        )
+        self.assertEqual(self.post("alice", {"tool": "Bash", "args": args})[0], 202)
+        stored = json.dumps(self.redis.streams[prefix("test", "office", "alice", "audit")])
+        _, listed = self.get("/agents/alice/audit")
+        for secret in (self.BEARER, self.COOP.rsplit(".", 1)[1], "zzzPEMBODYzzz", "MIIEvQIBADANBgk"):
+            self.assertNotIn(secret, stored)
+            self.assertNotIn(secret, json.dumps(listed))
+        self.assertIn("[redacted]", listed["audit"][0]["args"])
+
+    def test_after_cursor_pages_forward(self):
+        for n in range(3):
+            self.post("alice", {"tool": "Bash", "args": str(n)})
+        _, first = self.get("/agents/alice/audit?limit=2")
+        self.assertEqual([row["args"] for row in first["audit"]], ["0", "1"])
+        _, rest = self.get(f"/agents/alice/audit?after={first['next_cursor']}")
+        self.assertEqual([row["args"] for row in rest["audit"]], ["2"])
+        _, empty = self.get(f"/agents/alice/audit?after={rest['next_cursor']}")
+        self.assertEqual((empty["audit"], empty["next_cursor"]), ([], rest["next_cursor"]))
+
+    def test_oversize_body_is_413_and_nothing_is_stored(self):
+        status, _ = self.post("alice", {"tool": "Bash", "args": "x" * 9000})
+        self.assertEqual(status, 413)
+        self.assertNotIn(prefix("test", "office", "alice", "audit"), self.redis.streams)
+
+    def test_bad_records_are_422(self):
+        for body in ({}, {"tool": "Bash", "surprise": 1}, {"tool": "Bash", "exit": "x"}, ["not", "an", "object"]):
+            self.assertEqual(self.post("alice", body)[0], 422, body)
+        self.assertEqual(self.post("alice", raw=b"{not json")[0], 422)
+        self.assertNotIn(prefix("test", "office", "alice", "audit"), self.redis.streams)
+
+    def test_unknown_or_invalid_agent_is_404(self):
+        self.assertEqual(self.post("nobody", {"tool": "Bash"})[0], 404)
+        self.assertEqual(self.post("Bad_Name", {"tool": "Bash"})[0], 404)
+        self.assertEqual(self.get("/agents/nobody/audit")[0], 404)
+
+    def test_token_is_required(self):
+        self.assertEqual(self.post("alice", {"tool": "Bash"}, token=None)[0], 401)
+        self.assertEqual(self.get("/agents/alice/audit", token=None)[0], 401)
+        self.assertEqual(self.post("alice", {"tool": "Bash"}, token="wrong")[0], 401)
+
+    def test_a_cooperation_token_cannot_write_or_read_the_audit(self):
+        _, coop_token = grant(self.redis, "test", "office", "coop-a")
+        self.assertEqual(self.post("alice", {"tool": "Bash"}, token=coop_token)[0], 403)
+        self.assertEqual(self.post("coop-a", {"tool": "Bash"}, token=coop_token)[0], 403)
+        self.assertEqual(self.get("/agents/alice/audit", token=coop_token)[0], 403)
+        self.assertEqual(self.get("/agents/coop-a/audit", token=coop_token)[0], 403)
+        self.assertNotIn(prefix("test", "office", "alice", "audit"), self.redis.streams)
+
+    def test_records_are_kept_per_agent(self):
+        self.post("alice", {"tool": "Bash", "args": "a"})
+        self.post("coop-a", {"tool": "Bash", "args": "b"})
+        self.assertEqual([r["args"] for r in self.get("/agents/alice/audit")[1]["audit"]], ["a"])
+        self.assertEqual([r["args"] for r in self.get("/agents/coop-a/audit")[1]["audit"]], ["b"])
+
+    def test_the_routes_are_documented_in_restdoc(self):
+        routes = {(method, route.path) for route in self.app.routes for method in getattr(route, "methods", set())}
+        self.assertTrue({("POST", "/agents/{agent}/audit"), ("GET", "/agents/{agent}/audit")} <= routes)
+        self.assertIn("/agents/{agent}/audit", server_module._render_restdoc_html(self.app))
 
 
 class RealApiPortSubprocessTests(unittest.TestCase):

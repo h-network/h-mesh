@@ -111,7 +111,9 @@ class IngressStallMonitor:
             else "absent"
         )
         first = agent not in self._stalled
-        existing = _text(self.r.hget(key, agent)) if first else None
+        # Read on every pass, not only the first: `since` is when the stall began,
+        # so a later poll must keep it, not stamp the current time over it.
+        existing = _text(self.r.hget(key, agent))
         since = None
         if existing:
             try:

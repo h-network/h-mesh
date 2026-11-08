@@ -11,6 +11,7 @@ same as every module owning its own daemon logic.
 |---|---|
 | `ops.py` | passive tmux mechanics: `run_tmux`, `create_window`, `kill_window`, `submit_text`, session-history detection, CLI trust/guide seeding, single-guide decision (`claude_reads_agents_md`, `migrate_agent_guide`) |
 | `port.py` | `deliver_tmux` entrypoint and terminal delivery handlers (`message_opener`, `command_opener`, `attachment_opener`), delivery-verification marking |
+| `run_windows.py` | observe and remove `office run` windows: `snapshot` (state of every `__run__*` window), `publish` (mirror it to Redis `run.windows`), `process_removals` (honour `run.remove`) |
 | `reconciler.py` | `TmuxReconciler` -- the daemon logic: compares desired tmux membership against real windows, creates/removes them |
 
 ⚠ `require_isolated_tmux()` and `run_tmux()` in `ops.py` enforce strict isolation:
@@ -35,6 +36,19 @@ underscores are invalid in participant addresses, and `submit_text` also
 rejects this namespace before issuing a tmux command. The reconciler excludes
 these windows from stale-window cleanup and agent restart tracking, including
 when the registry has no tmux agents.
+
+At the end of each pass the reconciler also calls `run_windows.process_removals`
+and `run_windows.publish` (inside a try/except, so a fault there never stops
+agent reconciliation). It is the one process that can always ask tmux: an agent
+pane may not, because of the isolation guard. `publish` mirrors every run window
+to the tenant hash `run.windows` (`name -> {state: running|exited, exit_status,
+signal, command, since}`), writing only on a change, and `process_removals`
+kills the windows named in the set `run.remove` **by tmux window id**, never by
+name (tmux resolves `-t session:a` by prefix, so removing `a` must not be able to
+take `ab`). A dead pane can briefly (tmux 3.5a: sometimes for a long while) have
+no `pane_dead_status`; `publish` stores `exit_status: null` and rewrites as soon
+as the status appears, and the CLI shows `exited (status pending)` meanwhile. The
+reconciler does not nudge tmux to reap. Both go through `ops.run_tmux`; `ops.py` is unchanged.
 
 A new window initially holds a private placeholder process while
 `remain-on-exit` and rename protection are set. Only then is the requested
@@ -86,6 +100,38 @@ back to the sender. Hints for every other api-type source are unchanged.
 The #20 stamp is written before `[message from relay]`, outside the text the
 header is parsed from, so a stamped relayed message still gets its hint
 (`test_the_hint_still_matches_with_the_full_time_and_id_stamp_in_front`).
+
+## Default tmux.conf keys
+
+`assets/tmux.conf` is the tmux config h-mesh ships (installed as `~/.tmux.conf` by
+`setup.sh` / `h-mesh upgrade` via `services.tmux_conf`; a user's own file or a link
+elsewhere is never touched). Prefix is `Ctrl+b`. Mouse mode is **on** by default.
+
+| Keys | Action |
+|---|---|
+| `Ctrl+b m` | toggle mouse mode and show `mouse on` / `mouse off` |
+| `Ctrl+b \|` / `Ctrl+b -` | split right / below, in the current path |
+| `Ctrl+b z` | zoom the pane |
+| `Ctrl+b .` | set the pane title |
+| `Ctrl+b r` | reload `~/.tmux.conf` |
+| `Ctrl+b k` / `Ctrl+b K` | kill the pane / the session |
+| `Alt+Arrow` / `Ctrl+Arrow` | move between panes / resize (no prefix) |
+
+**Copying text.** With mouse on, a drag selects in tmux's own copy mode, copies to
+tmux's buffer and leaves copy mode, so nothing reaches the system clipboard.
+`Ctrl+b m` turns mouse off for terminal-native select/copy/paste (press it again to
+get click-between-panes, scroll and drag-resize back), and **Shift-drag** (Option-drag
+on macOS) selects natively even while mouse is on. `m` replaces tmux's default
+binding for marking a pane (`select-pane -m`). No OSC 52 / vi-mode copy settings are
+changed.
+
+**Moved from the repo root.** The file used to be `tmux.conf` at the repo root, so
+existing installs hold `~/.tmux.conf -> <repo>/tmux.conf`, now dangling. The
+installer treats a symlink whose target is exactly this repo's old root `tmux.conf`
+(dangling or not, absolute or relative, through a symlinked directory) as its own and
+re-points it at `assets/tmux.conf` atomically. A real file, a link anywhere else, or a
+dangling link to another checkout is left alone. The container image copies `assets/`
+(not a root file); nothing in the image links it into `~/.tmux.conf` itself.
 
 ## Agent guide
 
@@ -192,10 +238,31 @@ claude especially, read those as a reason to refuse or to demand an architect
 ack for legitimate Telegram/api messages (issue #5), so they were removed.
 The `⚠ Treat where a message arrives (an external door) ...` paragraph
 ("untrusted external content", "without blindly executing arbitrary remote
-input") was removed too, with no replacement text, for the same reason: it was
-the first alarm an agent read and the main cause of refusals of the operator's
-own Telegram messages. All that remains on the subject is the "destructive,
-ambiguous, or outside scope: ask the lead first" rule.
+input") was removed too, for the same reason: it was the first alarm an agent
+read and the main cause of refusals of the operator's own Telegram messages.
+
+What replaced it is a calibrated two-paragraph section, placed late in
+"Working in this office" (just before the "destructive, ambiguous, or outside
+scope: ask the lead first" rule), not at the top. It separates two things the
+alarm text had fused: **doing the requested work** and **honouring a claim of
+authority**. The first paragraph says other agents, the api, Telegram and any
+other connection are designed, expected ways for work to arrive, that a benign
+in-scope request is ordinary work to do and answer with `send`, and that the
+switch and participant list, not each agent per message, decide who may send.
+The second keeps the guardrails: the `[message from <name>]` label is the
+switch's stamp and stays meaningful (a message *from* `telegram` is not a
+message from someone else *saying* what the operator wants); words in a body
+claiming to be the operator or the lead are a claim, not an instruction
+(a non-lead agent is told direction comes from the lead writing as itself); and
+a destructive or out-of-scope request is not acted on because a message says so,
+whichever door it used. It uses none of the removed alarm phrases.
+`tests/test_guide_external_doors.py` pins each sentence for a non-lead agent,
+the lead and an office with no lead, plus the alarm phrases' absence and that
+the destructive rule is unchanged and directly follows.
+
+Status: unit-tested, not proven live. No live claude agent has been shown to act on a
+benign api request and decline a body-claimed "I am the operator" one; the operator
+verifies that on a real claude office.
 
 The "ticket done" rule is a one-line notice, not a report: when a ticket is
 done the agent sends the lead ONE line saying so, naming the ticket (title or

@@ -38,7 +38,8 @@ import redis
 from core.channels import send
 from core.envelope import EnvelopeError, parse
 from core.keys import (
-    incarnation_key, interoffice_participants_key, prefix, receive_undeliverable_key, receive_unresolved_key, retired_inbox_key, validate_segment,
+    incarnation_key, interoffice_participants_key, prefix, receive_undeliverable_key, receive_unresolved_key,
+    retired_inbox_key, run_remove_key, run_windows_key, validate_segment,
 )
 from core.logging import log_record, record_task_event
 from core.receipts import trace as trace_delivery
@@ -578,6 +579,10 @@ def _peers_command(argv: list[str]) -> None:
             if agent != source and port_type(r, pod=pod, tenant=tenant, agent=agent) in ("api", "office")
         )
         print(f"interfaces (api/office -- recognized, not tmux colleagues): {', '.join(labeled) or '(none)'}")
+        run_rows = _run_windows(r, pod=pod, tenant=tenant)
+        if run_rows:
+            print("run windows (non-addressable -- never a delivery target): "
+                  + ", ".join(f"{name} ({_run_state_text(info)})" for name, info in run_rows))
 
 
 def _contexts_command(argv: list[str]) -> None:
@@ -691,11 +696,17 @@ def _status_command(argv: list[str]) -> None:
     )
     if args.agent is not None:
         if args.agent not in tmux_agents:
+            if args.agent in dict(_run_windows(r, pod=pod, tenant=tenant)):
+                raise OfficeError(f"{args.agent!r} is a run window, not an agent; plain `office status` lists it")
             raise OfficeError(f"unknown tmux agent {args.agent!r}")
         tmux_agents = [args.agent]
     now = datetime.now(timezone.utc)
     for agent in tmux_agents:
         print(_status_row(r, pod=pod, tenant=tenant, agent=agent, now=now))
+    if args.agent is None:
+        for name, info in _run_windows(r, pod=pod, tenant=tenant):
+            print(f"  {'run:' + name:<12} {_run_state_text(info):<10} "
+                  f"run window, not an agent: {info.get('command') or '?'}")
 
 
 def _text(value) -> str:
@@ -708,7 +719,8 @@ def _run_command(argv: list[str]) -> None:
     parser = _operation_parser(
         "run", "Open a non-addressable process window; not an agent. "
         "Use: office run NAME [--cwd PATH] [-- COMMAND ...]. "
-        "Default: bash -il. Exited commands stay visible and are never restarted.",
+        "Default: bash -il. Exited commands stay visible and are never restarted. "
+        "Remove with: office run-rm NAME.",
     )
     parser.add_argument("name", help="window label (lowercase office-name syntax)")
     parser.add_argument("--cwd", type=Path, help="working directory (default: current directory)")
@@ -729,6 +741,76 @@ def _run_command(argv: list[str]) -> None:
     except (OSError, RuntimeError, ValueError) as exc:
         raise OfficeError(str(exc)) from exc
     print(f"opened non-addressable window {window} in {session}")
+
+
+def _run_windows(r, *, pod: str, tenant: str) -> list[tuple[str, dict]]:
+    """The `office run` windows the tmux reconciler last published, sorted by name.
+
+    Read from Redis, not tmux: from inside an agent pane the tmux isolation guard
+    forbids asking the office's own server. A missing or unreadable key is "none".
+    """
+    try:
+        raw = r.hgetall(run_windows_key(pod, tenant)) or {}
+    except redis.RedisError:
+        return []
+    rows = []
+    for name, value in raw.items():
+        try:
+            info = json.loads(_text(value))
+        except ValueError:
+            info = {}
+        rows.append((_text(name), info if isinstance(info, dict) else {}))
+    return sorted(rows)
+
+
+def _run_state_text(info: dict) -> str:
+    if info.get("state") != "exited":
+        return "running"
+    if info.get("signal"):
+        return f"exited (signal {info['signal']})"
+    if isinstance(info.get("exit_status"), int):
+        return f"exited {info['exit_status']}"
+    # tmux records a dead pane's status only when it reaps the child, which can lag
+    # (tmux 3.5a); the reconciler republishes the moment the code appears.
+    return "exited (status pending)"
+
+
+def _run_rm_command(argv: list[str]) -> None:
+    parser = _operation_parser(
+        "run-rm", "Remove an `office run` window (running or exited). Lead only. "
+        "The tmux reconciler performs the removal; this never touches tmux itself.",
+    )
+    parser.add_argument("name", help="the run window's NAME as shown by `office status`")
+    parser.add_argument("--wait", type=float, default=20.0, metavar="SECONDS",
+                        help="how long to wait for the reconciler to confirm (default 20; 0 = do not wait)")
+    args = parser.parse_args(argv)
+    try:
+        name = validate_segment(args.name)
+    except KeyError:
+        raise OfficeError(f"invalid run window name {args.name!r}") from None
+    r, pod, tenant, source = _context()
+    _require_lead(r, pod=pod, tenant=tenant, source=source, command="run-rm")
+    if name not in dict(_run_windows(r, pod=pod, tenant=tenant)):
+        raise OfficeError(
+            f"unknown run window {name!r} (see `office status`; a window opened in the last few "
+            "seconds is listed after the reconciler's next pass)"
+        )
+    try:
+        r.sadd(run_remove_key(pod, tenant), name)
+    except redis.RedisError as exc:
+        raise OfficeError(f"cannot request the removal: {exc}") from exc
+    log_record("office", "run_window_remove_requested", source=source, destination=name)
+    deadline = time.monotonic() + max(args.wait, 0.0)
+    while True:
+        if name not in dict(_run_windows(r, pod=pod, tenant=tenant)) and not r.sismember(run_remove_key(pod, tenant), name):
+            print(f"removed run window {name}")
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+    print(f"office: removal of run window {name!r} requested but not yet confirmed "
+          "(is the tmux reconciler running?)", file=sys.stderr)
+    raise SystemExit(2)
 
 
 def _fields(raw: dict) -> dict[str, str]:
@@ -2731,6 +2813,13 @@ _TOKEN_REASON_TEXT = {
 _NOT_SENT_ERRORS = (ConnectionRefusedError, socket.gaierror)
 
 
+def _name_hint(reason) -> str:
+    if isinstance(reason, socket.gaierror):
+        return (" -- the host name does not resolve from this container: is the peer on the "
+                "same shared office network, and is its alias right (see its SUMMARY.md)?")
+    return ""
+
+
 def _post_to_office(url: str, token: str, agent: str, body: dict, ca_cert: str | None = None) -> dict:
     """POST one envelope; return the parsed 202 body.
 
@@ -2773,7 +2862,9 @@ def _post_to_office(url: str, token: str, agent: str, body: dict, ca_cert: str |
         ) from None
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, _NOT_SENT_ERRORS):
-            raise OfficeError(f"cannot reach the remote office at {url}: {exc.reason}") from None
+            raise OfficeError(
+                f"cannot reach the remote office at {url}: {exc.reason}{_name_hint(exc.reason)}"
+            ) from None
         if url.lower().startswith("https://") and not tls["tls"]:
             # Nothing is written before the handshake completes, so this is
             # provably NOT sent -- verification and handshake failures included.
@@ -2856,7 +2947,8 @@ def _probe_office(url: str, token: str, expect_participant: str | None,
                 and not isinstance(exc.reason, _NOT_SENT_ERRORS):
             what, fix = _tls_failure(exc.reason, url, ca_cert)
             return _Link("tls", f"{what} -- {fix}")
-        return _Link("unreachable", f"cannot reach the remote office at {url}: {exc.reason}")
+        return _Link("unreachable",
+                     f"cannot reach the remote office at {url}: {exc.reason}{_name_hint(exc.reason)}")
     except (OSError, http.client.HTTPException) as exc:
         return _Link("unreachable", (
             f"connection to the remote office at {url} broke ({type(exc).__name__})"))
@@ -2937,6 +3029,129 @@ def _send_to_office(office: str, agent: str, text: str) -> None:
     print(f"sent to {office}/{agent}: {len(text.encode('utf-8'))} bytes ({stream_id})")
 
 
+_DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_DEFAULT_BY_NAME_PORT = 8080          # the api port INSIDE every office container
+
+
+def _resolve_office_host(host: str, port: int) -> list[str]:
+    """Addresses the container's resolver gives `host` (a seam for tests)."""
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    return sorted({info[4][0] for info in infos})
+
+
+def _parse_route_table(text: str) -> list:
+    """Directly attached IPv4 networks from /proc/net/route text."""
+    networks = []
+    for line in text.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 8:
+            continue
+        try:
+            destination = int(fields[1], 16)
+            gateway = int(fields[2], 16)
+            flags = int(fields[3], 16)
+            mask = int(fields[7], 16)
+            if destination == 0 or gateway != 0 or not flags & 1:
+                continue            # default route, a routed (gatewayed) net, or down
+            # /proc/net/route prints the 32-bit values byte-reversed (little endian)
+            network = int.from_bytes(destination.to_bytes(4, "little"), "big")
+            prefix = bin(int.from_bytes(mask.to_bytes(4, "little"), "big")).count("1")
+            networks.append(ipaddress.IPv4Network((network, prefix), strict=False))
+        except (ValueError, OverflowError):
+            continue
+    return networks
+
+
+def _parse_if_inet6(text: str) -> list:
+    """Directly attached IPv6 networks from /proc/net/if_inet6 text."""
+    networks = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or len(fields[0]) != 32:
+            continue
+        try:
+            address = ipaddress.IPv6Address(bytes.fromhex(fields[0]))
+            networks.append(ipaddress.IPv6Network((address, int(fields[2], 16)), strict=False))
+        except ValueError:
+            continue
+    return networks
+
+
+def _local_subnets() -> list:
+    """Subnets of this container's own network interfaces (plus loopback).
+
+    A by-name office whose address lies in one of these is on a directly
+    attached (docker) network; anything else, even a private LAN address, is
+    reached over a routed path. A seam for tests.
+    """
+    networks = [ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("::1/128")]
+    for path, parse in (("/proc/net/route", _parse_route_table),
+                        ("/proc/net/if_inet6", _parse_if_inet6)):
+        try:
+            networks.extend(parse(Path(path).read_text()))
+        except OSError:
+            pass
+    return networks
+
+
+def _url_by_name(name: str, port: int, *, https: bool, allow_plaintext: bool = False) -> str:
+    """The url of an office reachable by name on a shared network.
+
+    Only a plain DNS label is accepted (no dots, slashes, colons, '@', so the
+    lookup cannot be pointed at an arbitrary host or smuggle a URL part), and
+    every address it resolves to must be private/loopback: a by-name office is
+    one on the same host or network, never a public address.
+
+    Plaintext is a separate gate: http without --allow-plaintext is accepted
+    only if every address lies inside a subnet of one of this container's own
+    interfaces (a directly attached docker network). A private address outside
+    them (e.g. a LAN host reached through a search domain) needs the flag.
+    """
+    if not _DNS_LABEL_RE.fullmatch(name) or name.isdigit():
+        raise OfficeError(
+            f"cannot look up {name!r} by name: only a plain DNS label is accepted "
+            "(lowercase letters, digits and hyphens; no dots, slashes, colons or '@'). "
+            "Pass the url explicitly for anything else"
+        )
+    try:
+        addresses = _resolve_office_host(name, port)
+    except (OSError, UnicodeError) as exc:
+        raise OfficeError(
+            f"cannot resolve office name {name!r}: {exc}. Check that this office and {name!r} "
+            "are on the same shared office network, and that the name is the peer's network "
+            "alias (see its SUMMARY.md). Nothing saved; to reach it another way give its url"
+        ) from None
+    if not addresses:
+        raise OfficeError(f"office name {name!r} resolved to no address. Nothing saved")
+    parsed = []
+    for address in addresses:
+        try:
+            ip = ipaddress.ip_address(address.split("%", 1)[0])
+            private = ip.is_private
+        except ValueError:
+            raise OfficeError(f"office name {name!r} resolved to an unreadable address {address!r}. Nothing saved") from None
+        if not private:
+            raise OfficeError(
+                f"office name {name!r} resolves to {address}, which is not a private address; "
+                "by-name lookup is only for offices on a shared private network. "
+                "Nothing saved; pass its url explicitly if that is really the office"
+            )
+        parsed.append(ip)
+    scheme = "https" if https else "http"
+    if not https and not allow_plaintext:
+        subnets = _local_subnets()
+        foreign = [str(ip) for ip in parsed
+                   if not any(ip.version == net.version and ip in net for net in subnets)]
+        if foreign:
+            raise OfficeError(
+                f"office name {name!r} resolves to {foreign[0]}, a private address outside every "
+                "network this container is attached to; plaintext http to it would cross a LAN "
+                "or a routed path. Use https (--ca-cert PATH), or pass --allow-plaintext for a "
+                "lab test bed. Nothing saved"
+            )
+    return f"{scheme}://{name}:{port}"
+
+
 def _office_add_command(argv: list[str]) -> None:
     parser = _operation_parser(
         "office-add",
@@ -2944,7 +3159,14 @@ def _office_add_command(argv: list[str]) -> None:
         "The cooperation token is read from stdin and never accepted as an argument.",
     )
     parser.add_argument("name", help="local name for the other office")
-    parser.add_argument("url", help="base url of its api door, e.g. https://office-b.example:8080")
+    parser.add_argument("url", nargs="?",
+                        help="base url of its api door, e.g. https://office-b.example:8080. "
+                             "Omit it for an office on a shared office network: NAME is then "
+                             "looked up by name and the url is http://NAME:8080 "
+                             "(https with --ca-cert)")
+    parser.add_argument("--port", type=int, metavar="PORT",
+                        help="api port for a by-name office (default 8080, the port inside "
+                             "the container); not valid with a url")
     parser.add_argument("--participant", metavar="NAME",
                         help="the participant the cooperation was granted to (the 'as' value); "
                              "taken from the remote office when omitted (required with --no-verify)")
@@ -2970,7 +3192,22 @@ def _office_add_command(argv: list[str]) -> None:
     participant = _segment_arg(args.participant, "participant") if args.participant else None
     if participant in _FIXED_PARTICIPANTS:
         raise OfficeError(f"participant {participant!r} is reserved")
-    url, plaintext = _validated_office_url(args.url, allow_plaintext=args.allow_plaintext)
+    if args.url is not None and args.port is not None:
+        raise OfficeError("--port only applies when the url is omitted; put the port in the url")
+    if args.url is None:
+        port = _DEFAULT_BY_NAME_PORT if args.port is None else args.port
+        if not 1 <= port <= 65535:
+            raise OfficeError(f"invalid --port {port}: must be 1-65535")
+        # Names that cannot be a DNS label are refused before any lookup. An
+        # address on a directly attached network may use plaintext without the
+        # flag; any other private address needs it. The warning still prints.
+        by_name = _url_by_name(
+            args.name, port, https=args.ca_cert is not None,
+            allow_plaintext=args.allow_plaintext or os.environ.get("H_MESH_ALLOW_PLAINTEXT") == "1",
+        )
+        url, plaintext = _validated_office_url(by_name, allow_plaintext=True)
+    else:
+        url, plaintext = _validated_office_url(args.url, allow_plaintext=args.allow_plaintext)
     ca_cert = None
     if args.ca_cert is not None:
         if not url.startswith("https://"):
@@ -3171,6 +3408,56 @@ def _coops_command(argv: list[str]) -> None:
 
 
 
+def _audit_command(argv: list[str]) -> None:
+    """Read the action audit (#27): what agents DID, newest last.
+
+    ⚠ Reads Redis directly like the other office commands, so it is a
+    convenience, NOT an access boundary: with one shared OS user any agent can
+    read (or forge, or delete) these records. See modules/office/README.md.
+    """
+    parser = _operation_parser("audit", "Show the action audit: commands and tool calls agents ran.")
+    parser.add_argument("-a", "--agent", metavar="AGENT",
+                        help="only this agent (also works for a retired agent whose records are kept)")
+    parser.add_argument("--since", metavar="WHEN", help="90m, 2h, 1d or an ISO-8601 time (by receive time)")
+    parser.add_argument("--tool", metavar="TOOL", help="only this tool (e.g. Bash)")
+    parser.add_argument("--limit", type=int, default=50, metavar="N",
+                        help="show at most the newest N records (default 50)")
+    parser.add_argument("--json", action="store_true", help="one JSON record per line")
+    args = parser.parse_args(argv)
+    if args.limit < 1:
+        parser.error("--limit must be >= 1")
+    audit = importlib.import_module("lib.audit")
+    r, pod, tenant, _ = _context()
+    try:
+        moment = audit.parse_since(args.since) if args.since else None
+        if args.agent:
+            validate_segment(args.agent)
+    except (audit.AuditError, KeyError) as exc:
+        raise OfficeError(str(exc) if isinstance(exc, audit.AuditError) else f"invalid agent name {args.agent!r}") from exc
+    agents = [args.agent] if args.agent else sorted(_text(a) for a in members(r, pod=pod, tenant=tenant))
+    rows = []
+    for name in agents:
+        rows.extend(audit.read_since(r, pod, tenant, name, moment))
+    if args.tool:
+        rows = [row for row in rows if row.get("tool") == args.tool]
+    rows.sort(key=lambda row: (str(row.get("recv_ts", "")), str(row.get("cursor", ""))))
+    rows = rows[-args.limit:]
+    if not rows:
+        print("no audit records")
+        return
+    for row in rows:
+        if args.json:
+            print(json.dumps(row, separators=(",", ":")))
+            continue
+        exit_code = row.get("exit")
+        shown = "-" if exit_code is None else str(exit_code)
+        # One physical line per record: args may hold newlines.
+        text = str(row.get("args", "")).replace("\\", "\\\\").replace("\n", "\\n")
+        more = "\u2026" if row.get("args_truncated") else ""
+        print(f"{row.get('recv_ts', '?')}\t{row.get('agent', '?')}\t{row.get('tool', '?')}\t"
+              f"exit={shown}\t{text}{more}")
+
+
 # ---------------------------------------------------------------------------
 # Dispatch: one table, not three hand-synced places.
 #
@@ -3197,6 +3484,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("status",), "show agent presence and open work", _status_command),
     (("hire",), "enrol a new agent", lambda argv: _lifecycle_command("hire", argv)),
     (("run",), "open a non-addressable shell or command window", _run_command),
+    (("run-rm",), "remove a run window (restricted to the lead)", _run_rm_command),
     (("let-go",), "retire an agent", lambda argv: _lifecycle_command("letGo", argv)),
     (("pause",), "pause an agent's CLI", lambda argv: _lifecycle_command("pause", argv)),
     (("resume",), "resume an agent's CLI and inbox", lambda argv: _lifecycle_command("resume", argv)),
@@ -3225,6 +3513,7 @@ _COMMAND_TABLE: tuple[tuple[tuple[str, ...], str, "callable"], ...] = (
     (("coop-grant",), "grant another office a cooperation token (lead only)", _coop_grant_command),
     (("coop-revoke",), "revoke a cooperation token (lead only)", _coop_revoke_command),
     (("coops",), "list granted cooperation tokens", _coops_command),
+    (("audit",), "show the action audit: commands and tool calls agents ran", _audit_command),
 )
 
 _COMMANDS: tuple[str, ...] = tuple(name for names, _, _ in _COMMAND_TABLE for name in names)

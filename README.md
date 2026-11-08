@@ -93,7 +93,11 @@ also:
   shell/pane, not just the one running setup.sh)
 - installs h-mesh's default `~/.tmux.conf` (mouse mode, status bar, pane
   borders -- the same UX the container base image otherwise bakes in, for a
-  bare host that has none; never overwrites an existing `~/.tmux.conf`)
+  bare host that has none; never overwrites an existing `~/.tmux.conf`). It is
+  a symlink to `assets/tmux.conf`; an install from before that file moved out of
+  the repo root has a dangling link to the old path, which setup.sh and
+  `h-mesh upgrade` re-point (and nothing else). Keys: see
+  [the tmux module README](h-app/modules/tmux/README.md#default-tmuxconf-keys)
 - installs a context-usage statusline (a progress bar showing how full the
   model's context window is) for the default account's claude config;
   profiled accounts get it too, at hire time, since that account's config
@@ -203,19 +207,64 @@ which you want before anything else, with container as the default -- see
 "Bootstrap script" above. Selecting container or passing `--container`
 hands off entirely to `container/bootstrap.sh`, a smaller wizard (same
 banner as the host wizard) that collects `POD`/`TENANT`/`AGENTS`/
-`DEFAULT_CLI`, whether to publish the API/session ports (and which host
+`DEFAULT_CLI`, an optional shared `h-mesh` office network choice (`1` none,
+`2` create a new office network, or `3` join an existing office network),
+whether to publish the API/session ports (and which host
 ports to use), one or more Claude account names, and each account's OAuth
 token (blank to log in
 interactively later -- see "Finding and attaching..." below for how a
-container operator can actually do that), and optional Telegram bot config,
-writes them to `offices/<pod>/<tenant>/.env` (alongside a regenerated
-`SUMMARY.md` and executable `attach.sh`, neither of which contains secret
+container operator can actually do that), an optional local OpenAI-compatible
+model provider (`PROVIDER_LOCAL_URL`, `PROVIDER_LOCAL_MODEL`, which agents use
+it via `AGENT_PROVIDERS`, and optional `PROVIDER_LOCAL_TOKEN`), and optional
+Telegram bot config,
+writes them to `offices/<pod>/<tenant>/.env` (alongside an optional
+`compose.network.yaml`, a regenerated
+`SUMMARY.md`, and an executable `attach.sh`, none of which contain secret
 values), and runs `docker compose up
---build`. The interactive wizard always requires a TLS-or-plaintext choice
-for the API, including when Telegram is declined. A certificate path requires
-its key; plaintext requires an explicit yes, so completing the guided install
-with published ports leaves the API reachable. Run `./container/bootstrap.sh
+--build`. Whenever the API is reachable outside the container (via published
+host ports or a shared office network), the interactive wizard requires a
+TLS-or-plaintext choice for the API, including when Telegram is declined. When
+no office network is joined and no host ports are published, nothing outside
+the container can reach the API, so the wizard skips the TLS/plaintext prompt
+and keeps the API loopback-only inside the container. Run `./container/bootstrap.sh
 --help` for its full flag/env surface.
+
+**Shared office network (same-host inter-office without publishing host ports).**
+`container/bootstrap.sh` can attach offices on the same Docker host to a
+labelled `h-mesh` Docker network (`io.h-mesh.office-network=1`):
+- **Interactive picker:** Offers `(1) none` (default on a fresh office),
+  `(2) create a new office network`, or `(3) join an existing office network`.
+  The picker lists **only** Docker networks carrying the label
+  `io.h-mesh.office-network=1` (filtered by label, never by name, so `bridge`
+  or unrelated Docker networks are never shown or joined; when joining, it
+  defaults to the only labelled network when there is just one, and has no
+  default when multiple exist).
+- **Non-interactive flag/env:** `--office-network <name>` (or
+  `H_MESH_OFFICE_NETWORK=<name>`) creates `<name>` with label
+  `io.h-mesh.office-network=1` if missing, or joins it if it already carries
+  that label. If a network named `<name>` already exists without
+  `io.h-mesh.office-network=1`, `bootstrap.sh` refuses before starting Compose.
+- **Stable DNS alias (`<pod>-<tenant>`):** The container joins the office
+  network with the alias `<pod>-<tenant>` (validated as a legal RFC 1123 DNS
+  label), so sibling offices on the same office network reach its API at
+  `http://<pod>-<tenant>:8080` (or `https://<pod>-<tenant>:8080`) without
+  publishing any ports on the host.
+- **Pairing by name:** on a shared office network the lead registers the peer
+  with `h-mesh-office office-add <pod>-<tenant> --token-stdin` and no url; see
+  [Inter-Office Communication Guide](docs/inter-office.md).
+- **Host port publishing default:** When an office network is chosen, host port
+  publishing defaults to **no** (`H_MESH_BIND_PORTS=0`); pass `--bind-ports`
+  (or answer `y` interactively) to also publish host ports.
+- **Persistence and idempotent reruns:** `bootstrap.sh` records
+  `H_MESH_OFFICE_NETWORK` and `H_MESH_OFFICE_ALIAS` in
+  `offices/<pod>/<tenant>/.env` and `SUMMARY.md`, and writes
+  `offices/<pod>/<tenant>/compose.network.yaml` next to `.env` (included in
+  `SUMMARY.md` and `attach.sh` Compose commands so the network attachment
+  survives container recreates and manual `docker compose up`). Rerunning
+  `./container/bootstrap.sh --pod <pod> --tenant <tenant>` is idempotent and
+  keeps the office on its configured network unless `--no-office-network` (or
+  interactive choice `1`) is explicitly given. Existing offices without
+  `H_MESH_OFFICE_NETWORK` keep working unchanged.
 
 **One office, one directory, one explicit Compose project.** Docker
 Compose's own project-name default is the *containing folder's* name
@@ -228,7 +277,7 @@ always resolves an office to `offices/<pod>/<tenant>/.env` and always passes
 are isolated by construction. `offices/` is gitignored -- it holds live
 credentials (`CLAUDE_OAUTH_TOKEN_<PROFILE>`, `API_TOKEN`, etc.), the same as
 `container/.env` (kept as a single-office convenience default) always was.
-Port publishing defaults to yes, with `API_PORT=8080` and
+Without an office network, port publishing defaults to yes, with `API_PORT=8080` and
 `SESSION_PORT=8081`, preserving the previous single-office behavior. The
 wizard warns if a selected port appears in a sibling office's `.env` or is
 already listening locally; choose distinct ports for multiple offices, or
@@ -272,13 +321,18 @@ Every non-interactive env var from "Bootstrap script" above (`AGENTS`,
 `API_TOKEN`, `H_MESH_BIND_PORTS`, `API_PORT`, and `SESSION_PORT`) applies
 unchanged. `bootstrap.sh`'s interactive wizard prompts
 for the account count and names, each account's corresponding
-`CLAUDE_OAUTH_TOKEN_<PROFILE>`, and for
+`CLAUDE_OAUTH_TOKEN_<PROFILE>`, optional local model provider settings
+(`PROVIDER_LOCAL_URL`, `PROVIDER_LOCAL_MODEL`, `AGENT_PROVIDERS`, and optional
+`PROVIDER_LOCAL_TOKEN` -- on a rerun when a provider is already configured,
+`A local model provider is already configured (<url>, <model>). Keep it? [Y/n]:`
+keeps it on `Y`/blank and removes it on `n`, the same effect as `--no-provider`;
+or non-interactively via `--provider-url`,
+`--provider-model`, `--provider-agents`, `--no-provider`), and for
 `TELEGRAM_*` directly, mirroring the host wizard -- these were previously,
 incorrectly, treated as file-only "advanced" options; a working office
 always needs some credential, and the choice to enable Telegram is one the
-host wizard already offered. Per-agent account assignment and other
-exceptions (`AGENT_CLIS`/`AGENT_PROFILES`/`AGENT_PROVIDERS`) and local model
-provider config (`PROVIDER_LOCAL_*`) remain file-only. `API_TOKEN` is never
+host wizard already offered. Per-agent CLI/account assignment and other
+exceptions (`AGENT_CLIS`/`AGENT_PROFILES`) remain file-only. `API_TOKEN` is never
 prompted anywhere. Both host setup and container bootstrap generate 32 random
 bytes (64 hex characters) when no token is configured, including without
 Telegram. Container bootstrap persists it in `offices/<pod>/<tenant>/.env`
@@ -470,7 +524,7 @@ setup.sh, plus `--skip-install` and `--skip-pull` (`h-mesh-upgrade --help`
 for the full list). Pod and tenant must be valid non-empty h-mesh names; an
 invalid value is rejected before the upgrade stops or starts anything. It
 also re-persists the venv bin dir on `PATH`,
-re-installs the default `tmux.conf`, and re-installs the default account's
+re-installs the default `assets/tmux.conf` link (repairing the old root-path link), and re-installs the default account's
 statusline, so running it repairs an install that predates any of those
 fixes.
 
@@ -523,10 +577,10 @@ python -m tools.run_tests
 ```
 
 The configured test path covers the entire `h-app` source tree, including
-tests colocated under `clients/web`. The runner asserts a minimum collection
-count before executing pytest, so under-collection fails loudly while normal
-test additions require no maintenance. If tests are intentionally removed,
-update `EXPECTED_MINIMUM_TEST_COUNT` in the runner.
+tests colocated under `clients/web`. The runner checks collection against the
+reviewed node list `h-app/tools/test_nodeids.txt` and reports every `added` or
+`missing` node, so adding, removing or renaming a test means updating that file
+in the same change (see [`docs/ci.md`](docs/ci.md)).
 Passing an explicit path such as `pytest tests/` overrides configured discovery
 and intentionally runs only the selected subtree; do not use a narrowed path
 as evidence that the complete suite passes.
@@ -547,6 +601,8 @@ provides these process entry points:
 - `h-mesh-tmux-reconciler` — the tmux registry reconciler daemon
 - `h-mesh-watchdog` — the delivery and presence watchdog daemon
 - `h-mesh-tmux-port AGENT` — direct tmux delivery-port invocation
+- `h-mesh` — the unified command dispatcher (`h-mesh start`, `h-mesh upgrade`, ...)
+- `h-mesh-claude-sdk-port AGENT` — direct claude_sdk delivery-port invocation
 - `h-mesh-office` — the operator CLI
 - `h-mesh-clone-to-all` — the standalone clone-to-all compatibility command
 - `h-mesh-upgrade` — pull, reinstall, and cleanly restart the daemons setup.sh started

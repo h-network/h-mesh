@@ -12,9 +12,9 @@ settled `lib.agentlifecycle` API. Same domain, both sides, one module.
 | `pricing.py` | model token pricing and cost calculation, used only by `usage` |
 | `port.py` | the receiving half -- one-envelope lifecycle dispatch plus its runnable kick entrypoint |
 
-Not runnable via any packaging yet -- h-mesh has no console-scripts story for
-any module, so `office` is reached the same way tests reach it: put `h-app/`
-on `sys.path` and call `modules.office.cli.main`.
+The installed commands are `h-mesh-office` (this CLI, `modules.office.cli:main`)
+and `h-mesh COMMAND` (`dispatcher.py`, which also routes the service entry
+points); `h-mesh-clone-to-all` is the standalone `clone-to-all`.
 
 `profiles` is not a command yet: it needs an `available_profiles()`
 (configured-accounts) read that has no h-mesh equivalent anywhere in `core`
@@ -47,11 +47,30 @@ Direct sends and broadcasts cannot target it, and tmux's message-paste helper
 refuses that namespace. Its process runs once: exited output and exit status
 stay in a dead pane for inspection, with no agent restart, resume, presence,
 or stall tracking. The reconciler preserves these windows even with an empty
-agent roster. Close it explicitly, for example
-`tmux -S "$TMUX_SOCKET" kill-window -t "$TMUX_SESSION:__run__monitor"`;
+agent roster. Close it explicitly with `office run-rm monitor` (below);
 closing it does not recreate it. Reusing an existing run name fails instead
 of replacing or restarting the process. Ordinary manual typing in a run shell
 remains available through tmux. Do not rename it into an agent window.
+
+`office status` lists each run window after the agents, as
+`run:NAME  running|exited N  run window, not an agent: COMMAND`, and
+`office peers -i` adds a `run windows (non-addressable ...)` line (plain `peers`
+stays colleagues only). The state comes from Redis (`run.windows`), published by
+the tmux reconciler within one poll (about 5 s), so it works from inside an agent
+pane where the tmux isolation guard forbids asking the office's own server. A
+command that exits stays listed as `exited N` (or `exited (signal N)`) until
+removed; nothing restarts it. tmux fills in a dead pane's status only when it reaps
+the child, which can lag, so a window that is dead but has no status or signal yet
+reads `exited (status pending)` rather than a bare `exited`; the code appears on
+its own once tmux reaps (the reconciler republishes on any status change).
+
+`office run-rm NAME [--wait SECONDS]` (lead only, advisory like `coop-grant`)
+removes a run window, running or exited. It writes the request to `run.remove`
+and waits (default 20 s) for the reconciler to kill the window and clear the
+listing; it never touches tmux itself, so it works from any pane. Exit 0 =
+removed, 1 = refused (unknown or invalid name, not the lead), 2 = requested but
+the reconciler has not confirmed (is `tmux_reconciler` running?). A raw
+`tmux kill-window -t "$TMUX_SESSION:__run__NAME"` still works but is no longer needed.
 
 Board transitions run in one isolated Lua script and preflight both Redis key
 types before mutation; `take` also checks destination emptiness before its
@@ -131,7 +150,8 @@ one JSON line `{"agent", "state", "ticket"}` per match, so a `rel:<id>` or a
 quoted id resolves without guessing `-a`. Plain `office show ID [-a AGENT]` is
 unchanged, as are tickets already stored and the `-r/--related` option (related
 ids are still stored unvalidated). The id is already the first column of
-`office list` and what `add` prints; there is no notification on `add`.
+`office list` and what `add` prints. `add` also sends the assignee a notice
+(see "Board event notices (#18)" below; `--no-notify` suppresses it).
 
 `office add --authority TEXT` sets the ticket's authoritative directive once, at
 creation: what the creator is instructing or approving, up to 2000 characters.
@@ -329,9 +349,9 @@ total, so the total understates real spend whenever an agy agent is running.
 Collecting agy usage would need a new data source in the watchdog; no
 collection code exists in `office`.
 
-## Inter-office (proof of concept)
+## Inter-office
 
-One office can send a message to an agent in another office. The CLI itself
+The user guide is [`docs/inter-office.md`](../../../docs/inter-office.md). One office can send a message to an agent in another office. The CLI itself
 POSTs to the other office's api door; a separate relay daemon handles replies
 only (it is not part of this module). Message kind only, no attachments.
 
@@ -376,11 +396,11 @@ as a substitute.
 
 | resource | holds |
 |---|---|
-| `offices` | hash `name -> {url, participant, added_by, added_ts}`, no secrets |
+| `offices` | hash `name -> {url, participant, added_by, added_ts[, ca_cert]}`, no secrets |
 | `offices.tokens` | hash `name -> token`, read only by `send --office` and the relay |
 | `xsent.s<stream_id>` | the reply-routing record above |
 
-- `office office-add NAME URL [--participant P] --token-stdin [--allow-plaintext] [--ca-cert PATH] [--no-verify]`
+- `office office-add NAME [URL] [--port PORT] [--participant P] --token-stdin [--allow-plaintext] [--ca-cert PATH] [--no-verify]`
   (lead only). The token is read from stdin and there is no `--token` option,
   so it never appears in process arguments. It also enrols the local api
   participant `relay` with a `StartAgent` envelope if it is absent, and refuses
@@ -398,6 +418,30 @@ as a substitute.
   taken from the remote's answer. `--no-verify` skips the call for offline use
   (then `--participant` is required, and a wrong participant or token only
   shows on the first send; the command says `NOT verified`).
+- **By name (shared office network).** Omit `URL` and `NAME` is looked up with
+  the container's own name resolution: the url becomes `http://NAME:8080`
+  (8080 is the api port inside every office container; `--port` overrides it,
+  and is refused together with a url), or `https://NAME:8080` when `--ca-cert`
+  is given (the certificate must then be valid for `NAME`). The rest is the
+  ordinary `office-add`: `GET /whoami` with the token, a participant mismatch
+  or bad token saves nothing, `--participant` is read from the answer. Safety
+  rules: `NAME` must be a plain DNS label (lowercase letters, digits, hyphens;
+  no dots, slashes, colons or `@`, not all digits), the lookup happens before
+  anything is written (also with `--no-verify`), and **every** address it
+  returns must be private/loopback, so a by-name lookup can never point the
+  token at a public host. **Plaintext gate:** plain `http://` skips
+  `--allow-plaintext` only when every resolved address lies inside a subnet of
+  one of this container's own network interfaces (read from
+  `/proc/net/route` and `/proc/net/if_inet6`; loopback counts), i.e. a
+  directly attached docker network. A private address outside those subnets
+  (for instance a LAN host reached through a search domain) still resolves but
+  needs `--allow-plaintext` (or `H_MESH_ALLOW_PLAINTEXT=1`); `https://` via
+  `--ca-cert` needs neither. The plaintext warning is always printed. If the name does not resolve the error says to check that both
+  offices share a network and that `NAME` is the peer's network alias (its
+  `SUMMARY.md`), and nothing is saved. An explicit `URL` behaves exactly as
+  before and never triggers a lookup. Afterwards `offices --check` and
+  `send --office NAME` treat the entry like any other; a name that stops
+  resolving is reported with the same hint.
 - `office offices` lists names, urls and participants. It reads only the
   `offices` hash, so it cannot print a token, and makes no network call.
   `office offices --check` also probes every entry with its saved token and
@@ -449,6 +493,24 @@ unauthenticated environment variable and any process with Redis access can
 write the same keys directly, so this stops mistakes and non-lead agents, not a
 hostile local process. The same applies to the tokens hash: hiding tokens from
 `offices` prevents accidental disclosure, not reading Redis.
+
+## Action audit (#27)
+
+`office audit [-a AGENT] [--since 90m|2h|1d|ISO] [--tool TOOL] [--limit N] [--json]`
+shows what agents *did*: the records h-agent's tool hooks submitted to the api
+door (`POST /agents/{agent}/audit`, see `modules/api/README.md` for the record
+format, caps and masking). Output is one line per record, oldest first,
+`recv_ts<TAB>agent<TAB>tool<TAB>exit=N<TAB>args` (`exit=-` when unknown, `…`
+after truncated args, newlines in args shown as `\n`); `--json` prints the stored
+records, one per line, including `cursor`. Without `-a` it covers every enrolled
+agent; a retired agent's kept records are read with `-a NAME`. `--since` and
+the ordering use the server's `recv_ts`, never the caller's claimed `ts`;
+`--limit` (default 50) keeps the newest N.
+
+The command reads Redis directly like the other office commands, so it needs no
+`API_TOKEN` (the HTTP read route does). That is a convenience, not an access
+boundary, and the records are not tamper-evident: with one shared OS user an
+agent can forge, skip or delete them (the plain list is in the api README).
 
 ## Board event notices (#18)
 
